@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SteamLoader.App/SteamLoader.App.csproj" />
+  </Folder>
+</Solution>

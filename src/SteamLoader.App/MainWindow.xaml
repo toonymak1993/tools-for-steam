@@ -1,0 +1,287 @@
+<Window x:Class="SteamLoader.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Steam Tools"
+        Width="980"
+        Height="660"
+        MinWidth="920"
+        MinHeight="620"
+        Background="#10161F"
+        WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+
+        <Style x:Key="CardBorderStyle" TargetType="Border">
+            <Setter Property="Background" Value="#1B2430" />
+            <Setter Property="BorderBrush" Value="#2A3442" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="Padding" Value="22" />
+        </Style>
+
+        <Style x:Key="PrimaryButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#3D4652" />
+            <Setter Property="Foreground" Value="#E6EDF5" />
+            <Setter Property="BorderBrush" Value="#4A5562" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="16,11" />
+            <Setter Property="FontSize" Value="15" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="12">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              Margin="{TemplateBinding Padding}" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#4A5664" />
+                </Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter Property="Background" Value="#E8EEF5" />
+                    <Setter Property="Foreground" Value="#253140" />
+                    <Setter Property="BorderBrush" Value="#E8EEF5" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Opacity" Value="0.45" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="GhostButtonStyle" BasedOn="{StaticResource PrimaryButtonStyle}" TargetType="Button">
+            <Setter Property="Background" Value="#202A36" />
+            <Setter Property="BorderBrush" Value="#334050" />
+        </Style>
+
+        <Style x:Key="SectionHeadingStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#E9EFF6" />
+            <Setter Property="FontSize" Value="28" />
+            <Setter Property="FontWeight" Value="Bold" />
+        </Style>
+
+        <Style x:Key="LabelStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#94A1AF" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+
+        <Style x:Key="ValueStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#D8E0E8" />
+            <Setter Property="FontSize" Value="16" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="88" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Column="0" Background="#0C1118" BorderBrush="#1E2732" BorderThickness="0,0,1,0">
+            <Grid Margin="0,28,0,28">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Border Width="48"
+                        Height="48"
+                        Margin="20,0,20,0"
+                        Background="#1E2732"
+                        CornerRadius="15"
+                        HorizontalAlignment="Center">
+                    <Viewbox Margin="12">
+                        <Grid Width="24" Height="24">
+                            <Rectangle RadiusX="3" RadiusY="3" Width="10" Height="10" Fill="#D5DDE6" HorizontalAlignment="Left" VerticalAlignment="Top" />
+                            <Rectangle RadiusX="3" RadiusY="3" Width="6" Height="6" Fill="#D5DDE6" HorizontalAlignment="Right" VerticalAlignment="Top" />
+                            <Rectangle RadiusX="3" RadiusY="3" Width="6" Height="6" Fill="#D5DDE6" HorizontalAlignment="Left" VerticalAlignment="Bottom" />
+                            <Rectangle RadiusX="3" RadiusY="3" Width="12" Height="4" Fill="#D5DDE6" HorizontalAlignment="Right" VerticalAlignment="Bottom" />
+                        </Grid>
+                    </Viewbox>
+                </Border>
+
+                <StackPanel Grid.Row="2" Margin="18,0,18,0">
+                    <TextBlock Text="PORTABLE" Foreground="#6D7B8A" FontSize="11" FontWeight="Bold" HorizontalAlignment="Center" />
+                    <TextBlock Text="MANAGER" Foreground="#9DABB9" FontSize="11" HorizontalAlignment="Center" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1" Margin="26,22,26,24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <StackPanel>
+                <TextBlock Text="{Binding WindowTitle}" Style="{StaticResource SectionHeadingStyle}" FontSize="46" />
+                <TextBlock Text="{Binding Subtitle}"
+                           Margin="0,8,0,0"
+                           Foreground="#8E9CAB"
+                           FontSize="16"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+
+            <Border Grid.Row="1"
+                    Margin="0,18,0,0"
+                    Padding="14,12"
+                    Background="#5D2F1F"
+                    BorderBrush="#7A4128"
+                    BorderThickness="1"
+                    CornerRadius="14"
+                    Visibility="{Binding HasError, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <TextBlock Text="{Binding ErrorText}"
+                           Foreground="#F0CAA8"
+                           FontSize="13"
+                           TextWrapping="Wrap" />
+            </Border>
+
+            <Grid Grid.Row="2" Margin="0,18,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2.1*" />
+                    <ColumnDefinition Width="1*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Style="{StaticResource CardBorderStyle}" Margin="0,0,14,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <DockPanel>
+                            <TextBlock Text="Background Host"
+                                       Foreground="#E7EEF6"
+                                       FontSize="24"
+                                       FontWeight="Bold" />
+                            <Border DockPanel.Dock="Right"
+                                    Padding="12,6"
+                                    Background="#2A3440"
+                                    CornerRadius="999">
+                                <TextBlock Text="{Binding StatusPillText}"
+                                           Foreground="#CCD7E3"
+                                           FontSize="12"
+                                           FontWeight="SemiBold" />
+                            </Border>
+                        </DockPanel>
+
+                        <TextBlock Grid.Row="1"
+                                   Margin="0,6,0,0"
+                                   Text="{Binding ServiceStateText}"
+                                   Style="{StaticResource ValueStyle}" />
+
+                        <TextBlock Grid.Row="2"
+                                   Margin="0,4,0,0"
+                                   Text="{Binding ServiceDetailText}"
+                                   Foreground="#92A0AF"
+                                   FontSize="13"
+                                   TextWrapping="Wrap" />
+
+                        <Grid Grid.Row="3" Margin="0,18,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel>
+                                <TextBlock Text="Steam Status" Style="{StaticResource LabelStyle}" />
+                                <TextBlock Text="{Binding SteamStateText}" Style="{StaticResource ValueStyle}" Margin="0,4,10,0" />
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Text="API Endpoint" Style="{StaticResource LabelStyle}" />
+                                <TextBlock Text="{Binding ApiStateText}" Style="{StaticResource ValueStyle}" Margin="0,4,0,0" />
+                            </StackPanel>
+                        </Grid>
+
+                        <StackPanel Grid.Row="5"
+                                    Margin="0,20,0,0"
+                                    Orientation="Horizontal">
+                            <Button Content="Start"
+                                    Style="{StaticResource PrimaryButtonStyle}"
+                                    Command="{Binding StartCommand}" />
+                            <Button Content="Stop"
+                                    Margin="12,0,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding StopCommand}" />
+                            <Button Content="Restart"
+                                    Margin="12,0,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding RestartCommand}" />
+                            <Button Content="Refresh"
+                                    Margin="12,0,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding RefreshCommand}" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <Grid Grid.Column="1">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel>
+                            <TextBlock Text="Autostart"
+                                       Foreground="#E7EEF6"
+                                       FontSize="21"
+                                       FontWeight="Bold" />
+                            <TextBlock Text="{Binding AutostartStateText}"
+                                       Margin="0,10,0,0"
+                                       Foreground="#93A1AF"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
+                            <Button Content="{Binding AutostartButtonText}"
+                                    Margin="0,18,0,0"
+                                    Style="{StaticResource PrimaryButtonStyle}"
+                                    Command="{Binding ToggleAutostartCommand}" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Row="1"
+                            Margin="0,14,0,0"
+                            Style="{StaticResource CardBorderStyle}">
+                        <StackPanel>
+                            <TextBlock Text="Portable Folder"
+                                       Foreground="#E7EEF6"
+                                       FontSize="21"
+                                       FontWeight="Bold" />
+                            <TextBlock Text="{Binding InstallPath}"
+                                       Margin="0,10,0,0"
+                                       Foreground="#C3CDD8"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
+                            <Button Content="Open Folder"
+                                    Margin="0,18,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding OpenFolderCommand}" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
