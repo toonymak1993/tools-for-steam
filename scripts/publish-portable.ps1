@@ -4,7 +4,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $projectPath = Join-Path $projectRoot "src\SteamLoader.App\SteamLoader.App.csproj"
 $distRoot = Join-Path $projectRoot "dist"
 $portableRoot = Join-Path $distRoot "portable"
-$zipPath = Join-Path $distRoot "SteamLoader-portable-win-x64.zip"
+$zipPath = Join-Path $distRoot "SteamTools-portable-win-x64.zip"
 
 if (Test-Path $portableRoot) {
     Remove-Item -LiteralPath $portableRoot -Recurse -Force

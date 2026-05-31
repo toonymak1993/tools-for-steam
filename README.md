@@ -1,47 +1,97 @@
 # Steam Tools
 
-Steam Tools is a Windows-first Quick Access host for Steam Big Picture. Instead of shipping a plugin store or a separate in-game window, it injects a fixed set of built-in pages directly into Steam's native Quick Access flow and keeps the overall look close to the real Steam UI.
+Steam Tools is a Windows-first Quick Access toolkit for Steam Big Picture. It injects built-in tools directly into Steam's native side panel instead of opening a separate in-game window or shipping a plugin store.
 
-## Architecture
+> [!IMPORTANT]
+> Steam Tools is still a work in progress.
+> This project is part of **GCM - Gaming Console Mode** and is under active development. Expect rough edges, missing polish, and frequent behavior changes between preview releases.
 
-- `src/SteamLoader.App/Infrastructure/Audio`: Windows Core Audio device discovery and default-device switching
-- `src/SteamLoader.App/Infrastructure/Steam`: access to Steam's DevTools and runtime targets
-- `src/SteamLoader.App/Hosting`: local control API and Quick Access injection loop
-- `src/SteamLoader.App/Assets/quickaccess-popup.js`: the injected Quick Access UI shell and built-in plugin pages
-- `src/SteamLoader.App/MainWindow.xaml`: the Windows management UI for the portable build
+## What It Does
 
-## Current Features
+- injects a native-feeling `Steam Tools` tab into Steam Big Picture / Gamepad UI
+- keeps the interaction model controller-first and close to Steam's own Quick Access panels
+- runs as a lightweight Windows tray app with a background host
+- exposes built-in tools instead of a general plugin marketplace
 
-- Connects to the running Steam client through DevTools on `127.0.0.1:8080`
-- Hooks into the real Quick Access flow used by Steam Big Picture
-- Renders a built-in `Steam Tools -> Audio -> Output Device Changer` path
-- Lists active playback devices
-- Changes the Windows default output device directly from Steam
-- Ships with a Steam-styled Windows manager UI
-- Supports optional Windows autostart for the silent background host
+## Current Built-In Tools
+
+- `Audio`
+  - switch the default Windows output device
+  - control system volume from Steam
+- `Store Sync`
+  - scan supported launchers and custom folders
+  - sync discovered non-Steam games into Steam
+  - optionally fetch artwork from SteamGridDB during sync
+- `Themes`
+  - enable and configure currently bundled themes
+  - includes early CSS Loader-style groundwork and profile support
+- `Display`
+  - switch between internal and external display modes
+- `HLTB`
+  - show HowLongToBeat estimates on supported game detail pages
+- `Settings`
+  - general Steam Tools behavior such as Windows sign-in startup
+
+## Project Status
+
+Right now this repository should be treated as an early preview branch of the wider GCM idea.
+
+That means:
+
+- the visible product branding is already `Steam Tools`
+- some internal file and executable names still use the older `SteamLoader` codename
+- not every theme or overlay behaves perfectly on every Steam surface yet
+- releases are meant for testing and iteration, not as a final polished stable build
+
+## Requirements
+
+- Windows
+- Steam running in Big Picture / Gamepad UI mode
+- Steam's DevTools endpoint reachable on `127.0.0.1:8080`
 
 ## Run From Source
-
-Requirement: Steam must be running in Big Picture or `-gamepadui` mode, and the CEF debug endpoint must be reachable on `127.0.0.1:8080`.
 
 ```powershell
 dotnet build .\SteamLoader.slnx
 dotnet run --project .\src\SteamLoader.App\SteamLoader.App.csproj
 ```
 
-Launching the app opens the manager UI. The manager automatically starts the background host if it is not already running. The host exposes a local API on `http://127.0.0.1:47652/` and keeps trying to attach Steam Tools to Quick Access.
+The background host serves a local control API on `http://127.0.0.1:47652/` and keeps trying to attach Steam Tools to Steam's Quick Access and supported Big Picture surfaces.
 
 ## Portable Build
 
-Use the publish script to create a self-contained single-file Windows build and a matching ZIP package:
+Create a self-contained single-file Windows package with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-portable.ps1
 ```
 
-The script outputs:
+The publish script outputs:
 
 - `dist\portable\SteamLoader.exe`
-- `dist\SteamLoader-portable-win-x64.zip`
+- `dist\SteamTools-portable-win-x64.zip`
 
-Run `SteamLoader.exe` to open the manager. From there you can start or stop the background host, enable autostart, and open the portable folder.
+Run `SteamLoader.exe` to start the tray app. Steam Tools can then start its background host automatically and attach to Steam when Big Picture is open.
+
+## Repository Layout
+
+- `src/SteamLoader.App/Hosting`
+  - local API host and Steam injection loop
+- `src/SteamLoader.App/Infrastructure/Steam`
+  - Steam DevTools communication
+- `src/SteamLoader.App/Infrastructure/Audio`
+  - Core Audio integration
+- `src/SteamLoader.App/Infrastructure/StoreSync`
+  - launcher scanning, shortcut sync, artwork download
+- `src/SteamLoader.App/Infrastructure/Themes`
+  - theme state, CSS resolution, profiles
+- `src/SteamLoader.App/Infrastructure/Hltb`
+  - HowLongToBeat integration
+- `src/SteamLoader.App/Assets`
+  - injected Quick Access UI, theme surface logic, and bundled theme assets
+
+## Notes
+
+- Portable releases currently ship as preview builds.
+- If Steam updates its internal UI structure, some tools or themes may need follow-up fixes.
+- Feedback from real Big Picture usage is part of the expected development loop for this project.
