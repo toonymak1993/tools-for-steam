@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using SteamLoader.App;
 using SteamLoader.App.Hosting;
 using SteamLoader.App.Services;
 
@@ -8,13 +9,19 @@ public sealed class MainWindowViewModel : BindableBase
 {
     private readonly SteamLoaderProcessManager _processManager;
     private readonly WindowsAutostartService _autostartService;
-    private readonly string _autostartLaunchArguments;
+    private readonly WindowsShellService _shellService;
+    private readonly string _shellLaunchArguments;
+    private readonly bool _shellBootstrapMode;
     private readonly bool _runStartupSyncOnInitialize;
     private bool _isBusy;
     private bool _isRunning;
     private bool _autostartEnabled;
     private bool _initialized;
     private bool _startupSyncTriggered;
+    private bool _showStartupSplash;
+    private bool _windowsShellStarted;
+    private Task? _shellBootstrapMonitorTask;
+    private SteamLoaderHostStatus? _lastKnownStatus;
     private string _serviceStateText = "Checking background host...";
     private string _serviceDetailText = "The manager is reading the current runtime status.";
     private string _steamStateText = "Waiting for status...";
@@ -25,13 +32,24 @@ public sealed class MainWindowViewModel : BindableBase
     public MainWindowViewModel(
         SteamLoaderProcessManager processManager,
         WindowsAutostartService autostartService,
-        string autostartLaunchArguments,
+        WindowsShellService shellService,
+        string shellLaunchArguments,
+        bool shellBootstrapMode,
         bool runStartupSyncOnInitialize)
     {
         _processManager = processManager;
         _autostartService = autostartService;
-        _autostartLaunchArguments = autostartLaunchArguments;
+        _shellService = shellService;
+        _shellLaunchArguments = shellLaunchArguments;
+        _shellBootstrapMode = shellBootstrapMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
+        _showStartupSplash = shellBootstrapMode;
+        if (shellBootstrapMode)
+        {
+            _serviceStateText = "Preparing Steam Tools";
+            _serviceDetailText = "Starting the background service.";
+            _steamStateText = "Waiting to begin the Steam startup flow.";
+        }
 
         StartCommand = new AsyncRelayCommand(StartAsync, () => !IsBusy && !IsRunning);
         StopCommand = new AsyncRelayCommand(StopAsync, () => !IsBusy && IsRunning);
@@ -128,6 +146,12 @@ public sealed class MainWindowViewModel : BindableBase
         }
     }
 
+    public bool ShowStartupSplash
+    {
+        get => _showStartupSplash;
+        private set => SetProperty(ref _showStartupSplash, value);
+    }
+
     public string StatusPillText => IsRunning ? "Running" : "Stopped";
 
     public string AutostartButtonText => AutostartEnabled ? "Disable Autostart" : "Enable Autostart";
@@ -165,6 +189,11 @@ public sealed class MainWindowViewModel : BindableBase
             _startupSyncTriggered = true;
             await TriggerStartupSyncAsync();
         }
+
+        if (_shellBootstrapMode)
+        {
+            EnsureShellBootstrapMonitor();
+        }
     }
 
     public async Task RefreshAsync()
@@ -181,9 +210,14 @@ public sealed class MainWindowViewModel : BindableBase
             ErrorText = string.Empty;
 
             var status = await _processManager.GetStatusAsync();
+            _lastKnownStatus = status;
             IsRunning = status is not null;
 
-            if (status is null)
+            if (_shellBootstrapMode && !_windowsShellStarted)
+            {
+                ApplyShellBootstrapStatus(status);
+            }
+            else if (status is null)
             {
                 ServiceStateText = "Background host is offline.";
                 ServiceDetailText = "Start the host to inject Steam Tools into Steam Quick Access.";
@@ -199,14 +233,19 @@ public sealed class MainWindowViewModel : BindableBase
                 ErrorText = status.LastError ?? string.Empty;
             }
 
-            AutostartEnabled = _autostartService.IsEnabled(_processManager.ExecutablePath, _autostartLaunchArguments);
-            AutostartStateText = AutostartEnabled
-                ? "Steam Tools opens in the tray when you sign in to Windows, syncs your launchers first, and then starts Steam for you."
-                : "Steam Tools only starts when you launch it manually.";
+            AutostartEnabled = _shellService.IsEnabled(_processManager.ExecutablePath, _shellLaunchArguments);
+            AutostartStateText = BuildAutostartStateText(AutostartEnabled);
         }
         catch (Exception exception)
         {
-            ErrorText = exception.Message;
+            if (_shellBootstrapMode && !_windowsShellStarted)
+            {
+                ApplyShellBootstrapStatus(null);
+            }
+            else
+            {
+                ErrorText = exception.Message;
+            }
         }
         finally
         {
@@ -266,11 +305,10 @@ public sealed class MainWindowViewModel : BindableBase
                 _autostartService.DisableSteamAutostartEntries();
             }
 
-            _autostartService.SetEnabled(_processManager.ExecutablePath, _autostartLaunchArguments, nextState);
+            _autostartService.SetEnabled(_processManager.ExecutablePath, SteamLoaderRuntime.AutostartArguments, false);
+            _shellService.SetEnabled(_processManager.ExecutablePath, _shellLaunchArguments, nextState);
             AutostartEnabled = nextState;
-            AutostartStateText = nextState
-                ? "Steam Tools opens in the tray when you sign in to Windows, syncs your launchers first, and then starts Steam for you."
-                : "Steam Tools only starts when you launch it manually.";
+            AutostartStateText = BuildAutostartStateText(nextState);
             ErrorText = string.Empty;
         }
         catch (Exception exception)
@@ -312,9 +350,14 @@ public sealed class MainWindowViewModel : BindableBase
         {
             await _processManager.RequestStartupSyncAsync();
             ServiceDetailText = "Startup sync requested. Steam Tools will finish the sync and launch Steam.";
+            if (_shellBootstrapMode)
+            {
+                EnsureShellBootstrapMonitor();
+            }
         }
         catch (Exception exception)
         {
+            CompleteShellBootstrap();
             ErrorText = exception.Message;
         }
         finally
@@ -364,5 +407,94 @@ public sealed class MainWindowViewModel : BindableBase
         RefreshCommand.RaiseCanExecuteChanged();
         ToggleAutostartCommand.RaiseCanExecuteChanged();
         OpenFolderCommand.RaiseCanExecuteChanged();
+    }
+
+    private void EnsureShellBootstrapMonitor()
+    {
+        if (!_shellBootstrapMode || _shellBootstrapMonitorTask is not null)
+        {
+            return;
+        }
+
+        _shellBootstrapMonitorTask = MonitorShellBootstrapAsync();
+    }
+
+    private async Task MonitorShellBootstrapAsync()
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (SteamReadyForShellHandOff())
+            {
+                break;
+            }
+
+            await Task.Delay(900);
+            await RefreshAsync();
+        }
+
+        CompleteShellBootstrap();
+    }
+
+    private bool SteamReadyForShellHandOff()
+    {
+        return _lastKnownStatus?.QuickAccessAttached == true
+            || _lastKnownStatus?.SharedContextAttached == true;
+    }
+
+    private void CompleteShellBootstrap()
+    {
+        if (_windowsShellStarted)
+        {
+            return;
+        }
+
+        _windowsShellStarted = true;
+        _shellService.StartWindowsShellIfNeeded();
+        ShowStartupSplash = false;
+    }
+
+    private void ApplyShellBootstrapStatus(SteamLoaderHostStatus? status)
+    {
+        ErrorText = string.Empty;
+        ApiStateText = _processManager.ApiBaseUri.ToString();
+
+        if (status is null)
+        {
+            ServiceStateText = "Preparing Steam Tools";
+            ServiceDetailText = "Starting the background service.";
+            SteamStateText = "Waiting to begin the Steam startup flow.";
+            return;
+        }
+
+        ApiStateText = $"{_processManager.ApiBaseUri} ({FormatElapsed(status.StartedAtUtc)})";
+
+        if (status.QuickAccessAttached)
+        {
+            ServiceStateText = "Steam is ready";
+            ServiceDetailText = "Gamepad UI is live. Finishing the Windows hand-off.";
+            SteamStateText = "Quick Access is attached.";
+            return;
+        }
+
+        if (status.SharedContextAttached)
+        {
+            ServiceStateText = "Steam is starting";
+            ServiceDetailText = "Steam is up and the shared UI context is ready.";
+            SteamStateText = "Waiting for the final Gamepad UI surfaces.";
+            return;
+        }
+
+        ServiceStateText = "Launching Steam";
+        ServiceDetailText = "Syncing launchers and starting Steam in Gamepad UI.";
+        SteamStateText = "Waiting for Steam to finish booting.";
+    }
+
+    private static string BuildAutostartStateText(bool enabled)
+    {
+        return enabled
+            ? "Steam Tools takes over the sign-in shell, syncs your launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
+            : "Steam Tools only starts when you launch it manually.";
     }
 }

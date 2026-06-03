@@ -6,7 +6,10 @@ internal static class SteamLoaderRuntime
     public const string TrayArgument = "--tray";
     public const string ManagerArgument = "--manager";
     public const string StartupSyncArgument = "--startup-sync";
+    public const string ShellBootstrapArgument = "--shell-bootstrap";
     public const string AutostartValueName = "SteamLoader";
 
     public static string AutostartArguments => $"{TrayArgument} {StartupSyncArgument}";
+
+    public static string ShellLaunchArguments => $"{TrayArgument} {StartupSyncArgument} {ShellBootstrapArgument}";
 }

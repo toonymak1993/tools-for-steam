@@ -2,6 +2,7 @@ using SteamLoader.App.Infrastructure.Assets;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
@@ -33,15 +34,18 @@ public sealed class SteamLoaderBackgroundHost
 
         var audioOutputDeviceService = new CoreAudioOutputDeviceService();
         var displaySwitchService = new DisplaySwitchService();
+        var processWindowService = new ProcessWindowService();
         var hltbService = new HltbService(
             new HltbSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "hltb.json")));
         var autostartService = new WindowsAutostartService(SteamLoaderRuntime.AutostartValueName);
+        var shellService = new WindowsShellService();
         var storeSyncSettingsStore = new StoreSyncSettingsStore(
             Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json"));
         var storeSyncService = new StoreSyncService(
             storeSyncSettingsStore,
             new SteamShortcutFile(),
             new SteamGridDbArtworkDownloader(),
+            shellService,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         var themesService = new ThemesService(
             new ThemesSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "themes.json")),
@@ -50,11 +54,17 @@ public sealed class SteamLoaderBackgroundHost
             Path.Combine(AppContext.BaseDirectory, "data", "themes"));
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
+            shellService,
             Environment.ProcessPath
                 ?? throw new InvalidOperationException("Unable to resolve the SteamLoader executable path."),
-            SteamLoaderRuntime.AutostartArguments);
+            SteamLoaderRuntime.ShellLaunchArguments);
+        var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
+        var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
-        var popupScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js");
+        var popupScript = string.Join(
+            Environment.NewLine,
+            EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
+            EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"));
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
@@ -63,15 +73,16 @@ public sealed class SteamLoaderBackgroundHost
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
             displaySwitchService,
+            processWindowService,
             hltbService,
             storeSyncService,
             themesService,
             steamLoaderSettingsService,
+            frontendComponentService,
             ApiBaseUri,
             _hostState,
             requestShutdown);
 
-        var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
         var injector = new QuickAccessShellInjector(
             devToolsClient,
             ApiBaseUri,

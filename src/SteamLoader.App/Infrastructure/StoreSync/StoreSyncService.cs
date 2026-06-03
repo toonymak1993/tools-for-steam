@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using System.Text.Json;
 using Microsoft.Win32;
 using SteamLoader.App.Models;
+using SteamLoader.App.Services;
 
 namespace SteamLoader.App.Infrastructure.StoreSync;
 
@@ -124,6 +125,7 @@ public sealed class StoreSyncService
     private readonly StoreSyncSettingsStore _settingsStore;
     private readonly SteamShortcutFile _shortcutFile;
     private readonly SteamGridDbArtworkDownloader _artworkDownloader;
+    private readonly WindowsShellService _shellService;
     private readonly string _steamRootPath;
     private Task? _activeSyncTask;
 
@@ -131,11 +133,13 @@ public sealed class StoreSyncService
         StoreSyncSettingsStore settingsStore,
         SteamShortcutFile shortcutFile,
         SteamGridDbArtworkDownloader artworkDownloader,
+        WindowsShellService shellService,
         string steamRootPath)
     {
         _settingsStore = settingsStore;
         _shortcutFile = shortcutFile;
         _artworkDownloader = artworkDownloader;
+        _shellService = shellService;
         _steamRootPath = steamRootPath;
     }
 
@@ -859,26 +863,10 @@ public sealed class StoreSyncService
             return;
         }
 
-        if (launchBigPicture)
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = "steam://open/bigpicture",
-                    UseShellExecute = true,
-                })?.Dispose();
-                return;
-            }
-            catch
-            {
-            }
-        }
-
         Process.Start(new ProcessStartInfo
         {
             FileName = steamExePath,
-            Arguments = launchBigPicture ? "-start steam://open/bigpicture" : string.Empty,
+            Arguments = launchBigPicture ? "-gamepadui -dev" : "-dev",
             WorkingDirectory = _steamRootPath,
             UseShellExecute = false,
             CreateNoWindow = true,

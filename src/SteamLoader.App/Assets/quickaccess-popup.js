@@ -1,11 +1,16 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 21;
+  const stateVersion = 29;
   const soundtrackTabKey = 7;
 
   if (window.__steamLoaderPopupTimer) {
     window.clearInterval(window.__steamLoaderPopupTimer);
     window.__steamLoaderPopupTimer = null;
+  }
+
+  if (window.__steamToolsProcessesPollTimer) {
+    window.clearInterval(window.__steamToolsProcessesPollTimer);
+    window.__steamToolsProcessesPollTimer = null;
   }
 
   const previousState = window.__steamLoaderPopupReactState;
@@ -34,6 +39,12 @@
             switching: false,
             error: "",
             status: "",
+          },
+          processes: {
+            loading: false,
+            activating: false,
+            error: "",
+            snapshot: null,
           },
           hltb: {
             loading: false,
@@ -68,6 +79,12 @@
           },
           nativeUi: {
             dialogButtonType: null,
+            componentCandidates: null,
+            registrySnapshot: null,
+            registryLoading: false,
+            registryError: "",
+            registryLastAttemptMs: 0,
+            renderError: "",
           },
           slotActions: [],
           renderRevision: 1,
@@ -90,6 +107,34 @@
           id: "general",
           title: "General",
           description: "Startup behavior and global loader options",
+        },
+      ],
+    },
+    {
+      id: "processes",
+      title: "Processes",
+      description: "Jump between currently open app windows",
+      pages: [],
+    },
+    {
+      id: "store-sync",
+      title: "Store Sync",
+      description: "Bring other PC launchers into Steam",
+      pages: [
+        {
+          id: "sync-now",
+          title: "Sync Now",
+          description: "Scan enabled stores and update Steam shortcuts",
+        },
+        {
+          id: "settings",
+          title: "Settings",
+          description: "Artwork and sync behavior",
+        },
+        {
+          id: "stores",
+          title: "Stores",
+          description: "Manage individual launcher sources and custom paths",
         },
       ],
     },
@@ -125,28 +170,6 @@
           id: "settings",
           title: "Settings",
           description: "Choose which HLTB stats appear on the open game page",
-        },
-      ],
-    },
-    {
-      id: "store-sync",
-      title: "Store Sync",
-      description: "Bring other PC launchers into Steam",
-      pages: [
-        {
-          id: "sync-now",
-          title: "Sync Now",
-          description: "Scan enabled stores and update Steam shortcuts",
-        },
-        {
-          id: "settings",
-          title: "Settings",
-          description: "Artwork and sync behavior",
-        },
-        {
-          id: "stores",
-          title: "Stores",
-          description: "Manage individual launcher sources and custom paths",
         },
       ],
     },
@@ -424,6 +447,60 @@
         gap: 8px;
       }
 
+      .steamtools-native-toggle-wrap {
+        min-width: 42px;
+        justify-content: flex-end;
+      }
+
+      .steamtools-native-toggle {
+        position: relative !important;
+        display: block !important;
+        flex: 0 0 auto;
+        width: 40px !important;
+        height: 22px !important;
+        min-width: 40px;
+        min-height: 22px;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .steamtools-native-toggle > span {
+        box-sizing: border-box;
+      }
+
+      .steamtools-native-toggle > span:first-child {
+        position: absolute !important;
+        inset: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+        border-radius: 999px !important;
+        background: rgba(255, 255, 255, 0.15);
+      }
+
+      .steamtools-native-toggle > span:last-child {
+        position: absolute !important;
+        top: 2px !important;
+        left: 2px !important;
+        width: 18px !important;
+        height: 18px !important;
+        border-radius: 50% !important;
+        background: #f1f5f8;
+        transform: translateX(0);
+        transition: transform 120ms ease, background 120ms ease;
+      }
+
+      .steamtools-native-toggle.is-on > span:first-child {
+        background: rgba(57, 158, 255, 0.86);
+      }
+
+      .steamtools-native-toggle.is-on > span:last-child {
+        transform: translateX(18px);
+      }
+
+      .steamtools-native-toggle.is-disabled {
+        opacity: 0.46;
+      }
+
       .steamloader-switch {
         position: relative;
         width: 40px;
@@ -589,6 +666,18 @@
         color: #293544;
       }
 
+      .steamloader-dialog-button.gpfocus .steamtools-native-toggle > span:first-child {
+        background: rgba(41, 53, 68, 0.24);
+      }
+
+      .steamloader-dialog-button.gpfocus .steamtools-native-toggle.is-on > span:first-child {
+        background: rgba(41, 53, 68, 0.82);
+      }
+
+      .steamloader-dialog-button.gpfocus .steamtools-native-toggle > span:last-child {
+        background: #f5f7f9;
+      }
+
       .steamloader-dialog-button.gpfocus .steamloader-volume-action-title {
         color: #293544;
       }
@@ -660,6 +749,10 @@
   }
 
   function getReactPropertyKey(element, prefix) {
+    if (window.STFrontendLib?.getReactPropertyKey) {
+      return window.STFrontendLib.getReactPropertyKey(element, prefix);
+    }
+
     return element
       ? Object.getOwnPropertyNames(element).find((name) => name.startsWith(prefix))
       : null;
@@ -675,6 +768,10 @@
   }
 
   function getReactFiber(element) {
+    if (window.STFrontendLib?.getReactFiber) {
+      return window.STFrontendLib.getReactFiber(element);
+    }
+
     const fiberKey = getReactPropertyKey(element, "__reactFiber");
     return fiberKey ? element[fiberKey] : null;
   }
@@ -1094,29 +1191,44 @@
   }
 
   function captureNativeUi() {
-    if (state.nativeUi.dialogButtonType) {
-      return true;
+    if (window.STFrontendLib?.captureNativeUi) {
+      return window.STFrontendLib.captureNativeUi(state);
     }
 
-    const dialogButton = document.querySelector(".DialogButton");
-    const fiberKey = getReactPropertyKey(dialogButton, "__reactFiber");
-    let current = fiberKey ? dialogButton[fiberKey] : null;
+    return Boolean(state.nativeUi.dialogButtonType);
+  }
 
-    while (current) {
-      const renderSource =
-        typeof current.elementType?.render?.toString === "function"
-          ? current.elementType.render.toString()
-          : "";
-
-      if (renderSource.includes('"DialogButton"') && renderSource.includes('"Secondary"')) {
-        state.nativeUi.dialogButtonType = current.elementType;
-        return Boolean(state.nativeUi.dialogButtonType);
-      }
-
-      current = current.return;
+  function shouldLoadFrontendComponentRegistry() {
+    if (!window.STFrontendLib?.refreshComponentRegistry || state.nativeUi.registryLoading) {
+      return false;
     }
 
-    return false;
+    const snapshot = state.nativeUi.registrySnapshot;
+    const lastAttemptMs = Number(state.nativeUi.registryLastAttemptMs) || 0;
+    const isComplete =
+      snapshot?.runtimeReady &&
+      Number.isInteger(snapshot.availableCount) &&
+      Number.isInteger(snapshot.totalCount) &&
+      snapshot.availableCount >= snapshot.totalCount;
+
+    return !isComplete && Date.now() - lastAttemptMs > 5000;
+  }
+
+  async function loadFrontendComponentRegistry() {
+    if (!window.STFrontendLib?.refreshComponentRegistry) {
+      return;
+    }
+
+    const previousVersion = state.nativeUi.registrySnapshot?.version || 0;
+    const previousAvailableCount = state.nativeUi.registrySnapshot?.availableCount || 0;
+    await window.STFrontendLib.refreshComponentRegistry(apiBase, state);
+
+    const nextVersion = state.nativeUi.registrySnapshot?.version || 0;
+    const nextAvailableCount = state.nativeUi.registrySnapshot?.availableCount || 0;
+    if (nextVersion !== previousVersion || nextAvailableCount !== previousAvailableCount) {
+      state.renderRevision += 1;
+      refreshQuickAccessPanel();
+    }
   }
 
   function findRuntime(rootFiber = getQuickAccessRootFiber()) {
@@ -1427,12 +1539,49 @@
     );
   }
 
+  function ProcessesPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("rect", {
+          x: "6.5",
+          y: "8",
+          width: "23",
+          height: "16",
+          rx: "3.5",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+        }),
+        createElement("path", {
+          d: "M12 28H24",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M14 18L17 15L19.8 17.5L24 13.5",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
   function getPluginIconComponent(pluginId) {
     switch (pluginId) {
       case "audio":
         return AudioPluginIcon;
       case "display":
         return DisplayPluginIcon;
+      case "processes":
+        return ProcessesPluginIcon;
       case "hltb":
         return HltbPluginIcon;
       case "store-sync":
@@ -1491,31 +1640,34 @@
   }
 
   function NativeDialogButton(content, onClick, options = {}) {
-    const commonProps = {
-      onClick,
-      onOKButton: onClick,
-      disabled: Boolean(options.disabled),
-      className: options.className || "steamloader-dialog-button",
-      children: content,
-      ...(options.extraProps || {}),
-    };
-
-    if (state.nativeUi.dialogButtonType) {
-      return createElement(state.nativeUi.dialogButtonType, {
-        ...commonProps,
-        focusable: true,
-      });
+    if (window.STFrontendLib?.createDialogButton) {
+      return window.STFrontendLib.createDialogButton(
+        state,
+        createElement,
+        content,
+        onClick,
+        options,
+      );
     }
 
     return createElement("button", {
       type: "button",
-      ...commonProps,
+      onClick,
+      onOKButton: onClick,
+      onActivate: onClick,
+      disabled: Boolean(options.disabled),
       className: "steamloader-fallback-button",
+      children: content,
+      ...(options.extraProps || {}),
     });
   }
 
   function renderTrailingContent(slot) {
     if (typeof slot.switchValue === "boolean") {
+      if (window.STFrontendLib?.renderSwitchAccessory) {
+        return window.STFrontendLib.renderSwitchAccessory(createElement, withChildren, slot);
+      }
+
       return createElement(
         "span",
         withChildren(
@@ -1620,6 +1772,23 @@
   }
 
   function createButtonSlot(slot, index, autoFocusIndex) {
+    if (window.STFrontendLib?.createButtonSlot) {
+      return window.STFrontendLib.createButtonSlot(
+        state,
+        createElement,
+        withChildren,
+        slot,
+        index,
+        autoFocusIndex,
+        {
+          getBackNavigation,
+          renderTrailingContent,
+          handleSlotClick,
+          navigateBackFromRoute,
+        },
+      );
+    }
+
     const backNavigation = getBackNavigation();
     const rowClassName = slot.leadingIcon
       ? slot.rowClassName
@@ -1739,6 +1908,19 @@
     renderPanelState();
   }
 
+  function rerenderProcessesPanel() {
+    if (state.route.pluginId === "processes") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
   function rerenderHltbPanel() {
     if (state.route.pluginId === "hltb") {
       const currentRoute = { ...state.route };
@@ -1756,6 +1938,19 @@
     applyActiveThemeCss();
 
     if (state.route.pluginId === "themes") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
+  function rerenderGeneralSettingsPanel() {
+    if (state.route.pluginId === "settings") {
       const currentRoute = { ...state.route };
       const focusedIndex = getFocusedSlotIndex();
       requestFocusForRoute(currentRoute, focusedIndex);
@@ -1863,8 +2058,43 @@
     );
   }
 
+  function createFrontendRenderHelpers() {
+    return {
+      DefaultIcon: SteamLoaderIcon,
+      BackIcon,
+      ChevronIcon,
+      getBackNavigation,
+      handleSlotClick,
+      navigateBackFromRoute,
+      consumeResolvedFocus,
+      consumeVolumeActionAutoFocus,
+      rememberVolumeActionFocus,
+      getActiveVolumeActionIndex: () => state.audio.activeVolumeActionIndex,
+    };
+  }
+
   function SteamLoaderPanelShell() {
-    const model = buildScreenModel();
+    let model = buildScreenModel();
+
+    if (window.STFrontendLib?.createPanelShell) {
+      try {
+        return window.STFrontendLib.createPanelShell(
+          state,
+          createElement,
+          withChildren,
+          model,
+          createFrontendRenderHelpers(),
+        );
+      } catch (error) {
+        state.nativeUi.renderError = error instanceof Error ? error.message : String(error);
+        console.warn("[Steam Tools] Recovered from st-frontend-lib render error.", error);
+        model = {
+          ...model,
+          error: model.error || "Steam Tools recovered from an internal UI renderer error.",
+        };
+      }
+    }
+
     const HeaderIcon = model.headerIcon || SteamLoaderIcon;
     state.slotActions = model.slots.map((slot) => slot.onClick);
     consumeResolvedFocus(state.route, model.autoFocusIndex);
@@ -2344,7 +2574,7 @@
   async function loadGeneralSettingsState() {
     state.generalSettings.loading = true;
     state.generalSettings.error = "";
-    renderPanelState();
+    rerenderGeneralSettingsPanel();
 
     try {
       const response = await fetch(`${apiBase}api/settings/state`, { cache: "no-store" });
@@ -2359,7 +2589,7 @@
       state.generalSettings.snapshot = null;
     } finally {
       state.generalSettings.loading = false;
-      renderPanelState();
+      rerenderGeneralSettingsPanel();
     }
   }
 
@@ -2382,6 +2612,32 @@
     } finally {
       state.hltb.loading = false;
       rerenderHltbPanel();
+    }
+  }
+
+  async function loadProcessesState() {
+    if (state.processes.loading) {
+      return;
+    }
+
+    state.processes.loading = true;
+    state.processes.error = "";
+    rerenderProcessesPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/processes/windows`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Processes could not be loaded (${response.status}).`);
+      }
+
+      state.processes.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.processes.error = error instanceof Error ? error.message : String(error);
+      state.processes.snapshot = null;
+    } finally {
+      state.processes.loading = false;
+      rerenderProcessesPanel();
     }
   }
 
@@ -2445,7 +2701,7 @@
   async function sendGeneralSettingsRequest(path, bodyPayload = null) {
     state.generalSettings.saving = true;
     state.generalSettings.error = "";
-    renderPanelState();
+    rerenderGeneralSettingsPanel();
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -2466,7 +2722,7 @@
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.generalSettings.saving = false;
-      renderPanelState();
+      rerenderGeneralSettingsPanel();
     }
   }
 
@@ -2495,6 +2751,36 @@
     } finally {
       state.hltb.saving = false;
       rerenderHltbPanel();
+    }
+  }
+
+  async function sendProcessesRequest(path, bodyPayload = null) {
+    state.processes.activating = true;
+    state.processes.error = "";
+    rerenderProcessesPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.processes.snapshot = payload && typeof payload === "object" ? payload : null;
+      return true;
+    } catch (error) {
+      state.processes.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.processes.activating = false;
+      rerenderProcessesPanel();
     }
   }
 
@@ -2559,7 +2845,7 @@
         ...snapshot,
         runOnWindowsSignIn: enabled,
       };
-      renderPanelState();
+      rerenderGeneralSettingsPanel();
     }
 
     await sendGeneralSettingsRequest("api/settings/autostart", { value: enabled });
@@ -2593,6 +2879,10 @@
 
   async function clearHltbCache() {
     await sendHltbRequest("api/hltb/cache/clear");
+  }
+
+  async function activateProcessWindow(handle) {
+    await sendProcessesRequest("api/processes/activate", { value: handle });
   }
 
   async function toggleThemesSetting(key) {
@@ -2844,8 +3134,10 @@
   }
 
   function buildScreenModel() {
-    const makeSlot = (title, copy, onClick, options = {}) => ({
+    const ui = window.STFrontendLib || {};
+    const makeSlot = ui.createSlot || ((title, copy, onClick, options = {}) => ({
       kind: "button",
+      role: options.role || "action",
       title,
       copy: copy || "",
       onClick,
@@ -2857,16 +3149,59 @@
       leadingIcon: options.leadingIcon || null,
       buttonClassName: options.buttonClassName || "",
       rowClassName: options.rowClassName || "",
-    });
+      selected: Boolean(options.selected),
+      value: options.value,
+    }));
 
-    const makeToggleSlot = (title, copy, value, onClick, options = {}) =>
+    const makeToggleSlot = ui.createToggleSlot || ((title, copy, value, onClick, options = {}) =>
       makeSlot(title, copy, onClick, {
         ...options,
+        role: "toggle",
         trailing: "none",
         switchValue: value,
-      });
+      }));
 
-    const defaultModel = {
+    const makeSettingToggleSlot = ui.createSettingToggleSlot || ((scope, key, title, copy, value, onClick, options = {}) => ({
+      ...makeToggleSlot(title, copy, value, onClick, options),
+      settingScope: scope || "",
+      settingKey: key || "",
+    }));
+
+    const makeChoiceSlot = ui.createChoiceSlot || ((title, copy, onClick, options = {}) =>
+      makeSlot(title, copy, onClick, {
+        ...options,
+        role: "choice",
+        badge: options.badge || options.value || "",
+        selected: Boolean(options.selected || options.badge === "Selected"),
+      }));
+
+    const makeCommandSlot = ui.createCommandSlot || ((title, copy, onClick, options = {}) =>
+      makeSlot(title, copy, onClick, {
+        ...options,
+        role: "command",
+        trailing: options.trailing || "none",
+      }));
+
+    const makeNavigationSlot = ui.createNavigationSlot || ((title, copy, onClick, options = {}) =>
+      makeSlot(title, copy, onClick, {
+        ...options,
+        role: "navigation",
+        trailing: options.trailing || "chevron",
+      }));
+
+    const makeBackSlot = ui.createBackSlot || ((title, copy, onClick, options = {}) =>
+      makeSlot(title, copy, onClick, {
+        ...options,
+        role: "back",
+        trailing: options.trailing || "back",
+      }));
+
+    const defaultModel = ui.createScreenModel
+      ? ui.createScreenModel({
+          headerIcon: getRouteHeaderIcon(state.route),
+          autoFocusIndex: resolveAutoFocusIndex(state.route),
+        })
+      : {
       title: "Steam Tools",
       subtitle: "",
       status: "",
@@ -2891,22 +3226,69 @@
         note: "Steam Tools uses the Windows display switch, the same Windows feature behind Win + P.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         slots: [
-          makeSlot(
+          makeCommandSlot(
             "External Display",
             "Keep the external screen active and switch away from the built-in display.",
             () => switchDisplayMode("external"),
             {
               disabled: isDisplayBusy(),
-              trailing: "none",
             },
           ),
-          makeSlot(
+          makeCommandSlot(
             "Internal Display",
             "Return to the built-in screen and disable the external display output.",
             () => switchDisplayMode("internal"),
             {
               disabled: isDisplayBusy(),
-              trailing: "none",
+            },
+          ),
+        ],
+      };
+    }
+
+    if (state.route.screen === "plugin" && state.route.pluginId === "processes") {
+      const snapshot = getProcessesSnapshot();
+      const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
+
+      return {
+        ...defaultModel,
+        title: "Processes",
+        subtitle: "Open App Windows",
+        status: resolveProcessesStatusText(),
+        error: state.processes.error,
+        note: "Only visible top-level app windows are listed here so taskbar hosts and ghost surfaces stay out of the way.",
+        cards: [
+          {
+            title: "Window Switcher",
+            lines: [
+              windows.length === 1 ? "1 app window is ready." : `${windows.length} app windows are ready.`,
+              "Press A on any row to bring that app to the front.",
+            ],
+          },
+        ],
+        slots: [
+          ...windows.map((windowInfo) =>
+            makeSlot(
+              windowInfo.title,
+              `${windowInfo.processName}${windowInfo.isMinimized ? " - Minimized" : ""}`,
+              () => activateProcessWindow(windowInfo.handle),
+              {
+                disabled: isProcessesBusy(),
+                badge: windowInfo.isForeground
+                  ? "Current"
+                  : windowInfo.isMinimized
+                    ? "Minimized"
+                    : "",
+                trailing: "none",
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Windows",
+            "Reload the current list of open app windows.",
+            () => loadProcessesState(),
+            {
+              disabled: isProcessesBusy(),
             },
           ),
         ],
@@ -2937,7 +3319,9 @@
           },
         ],
         slots: [
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "enabled",
             "Enable Game Page Stats",
             "Turn the HowLongToBeat panel on or off everywhere at once.",
             Boolean(settings?.enabled),
@@ -2946,7 +3330,9 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "show-main-story",
             "Show Main Story",
             "Display the main story estimate on the game page.",
             Boolean(settings?.showMainStory),
@@ -2955,7 +3341,9 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "show-main-plus",
             "Show Main + Extras",
             "Display the main plus extras estimate on the game page.",
             Boolean(settings?.showMainPlus),
@@ -2964,7 +3352,9 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "show-completionist",
             "Show Completionist",
             "Display the completionist estimate on the game page.",
             Boolean(settings?.showCompletionist),
@@ -2973,7 +3363,9 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "show-all-styles",
             "Show All Styles",
             "Display the all styles estimate on the game page.",
             Boolean(settings?.showAllStyles),
@@ -2982,7 +3374,9 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "hltb",
+            "show-view-details",
             "Show View Details",
             "Keep a quick link to the full HowLongToBeat page for the current game.",
             Boolean(settings?.showViewDetails),
@@ -2991,13 +3385,12 @@
               disabled: isHltbBusy(),
             },
           ),
-          makeSlot(
+          makeCommandSlot(
             "Clear Cached Results",
             "Drop the stored HLTB matches so Steam Tools fetches them again fresh.",
             () => clearHltbCache(),
             {
               disabled: isHltbBusy(),
-              trailing: "none",
             },
           ),
         ],
@@ -3010,7 +3403,7 @@
       state.route.pageId === "output-device-changer"
     ) {
       const slots = [
-        makeSlot("Refresh", resolveAudioStatusText(), () => loadAudioDevices(), {
+        makeCommandSlot("Refresh", resolveAudioStatusText(), () => loadAudioDevices(), {
           disabled: state.audio.loading,
         }),
       ];
@@ -3079,22 +3472,20 @@
           buildSteamProfileCard(storeSyncSnapshot?.steamProfile),
         ],
         slots: [
-          makeSlot(
+          makeCommandSlot(
             "Run Sync Now",
             "Scan enabled stores and refresh Steam shortcuts.",
             () => runStoreSyncNow(),
             {
               disabled: isStoreSyncBusy() || !storeSyncSnapshot?.steamProfile,
-              trailing: "none",
             },
           ),
-          makeSlot(
+          makeCommandSlot(
             "Refresh State",
             "Reload store availability, detected titles, and Steam profile details.",
             () => loadStoreSyncState(),
             {
               disabled: isStoreSyncBusy(),
-              trailing: "none",
             },
           ),
         ],
@@ -3117,7 +3508,9 @@
         note: "SteamGridDB artwork is built in. Sync Now handles the Steam restart automatically.",
         cards: [buildSteamProfileCard(storeSyncSnapshot?.steamProfile)],
         slots: [
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "store-sync",
+            "download-artwork",
             "Download Artwork",
             "Download SteamGridDB artwork during sync.",
             Boolean(settings?.downloadArtwork),
@@ -3126,7 +3519,9 @@
               disabled: isStoreSyncBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "store-sync",
+            "prefer-animated-artwork",
             "Prefer Animated Artwork",
             "Prefer animated artwork when compatible assets exist.",
             Boolean(settings?.preferAnimatedArtwork),
@@ -3135,7 +3530,9 @@
               disabled: isStoreSyncBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "store-sync",
+            "backup-shortcuts",
             "Back Up shortcuts.vdf",
             "Create a timestamped backup before each sync.",
             Boolean(settings?.backupShortcuts),
@@ -3144,7 +3541,9 @@
               disabled: isStoreSyncBusy(),
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "store-sync",
+            "launch-big-picture-after-sync",
             "Return to Big Picture After Sync",
             "Restart Steam in GamepadUI when the sync finishes.",
             Boolean(settings?.launchBigPictureAfterSync),
@@ -3172,9 +3571,11 @@
         error: state.generalSettings.error,
         note: "Steam Tools-wide options live here so plugin settings can stay focused on their own job.",
         slots: [
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "steam-tools",
+            "run-on-windows-sign-in",
             "Run on Windows Sign-In",
-            "Start Steam Tools at Windows login, sync your launchers first, and then launch Steam for you.",
+            "Start Steam Tools before Explorer, sync your launchers, launch Steam in dev mode, and then bring Windows back in behind it.",
             Boolean(settings?.runOnWindowsSignIn),
             () => toggleRunOnWindowsSignIn(),
             {
@@ -3207,9 +3608,8 @@
           error: state.themes.error,
           note: "The requested theme option could not be found.",
           slots: [
-            makeSlot("Refresh Themes", "Reload the current theme catalog and state.", () => loadThemesState(), {
+            makeCommandSlot("Refresh Themes", "Reload the current theme catalog and state.", () => loadThemesState(), {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             }),
           ],
         };
@@ -3230,13 +3630,14 @@
             },
           ],
           slots: option.choices.map((choice) =>
-            makeSlot(
+            makeChoiceSlot(
               choice.title,
               choice.id === option.selectedChoiceId ? "Current selection" : "Apply this value",
               () => setThemeChoice(theme.id, option.id, choice.id),
               {
                 disabled: state.themes.loading || state.themes.saving || !theme.installed,
                 badge: choice.id === option.selectedChoiceId ? "Selected" : "",
+                selected: choice.id === option.selectedChoiceId,
                 trailing: choice.id === option.selectedChoiceId ? "none" : "chevron",
               },
             ),
@@ -3264,7 +3665,7 @@
             },
           ],
           slots: [
-            makeSlot(
+            makeCommandSlot(
               `Decrease by ${stepLabel}`,
               "Move the setting down by one step.",
               () => adjustThemeRange(theme.id, option.id, -1),
@@ -3274,10 +3675,9 @@
                   state.themes.saving ||
                   !theme.installed ||
                   option.numberValue <= option.min,
-                trailing: "none",
               },
             ),
-            makeSlot(
+            makeCommandSlot(
               `Increase by ${stepLabel}`,
               "Move the setting up by one step.",
               () => adjustThemeRange(theme.id, option.id, 1),
@@ -3287,16 +3687,14 @@
                   state.themes.saving ||
                   !theme.installed ||
                   option.numberValue >= option.max,
-                trailing: "none",
               },
             ),
-            makeSlot(
+            makeCommandSlot(
               "Reset to Default",
               "Restore the original value from the theme manifest.",
               () => resetThemeRange(theme.id, option.id),
               {
                 disabled: state.themes.loading || state.themes.saving || !theme.installed,
-                trailing: "none",
               },
             ),
           ],
@@ -3321,9 +3719,8 @@
           error: state.themes.error,
           note: "The requested theme profile could not be found.",
           slots: [
-            makeSlot("Refresh Catalog", "Reload theme and profile entries.", () => refreshThemesCatalog(), {
+            makeCommandSlot("Refresh Catalog", "Reload theme and profile entries.", () => refreshThemesCatalog(), {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             }),
           ],
         };
@@ -3339,43 +3736,39 @@
         cards: [buildThemeProfileSummaryCard(profile)],
         slots: profile.installed
           ? [
-              makeSlot(
+              makeCommandSlot(
                 "Apply Profile",
                 "Install any missing themes from this profile and switch the current setup to match it.",
                 () => applyThemeProfile(profile.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
                   badge: profile.selected ? "Selected" : "",
-                  trailing: "none",
                 },
               ),
-              makeSlot(
+              makeCommandSlot(
                 "Update From Current Setup",
                 "Overwrite this installed profile with the themes and values you are using right now.",
                 () => updateThemeProfile(profile.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
-                  trailing: "none",
                 },
               ),
-              makeSlot(
+              makeCommandSlot(
                 "Remove Profile",
                 "Remove this profile from your local installed list.",
                 () => removeThemeProfile(profile.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
-                  trailing: "none",
                 },
               ),
             ]
           : [
-              makeSlot(
+              makeCommandSlot(
                 "Download Profile",
                 "Add this profile to your installed profile library.",
                 () => installThemeProfile(profile.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
-                  trailing: "none",
                 },
               ),
             ],
@@ -3399,9 +3792,8 @@
           error: state.themes.error,
           note: "The requested theme could not be found in the current catalog.",
           slots: [
-            makeSlot("Refresh Catalog", "Reload built-in and community theme entries.", () => refreshThemesCatalog(), {
+            makeCommandSlot("Refresh Catalog", "Reload built-in and community theme entries.", () => refreshThemesCatalog(), {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             }),
           ],
         };
@@ -3410,7 +3802,9 @@
       const optionSlots = theme.installed
         ? theme.options.map((option, optionIndex) => {
             if (option.type === "toggle") {
-              return makeToggleSlot(
+              return makeSettingToggleSlot(
+                "themes.theme-option",
+                `${theme.id}:${option.id}`,
                 option.title,
                 `${option.description} - ${formatThemeOptionValue(option)}`,
                 Boolean(option.boolValue),
@@ -3422,7 +3816,7 @@
             }
 
             state.themes.detailOriginByThemeId[theme.id] ??= "store";
-            return makeSlot(
+            return makeNavigationSlot(
               option.title,
               `${option.description} - ${formatThemeOptionValue(option)}`,
               () => {
@@ -3451,7 +3845,9 @@
         cards: [buildThemeSummaryCard(theme)],
         slots: theme.installed
           ? [
-              makeToggleSlot(
+              makeSettingToggleSlot(
+                "themes.theme",
+                theme.id,
                 "Enabled",
                 "Turn this theme on or off and reapply the current theme stack.",
                 Boolean(theme.enabled),
@@ -3461,24 +3857,22 @@
                 },
               ),
               ...optionSlots,
-              makeSlot(
+              makeCommandSlot(
                 "Uninstall Theme",
                 "Remove this theme from the installed list but keep it available in the store.",
                 () => uninstallTheme(theme.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
-                  trailing: "none",
                 },
               ),
             ]
           : [
-              makeSlot(
+              makeCommandSlot(
                 "Install Theme",
                 "Add this theme to the installed list so you can enable and tune it.",
                 () => installTheme(theme.id),
                 {
                   disabled: state.themes.loading || state.themes.saving,
-                  trailing: "none",
                 },
               ),
             ],
@@ -3510,7 +3904,7 @@
             : [],
         slots: [
           ...browseThemes.map((theme, themeIndex) =>
-            makeSlot(
+            makeNavigationSlot(
               theme.title,
               `${theme.author} - ${theme.statusText} - ${theme.downloadCount.toLocaleString()} downloads`,
               () => {
@@ -3528,13 +3922,12 @@
               },
             ),
           ),
-          makeSlot(
+          makeCommandSlot(
             "Refresh Catalog",
             "Reload the current theme catalog and installation state.",
             () => refreshThemesCatalog(),
             {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             },
           ),
         ],
@@ -3561,7 +3954,7 @@
             ? "Open an installed theme to enable it, change switches, or tune range and choice options."
             : "No themes are installed yet. Use the Store to add your first theme.",
         slots: installedThemes.map((theme, themeIndex) =>
-          makeSlot(
+          makeNavigationSlot(
             theme.title,
             `${theme.author} - ${theme.enabled ? "Active" : "Installed"} - ${theme.options.length} setting${theme.options.length === 1 ? "" : "s"}`,
             () => {
@@ -3630,17 +4023,16 @@
           },
         },
         slots: [
-          makeSlot(
+          makeCommandSlot(
             "Save Current Setup As Profile",
             "Capture the themes you have installed right now into a reusable profile.",
             () => createThemeProfileFromCurrentSetup(),
             {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             },
           ),
           ...installedProfiles.map((profile, profileIndex) =>
-            makeSlot(
+            makeNavigationSlot(
               profile.title,
               `${profile.statusText} - ${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"}`,
               () => {
@@ -3659,7 +4051,7 @@
             ),
           ),
           ...browseProfiles.map((profile, browseIndex) =>
-            makeSlot(
+            makeNavigationSlot(
               profile.title,
               `${profile.author} - ${profile.downloadCount.toLocaleString()} downloads - ${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"}`,
               () => {
@@ -3677,13 +4069,12 @@
               },
             ),
           ),
-          makeSlot(
+          makeCommandSlot(
             "Refresh Catalog",
             "Reload local themes, theme profiles, and built-in catalog entries.",
             () => refreshThemesCatalog(),
             {
               disabled: state.themes.loading || state.themes.saving,
-              trailing: "none",
             },
           ),
         ],
@@ -3705,7 +4096,9 @@
         error: state.themes.error,
         note: `These settings control how the theme framework behaves across the whole Steam Tools shell. Local themes are loaded from ${themesSnapshot?.localThemesFolder || "the local themes folder"}.`,
         slots: [
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "themes",
+            "theme-engine-enabled",
             "Theme Engine Enabled",
             "Apply active theme CSS into the current Steam Tools surfaces.",
             Boolean(settings?.themeEngineEnabled),
@@ -3714,7 +4107,9 @@
               disabled: state.themes.loading || state.themes.saving,
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "themes",
+            "show-community-themes",
             "Show Community Themes",
             "Include community-made catalog entries in the theme store.",
             Boolean(settings?.showCommunityThemes),
@@ -3723,7 +4118,9 @@
               disabled: state.themes.loading || state.themes.saving,
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "themes",
+            "single-theme-mode",
             "Single Theme Mode",
             "Keep only one theme active at a time when you enable a new one.",
             Boolean(settings?.singleThemeMode),
@@ -3732,7 +4129,9 @@
               disabled: state.themes.loading || state.themes.saving,
             },
           ),
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "themes",
+            "auto-enable-on-install",
             "Auto-Enable On Install",
             "Turn a freshly installed theme on as soon as it is added.",
             Boolean(settings?.autoEnableOnInstall),
@@ -3760,7 +4159,7 @@
         error: state.storeSync.error,
         note: "Each store keeps its own enable state and detection rules.",
         slots: stores.map((store, storeIndex) =>
-          makeSlot(
+          makeNavigationSlot(
             store.title,
             `${store.enabled ? "Enabled" : "Disabled"} - ${store.statusText} - ${store.detailText}`,
             () => {
@@ -3816,7 +4215,9 @@
               }
             : null,
         slots: [
-          makeToggleSlot(
+          makeSettingToggleSlot(
+            "store-sync.store",
+            storeId,
             "Enabled",
             "Turn this source on or off for future sync runs.",
             Boolean(store?.enabled),
@@ -3827,7 +4228,7 @@
           ),
           ...(storeId === "custom-locations"
             ? [
-                makeSlot(
+                makeCommandSlot(
                   "Save Custom Folder",
                   "Store the folder path above for the next sync run.",
                   () => setCustomStorePath(),
@@ -3835,24 +4236,22 @@
                     disabled: isStoreSyncBusy(),
                   },
                 ),
-                makeSlot(
+                makeCommandSlot(
                   "Clear Custom Folder",
                   "Remove the current custom scan folder.",
                   () => clearCustomStorePath(),
                   {
                     disabled: isStoreSyncBusy(),
-                    trailing: "none",
                   },
                 ),
               ]
             : []),
-          makeSlot(
+          makeCommandSlot(
             "Refresh Store State",
             "Reload the store and validate the current detection status.",
             () => loadStoreSyncState(),
             {
               disabled: isStoreSyncBusy(),
-              trailing: "none",
             },
           ),
         ],
@@ -3881,7 +4280,7 @@
           autoFocusIndex: resolveAutoFocusIndex(state.route),
           slots: [
             ...plugin.pages.map((page, pageIndex) =>
-              makeSlot(page.title, page.description, () => {
+              makeNavigationSlot(page.title, page.description, () => {
                 rememberCurrentRouteIndex(pageIndex);
                 setRoute({ screen: "page", pluginId: plugin.id, pageId: page.id });
               }),
@@ -3895,7 +4294,7 @@
       ...defaultModel,
       dividerAfterIndex: 0,
       slots: plugins.map((plugin, pluginIndex) =>
-        makeSlot(plugin.title, plugin.description, () => {
+        makeNavigationSlot(plugin.title, plugin.description, () => {
           rememberCurrentRouteIndex(pluginIndex);
           setRoute(
             plugin.id === "settings"
@@ -3935,6 +4334,17 @@
   }
 
   function setRoute(route) {
+    const previousRoute = state.route;
+    const enteringGeneralSettingsPage =
+      route.screen === "page" &&
+      route.pluginId === "settings" &&
+      route.pageId === "general" &&
+      !(
+        previousRoute?.screen === "page" &&
+        previousRoute?.pluginId === "settings" &&
+        previousRoute?.pageId === "general"
+      );
+
     state.audio.pendingVolumeActionAutoFocus =
       route.screen === "page" &&
       route.pluginId === "audio" &&
@@ -3988,6 +4398,15 @@
     }
 
     if (
+      route.pluginId === "processes" &&
+      !state.processes.loading &&
+      !state.processes.snapshot &&
+      !state.processes.error
+    ) {
+      void loadProcessesState();
+    }
+
+    if (
       route.pluginId === "themes" &&
       !state.themes.loading &&
       !state.themes.snapshot &&
@@ -4004,10 +4423,12 @@
       route.pluginId === "settings" &&
       !state.generalSettings.loading &&
       !state.generalSettings.snapshot &&
-      !state.generalSettings.error
+      (enteringGeneralSettingsPage || !state.generalSettings.error)
     ) {
       void loadGeneralSettingsState();
     }
+
+    updateProcessesPolling();
 
     refreshQuickAccessPanel();
   }
@@ -4168,6 +4589,43 @@
     return state.display.status || "Use the Windows display switch to keep either the internal or external display active.";
   }
 
+  function getProcessesSnapshot() {
+    return state.processes.snapshot;
+  }
+
+  function isProcessesBusy() {
+    return state.processes.loading || state.processes.activating;
+  }
+
+  function resolveProcessesStatusText() {
+    if (state.processes.activating) {
+      return "Opening the selected app window...";
+    }
+
+    if (state.processes.loading) {
+      return "Loading open app windows...";
+    }
+
+    return getProcessesSnapshot()?.statusText || "Live app windows will appear here.";
+  }
+
+  function updateProcessesPolling() {
+    if (window.__steamToolsProcessesPollTimer) {
+      window.clearInterval(window.__steamToolsProcessesPollTimer);
+      window.__steamToolsProcessesPollTimer = null;
+    }
+
+    if (state.route.pluginId !== "processes") {
+      return;
+    }
+
+    window.__steamToolsProcessesPollTimer = window.setInterval(() => {
+      if (!state.processes.loading && !state.processes.activating) {
+        void loadProcessesState();
+      }
+    }, 2500);
+  }
+
   async function switchDisplayMode(mode) {
     const statusText =
       mode === "internal"
@@ -4300,6 +4758,10 @@
     applyActiveThemeCss();
     cleanupLegacyNodes();
     captureNativeUi();
+
+    if (shouldLoadFrontendComponentRegistry()) {
+      void loadFrontendComponentRegistry();
+    }
 
     if (!state.themes.loading && !state.themes.snapshot && !state.themes.error) {
       void loadThemesState();

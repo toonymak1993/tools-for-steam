@@ -4,8 +4,10 @@ using System.Text.Json;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
+using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Infrastructure.Themes;
 
 namespace SteamLoader.App.Hosting;
@@ -16,10 +18,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private readonly IAudioOutputDeviceService _audioOutputDeviceService;
     private readonly DisplaySwitchService _displaySwitchService;
+    private readonly ProcessWindowService _processWindowService;
     private readonly HltbService _hltbService;
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
     private readonly SteamLoaderSettingsService _steamLoaderSettingsService;
+    private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamLoaderHostState _hostState;
     private readonly HttpListener _listener;
     private readonly Action _requestShutdown;
@@ -28,20 +32,24 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     public SteamLoaderApiServer(
         IAudioOutputDeviceService audioOutputDeviceService,
         DisplaySwitchService displaySwitchService,
+        ProcessWindowService processWindowService,
         HltbService hltbService,
         StoreSyncService storeSyncService,
         ThemesService themesService,
         SteamLoaderSettingsService steamLoaderSettingsService,
+        SteamFrontendComponentService frontendComponentService,
         Uri baseUri,
         SteamLoaderHostState hostState,
         Action requestShutdown)
     {
         _audioOutputDeviceService = audioOutputDeviceService;
         _displaySwitchService = displaySwitchService;
+        _processWindowService = processWindowService;
         _hltbService = hltbService;
         _storeSyncService = storeSyncService;
         _themesService = themesService;
         _steamLoaderSettingsService = steamLoaderSettingsService;
+        _frontendComponentService = frontendComponentService;
         _hostState = hostState;
         _requestShutdown = requestShutdown;
         _listener = new HttpListener();
@@ -130,6 +138,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 request.Url?.AbsolutePath == "/api/control/status")
             {
                 await WriteJsonAsync(response, HttpStatusCode.OK, _hostState.Snapshot(), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/frontend/components")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _frontendComponentService.GetSnapshotAsync(cancellationToken),
+                    cancellationToken);
                 return;
             }
 
@@ -320,6 +339,43 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _displaySwitchService.SwitchToExternalDisplay(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/processes/windows")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _processWindowService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/processes/activate")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A window handle is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _processWindowService.ActivateWindow(payload.Value),
                     cancellationToken);
                 return;
             }

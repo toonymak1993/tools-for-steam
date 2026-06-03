@@ -15,20 +15,40 @@ public static class Program
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
         }
 
+        var shellBootstrapMode = args.Any(argument =>
+            string.Equals(argument, SteamLoaderRuntime.ShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+        if (shellBootstrapMode)
+        {
+            var bootstrapShellService = new WindowsShellService();
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Steam Tools executable path.");
+            bootstrapShellService.PrepareCurrentSession(executablePath, SteamLoaderRuntime.ShellLaunchArguments);
+        }
+
         var showManager = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.ManagerArgument, StringComparison.OrdinalIgnoreCase));
         var runStartupSync = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
+        if (shellBootstrapMode && !runStartupSync)
+        {
+            var bootstrapShellService = new WindowsShellService();
+            bootstrapShellService.StartWindowsShellIfNeeded();
+        }
+
         var startHiddenInTray = !showManager;
 
         var processManager = new SteamLoaderProcessManager(
             new Uri("http://127.0.0.1:47652/"),
             SteamLoaderRuntime.BackgroundArgument);
         var autostartService = new WindowsAutostartService(SteamLoaderRuntime.AutostartValueName);
+        var shellService = new WindowsShellService();
         var viewModel = new MainWindowViewModel(
             processManager,
             autostartService,
-            SteamLoaderRuntime.AutostartArguments,
+            shellService,
+            SteamLoaderRuntime.ShellLaunchArguments,
+            shellBootstrapMode,
             runStartupSync);
 
         var application = new System.Windows.Application
@@ -39,10 +59,11 @@ public static class Program
         var window = new MainWindow
         {
             DataContext = viewModel,
-            StartHiddenInTray = startHiddenInTray
+            StartHiddenInTray = startHiddenInTray,
+            ShellBootstrapMode = shellBootstrapMode
         };
 
-        if (startHiddenInTray)
+        if (startHiddenInTray && !shellBootstrapMode)
         {
             window.ShowInTaskbar = false;
             window.WindowState = WindowState.Minimized;
