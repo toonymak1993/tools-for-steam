@@ -22,6 +22,7 @@ public sealed class TrayIconController : IDisposable
     private readonly Forms.ToolStripMenuItem _restartHostItem;
     private readonly Forms.ToolStripMenuItem _stopHostItem;
     private readonly Forms.ToolStripMenuItem _autostartItem;
+    private readonly Forms.ToolStripMenuItem _startDesktopItem;
     private readonly Forms.ToolStripMenuItem _openFolderItem;
     private readonly Forms.ToolStripMenuItem _refreshItem;
     private readonly Forms.ToolStripMenuItem _quitItem;
@@ -59,6 +60,7 @@ public sealed class TrayIconController : IDisposable
         {
             CheckOnClick = false
         };
+        _startDesktopItem = new Forms.ToolStripMenuItem("Start Windows Desktop", null, (_, _) => _viewModel.StartWindowsDesktop());
         _openFolderItem = new Forms.ToolStripMenuItem("Open Portable Folder", null, (_, _) => _viewModel.OpenInstallFolder());
         _refreshItem = new Forms.ToolStripMenuItem("Refresh Status", null, async (_, _) => await _viewModel.RefreshAsync());
         _quitItem = new Forms.ToolStripMenuItem("Quit Tray App", null, (_, _) => QuitTrayApp());
@@ -75,6 +77,7 @@ public sealed class TrayIconController : IDisposable
             _stopHostItem,
             new Forms.ToolStripSeparator(),
             _autostartItem,
+            _startDesktopItem,
             _openFolderItem,
             _refreshItem,
             new Forms.ToolStripSeparator(),
@@ -171,6 +174,7 @@ public sealed class TrayIconController : IDisposable
         _refreshItem.Enabled = _viewModel.RefreshCommand.CanExecute(null);
         _autostartItem.Enabled = _viewModel.ToggleAutostartCommand.CanExecute(null);
         _autostartItem.Checked = _viewModel.AutostartEnabled;
+        _startDesktopItem.Enabled = _viewModel.StartDesktopCommand.CanExecute(null);
     }
 
     private void QuitTrayApp()

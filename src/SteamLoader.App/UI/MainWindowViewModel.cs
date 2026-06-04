@@ -27,6 +27,8 @@ public sealed class MainWindowViewModel : BindableBase
     private string _steamStateText = "Waiting for status...";
     private string _apiStateText = "Waiting for status...";
     private string _autostartStateText = "Checking startup registration...";
+    private string _setupChecklistText = "Setup checks have not run yet.";
+    private string _recoveryHintText = "If Steam does not appear, start the Windows desktop and relaunch Steam Tools.";
     private string _errorText = string.Empty;
 
     public MainWindowViewModel(
@@ -57,6 +59,7 @@ public sealed class MainWindowViewModel : BindableBase
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => !IsBusy);
         ToggleAutostartCommand = new RelayCommand(ToggleAutostart, () => !IsBusy);
         OpenFolderCommand = new RelayCommand(OpenFolder);
+        StartDesktopCommand = new RelayCommand(StartDesktop);
     }
 
     public string InstallPath => _processManager.WorkingDirectory.TrimEnd(Path.DirectorySeparatorChar);
@@ -93,6 +96,18 @@ public sealed class MainWindowViewModel : BindableBase
     {
         get => _autostartStateText;
         private set => SetProperty(ref _autostartStateText, value);
+    }
+
+    public string SetupChecklistText
+    {
+        get => _setupChecklistText;
+        private set => SetProperty(ref _setupChecklistText, value);
+    }
+
+    public string RecoveryHintText
+    {
+        get => _recoveryHintText;
+        private set => SetProperty(ref _recoveryHintText, value);
     }
 
     public string ErrorText
@@ -168,6 +183,8 @@ public sealed class MainWindowViewModel : BindableBase
 
     public RelayCommand OpenFolderCommand { get; }
 
+    public RelayCommand StartDesktopCommand { get; }
+
     public async Task InitializeAsync()
     {
         if (_initialized)
@@ -232,6 +249,9 @@ public sealed class MainWindowViewModel : BindableBase
                 ApiStateText = $"{_processManager.ApiBaseUri} ({FormatElapsed(status.StartedAtUtc)})";
                 ErrorText = status.LastError ?? string.Empty;
             }
+
+            SetupChecklistText = BuildSetupChecklistText(status);
+            RecoveryHintText = BuildRecoveryHintText(status);
 
             AutostartEnabled = _shellService.IsEnabled(_processManager.ExecutablePath, _shellLaunchArguments);
             AutostartStateText = BuildAutostartStateText(AutostartEnabled);
@@ -330,6 +350,20 @@ public sealed class MainWindowViewModel : BindableBase
         });
     }
 
+    private void StartDesktop()
+    {
+        try
+        {
+            _shellService.StartWindowsShellIfNeeded();
+            ErrorText = string.Empty;
+            RecoveryHintText = "Windows desktop was requested. You can return to Steam after recovery.";
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+        }
+    }
+
     public void ToggleAutostartSetting()
     {
         ToggleAutostart();
@@ -338,6 +372,11 @@ public sealed class MainWindowViewModel : BindableBase
     public void OpenInstallFolder()
     {
         OpenFolder();
+    }
+
+    public void StartWindowsDesktop()
+    {
+        StartDesktop();
     }
 
     private async Task TriggerStartupSyncAsync()
@@ -407,6 +446,49 @@ public sealed class MainWindowViewModel : BindableBase
         RefreshCommand.RaiseCanExecuteChanged();
         ToggleAutostartCommand.RaiseCanExecuteChanged();
         OpenFolderCommand.RaiseCanExecuteChanged();
+        StartDesktopCommand.RaiseCanExecuteChanged();
+    }
+
+    private static string BuildSetupChecklistText(SteamLoaderHostStatus? status)
+    {
+        if (status is null)
+        {
+            return "Host offline - Steam Tools can start it from this manager.";
+        }
+
+        if (status.QuickAccessAttached)
+        {
+            return "Ready - host online, Steam DevTools reachable, and Quick Access attached.";
+        }
+
+        if (status.SharedContextAttached)
+        {
+            return "Almost ready - Steam DevTools is reachable. Open Quick Access once to attach the panel.";
+        }
+
+        return status.ServiceMessage.Contains("DevTools", StringComparison.OrdinalIgnoreCase)
+            ? "Recovering - Steam is being started or restarted with DevTools enabled."
+            : "Waiting - Steam Gamepad UI is not ready yet.";
+    }
+
+    private static string BuildRecoveryHintText(SteamLoaderHostStatus? status)
+    {
+        if (status is null)
+        {
+            return "Start the host first. If you are in shell mode and need Windows, press Start Windows Desktop.";
+        }
+
+        if (status.LastError is not null)
+        {
+            return "Use Restart Host first. If Steam still does not attach, start the Windows desktop and check Steam.";
+        }
+
+        if (status.QuickAccessAttached)
+        {
+            return "No recovery needed. Steam Tools is attached and ready.";
+        }
+
+        return "If this state lasts too long, use Restart Host or Start Windows Desktop. Steam Tools will keep trying safely.";
     }
 
     private void EnsureShellBootstrapMonitor()

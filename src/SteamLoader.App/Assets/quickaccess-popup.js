@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 29;
+  const stateVersion = 31;
   const soundtrackTabKey = 7;
 
   if (window.__steamLoaderPopupTimer) {
@@ -39,6 +39,12 @@
             switching: false,
             error: "",
             status: "",
+          },
+          power: {
+            actioning: false,
+            error: "",
+            status: "",
+            confirmingPath: "",
           },
           processes: {
             loading: false,
@@ -159,6 +165,12 @@
       id: "display",
       title: "Display",
       description: "Switch between internal and external output",
+      pages: [],
+    },
+    {
+      id: "power",
+      title: "Power",
+      description: "Steam, Windows, and recovery actions",
       pages: [],
     },
     {
@@ -1394,6 +1406,32 @@
     );
   }
 
+  function PowerPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M18 8.5V17.5",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M13 11.5C10.3 13.2 8.5 16.2 8.5 19.6C8.5 24.8 12.8 29 18 29C23.2 29 27.5 24.8 27.5 19.6C27.5 16.2 25.7 13.2 23 11.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
   function StoreSyncPluginIcon() {
     return createElement(
       "svg",
@@ -1580,6 +1618,8 @@
         return AudioPluginIcon;
       case "display":
         return DisplayPluginIcon;
+      case "power":
+        return PowerPluginIcon;
       case "processes":
         return ProcessesPluginIcon;
       case "hltb":
@@ -1897,6 +1937,19 @@
 
   function rerenderDisplayPanel() {
     if (state.route.pluginId === "display") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
+  function rerenderPowerPanel() {
+    if (state.route.pluginId === "power") {
       const currentRoute = { ...state.route };
       const focusedIndex = getFocusedSlotIndex();
       requestFocusForRoute(currentRoute, focusedIndex);
@@ -3246,6 +3299,83 @@
       };
     }
 
+    if (state.route.screen === "plugin" && state.route.pluginId === "power") {
+      return {
+        ...defaultModel,
+        title: "Power",
+        subtitle: "Steam, Windows, and recovery",
+        status: resolvePowerStatusText(),
+        error: state.power.error,
+        note: "Use these actions when console mode needs a safe escape hatch or a quick restart.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [
+          {
+            title: "Recovery Ready",
+            lines: [
+              "Start Windows Desktop brings Explorer back without leaving Steam Tools.",
+              "Restart Steam relaunches Big Picture with the required Steam Tools bridge.",
+            ],
+          },
+        ],
+        slots: [
+          makeCommandSlot(
+            "Restart Steam",
+            "Close Steam and relaunch Big Picture with the Steam Tools bridge enabled.",
+            () => sendPowerRequest("api/power/restart-steam", "Restarting Steam..."),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Start Windows Desktop",
+            "Recover Explorer and the Windows taskbar if console mode gets stuck.",
+            () => sendPowerRequest("api/power/start-desktop", "Starting Windows desktop..."),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Restart Steam Tools",
+            "Restart the background host without rebooting Windows.",
+            () => sendPowerRequest("api/power/restart-steam-tools", "Restarting Steam Tools..."),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Sleep Windows",
+            "Put the PC into sleep mode.",
+            () => sendPowerRequest("api/power/sleep", "Sending Windows to sleep...", {
+              confirmText: "Press A again to put Windows to sleep.",
+            }),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Restart Windows",
+            "Reboot the PC.",
+            () => sendPowerRequest("api/power/restart-windows", "Restarting Windows...", {
+              confirmText: "Press A again to restart Windows.",
+            }),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Shut Down Windows",
+            "Power off the PC.",
+            () => sendPowerRequest("api/power/shutdown-windows", "Shutting down Windows...", {
+              confirmText: "Press A again to shut down Windows.",
+            }),
+            {
+              disabled: isPowerBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
     if (state.route.screen === "plugin" && state.route.pluginId === "processes") {
       const snapshot = getProcessesSnapshot();
       const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
@@ -4589,6 +4719,18 @@
     return state.display.status || "Use the Windows display switch to keep either the internal or external display active.";
   }
 
+  function isPowerBusy() {
+    return state.power.actioning;
+  }
+
+  function resolvePowerStatusText() {
+    if (state.power.actioning) {
+      return state.power.status || "Running power action...";
+    }
+
+    return state.power.status || "Recovery and power actions are ready.";
+  }
+
   function getProcessesSnapshot() {
     return state.processes.snapshot;
   }
@@ -4653,6 +4795,40 @@
     } finally {
       state.display.switching = false;
       rerenderDisplayPanel();
+    }
+  }
+
+  async function sendPowerRequest(path, statusText, options = {}) {
+    if (options.confirmText && state.power.confirmingPath !== path) {
+      state.power.confirmingPath = path;
+      state.power.error = "";
+      state.power.status = options.confirmText;
+      rerenderPowerPanel();
+      return;
+    }
+
+    state.power.confirmingPath = "";
+    state.power.actioning = true;
+    state.power.error = "";
+    state.power.status = statusText;
+    rerenderPowerPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.power.status = payload?.message || statusText;
+    } catch (error) {
+      state.power.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.power.actioning = false;
+      rerenderPowerPanel();
     }
   }
 

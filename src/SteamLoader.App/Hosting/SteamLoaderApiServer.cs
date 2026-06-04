@@ -9,6 +9,7 @@ using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Infrastructure.Themes;
+using SteamLoader.App.Services;
 
 namespace SteamLoader.App.Hosting;
 
@@ -23,6 +24,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
     private readonly SteamLoaderSettingsService _steamLoaderSettingsService;
+    private readonly PowerActionService _powerActionService;
     private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamLoaderHostState _hostState;
     private readonly HttpListener _listener;
@@ -37,6 +39,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         StoreSyncService storeSyncService,
         ThemesService themesService,
         SteamLoaderSettingsService steamLoaderSettingsService,
+        PowerActionService powerActionService,
         SteamFrontendComponentService frontendComponentService,
         Uri baseUri,
         SteamLoaderHostState hostState,
@@ -49,6 +52,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _storeSyncService = storeSyncService;
         _themesService = themesService;
         _steamLoaderSettingsService = steamLoaderSettingsService;
+        _powerActionService = powerActionService;
         _frontendComponentService = frontendComponentService;
         _hostState = hostState;
         _requestShutdown = requestShutdown;
@@ -828,6 +832,74 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     new { message = "Opened the HowLongToBeat detail page." },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/start-desktop")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.StartWindowsDesktop(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/restart-steam")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.RestartSteam(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/restart-steam-tools")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.RestartSteamTools(),
+                    cancellationToken);
+
+                _requestShutdown();
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/sleep")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.SleepWindows(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/restart-windows")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.RestartWindows(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/power/shutdown-windows")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.ShutDownWindows(),
                     cancellationToken);
                 return;
             }

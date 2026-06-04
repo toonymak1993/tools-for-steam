@@ -60,10 +60,18 @@ public sealed class SteamLoaderBackgroundHost
             SteamLoaderRuntime.ShellLaunchArguments);
         var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
+        var executablePath =
+            Environment.ProcessPath
+            ?? throw new InvalidOperationException("Unable to resolve the Steam Tools executable path.");
         var steamClientLaunchService = new SteamClientLaunchService(
             httpClient,
             DebugEndpoint,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+        var powerActionService = new PowerActionService(
+            steamClientLaunchService,
+            shellService,
+            executablePath,
+            SteamLoaderRuntime.BackgroundArgument);
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
         var popupScript = string.Join(
             Environment.NewLine,
@@ -82,6 +90,7 @@ public sealed class SteamLoaderBackgroundHost
             storeSyncService,
             themesService,
             steamLoaderSettingsService,
+            powerActionService,
             frontendComponentService,
             ApiBaseUri,
             _hostState,

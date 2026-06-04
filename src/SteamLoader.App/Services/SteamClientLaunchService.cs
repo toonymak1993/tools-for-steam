@@ -83,6 +83,26 @@ public sealed class SteamClientLaunchService
             : "-dev -cef-enable-debugging";
     }
 
+    public SteamClientLaunchState RestartSteamForSteamTools()
+    {
+        var steamExePath = ResolveSteamExecutablePath();
+        if (steamExePath is null)
+        {
+            return new SteamClientLaunchState(
+                false,
+                "Steam Tools could not find steam.exe. Install Steam or start it once manually.");
+        }
+
+        RestartSteamForDevTools(steamExePath);
+        _lastActionAt = DateTimeOffset.UtcNow;
+        _firstUnavailableAt = _lastActionAt;
+        _restartedExistingSteam = true;
+
+        return new SteamClientLaunchState(
+            false,
+            "Steam is restarting in Gamepad UI with DevTools enabled.");
+    }
+
     private async Task<bool> IsDebugEndpointAvailableAsync(CancellationToken cancellationToken)
     {
         try

@@ -15,6 +15,9 @@ Steam Tools is a Windows-first Quick Access toolkit for Steam Big Picture. It in
 
 ## Current Built-In Tools
 
+- `Processes`
+  - list visible app windows in real time
+  - bring a selected window to the front from the controller
 - `Audio`
   - switch the default Windows output device
   - control system volume from Steam
@@ -27,6 +30,9 @@ Steam Tools is a Windows-first Quick Access toolkit for Steam Big Picture. It in
   - includes early CSS Loader-style groundwork and profile support
 - `Display`
   - switch between internal and external display modes
+- `Power`
+  - restart Steam with the Steam Tools bridge enabled
+  - recover the Windows desktop or trigger system power actions
 - `HLTB`
   - show HowLongToBeat estimates on supported game detail pages
 - `Settings`

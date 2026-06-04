@@ -280,6 +280,31 @@
                                     Command="{Binding OpenFolderCommand}" />
                         </StackPanel>
                     </Border>
+
+                    <Border Grid.Row="2"
+                            Margin="0,14,0,0"
+                            Style="{StaticResource CardBorderStyle}">
+                        <StackPanel>
+                            <TextBlock Text="Recovery"
+                                       Foreground="#E7EEF6"
+                                       FontSize="21"
+                                       FontWeight="Bold" />
+                            <TextBlock Text="{Binding SetupChecklistText}"
+                                       Margin="0,10,0,0"
+                                       Foreground="#C3CDD8"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="{Binding RecoveryHintText}"
+                                       Margin="0,8,0,0"
+                                       Foreground="#93A1AF"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
+                            <Button Content="Start Windows Desktop"
+                                    Margin="0,18,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding StartDesktopCommand}" />
+                        </StackPanel>
+                    </Border>
                 </Grid>
             </Grid>
         </Grid>
