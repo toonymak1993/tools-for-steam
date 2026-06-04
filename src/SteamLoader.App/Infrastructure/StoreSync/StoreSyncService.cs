@@ -866,7 +866,7 @@ public sealed class StoreSyncService
         Process.Start(new ProcessStartInfo
         {
             FileName = steamExePath,
-            Arguments = launchBigPicture ? "-gamepadui -dev" : "-dev",
+            Arguments = SteamClientLaunchService.BuildSteamLaunchArguments(launchBigPicture),
             WorkingDirectory = _steamRootPath,
             UseShellExecute = false,
             CreateNoWindow = true,

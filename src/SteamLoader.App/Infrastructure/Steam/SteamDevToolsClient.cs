@@ -53,10 +53,21 @@ public sealed class SteamDevToolsClient
 
     public async Task<IReadOnlyList<SteamDevToolsTarget>> GetTargetsAsync(CancellationToken cancellationToken)
     {
-        var targetsUri = new Uri(_debugEndpoint, "/json/list");
-        await using var stream = await _httpClient.GetStreamAsync(targetsUri, cancellationToken);
-        var targets = await JsonSerializer.DeserializeAsync<List<SteamDevToolsTarget>>(stream, JsonOptions, cancellationToken);
-        return targets ?? [];
+        try
+        {
+            var targetsUri = new Uri(_debugEndpoint, "/json/list");
+            await using var stream = await _httpClient.GetStreamAsync(targetsUri, cancellationToken);
+            var targets = await JsonSerializer.DeserializeAsync<List<SteamDevToolsTarget>>(stream, JsonOptions, cancellationToken);
+            return targets ?? [];
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     public async Task<SteamDevToolsEvaluationResult> EvaluateAsync(

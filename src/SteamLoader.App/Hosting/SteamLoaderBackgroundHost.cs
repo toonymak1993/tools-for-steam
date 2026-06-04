@@ -60,6 +60,10 @@ public sealed class SteamLoaderBackgroundHost
             SteamLoaderRuntime.ShellLaunchArguments);
         var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
+        var steamClientLaunchService = new SteamClientLaunchService(
+            httpClient,
+            DebugEndpoint,
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
         var popupScript = string.Join(
             Environment.NewLine,
@@ -86,6 +90,7 @@ public sealed class SteamLoaderBackgroundHost
         var injector = new QuickAccessShellInjector(
             devToolsClient,
             ApiBaseUri,
+            steamClientLaunchService,
             sharedScript,
             popupScript,
             themeSurfaceScript,

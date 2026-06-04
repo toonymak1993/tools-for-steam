@@ -47,7 +47,9 @@ That means:
 
 - Windows
 - Steam running in Big Picture / Gamepad UI mode
-- Steam's DevTools endpoint reachable on `127.0.0.1:8080`
+- Steam Tools starts Steam with the required DevTools endpoint on `127.0.0.1:8080` when needed
+
+If Steam is already running without the DevTools endpoint, Steam Tools performs one controlled Steam restart so it can attach to Big Picture correctly.
 
 ## Run From Source
 

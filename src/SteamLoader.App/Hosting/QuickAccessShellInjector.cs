@@ -1,4 +1,5 @@
 using SteamLoader.App.Infrastructure.Steam;
+using SteamLoader.App.Services;
 
 namespace SteamLoader.App.Hosting;
 
@@ -7,6 +8,7 @@ public sealed class QuickAccessShellInjector
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SteamLoaderHostState _hostState;
     private readonly Uri _apiBaseUri;
+    private readonly SteamClientLaunchService _steamClientLaunchService;
     private readonly string _sharedScriptTemplate;
     private readonly string _popupScriptTemplate;
     private readonly string _themeSurfaceScriptTemplate;
@@ -20,6 +22,7 @@ public sealed class QuickAccessShellInjector
     public QuickAccessShellInjector(
         SteamDevToolsClient devToolsClient,
         Uri apiBaseUri,
+        SteamClientLaunchService steamClientLaunchService,
         string sharedScriptTemplate,
         string popupScriptTemplate,
         string themeSurfaceScriptTemplate,
@@ -27,6 +30,7 @@ public sealed class QuickAccessShellInjector
     {
         _devToolsClient = devToolsClient;
         _apiBaseUri = apiBaseUri;
+        _steamClientLaunchService = steamClientLaunchService;
         _sharedScriptTemplate = sharedScriptTemplate;
         _popupScriptTemplate = popupScriptTemplate;
         _themeSurfaceScriptTemplate = themeSurfaceScriptTemplate;
@@ -56,6 +60,17 @@ public sealed class QuickAccessShellInjector
 
     private async Task EnsureInjectedAsync(CancellationToken cancellationToken)
     {
+        var launchState = await _steamClientLaunchService.EnsureDevToolsReadyAsync(cancellationToken);
+        if (!launchState.DevToolsReady)
+        {
+            _sharedReadyLogged = false;
+            _popupReadyLogged = false;
+            _sharedTargetId = null;
+            _quickAccessTargetId = null;
+            _hostState.UpdateSharedContext(false, launchState.Message);
+            return;
+        }
+
         var sharedTarget = await _devToolsClient.GetSharedJsContextTargetAsync(cancellationToken);
         if (sharedTarget is null)
         {
