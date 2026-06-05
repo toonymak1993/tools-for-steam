@@ -391,7 +391,7 @@ public sealed class ThemesService
 
             var replacement = BuildStoredProfile(profile.Title, configuration);
             replacement.Author = profile.Author;
-            replacement.Description = $"Updated from the current Steam Tools theme stack on {DateTime.Now:yyyy-MM-dd}.";
+            replacement.Description = $"Updated from the current Tools for Steam theme stack on {DateTime.Now:yyyy-MM-dd}.";
             replacement.SourceLabel = profile.SourceLabel;
             replacement.DownloadCount = profile.DownloadCount;
             replacement.Version = profile.Version;
@@ -1529,8 +1529,8 @@ public sealed class ThemesService
         return new ThemeProfileConfiguration
         {
             Title = title,
-            Author = "Steam Tools",
-            Description = $"Created from the current Steam Tools theme stack on {DateTime.Now:yyyy-MM-dd}.",
+            Author = "Tools for Steam",
+            Description = $"Created from the current Tools for Steam theme stack on {DateTime.Now:yyyy-MM-dd}.",
             Version = "1.0",
             SourceLabel = "Local",
             DownloadCount = 0,
@@ -1829,7 +1829,7 @@ public sealed class ThemesService
 
         public string Title { get; set; } = string.Empty;
 
-        public string Author { get; set; } = "Steam Tools";
+        public string Author { get; set; } = "Tools for Steam";
 
         public string Description { get; set; } = string.Empty;
 

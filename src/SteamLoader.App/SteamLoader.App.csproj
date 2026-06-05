@@ -6,8 +6,13 @@
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
-    <AssemblyName>SteamLoader</AssemblyName>
-    <Product>Steam Tools</Product>
+    <AssemblyName>ToolsForSteam</AssemblyName>
+    <Product>Tools for Steam</Product>
+    <Version>0.2.0-preview.1</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
+    <InformationalVersion>0.2.0-preview.1</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>

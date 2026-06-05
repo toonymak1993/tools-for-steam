@@ -48,7 +48,7 @@ public sealed class SteamClientLaunchService
         {
             return new SteamClientLaunchState(
                 false,
-                "Steam Tools could not find steam.exe. Install Steam or start it once manually.");
+                "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
         }
 
         var steamRunning = IsSteamRunning();
@@ -68,7 +68,7 @@ public sealed class SteamClientLaunchService
             _restartedExistingSteam = true;
             return new SteamClientLaunchState(
                 false,
-                "Restarting Steam once so Steam Tools can attach to the DevTools endpoint.");
+                "Restarting Steam once so Tools for Steam can attach to the DevTools endpoint.");
         }
 
         return new SteamClientLaunchState(
@@ -90,7 +90,7 @@ public sealed class SteamClientLaunchService
         {
             return new SteamClientLaunchState(
                 false,
-                "Steam Tools could not find steam.exe. Install Steam or start it once manually.");
+                "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
         }
 
         RestartSteamForDevTools(steamExePath);

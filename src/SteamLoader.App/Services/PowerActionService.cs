@@ -37,7 +37,7 @@ public sealed class PowerActionService
     public PowerActionResult RestartSteamTools()
     {
         ScheduleBackgroundHostRestart();
-        return new PowerActionResult("Steam Tools background host is restarting.");
+        return new PowerActionResult("Tools for Steam background host is restarting.");
     }
 
     public PowerActionResult SleepWindows()

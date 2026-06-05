@@ -1,105 +1,120 @@
-# Steam Tools
+# Tools for Steam
 
-Steam Tools is a Windows-first Quick Access toolkit for Steam Big Picture. It injects built-in tools directly into Steam's native side panel instead of opening a separate in-game window or shipping a plugin store.
+Tools for Steam (TFS) brings a SteamOS-style console experience to Windows PCs that are used mainly with Steam Big Picture. It adds a native-feeling Tools for Steam tab to Steam's Quick Access side panel and ships with built-in tools for audio, display control, launcher sync, themes, HLTB, window switching, and recovery actions.
 
-> [!IMPORTANT]
-> Steam Tools is still a work in progress.
-> This project is part of **GCM - Gaming Console Mode** and is under active development. Expect rough edges, missing polish, and frequent behavior changes between preview releases.
+This release is part of **GCM - Gaming Console Mode**. The goal is simple: when a living-room PC boots, the first thing you should see is Steam Big Picture, not the Windows desktop.
 
-## What It Does
+![Tools for Steam plugin overview](docs/screenshots/plugin-overview.svg)
 
-- injects a native-feeling `Steam Tools` tab into Steam Big Picture / Gamepad UI
-- keeps the interaction model controller-first and close to Steam's own Quick Access panels
-- runs as a lightweight Windows tray app with a background host
-- exposes built-in tools instead of a general plugin marketplace
+## What TFS Does
 
-## Current Built-In Tools
+- Starts before the normal Windows desktop when console startup is enabled.
+- Launches Steam Big Picture with the local bridge required for the Quick Access integration.
+- Adds a Tools for Steam tab to Steam's native side panel.
+- Syncs supported launcher libraries and custom game folders into Steam.
+- Can hide the Windows taskbar and desktop icons while Big Picture is active.
+- Restores Explorer behind Steam after the startup flow so Windows remains usable.
+- Updates from GitHub releases through the installed app.
 
-- `Processes`
-  - list visible app windows in real time
-  - bring a selected window to the front from the controller
-- `Audio`
-  - switch the default Windows output device
-  - control system volume from Steam
-- `Store Sync`
-  - scan supported launchers and custom folders
-  - sync discovered non-Steam games into Steam
-  - optionally fetch artwork from SteamGridDB during sync
-- `Themes`
-  - enable and configure currently bundled themes
-  - includes early CSS Loader-style groundwork and profile support
-- `Display`
-  - switch between internal and external display modes
-- `Power`
-  - restart Steam with the Steam Tools bridge enabled
-  - recover the Windows desktop or trigger system power actions
-- `HLTB`
-  - show HowLongToBeat estimates on supported game detail pages
-- `Settings`
-  - general Steam Tools behavior such as Windows sign-in startup
+## Console Startup
 
-## Project Status
+Tools for Steam can change the current user's Windows shell so TFS launches first at sign-in. This is how it can imitate a SteamOS-like boot flow on Windows: TFS starts, prepares the background host, starts Steam Big Picture, hides the regular desktop layer, and then hands the session back to Windows Explorer behind Steam.
 
-Right now this repository should be treated as an early preview branch of the wider GCM idea.
+![Tools for Steam startup flow](docs/screenshots/startup-flow.svg)
 
-That means:
+This shell behavior is intentional and can be disabled again from `Tools for Steam > Settings`. If something goes wrong, the `Power` plugin and desktop manager both provide recovery actions to start Windows Explorer manually.
 
-- the visible product branding is already `Steam Tools`
-- some internal file and executable names still use the older `SteamLoader` codename
-- not every theme or overlay behaves perfectly on every Steam surface yet
-- releases are meant for testing and iteration, not as a final polished stable build
+## Built-In Plugins
+
+- `Settings`: Global TFS startup behavior, desktop manager access, and plugin enable/disable controls.
+- `Processes`: See visible app windows and bring one to the foreground from the controller.
+- `Store Sync`: Import supported launcher games and custom folders into Steam as non-Steam games, with SteamGridDB artwork support.
+- `Audio`: Switch Windows output devices and adjust system volume from Big Picture.
+- `Display`: Switch internal/external display output and choose supported resolution or refresh-rate presets.
+- `Power`: Restart Steam, recover the Windows desktop, sleep, reboot, or shut down the PC.
+- `HLTB`: Show HowLongToBeat estimates on supported Big Picture game pages.
+- `Themes`: Apply and manage bundled Steam UI themes and profiles.
+
+Plugins can be disabled from `Settings`. Disabled plugins are hidden from the TFS home screen and their background routes are blocked.
 
 ## Requirements
 
-- Windows
-- Steam running in Big Picture / Gamepad UI mode
-- Steam Tools starts Steam with the required DevTools endpoint on `127.0.0.1:8080` when needed
+- Windows 10 or newer.
+- Steam installed.
+- Steam Big Picture / Gamepad UI.
+- A user account where changing the current user's shell is acceptable.
 
-If Steam is already running without the DevTools endpoint, Steam Tools performs one controlled Steam restart so it can attach to Big Picture correctly.
+Tools for Steam starts Steam with the required local DevTools endpoint on `127.0.0.1:8080` when needed. If Steam is already running without that endpoint, TFS may perform one controlled Steam restart so it can attach correctly.
 
-## Run From Source
+## Install
+
+Download `ToolsForSteamSetup.exe` from the latest GitHub release and run it.
+
+The installer:
+
+- installs per-user under `%LOCALAPPDATA%\Programs\ToolsForSteam`
+- shows the license before installation
+- closes running TFS processes automatically during setup
+- creates Start Menu entries
+- starts the TFS console startup flow after installation
+
+## Updates
+
+Installed builds can check for and install updates from GitHub releases. The updater looks for the latest release asset named:
+
+```text
+ToolsForSteamSetup.exe
+```
+
+Updates are expected. TFS touches Steam UI surfaces that can change when Steam updates, so future releases will improve compatibility, plugins, themes, and the console startup experience.
+
+## Safety And Recovery
+
+Because TFS can take over the current user's shell, it is important to know how to recover:
+
+- Open `Tools for Steam > Settings` to disable console startup.
+- Use `Tools for Steam > Power > Start Windows Desktop` to bring Explorer back.
+- Start the desktop manager from the tray icon or Start Menu if you need a normal Windows window.
+- Uninstall from Windows Apps settings or the Start Menu uninstall entry.
+
+TFS only changes the current user's shell configuration. It does not replace Windows system files.
+
+## Build From Source
 
 ```powershell
 dotnet build .\SteamLoader.slnx
 dotnet run --project .\src\SteamLoader.App\SteamLoader.App.csproj
 ```
 
-The background host serves a local control API on `http://127.0.0.1:47652/` and keeps trying to attach Steam Tools to Steam's Quick Access and supported Big Picture surfaces.
+The background host serves a local API on `http://127.0.0.1:47652/` and injects the Quick Access UI into Steam Big Picture when Steam is available.
 
-## Portable Build
+## Build The Installer
 
-Create a self-contained single-file Windows package with:
+Inno Setup 6 is used for the Windows installer.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\publish-portable.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\publish-installer.ps1
 ```
 
-The publish script outputs:
+Outputs:
 
-- `dist\portable\SteamLoader.exe`
-- `dist\SteamTools-portable-win-x64.zip`
-
-Run `SteamLoader.exe` to start the tray app. Steam Tools can then start its background host automatically and attach to Steam when Big Picture is open.
+- `dist\installer\ToolsForSteamSetup.exe`
+- `dist\portable\ToolsForSteam.exe`
+- `dist\ToolsForSteam-portable-win-x64.zip`
 
 ## Repository Layout
 
-- `src/SteamLoader.App/Hosting`
-  - local API host and Steam injection loop
-- `src/SteamLoader.App/Infrastructure/Steam`
-  - Steam DevTools communication
-- `src/SteamLoader.App/Infrastructure/Audio`
-  - Core Audio integration
-- `src/SteamLoader.App/Infrastructure/StoreSync`
-  - launcher scanning, shortcut sync, artwork download
-- `src/SteamLoader.App/Infrastructure/Themes`
-  - theme state, CSS resolution, profiles
-- `src/SteamLoader.App/Infrastructure/Hltb`
-  - HowLongToBeat integration
-- `src/SteamLoader.App/Assets`
-  - injected Quick Access UI, theme surface logic, and bundled theme assets
+- `src/SteamLoader.App/Hosting`: local API host and Steam injection loop
+- `src/SteamLoader.App/Infrastructure/Steam`: Steam DevTools communication
+- `src/SteamLoader.App/Infrastructure/Audio`: Core Audio integration
+- `src/SteamLoader.App/Infrastructure/Display`: Windows display switching and mode selection
+- `src/SteamLoader.App/Infrastructure/StoreSync`: launcher scanning, shortcut sync, and artwork download
+- `src/SteamLoader.App/Infrastructure/Themes`: theme state, CSS resolution, and profiles
+- `src/SteamLoader.App/Infrastructure/Hltb`: HowLongToBeat integration
+- `src/SteamLoader.App/Assets`: injected Quick Access UI and Big Picture surface scripts
 
-## Notes
+## Status
 
-- Portable releases currently ship as preview builds.
-- If Steam updates its internal UI structure, some tools or themes may need follow-up fixes.
-- Feedback from real Big Picture usage is part of the expected development loop for this project.
+Tools for Steam is ready for its first public release, but it will continue to evolve. Some internals still use the older `SteamLoader` codename while the user-facing product is now `Tools for Steam` / `TFS`.
+
+Feedback from real Big Picture systems is welcome, especially around startup behavior, Steam UI updates, and controller-first navigation.

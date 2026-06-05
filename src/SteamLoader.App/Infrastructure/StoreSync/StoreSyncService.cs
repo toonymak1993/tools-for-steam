@@ -263,7 +263,7 @@ public sealed class StoreSyncService
                 Succeeded: true,
                 StartedAtUtc: startedAt,
                 CompletedAtUtc: startedAt,
-                Message: "Steam Tools is closing Steam, syncing your shortcuts, and preparing the restart.",
+                Message: "Tools for Steam is closing Steam, syncing your shortcuts, and preparing the restart.",
                 ImportedCount: 0,
                 RemovedCount: 0,
                 SkippedCount: 0);
@@ -295,7 +295,7 @@ public sealed class StoreSyncService
                 Succeeded: true,
                 StartedAtUtc: startedAt,
                 CompletedAtUtc: startedAt,
-                Message: "Steam Tools is syncing your launchers before starting Steam.",
+                Message: "Tools for Steam is syncing your launchers before starting Steam.",
                 ImportedCount: 0,
                 RemovedCount: 0,
                 SkippedCount: 0);
@@ -851,7 +851,7 @@ public sealed class StoreSyncService
         Thread.Sleep(800);
         if (IsSteamRunning())
         {
-            throw new InvalidOperationException("Steam Tools could not close Steam completely before syncing.");
+            throw new InvalidOperationException("Tools for Steam could not close Steam completely before syncing.");
         }
     }
 
@@ -1327,7 +1327,7 @@ public sealed class StoreSyncService
             ["FlatpakAppID"] = string.Empty,
             ["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
             {
-                ["0"] = "Steam Tools",
+                ["0"] = "Tools for Steam",
                 ["1"] = "Store Sync",
                 ["2"] = game.StoreId,
             },
@@ -1354,10 +1354,10 @@ public sealed class StoreSyncService
 
         if (artworkEnabled && artworkSummary is not null && artworkSummary.UpdatedTitleCount > 0)
         {
-            return $"Synced {importedCount} title{(importedCount == 1 ? string.Empty : "s")} into Steam, refreshed {removedCount} previous Steam Tools shortcut{(removedCount == 1 ? string.Empty : "s")}, and updated artwork for {artworkSummary.UpdatedTitleCount} title{(artworkSummary.UpdatedTitleCount == 1 ? string.Empty : "s")}.";
+            return $"Synced {importedCount} title{(importedCount == 1 ? string.Empty : "s")} into Steam, refreshed {removedCount} previous Tools for Steam shortcut{(removedCount == 1 ? string.Empty : "s")}, and updated artwork for {artworkSummary.UpdatedTitleCount} title{(artworkSummary.UpdatedTitleCount == 1 ? string.Empty : "s")}.";
         }
 
-        return $"Synced {importedCount} title{(importedCount == 1 ? string.Empty : "s")} into Steam and refreshed {removedCount} previous Steam Tools shortcut{(removedCount == 1 ? string.Empty : "s")}.";
+        return $"Synced {importedCount} title{(importedCount == 1 ? string.Empty : "s")} into Steam and refreshed {removedCount} previous Tools for Steam shortcut{(removedCount == 1 ? string.Empty : "s")}.";
     }
 
     private static IEnumerable<Process> GetSteamProcesses()

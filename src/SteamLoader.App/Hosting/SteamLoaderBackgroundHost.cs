@@ -35,12 +35,16 @@ public sealed class SteamLoaderBackgroundHost
         var audioOutputDeviceService = new CoreAudioOutputDeviceService();
         var displaySwitchService = new DisplaySwitchService();
         var processWindowService = new ProcessWindowService();
+        var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
         var hltbService = new HltbService(
-            new HltbSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "hltb.json")));
-        var autostartService = new WindowsAutostartService(SteamLoaderRuntime.AutostartValueName);
+            new HltbSettingsStore(Path.Combine(dataDirectory, "hltb.json")));
+        var autostartService = new WindowsAutostartService(
+            SteamLoaderRuntime.AutostartValueName,
+            "SteamLoader",
+            "SteamTools");
         var shellService = new WindowsShellService();
         var storeSyncSettingsStore = new StoreSyncSettingsStore(
-            Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json"));
+            Path.Combine(dataDirectory, "store-sync.json"));
         var storeSyncService = new StoreSyncService(
             storeSyncSettingsStore,
             new SteamShortcutFile(),
@@ -48,21 +52,28 @@ public sealed class SteamLoaderBackgroundHost
             shellService,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         var themesService = new ThemesService(
-            new ThemesSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "themes.json")),
+            new ThemesSettingsStore(Path.Combine(dataDirectory, "themes.json")),
             "Assets/themes-catalog.json",
             "Assets/themes-profiles-catalog.json",
-            Path.Combine(AppContext.BaseDirectory, "data", "themes"));
+            Path.Combine(dataDirectory, "themes"));
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
             Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the SteamLoader executable path."),
-            SteamLoaderRuntime.ShellLaunchArguments);
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path."),
+            SteamLoaderRuntime.ShellLaunchArguments,
+            Path.Combine(dataDirectory, "tfs.json"));
+        steamLoaderSettingsService.EnsureDefaultConsoleModeEnabled();
         var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
+        var shellVisibilityService = new WindowsShellVisibilityService();
+        var shellGuardService = new ConsoleModeShellGuardService(
+            devToolsClient,
+            steamLoaderSettingsService,
+            shellVisibilityService);
         var executablePath =
             Environment.ProcessPath
-            ?? throw new InvalidOperationException("Unable to resolve the Steam Tools executable path.");
+            ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
         var steamClientLaunchService = new SteamClientLaunchService(
             httpClient,
             DebugEndpoint,
@@ -106,6 +117,8 @@ public sealed class SteamLoaderBackgroundHost
             _hostState);
 
         await apiServer.StartAsync(cancellationToken);
+        using var shellGuardCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var shellGuardTask = shellGuardService.RunAsync(shellGuardCts.Token);
 
         try
         {
@@ -113,6 +126,15 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await shellGuardCts.CancelAsync();
+            try
+            {
+                await shellGuardTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             _hostState.UpdateMessage("Background host stopped.");
             await apiServer.StopAsync();
         }

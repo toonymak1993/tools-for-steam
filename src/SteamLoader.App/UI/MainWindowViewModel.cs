@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using SteamLoader.App;
 using SteamLoader.App.Hosting;
+using SteamLoader.App.Infrastructure.Settings;
+using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 
 namespace SteamLoader.App.UI;
@@ -10,6 +12,9 @@ public sealed class MainWindowViewModel : BindableBase
     private readonly SteamLoaderProcessManager _processManager;
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
+    private readonly SteamLoaderSettingsService _settingsService;
+    private readonly ReleaseUpdateService _releaseUpdateService;
+    private readonly SupportBundleService _supportBundleService;
     private readonly string _shellLaunchArguments;
     private readonly bool _shellBootstrapMode;
     private readonly bool _runStartupSyncOnInitialize;
@@ -19,6 +24,7 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _initialized;
     private bool _startupSyncTriggered;
     private bool _showStartupSplash;
+    private bool _showFirstRunSetup;
     private bool _windowsShellStarted;
     private Task? _shellBootstrapMonitorTask;
     private SteamLoaderHostStatus? _lastKnownStatus;
@@ -28,13 +34,19 @@ public sealed class MainWindowViewModel : BindableBase
     private string _apiStateText = "Waiting for status...";
     private string _autostartStateText = "Checking startup registration...";
     private string _setupChecklistText = "Setup checks have not run yet.";
-    private string _recoveryHintText = "If Steam does not appear, start the Windows desktop and relaunch Steam Tools.";
+    private string _recoveryHintText = "If Steam does not appear, start the Windows desktop and relaunch Tools for Steam.";
+    private string _updateStateText = "Updates have not been checked yet.";
+    private string _supportBundleText = "No support bundle has been exported yet.";
     private string _errorText = string.Empty;
+    private UpdateCheckSnapshot? _updateSnapshot;
 
     public MainWindowViewModel(
         SteamLoaderProcessManager processManager,
         WindowsAutostartService autostartService,
         WindowsShellService shellService,
+        SteamLoaderSettingsService settingsService,
+        ReleaseUpdateService releaseUpdateService,
+        SupportBundleService supportBundleService,
         string shellLaunchArguments,
         bool shellBootstrapMode,
         bool runStartupSyncOnInitialize)
@@ -42,13 +54,16 @@ public sealed class MainWindowViewModel : BindableBase
         _processManager = processManager;
         _autostartService = autostartService;
         _shellService = shellService;
+        _settingsService = settingsService;
+        _releaseUpdateService = releaseUpdateService;
+        _supportBundleService = supportBundleService;
         _shellLaunchArguments = shellLaunchArguments;
         _shellBootstrapMode = shellBootstrapMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
         _showStartupSplash = shellBootstrapMode;
         if (shellBootstrapMode)
         {
-            _serviceStateText = "Preparing Steam Tools";
+            _serviceStateText = "Preparing Tools for Steam";
             _serviceDetailText = "Starting the background service.";
             _steamStateText = "Waiting to begin the Steam startup flow.";
         }
@@ -60,13 +75,17 @@ public sealed class MainWindowViewModel : BindableBase
         ToggleAutostartCommand = new RelayCommand(ToggleAutostart, () => !IsBusy);
         OpenFolderCommand = new RelayCommand(OpenFolder);
         StartDesktopCommand = new RelayCommand(StartDesktop);
+        CompleteFirstRunCommand = new RelayCommand(CompleteFirstRunSetup, () => !IsBusy);
+        CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, () => !IsBusy);
+        InstallUpdateCommand = new AsyncRelayCommand(InstallUpdateAsync, () => !IsBusy && _updateSnapshot?.CanInstall == true);
+        ExportSupportBundleCommand = new AsyncRelayCommand(ExportSupportBundleAsync, () => !IsBusy);
     }
 
     public string InstallPath => _processManager.WorkingDirectory.TrimEnd(Path.DirectorySeparatorChar);
 
-    public string WindowTitle => "Steam Tools";
+    public string WindowTitle => "Tools for Steam";
 
-    public string Subtitle => "Portable tray shell and control panel for the Windows Quick Access toolkit.";
+    public string Subtitle => "Installed console shell and control panel for the Windows Quick Access toolkit.";
 
     public string ServiceStateText
     {
@@ -108,6 +127,18 @@ public sealed class MainWindowViewModel : BindableBase
     {
         get => _recoveryHintText;
         private set => SetProperty(ref _recoveryHintText, value);
+    }
+
+    public string UpdateStateText
+    {
+        get => _updateStateText;
+        private set => SetProperty(ref _updateStateText, value);
+    }
+
+    public string SupportBundleText
+    {
+        get => _supportBundleText;
+        private set => SetProperty(ref _supportBundleText, value);
     }
 
     public string ErrorText
@@ -167,6 +198,12 @@ public sealed class MainWindowViewModel : BindableBase
         private set => SetProperty(ref _showStartupSplash, value);
     }
 
+    public bool ShowFirstRunSetup
+    {
+        get => _showFirstRunSetup;
+        private set => SetProperty(ref _showFirstRunSetup, value);
+    }
+
     public string StatusPillText => IsRunning ? "Running" : "Stopped";
 
     public string AutostartButtonText => AutostartEnabled ? "Disable Autostart" : "Enable Autostart";
@@ -184,6 +221,14 @@ public sealed class MainWindowViewModel : BindableBase
     public RelayCommand OpenFolderCommand { get; }
 
     public RelayCommand StartDesktopCommand { get; }
+
+    public RelayCommand CompleteFirstRunCommand { get; }
+
+    public AsyncRelayCommand CheckForUpdatesCommand { get; }
+
+    public AsyncRelayCommand InstallUpdateCommand { get; }
+
+    public AsyncRelayCommand ExportSupportBundleCommand { get; }
 
     public async Task InitializeAsync()
     {
@@ -227,8 +272,10 @@ public sealed class MainWindowViewModel : BindableBase
             ErrorText = string.Empty;
 
             var status = await _processManager.GetStatusAsync();
+            var settings = _settingsService.GetSnapshot();
             _lastKnownStatus = status;
             IsRunning = status is not null;
+            ShowFirstRunSetup = false;
 
             if (_shellBootstrapMode && !_windowsShellStarted)
             {
@@ -237,7 +284,7 @@ public sealed class MainWindowViewModel : BindableBase
             else if (status is null)
             {
                 ServiceStateText = "Background host is offline.";
-                ServiceDetailText = "Start the host to inject Steam Tools into Steam Quick Access.";
+                ServiceDetailText = "Start the host to inject Tools for Steam into Steam Quick Access.";
                 SteamStateText = "Steam connection is not available yet.";
                 ApiStateText = _processManager.ApiBaseUri.ToString();
             }
@@ -253,7 +300,7 @@ public sealed class MainWindowViewModel : BindableBase
             SetupChecklistText = BuildSetupChecklistText(status);
             RecoveryHintText = BuildRecoveryHintText(status);
 
-            AutostartEnabled = _shellService.IsEnabled(_processManager.ExecutablePath, _shellLaunchArguments);
+            AutostartEnabled = settings.RunOnWindowsSignIn;
             AutostartStateText = BuildAutostartStateText(AutostartEnabled);
         }
         catch (Exception exception)
@@ -325,10 +372,9 @@ public sealed class MainWindowViewModel : BindableBase
                 _autostartService.DisableSteamAutostartEntries();
             }
 
-            _autostartService.SetEnabled(_processManager.ExecutablePath, SteamLoaderRuntime.AutostartArguments, false);
-            _shellService.SetEnabled(_processManager.ExecutablePath, _shellLaunchArguments, nextState);
-            AutostartEnabled = nextState;
-            AutostartStateText = BuildAutostartStateText(nextState);
+            var settings = _settingsService.SetRunOnWindowsSignIn(nextState);
+            AutostartEnabled = settings.RunOnWindowsSignIn;
+            AutostartStateText = BuildAutostartStateText(settings.RunOnWindowsSignIn);
             ErrorText = string.Empty;
         }
         catch (Exception exception)
@@ -379,6 +425,112 @@ public sealed class MainWindowViewModel : BindableBase
         StartDesktop();
     }
 
+    public async Task CheckForUpdatesAsync()
+    {
+        IsBusy = true;
+        ErrorText = string.Empty;
+        UpdateStateText = "Checking GitHub releases...";
+
+        try
+        {
+            _updateSnapshot = await _releaseUpdateService.CheckAsync();
+            UpdateStateText = _updateSnapshot.Message;
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+            UpdateStateText = "Update check failed.";
+        }
+        finally
+        {
+            IsBusy = false;
+            RefreshCommands();
+        }
+    }
+
+    public async Task InstallUpdateAsync()
+    {
+        IsBusy = true;
+        ErrorText = string.Empty;
+        UpdateStateText = "Preparing update...";
+
+        try
+        {
+            _updateSnapshot ??= await _releaseUpdateService.CheckAsync();
+            if (_updateSnapshot.CanInstall != true)
+            {
+                UpdateStateText = _updateSnapshot.Message;
+                return;
+            }
+
+            await _processManager.StopAsync();
+            var executableName = Path.GetFileNameWithoutExtension(_processManager.ExecutablePath);
+            var processIds = Process.GetProcessesByName(executableName)
+                .Select(process => process.Id)
+                .ToArray();
+
+            _updateSnapshot = await _releaseUpdateService.BeginInstallLatestAsync(
+                InstallPath,
+                _processManager.ExecutablePath,
+                processIds);
+
+            UpdateStateText = _updateSnapshot.Message;
+            _ = System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
+            {
+                System.Windows.Application.Current.Shutdown();
+            });
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+            UpdateStateText = "Update install failed.";
+        }
+        finally
+        {
+            IsBusy = false;
+            RefreshCommands();
+        }
+    }
+
+    public async Task ExportSupportBundleAsync()
+    {
+        IsBusy = true;
+        ErrorText = string.Empty;
+        SupportBundleText = "Collecting diagnostics...";
+
+        try
+        {
+            var status = await _processManager.GetStatusAsync();
+            var settings = _settingsService.GetSnapshot();
+            var bundlePath = _supportBundleService.Export(status, settings);
+            SupportBundleText = bundlePath;
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+            SupportBundleText = "Support bundle export failed.";
+        }
+        finally
+        {
+            IsBusy = false;
+            RefreshCommands();
+        }
+    }
+
+    private void CompleteFirstRunSetup()
+    {
+        try
+        {
+            _settingsService.CompleteFirstRunSetup();
+            ShowFirstRunSetup = false;
+            ErrorText = string.Empty;
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+        }
+    }
+
     private async Task TriggerStartupSyncAsync()
     {
         IsBusy = true;
@@ -388,7 +540,7 @@ public sealed class MainWindowViewModel : BindableBase
         try
         {
             await _processManager.RequestStartupSyncAsync();
-            ServiceDetailText = "Startup sync requested. Steam Tools will finish the sync and launch Steam.";
+            ServiceDetailText = "Startup sync requested. Tools for Steam will finish the sync and launch Steam.";
             if (_shellBootstrapMode)
             {
                 EnsureShellBootstrapMonitor();
@@ -447,13 +599,17 @@ public sealed class MainWindowViewModel : BindableBase
         ToggleAutostartCommand.RaiseCanExecuteChanged();
         OpenFolderCommand.RaiseCanExecuteChanged();
         StartDesktopCommand.RaiseCanExecuteChanged();
+        CompleteFirstRunCommand.RaiseCanExecuteChanged();
+        CheckForUpdatesCommand.RaiseCanExecuteChanged();
+        InstallUpdateCommand.RaiseCanExecuteChanged();
+        ExportSupportBundleCommand.RaiseCanExecuteChanged();
     }
 
     private static string BuildSetupChecklistText(SteamLoaderHostStatus? status)
     {
         if (status is null)
         {
-            return "Host offline - Steam Tools can start it from this manager.";
+            return "Host offline - Tools for Steam can start it from this manager.";
         }
 
         if (status.QuickAccessAttached)
@@ -485,10 +641,10 @@ public sealed class MainWindowViewModel : BindableBase
 
         if (status.QuickAccessAttached)
         {
-            return "No recovery needed. Steam Tools is attached and ready.";
+            return "No recovery needed. Tools for Steam is attached and ready.";
         }
 
-        return "If this state lasts too long, use Restart Host or Start Windows Desktop. Steam Tools will keep trying safely.";
+        return "If this state lasts too long, use Restart Host or Start Windows Desktop. Tools for Steam will keep trying safely.";
     }
 
     private void EnsureShellBootstrapMonitor()
@@ -503,7 +659,7 @@ public sealed class MainWindowViewModel : BindableBase
 
     private async Task MonitorShellBootstrapAsync()
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(90);
 
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -514,6 +670,13 @@ public sealed class MainWindowViewModel : BindableBase
 
             await Task.Delay(900);
             await RefreshAsync();
+        }
+
+        if (!SteamReadyForShellHandOff())
+        {
+            ServiceStateText = "Steam needs more time";
+            ServiceDetailText = "Starting Windows Desktop recovery while Tools for Steam keeps trying in the tray.";
+            SteamStateText = "Steam was not ready before the console-mode timeout.";
         }
 
         CompleteShellBootstrap();
@@ -535,6 +698,7 @@ public sealed class MainWindowViewModel : BindableBase
         _windowsShellStarted = true;
         _shellService.StartWindowsShellIfNeeded();
         ShowStartupSplash = false;
+        ShowFirstRunSetup = false;
     }
 
     private void ApplyShellBootstrapStatus(SteamLoaderHostStatus? status)
@@ -544,7 +708,7 @@ public sealed class MainWindowViewModel : BindableBase
 
         if (status is null)
         {
-            ServiceStateText = "Preparing Steam Tools";
+            ServiceStateText = "Preparing Tools for Steam";
             ServiceDetailText = "Starting the background service.";
             SteamStateText = "Waiting to begin the Steam startup flow.";
             return;
@@ -576,7 +740,7 @@ public sealed class MainWindowViewModel : BindableBase
     private static string BuildAutostartStateText(bool enabled)
     {
         return enabled
-            ? "Steam Tools takes over the sign-in shell, syncs your launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
-            : "Steam Tools only starts when you launch it manually.";
+            ? "Tools for Steam takes over the sign-in shell, syncs your launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
+            : "Tools for Steam only starts when you launch it manually.";
     }
 }

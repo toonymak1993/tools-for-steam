@@ -29,7 +29,7 @@ public sealed class SteamFrontendComponentService
 
         var result = await _devToolsClient.EvaluateAsync(
             target.WebSocketDebuggerUrl,
-            "window.SteamToolsFrontendRegistry?.refresh?.() ?? { runtimeReady: false, errors: ['Steam Tools frontend registry is not injected.'] }",
+            "window.SteamToolsFrontendRegistry?.refresh?.() ?? { runtimeReady: false, errors: ['Tools for Steam frontend registry is not injected.'] }",
             cancellationToken);
 
         if (!result.Success)

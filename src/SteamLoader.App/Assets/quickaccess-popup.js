@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 31;
+  const stateVersion = 36;
   const soundtrackTabKey = 7;
 
   if (window.__steamLoaderPopupTimer) {
@@ -37,8 +37,11 @@
           },
           display: {
             switching: false,
+            modesLoading: false,
+            modesSaving: false,
             error: "",
             status: "",
+            modesSnapshot: null,
           },
           power: {
             actioning: false,
@@ -107,7 +110,7 @@
     {
       id: "settings",
       title: "Settings",
-      description: "Steam Tools-wide behavior and startup",
+      description: "Global TFS behavior and startup",
       pages: [
         {
           id: "general",
@@ -164,8 +167,24 @@
     {
       id: "display",
       title: "Display",
-      description: "Switch between internal and external output",
-      pages: [],
+      description: "Screen output, resolution, and refresh rate",
+      pages: [
+        {
+          id: "output-mode",
+          title: "Output Mode",
+          description: "Choose internal or external display output",
+        },
+        {
+          id: "resolution",
+          title: "Resolution",
+          description: "Choose Full HD, 2K, or 4K when available",
+        },
+        {
+          id: "refresh-rate",
+          title: "Refresh Rate",
+          description: "Choose 60Hz or 120Hz when available",
+        },
+      ],
     },
     {
       id: "power",
@@ -188,7 +207,7 @@
     {
       id: "themes",
       title: "Themes",
-      description: "Browse, install, and tune Steam Tools themes",
+      description: "Browse, install, and tune Tools for Steam themes",
       pages: [
         {
           id: "store",
@@ -213,6 +232,32 @@
       ],
     },
   ];
+
+  function getPluginSettings() {
+    const entries = state.generalSettings.snapshot?.plugins;
+    return Array.isArray(entries) ? entries : [];
+  }
+
+  function getPluginSettingsEntry(pluginId) {
+    return getPluginSettings().find((entry) => entry.id === pluginId) || null;
+  }
+
+  function isPluginEnabled(pluginId) {
+    if (!pluginId || pluginId === "settings") {
+      return true;
+    }
+
+    const entry = getPluginSettingsEntry(pluginId);
+    return entry ? entry.enabled !== false || entry.canDisable === false : true;
+  }
+
+  function getVisiblePlugins() {
+    return plugins.filter((plugin) => isPluginEnabled(plugin.id));
+  }
+
+  function getVisiblePluginIndex(pluginId) {
+    return getVisiblePlugins().findIndex((plugin) => plugin.id === pluginId);
+  }
 
   function ensureStyles() {
     let style = document.getElementById("steamloader-react-style");
@@ -980,7 +1025,7 @@
     }
 
     if (route.screen === "plugin") {
-      const pluginIndex = plugins.findIndex((plugin) => plugin.id === route.pluginId);
+      const pluginIndex = getVisiblePluginIndex(route.pluginId);
       return {
         route: parseRoute("root"),
         fallbackIndex: pluginIndex >= 0 ? pluginIndex : 0,
@@ -989,7 +1034,7 @@
 
     if (route.screen === "page") {
       if (route.pluginId === "settings") {
-        const pluginIndex = plugins.findIndex((plugin) => plugin.id === "settings");
+        const pluginIndex = getVisiblePluginIndex("settings");
         return {
           route: parseRoute("root"),
           fallbackIndex: pluginIndex >= 0 ? pluginIndex : 0,
@@ -1329,19 +1374,10 @@
           xmlns: "http://www.w3.org/2000/svg",
           viewBox: "0 0 36 36",
           fill: "none",
-          style: { width: "20px", height: "20px" },
+          style: { width: "22px", height: "22px" },
         },
-        createElement("rect", {
-          x: "5",
-          y: "6",
-          width: "26",
-          height: "24",
-          rx: "6",
-          fill: "currentColor",
-          opacity: "0.17",
-        }),
         createElement("path", {
-          d: "M11 12.5C11 11.6716 11.6716 11 12.5 11H16.5C17.3284 11 18 11.6716 18 12.5V16.5C18 17.3284 17.3284 18 16.5 18H12.5C11.6716 18 11 17.3284 11 16.5V12.5ZM20 12.5C20 11.6716 20.6716 11 21.5 11H23.5C24.3284 11 25 11.6716 25 12.5V14.5C25 15.3284 24.3284 16 23.5 16H21.5C20.6716 16 20 15.3284 20 14.5V12.5ZM11 21.5C11 20.6716 11.6716 20 12.5 20H14.5C15.3284 20 16 20.6716 16 21.5V23.5C16 24.3284 15.3284 25 14.5 25H12.5C11.6716 25 11 24.3284 11 23.5V21.5ZM18 21H24.5C25.3284 21 26 21.6716 26 22.5C26 23.3284 25.3284 24 24.5 24H18V21Z",
+          d: "M14 7.5C14 6.6716 14.6716 6 15.5 6C16.3284 6 17 6.6716 17 7.5V11H19V7.5C19 6.6716 19.6716 6 20.5 6C21.3284 6 22 6.6716 22 7.5V11H23.2C24.7464 11 26 12.2536 26 13.8V17.2C26 20.3554 23.9442 23.0307 21.1 23.9596V28C21.1 28.8284 20.4284 29.5 19.6 29.5H16.4C15.5716 29.5 14.9 28.8284 14.9 28V23.9596C12.0558 23.0307 10 20.3554 10 17.2V13.8C10 12.2536 11.2536 11 12.8 11H14V7.5Z",
           fill: "currentColor",
         }),
       ),
@@ -2140,10 +2176,10 @@
         );
       } catch (error) {
         state.nativeUi.renderError = error instanceof Error ? error.message : String(error);
-        console.warn("[Steam Tools] Recovered from st-frontend-lib render error.", error);
+        console.warn("[Tools for Steam] Recovered from st-frontend-lib render error.", error);
         model = {
           ...model,
-          error: model.error || "Steam Tools recovered from an internal UI renderer error.",
+          error: model.error || "Tools for Steam recovered from an internal UI renderer error.",
         };
       }
     }
@@ -2297,8 +2333,16 @@
     return state.hltb.snapshot;
   }
 
+  function getDisplayModesSnapshot() {
+    return state.display.modesSnapshot;
+  }
+
   function getGeneralSettingsSnapshot() {
     return state.generalSettings.snapshot;
+  }
+
+  function getGeneralPluginSettings() {
+    return getPluginSettings().filter((plugin) => plugin.canDisable !== false);
   }
 
   function getStoreSyncStore(storeId) {
@@ -2420,6 +2464,38 @@
     };
   }
 
+  function buildDisplayCurrentModeCard() {
+    const modes = getDisplayModesSnapshot();
+    const lines = [];
+
+    if (modes?.display?.deviceLabel) {
+      lines.push(modes.display.deviceLabel);
+    }
+
+    if (modes?.currentResolution?.label && modes?.currentRefreshRate?.label) {
+      lines.push(`${modes.currentResolution.label} @ ${modes.currentRefreshRate.label}`);
+    } else if (state.display.modesLoading) {
+      lines.push("Loading current display mode...");
+    } else {
+      lines.push("Current mode is not available yet.");
+    }
+
+    return {
+      title: "Current Display",
+      lines,
+    };
+  }
+
+  function getDisplayResolutionPresets() {
+    const presets = getDisplayModesSnapshot()?.resolutionPresets;
+    return Array.isArray(presets) ? presets : [];
+  }
+
+  function getDisplayRefreshRatePresets() {
+    const presets = getDisplayModesSnapshot()?.refreshRatePresets;
+    return Array.isArray(presets) ? presets : [];
+  }
+
   function resolveStoreSyncStatusText() {
     if (state.storeSync.syncing) {
       return "Syncing enabled stores into Steam...";
@@ -2451,11 +2527,11 @@
 
   function resolveGeneralSettingsStatusText() {
     if (state.generalSettings.saving) {
-      return "Saving Steam Tools settings...";
+      return "Saving Tools for Steam settings...";
     }
 
     if (state.generalSettings.loading) {
-      return "Loading Steam Tools settings...";
+      return "Loading Tools for Steam settings...";
     }
 
     return "";
@@ -2633,7 +2709,7 @@
       const response = await fetch(`${apiBase}api/settings/state`, { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload.message || `Steam Tools settings could not be loaded (${response.status}).`);
+        throw new Error(payload.message || `Tools for Steam settings could not be loaded (${response.status}).`);
       }
 
       state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
@@ -2643,6 +2719,29 @@
     } finally {
       state.generalSettings.loading = false;
       rerenderGeneralSettingsPanel();
+    }
+  }
+
+  async function loadDisplayModes() {
+    state.display.modesLoading = true;
+    state.display.error = "";
+    rerenderDisplayPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/display/modes`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Display modes could not be loaded (${response.status}).`);
+      }
+
+      state.display.modesSnapshot = payload && typeof payload === "object" ? payload : null;
+      state.display.status = state.display.modesSnapshot?.statusText || state.display.status;
+    } catch (error) {
+      state.display.error = error instanceof Error ? error.message : String(error);
+      state.display.modesSnapshot = null;
+    } finally {
+      state.display.modesLoading = false;
+      rerenderDisplayPanel();
     }
   }
 
@@ -2902,6 +3001,59 @@
     }
 
     await sendGeneralSettingsRequest("api/settings/autostart", { value: enabled });
+  }
+
+  async function toggleHideWindowsShellInConsoleMode() {
+    const snapshot = getGeneralSettingsSnapshot();
+    const enabled = !Boolean(snapshot?.hideWindowsShellInConsoleMode);
+    if (snapshot) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        hideWindowsShellInConsoleMode: enabled,
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/hide-windows-shell", { value: enabled });
+  }
+
+  async function togglePluginEnabled(pluginId, enabled) {
+    const snapshot = getGeneralSettingsSnapshot();
+    if (snapshot?.plugins) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        plugins: snapshot.plugins.map((plugin) =>
+          plugin.id === pluginId
+            ? {
+                ...plugin,
+                enabled,
+              }
+            : plugin,
+        ),
+      };
+
+      if (!enabled && state.route.pluginId === pluginId) {
+        requestFocusForRoute(parseRoute("root"), 0);
+        state.route = parseRoute("root");
+      }
+
+      if (!enabled && pluginId === "themes") {
+        state.themes.snapshot = null;
+        applyActiveThemeCss();
+      }
+
+      if (!enabled && pluginId === "hltb") {
+        state.hltb.snapshot = null;
+      }
+
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/plugins/enabled", { pluginId, enabled });
+  }
+
+  async function openToolsForSteamManager() {
+    await sendGeneralSettingsRequest("api/settings/open-manager");
   }
 
   async function toggleHltbSetting(key) {
@@ -3255,7 +3407,7 @@
           autoFocusIndex: resolveAutoFocusIndex(state.route),
         })
       : {
-      title: "Steam Tools",
+      title: "Tools for Steam",
       subtitle: "",
       status: "",
       error: "",
@@ -3273,11 +3425,63 @@
       return {
         ...defaultModel,
         title: "Display",
-        subtitle: "Internal and external output",
+        subtitle: "Screen output and display mode",
         status: resolveDisplayStatusText(),
         error: state.display.error,
-        note: "Steam Tools uses the Windows display switch, the same Windows feature behind Win + P.",
+        note: "Open a section to change only one display area at a time.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [buildDisplayCurrentModeCard()],
+        slots: [
+          makeNavigationSlot(
+            "Output Mode",
+            "Choose internal or external display output.",
+            () => {
+              rememberCurrentRouteIndex(0);
+              setRoute({ screen: "page", pluginId: "display", pageId: "output-mode" });
+            },
+          ),
+          makeNavigationSlot(
+            "Resolution",
+            "Choose Full HD, 2K, or 4K when Windows reports them.",
+            () => {
+              rememberCurrentRouteIndex(1);
+              setRoute({ screen: "page", pluginId: "display", pageId: "resolution" });
+            },
+          ),
+          makeNavigationSlot(
+            "Refresh Rate",
+            "Choose 60Hz or 120Hz for the active resolution.",
+            () => {
+              rememberCurrentRouteIndex(2);
+              setRoute({ screen: "page", pluginId: "display", pageId: "refresh-rate" });
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Display Modes",
+            "Reload available resolutions and refresh rates from Windows.",
+            () => loadDisplayModes(),
+            {
+              disabled: isDisplayBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "display" &&
+      state.route.pageId === "output-mode"
+    ) {
+      return {
+        ...defaultModel,
+        title: "Display",
+        subtitle: "Output Mode",
+        status: resolveDisplayStatusText(),
+        error: state.display.error,
+        note: "This uses the same Windows display switch behind Win + P.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [buildDisplayCurrentModeCard()],
         slots: [
           makeCommandSlot(
             "External Display",
@@ -3291,6 +3495,98 @@
             "Internal Display",
             "Return to the built-in screen and disable the external display output.",
             () => switchDisplayMode("internal"),
+            {
+              disabled: isDisplayBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Display Modes",
+            "Reload available display data from Windows.",
+            () => loadDisplayModes(),
+            {
+              disabled: isDisplayBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "display" &&
+      state.route.pageId === "resolution"
+    ) {
+      const resolutionPresets = getDisplayResolutionPresets();
+
+      return {
+        ...defaultModel,
+        title: "Display",
+        subtitle: "Resolution",
+        status: resolveDisplayStatusText(),
+        error: state.display.error,
+        note: "Only resolutions reported by Windows for the active display are selectable.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [buildDisplayCurrentModeCard()],
+        slots: [
+          ...resolutionPresets.map((preset) =>
+            makeChoiceSlot(
+              preset.title,
+              preset.available ? preset.description : "Not available on the current display.",
+              () => setDisplayResolutionPreset(preset.id, preset.title),
+              {
+                disabled: isDisplayBusy() || !preset.available || preset.selected,
+                selected: Boolean(preset.selected),
+                badge: preset.selected ? "Current" : "",
+                trailing: preset.selected ? "none" : "chevron",
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Resolutions",
+            "Reload available resolutions from Windows.",
+            () => loadDisplayModes(),
+            {
+              disabled: isDisplayBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "display" &&
+      state.route.pageId === "refresh-rate"
+    ) {
+      const refreshRatePresets = getDisplayRefreshRatePresets();
+
+      return {
+        ...defaultModel,
+        title: "Display",
+        subtitle: "Refresh Rate",
+        status: resolveDisplayStatusText(),
+        error: state.display.error,
+        note: "Refresh choices are filtered for the current resolution.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [buildDisplayCurrentModeCard()],
+        slots: [
+          ...refreshRatePresets.map((preset) =>
+            makeChoiceSlot(
+              preset.title,
+              preset.available ? preset.description : "Not available at the current resolution.",
+              () => setDisplayRefreshRatePreset(preset.id),
+              {
+                disabled: isDisplayBusy() || !preset.available || preset.selected,
+                selected: Boolean(preset.selected),
+                badge: preset.selected ? "Current" : "",
+                trailing: preset.selected ? "none" : "chevron",
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Rates",
+            "Reload available refresh rates from Windows.",
+            () => loadDisplayModes(),
             {
               disabled: isDisplayBusy(),
             },
@@ -3312,15 +3608,15 @@
           {
             title: "Recovery Ready",
             lines: [
-              "Start Windows Desktop brings Explorer back without leaving Steam Tools.",
-              "Restart Steam relaunches Big Picture with the required Steam Tools bridge.",
+              "Start Windows Desktop brings Explorer back without leaving Tools for Steam.",
+              "Restart Steam relaunches Big Picture with the required Tools for Steam bridge.",
             ],
           },
         ],
         slots: [
           makeCommandSlot(
             "Restart Steam",
-            "Close Steam and relaunch Big Picture with the Steam Tools bridge enabled.",
+            "Close Steam and relaunch Big Picture with the Tools for Steam bridge enabled.",
             () => sendPowerRequest("api/power/restart-steam", "Restarting Steam..."),
             {
               disabled: isPowerBusy(),
@@ -3335,9 +3631,9 @@
             },
           ),
           makeCommandSlot(
-            "Restart Steam Tools",
+            "Restart Tools for Steam",
             "Restart the background host without rebooting Windows.",
-            () => sendPowerRequest("api/power/restart-steam-tools", "Restarting Steam Tools..."),
+            () => sendPowerRequest("api/power/restart-steam-tools", "Restarting Tools for Steam..."),
             {
               disabled: isPowerBusy(),
             },
@@ -3443,7 +3739,7 @@
           {
             title: "Game Page Overlay",
             lines: [
-              "Open any game in Big Picture and Steam Tools will place the HLTB values above the main play bar.",
+              "Open any game in Big Picture and Tools for Steam will place the HLTB values above the main play bar.",
               `${settings?.cacheEntryCount || 0} cached game${settings?.cacheEntryCount === 1 ? "" : "s"} ready.`,
             ],
           },
@@ -3517,7 +3813,7 @@
           ),
           makeCommandSlot(
             "Clear Cached Results",
-            "Drop the stored HLTB matches so Steam Tools fetches them again fresh.",
+            "Drop the stored HLTB matches so Tools for Steam fetches them again fresh.",
             () => clearHltbCache(),
             {
               disabled: isHltbBusy(),
@@ -3596,7 +3892,7 @@
         subtitle: "Sync Now",
         status: storeSyncStatus,
         error: state.storeSync.error,
-        note: "Steam Tools closes Steam, syncs your managed shortcuts, downloads artwork, and restarts Steam for you.",
+        note: "Tools for Steam closes Steam, syncs your managed shortcuts, downloads artwork, and restarts Steam for you.",
         cards: [
           buildStoreSyncLastSyncCard(storeSyncSnapshot?.lastSync),
           buildSteamProfileCard(storeSyncSnapshot?.steamProfile),
@@ -3692,6 +3988,7 @@
       state.route.pageId === "general"
     ) {
       const settings = getGeneralSettingsSnapshot();
+      const pluginSettings = getGeneralPluginSettings();
 
       return {
         ...defaultModel,
@@ -3699,18 +3996,51 @@
         subtitle: "General",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Steam Tools-wide options live here so plugin settings can stay focused on their own job.",
+        note: "Global Tools for Steam options live here so plugin settings can stay focused on their own job.",
+        dividerAfterIndex: 2,
         slots: [
           makeSettingToggleSlot(
-            "steam-tools",
+            "tfs",
             "run-on-windows-sign-in",
             "Run on Windows Sign-In",
-            "Start Steam Tools before Explorer, sync your launchers, launch Steam in dev mode, and then bring Windows back in behind it.",
+            "Start Tools for Steam before Explorer, sync your launchers, launch Steam in dev mode, and then bring Windows back in behind it.",
             Boolean(settings?.runOnWindowsSignIn),
             () => toggleRunOnWindowsSignIn(),
             {
               disabled: isGeneralSettingsBusy(),
             },
+          ),
+          makeSettingToggleSlot(
+            "tfs",
+            "hide-windows-shell",
+            "Hide Windows Shell in Console Mode",
+            "Hide the taskbar and desktop icons while Steam Big Picture is active. They return when Big Picture closes.",
+            settings?.hideWindowsShellInConsoleMode !== false,
+            () => toggleHideWindowsShellInConsoleMode(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Open Desktop Manager",
+            "Open the classic Tools for Steam manager on the Windows desktop.",
+            () => openToolsForSteamManager(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          ...pluginSettings.map((plugin) =>
+            makeSettingToggleSlot(
+              "tfs-plugin",
+              plugin.id,
+              plugin.title,
+              plugin.description || "Show or hide this plugin and disable its background routes.",
+              Boolean(plugin.enabled),
+              () => togglePluginEnabled(plugin.id, !Boolean(plugin.enabled)),
+              {
+                disabled: isGeneralSettingsBusy() || plugin.canDisable === false,
+              },
+            ),
           ),
         ],
       };
@@ -4022,7 +4352,7 @@
         subtitle: "Store",
         status: themesStatus,
         error: state.themes.error,
-        note: "Browse built-in and imported themes that can be installed into Steam Tools.",
+        note: "Browse built-in and imported themes that can be installed into Tools for Steam.",
         cards:
           themesSnapshot?.settings && !themesSnapshot.settings.showCommunityThemes
             ? [
@@ -4224,13 +4554,13 @@
         subtitle: "Settings",
         status: themesStatus,
         error: state.themes.error,
-        note: `These settings control how the theme framework behaves across the whole Steam Tools shell. Local themes are loaded from ${themesSnapshot?.localThemesFolder || "the local themes folder"}.`,
+        note: `These settings control how the theme framework behaves across the whole Tools for Steam shell. Local themes are loaded from ${themesSnapshot?.localThemesFolder || "the local themes folder"}.`,
         slots: [
           makeSettingToggleSlot(
             "themes",
             "theme-engine-enabled",
             "Theme Engine Enabled",
-            "Apply active theme CSS into the current Steam Tools surfaces.",
+            "Apply active theme CSS into the current Tools for Steam surfaces.",
             Boolean(settings?.themeEngineEnabled),
             () => toggleThemesSetting("theme-engine-enabled"),
             {
@@ -4403,9 +4733,9 @@
               : plugin.id === "hltb"
                 ? "Use Settings to choose which HowLongToBeat values appear on the open game page."
               : plugin.id === "themes"
-                ? "Use Store, Installed, Profiles, and Settings to build up a reusable Steam Tools theme library."
+                ? "Use Store, Installed, Profiles, and Settings to build up a reusable Tools for Steam theme library."
                 : plugin.id === "settings"
-                  ? "General Steam Tools options live here, separate from plugin-specific settings."
+                  ? "General Tools for Steam options live here, separate from plugin-specific settings."
                   : "",
           autoFocusIndex: resolveAutoFocusIndex(state.route),
           slots: [
@@ -4423,7 +4753,7 @@
     return {
       ...defaultModel,
       dividerAfterIndex: 0,
-      slots: plugins.map((plugin, pluginIndex) =>
+      slots: getVisiblePlugins().map((plugin, pluginIndex) =>
         makeNavigationSlot(plugin.title, plugin.description, () => {
           rememberCurrentRouteIndex(pluginIndex);
           setRoute(
@@ -4465,6 +4795,10 @@
 
   function setRoute(route) {
     const previousRoute = state.route;
+    if (route?.pluginId && !isPluginEnabled(route.pluginId)) {
+      route = parseRoute("root");
+    }
+
     const enteringGeneralSettingsPage =
       route.screen === "page" &&
       route.pluginId === "settings" &&
@@ -4510,6 +4844,15 @@
     }
 
     if (
+      route.pluginId === "display" &&
+      !state.display.modesLoading &&
+      !state.display.modesSnapshot &&
+      !state.display.error
+    ) {
+      void loadDisplayModes();
+    }
+
+    if (
       route.pluginId === "store-sync" &&
       !state.storeSync.loading &&
       !state.storeSync.snapshot &&
@@ -4550,10 +4893,10 @@
     }
 
     if (
-      route.pluginId === "settings" &&
+      (route.pluginId === "settings" || route.screen === "root") &&
       !state.generalSettings.loading &&
       !state.generalSettings.snapshot &&
-      (enteringGeneralSettingsPage || !state.generalSettings.error)
+      (route.screen === "root" || enteringGeneralSettingsPage || !state.generalSettings.error)
     ) {
       void loadGeneralSettingsState();
     }
@@ -4708,7 +5051,7 @@
   }
 
   function isDisplayBusy() {
-    return state.display.switching;
+    return state.display.switching || state.display.modesLoading || state.display.modesSaving;
   }
 
   function resolveDisplayStatusText() {
@@ -4716,7 +5059,19 @@
       return state.display.status || "Switching display mode...";
     }
 
-    return state.display.status || "Use the Windows display switch to keep either the internal or external display active.";
+    if (state.display.modesSaving) {
+      return state.display.status || "Applying display mode...";
+    }
+
+    if (state.display.modesLoading) {
+      return "Loading display modes...";
+    }
+
+    return (
+      state.display.status ||
+      getDisplayModesSnapshot()?.statusText ||
+      "Use the Windows display switch or select a supported resolution and refresh rate."
+    );
   }
 
   function isPowerBusy() {
@@ -4790,12 +5145,64 @@
       }
 
       state.display.status = payload?.message || statusText;
+      state.display.modesSnapshot = null;
     } catch (error) {
       state.display.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.display.switching = false;
       rerenderDisplayPanel();
+      if (!state.display.error) {
+        void loadDisplayModes();
+      }
     }
+  }
+
+  async function sendDisplayModeRequest(path, bodyPayload, statusText) {
+    state.display.modesSaving = true;
+    state.display.error = "";
+    state.display.status = statusText;
+    rerenderDisplayPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.display.modesSnapshot = payload && typeof payload === "object" ? payload : null;
+      state.display.status = state.display.modesSnapshot?.statusText || statusText;
+      return true;
+    } catch (error) {
+      state.display.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.display.modesSaving = false;
+      rerenderDisplayPanel();
+    }
+  }
+
+  async function setDisplayResolutionPreset(presetId, title) {
+    await sendDisplayModeRequest(
+      "api/display/resolution",
+      { value: presetId },
+      `Setting ${title} resolution...`,
+    );
+  }
+
+  async function setDisplayRefreshRatePreset(refreshRate) {
+    await sendDisplayModeRequest(
+      "api/display/refresh-rate",
+      { value: Number(refreshRate) },
+      `Setting ${refreshRate}Hz...`,
+    );
   }
 
   async function sendPowerRequest(path, statusText, options = {}) {
@@ -4859,7 +5266,7 @@
   function applyTabMutation(tab) {
     let changed = false;
 
-    tab.strTitle = "Steam Tools";
+    tab.strTitle = "Tools for Steam";
     tab.title = null;
 
     if (!isInjectedTabElement(tab.tab, SteamLoaderIcon)) {
@@ -4941,6 +5348,10 @@
 
     if (!state.themes.loading && !state.themes.snapshot && !state.themes.error) {
       void loadThemesState();
+    }
+
+    if (!state.generalSettings.loading && !state.generalSettings.snapshot && !state.generalSettings.error) {
+      void loadGeneralSettingsState();
     }
 
     const rootFiber = getQuickAccessRootFiber();

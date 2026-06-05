@@ -1,5 +1,6 @@
 using System.Windows;
 using SteamLoader.App.Hosting;
+using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Services;
 using SteamLoader.App.UI;
 
@@ -7,9 +8,13 @@ namespace SteamLoader.App;
 
 public static class Program
 {
+    private static Mutex? _installerMutex;
+
     [STAThread]
     public static int Main(string[] args)
     {
+        _installerMutex = new Mutex(false, SteamLoaderRuntime.InstallerMutexName);
+
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.BackgroundArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
@@ -22,7 +27,7 @@ public static class Program
             var bootstrapShellService = new WindowsShellService();
             var executablePath =
                 Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the Steam Tools executable path.");
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
             bootstrapShellService.PrepareCurrentSession(executablePath, SteamLoaderRuntime.ShellLaunchArguments);
         }
 
@@ -41,12 +46,33 @@ public static class Program
         var processManager = new SteamLoaderProcessManager(
             new Uri("http://127.0.0.1:47652/"),
             SteamLoaderRuntime.BackgroundArgument);
-        var autostartService = new WindowsAutostartService(SteamLoaderRuntime.AutostartValueName);
+        var autostartService = new WindowsAutostartService(
+            SteamLoaderRuntime.AutostartValueName,
+            "SteamLoader",
+            "SteamTools");
         var shellService = new WindowsShellService();
+        var settingsService = new SteamLoaderSettingsService(
+            autostartService,
+            shellService,
+            Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path."),
+            SteamLoaderRuntime.ShellLaunchArguments,
+            Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
+        var settingsSnapshot = settingsService.EnsureDefaultConsoleModeEnabled();
+        if (shellBootstrapMode && !settingsSnapshot.FirstRunCompleted)
+        {
+            settingsService.CompleteFirstRunSetup();
+        }
+        var releaseUpdateService = new ReleaseUpdateService();
+        var supportBundleService = new SupportBundleService(shellService);
+
         var viewModel = new MainWindowViewModel(
             processManager,
             autostartService,
             shellService,
+            settingsService,
+            releaseUpdateService,
+            supportBundleService,
             SteamLoaderRuntime.ShellLaunchArguments,
             shellBootstrapMode,
             runStartupSync);

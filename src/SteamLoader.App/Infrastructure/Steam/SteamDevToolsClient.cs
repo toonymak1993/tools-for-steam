@@ -28,15 +28,19 @@ public sealed class SteamDevToolsClient
     public async Task<SteamDevToolsTarget?> GetQuickAccessTargetAsync(CancellationToken cancellationToken)
     {
         var targets = await GetTargetsAsync(cancellationToken);
-        return targets.FirstOrDefault(target => target.Title.StartsWith("QuickAccess", StringComparison.OrdinalIgnoreCase));
+        return targets.FirstOrDefault(target => IsQuickAccessTarget(target));
     }
 
     public async Task<SteamDevToolsTarget?> GetBigPictureTargetAsync(CancellationToken cancellationToken)
     {
         var targets = await GetTargetsAsync(cancellationToken);
-        return targets.FirstOrDefault(target =>
-            target.Title.Contains("Big-Picture", StringComparison.OrdinalIgnoreCase) ||
-            target.Url.Contains("steamloopback.host/index.html", StringComparison.OrdinalIgnoreCase));
+        return targets.FirstOrDefault(target => IsBigPictureMainTarget(target));
+    }
+
+    public async Task<bool> HasBigPictureSurfaceAsync(CancellationToken cancellationToken)
+    {
+        var targets = await GetTargetsAsync(cancellationToken);
+        return targets.Any(target => IsBigPictureSurfaceTarget(target));
     }
 
     public async Task<IReadOnlyList<SteamDevToolsTarget>> GetThemeSurfaceTargetsAsync(CancellationToken cancellationToken)
@@ -68,6 +72,27 @@ public sealed class SteamDevToolsClient
         {
             return [];
         }
+    }
+
+    private static bool IsQuickAccessTarget(SteamDevToolsTarget target)
+    {
+        return target.Title.StartsWith("QuickAccess", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBigPictureMainTarget(SteamDevToolsTarget target)
+    {
+        return target.Title.Contains("Big-Picture", StringComparison.OrdinalIgnoreCase) ||
+            target.Url.Contains("steamloopback.host/index.html", StringComparison.OrdinalIgnoreCase) ||
+            target.Url.Contains("browserType=3", StringComparison.OrdinalIgnoreCase) ||
+            target.Url.Contains("Valve%20Steam%20Gamepad", StringComparison.OrdinalIgnoreCase) ||
+            target.Url.Contains("Valve Steam Gamepad", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBigPictureSurfaceTarget(SteamDevToolsTarget target)
+    {
+        return IsBigPictureMainTarget(target) ||
+            IsQuickAccessTarget(target) ||
+            target.Title.StartsWith("MainMenu", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<SteamDevToolsEvaluationResult> EvaluateAsync(

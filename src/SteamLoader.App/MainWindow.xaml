@@ -1,7 +1,7 @@
 <Window x:Class="SteamLoader.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Steam Tools"
+        Title="Tools for Steam"
         Width="980"
         Height="660"
         MinWidth="920"
@@ -112,7 +112,7 @@
                 </Border>
 
                 <StackPanel Grid.Row="2" Margin="18,0,18,0">
-                    <TextBlock Text="PORTABLE" Foreground="#6D7B8A" FontSize="11" FontWeight="Bold" HorizontalAlignment="Center" />
+                    <TextBlock Text="TFS" Foreground="#6D7B8A" FontSize="11" FontWeight="Bold" HorizontalAlignment="Center" />
                     <TextBlock Text="MANAGER" Foreground="#9DABB9" FontSize="11" HorizontalAlignment="Center" />
                 </StackPanel>
             </Grid>
@@ -265,7 +265,7 @@
                             Margin="0,14,0,0"
                             Style="{StaticResource CardBorderStyle}">
                         <StackPanel>
-                            <TextBlock Text="Portable Folder"
+                            <TextBlock Text="Installation"
                                        Foreground="#E7EEF6"
                                        FontSize="21"
                                        FontWeight="Bold" />
@@ -278,6 +278,21 @@
                                     Margin="0,18,0,0"
                                     Style="{StaticResource GhostButtonStyle}"
                                     Command="{Binding OpenFolderCommand}" />
+                            <TextBlock Text="{Binding UpdateStateText}"
+                                       Margin="0,14,0,0"
+                                       Foreground="#93A1AF"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
+                            <StackPanel Margin="0,14,0,0"
+                                        Orientation="Horizontal">
+                                <Button Content="Check Updates"
+                                        Style="{StaticResource GhostButtonStyle}"
+                                        Command="{Binding CheckForUpdatesCommand}" />
+                                <Button Content="Install Update"
+                                        Margin="10,0,0,0"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        Command="{Binding InstallUpdateCommand}" />
+                            </StackPanel>
                         </StackPanel>
                     </Border>
 
@@ -299,15 +314,72 @@
                                        Foreground="#93A1AF"
                                        FontSize="13"
                                        TextWrapping="Wrap" />
+                            <TextBlock Text="{Binding SupportBundleText}"
+                                       Margin="0,12,0,0"
+                                       Foreground="#93A1AF"
+                                       FontSize="13"
+                                       TextWrapping="Wrap" />
                             <Button Content="Start Windows Desktop"
                                     Margin="0,18,0,0"
                                     Style="{StaticResource GhostButtonStyle}"
                                     Command="{Binding StartDesktopCommand}" />
+                            <Button Content="Export Support Bundle"
+                                    Margin="0,10,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding ExportSupportBundleCommand}" />
                         </StackPanel>
                     </Border>
                 </Grid>
             </Grid>
         </Grid>
+
+        <Border Grid.Column="1"
+                Margin="26,22,26,24"
+                Background="#10161F"
+                Panel.ZIndex="80"
+                Visibility="{Binding ShowFirstRunSetup, Converter={StaticResource BooleanToVisibilityConverter}}">
+            <Grid>
+                <Border Width="620"
+                        Padding="30"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Background="#1B2430"
+                        BorderBrush="#334050"
+                        BorderThickness="1"
+                        CornerRadius="24">
+                    <StackPanel>
+                        <TextBlock Text="First-Run Setup"
+                                   Foreground="#F1F6FB"
+                                   FontSize="42"
+                                   FontWeight="Bold" />
+                        <TextBlock Text="Tools for Steam is ready to run as your console-mode startup shell. It will start first, sync launchers, boot Steam in Big Picture, and then restore Windows Explorer behind Steam."
+                                   Margin="0,14,0,0"
+                                   Foreground="#AAB8C6"
+                                   FontSize="17"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding AutostartStateText}"
+                                   Margin="0,18,0,0"
+                                   Foreground="#D8E3EE"
+                                   FontSize="15"
+                                   TextWrapping="Wrap" />
+                        <StackPanel Margin="0,26,0,0"
+                                    Orientation="Horizontal">
+                            <Button Content="Finish Setup"
+                                    Style="{StaticResource PrimaryButtonStyle}"
+                                    Command="{Binding CompleteFirstRunCommand}" />
+                            <Button Content="{Binding AutostartButtonText}"
+                                    Margin="12,0,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding ToggleAutostartCommand}" />
+                            <Button Content="Export Support Bundle"
+                                    Margin="12,0,0,0"
+                                    Style="{StaticResource GhostButtonStyle}"
+                                    Command="{Binding ExportSupportBundleCommand}" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
 
         <Border Grid.ColumnSpan="2"
                 Background="#081019"
@@ -349,7 +421,7 @@
                         </Canvas>
                     </Viewbox>
 
-                    <TextBlock Text="Steam Tools"
+                    <TextBlock Text="Tools for Steam"
                                Margin="0,28,0,0"
                                HorizontalAlignment="Center"
                                Foreground="#F1F6FB"

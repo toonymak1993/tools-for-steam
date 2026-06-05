@@ -118,7 +118,7 @@ public sealed class ThemeProfileConfiguration
 {
     public string Title { get; set; } = string.Empty;
 
-    public string Author { get; set; } = "Steam Tools";
+    public string Author { get; set; } = "Tools for Steam";
 
     public string Description { get; set; } = string.Empty;
 

@@ -9,6 +9,7 @@ using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Infrastructure.Themes;
+using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 
 namespace SteamLoader.App.Hosting;
@@ -169,6 +170,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            if (TryResolvePluginId(request.Url?.AbsolutePath, out var pluginId) &&
+                !_steamLoaderSettingsService.IsPluginEnabled(pluginId))
+            {
+                await WriteDisabledPluginResponseAsync(
+                    response,
+                    request.Url?.AbsolutePath,
+                    pluginId,
+                    cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/audio/devices")
             {
@@ -326,6 +338,82 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/hide-windows-shell")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetHideWindowsShellInConsoleMode(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/plugins/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetPluginEnabledRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.PluginId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A plugin ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetPluginEnabled(payload.PluginId, payload.Enabled),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/open-manager")
+            {
+                var executablePath = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(executablePath))
+                {
+                    throw new InvalidOperationException("Tools for Steam manager path could not be resolved.");
+                }
+
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    Arguments = SteamLoaderRuntime.ManagerArgument,
+                    UseShellExecute = true,
+                })?.Dispose();
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/display/internal")
             {
                 await WriteJsonAsync(
@@ -343,6 +431,69 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _displaySwitchService.SwitchToExternalDisplay(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/display/modes")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _displaySwitchService.GetModeSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/display/resolution")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A resolution preset is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _displaySwitchService.SetResolutionPreset(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/display/refresh-rate")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A refresh rate is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _displaySwitchService.SetRefreshRatePreset(payload.Value),
                     cancellationToken);
                 return;
             }
@@ -1072,6 +1223,83 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         await output.WriteAsync(bytes, cancellationToken);
     }
 
+    private async Task WriteDisabledPluginResponseAsync(
+        HttpListenerResponse response,
+        string? path,
+        string pluginId,
+        CancellationToken cancellationToken)
+    {
+        if (string.Equals(path, "/api/themes/resolve-css", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(response, HttpStatusCode.OK, new { css = string.Empty }, cancellationToken);
+            return;
+        }
+
+        if (string.Equals(path, "/api/hltb/game", StringComparison.OrdinalIgnoreCase))
+        {
+            var settings = new HltbSettingsState(false, false, false, false, false, false, 0);
+            await WriteJsonAsync(
+                response,
+                HttpStatusCode.OK,
+                new HltbGameSnapshot(
+                    RequestedTitle: string.Empty,
+                    MatchedTitle: string.Empty,
+                    AppId: null,
+                    GameId: null,
+                    MainStory: string.Empty,
+                    MainPlus: string.Empty,
+                    Completionist: string.Empty,
+                    AllStyles: string.Empty,
+                    DetailUrl: string.Empty,
+                    Found: false,
+                    Cached: false,
+                    Settings: settings,
+                    ErrorMessage: "HLTB is disabled in Tools for Steam settings."),
+                cancellationToken);
+            return;
+        }
+
+        await WriteJsonAsync(
+            response,
+            HttpStatusCode.Forbidden,
+            new { message = $"{pluginId} is disabled in Tools for Steam settings." },
+            cancellationToken);
+    }
+
+    private static bool TryResolvePluginId(string? path, out string pluginId)
+    {
+        pluginId = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var normalizedPath = path.TrimEnd('/');
+        var pluginPrefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["/api/audio"] = "audio",
+            ["/api/display"] = "display",
+            ["/api/processes"] = "processes",
+            ["/api/hltb"] = "hltb",
+            ["/api/store-sync"] = "store-sync",
+            ["/api/themes"] = "themes",
+            ["/api/power"] = "power"
+        };
+
+        foreach (var (prefix, id) in pluginPrefixes)
+        {
+            if (normalizedPath.Equals(prefix, StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                pluginId = id;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private sealed record SetDefaultDeviceRequest(string DeviceId);
 
     private sealed record SetVolumeRequest(double Volume);
@@ -1083,6 +1311,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetTextValueRequest(string Value);
 
     private sealed record SetBooleanValueRequest(bool Value);
+
+    private sealed record SetIntegerValueRequest(int Value);
+
+    private sealed record SetPluginEnabledRequest(string PluginId, bool Enabled);
 
     private sealed record SetStoreEnabledRequest(string StoreId, bool Enabled);
 

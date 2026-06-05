@@ -80,6 +80,7 @@ public sealed class SteamShortcutFile
         return tags.Values
             .OfType<string>()
             .Any(tag =>
+                string.Equals(tag, "Tools for Steam", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(tag, "Steam Tools", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(tag, "SteamLoader", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(tag, "Store Sync", StringComparison.OrdinalIgnoreCase));

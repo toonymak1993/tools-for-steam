@@ -24,6 +24,8 @@ public sealed class TrayIconController : IDisposable
     private readonly Forms.ToolStripMenuItem _autostartItem;
     private readonly Forms.ToolStripMenuItem _startDesktopItem;
     private readonly Forms.ToolStripMenuItem _openFolderItem;
+    private readonly Forms.ToolStripMenuItem _checkUpdatesItem;
+    private readonly Forms.ToolStripMenuItem _exportSupportBundleItem;
     private readonly Forms.ToolStripMenuItem _refreshItem;
     private readonly Forms.ToolStripMenuItem _quitItem;
     private readonly Drawing.Icon _runningIcon;
@@ -47,7 +49,7 @@ public sealed class TrayIconController : IDisposable
             ShowCheckMargin = true
         };
 
-        _headerItem = CreateLabelItem("Steam Tools");
+        _headerItem = CreateLabelItem("Tools for Steam");
         _serviceStateItem = CreateLabelItem("Service: Checking...");
         _steamStateItem = CreateLabelItem("Steam: Waiting for status...");
         _errorItem = CreateLabelItem(string.Empty);
@@ -61,7 +63,9 @@ public sealed class TrayIconController : IDisposable
             CheckOnClick = false
         };
         _startDesktopItem = new Forms.ToolStripMenuItem("Start Windows Desktop", null, (_, _) => _viewModel.StartWindowsDesktop());
-        _openFolderItem = new Forms.ToolStripMenuItem("Open Portable Folder", null, (_, _) => _viewModel.OpenInstallFolder());
+        _openFolderItem = new Forms.ToolStripMenuItem("Open Install Folder", null, (_, _) => _viewModel.OpenInstallFolder());
+        _checkUpdatesItem = new Forms.ToolStripMenuItem("Check for Updates", null, async (_, _) => await _viewModel.CheckForUpdatesAsync());
+        _exportSupportBundleItem = new Forms.ToolStripMenuItem("Export Support Bundle", null, async (_, _) => await _viewModel.ExportSupportBundleAsync());
         _refreshItem = new Forms.ToolStripMenuItem("Refresh Status", null, async (_, _) => await _viewModel.RefreshAsync());
         _quitItem = new Forms.ToolStripMenuItem("Quit Tray App", null, (_, _) => QuitTrayApp());
 
@@ -79,6 +83,8 @@ public sealed class TrayIconController : IDisposable
             _autostartItem,
             _startDesktopItem,
             _openFolderItem,
+            _checkUpdatesItem,
+            _exportSupportBundleItem,
             _refreshItem,
             new Forms.ToolStripSeparator(),
             _quitItem
@@ -175,6 +181,8 @@ public sealed class TrayIconController : IDisposable
         _autostartItem.Enabled = _viewModel.ToggleAutostartCommand.CanExecute(null);
         _autostartItem.Checked = _viewModel.AutostartEnabled;
         _startDesktopItem.Enabled = _viewModel.StartDesktopCommand.CanExecute(null);
+        _checkUpdatesItem.Enabled = _viewModel.CheckForUpdatesCommand.CanExecute(null);
+        _exportSupportBundleItem.Enabled = _viewModel.ExportSupportBundleCommand.CanExecute(null);
     }
 
     private void QuitTrayApp()
@@ -191,7 +199,7 @@ public sealed class TrayIconController : IDisposable
                 ? "Running"
                 : "Stopped";
 
-        return TrimText($"Steam Tools - {status}", 63);
+        return TrimText($"Tools for Steam - {status}", 63);
     }
 
     private static Forms.ToolStripMenuItem CreateLabelItem(string text)
@@ -223,19 +231,19 @@ public sealed class TrayIconController : IDisposable
         graphics.Clear(Drawing.Color.Transparent);
 
         using var shellPath = CreateRoundedRectanglePath(new Drawing.RectangleF(2, 2, 28, 28), 8f);
-        using var shellBrush = new Drawing.SolidBrush(Drawing.Color.FromArgb(28, 36, 48));
-        using var outlinePen = new Drawing.Pen(Drawing.Color.FromArgb(54, 68, 84), 1.4f);
-        using var glyphBrush = new Drawing.SolidBrush(Drawing.Color.FromArgb(224, 231, 239));
+        using var shellBrush = new Drawing.SolidBrush(Drawing.Color.FromArgb(45, 56, 70));
+        using var outlinePen = new Drawing.Pen(Drawing.Color.FromArgb(170, 184, 198), 1.6f);
+        using var glyphBrush = new Drawing.SolidBrush(Drawing.Color.White);
         using var accentBrush = new Drawing.SolidBrush(accentColor);
 
         graphics.FillPath(shellBrush, shellPath);
         graphics.DrawPath(outlinePen, shellPath);
 
-        graphics.FillRectangle(glyphBrush, 9, 9, 7, 7);
-        graphics.FillRectangle(glyphBrush, 18, 9, 5, 5);
-        graphics.FillRectangle(glyphBrush, 9, 18, 5, 5);
-        graphics.FillRectangle(glyphBrush, 16, 18, 8, 3);
-        graphics.FillEllipse(accentBrush, 20, 20, 7, 7);
+        graphics.FillRectangle(glyphBrush, 8, 8, 8, 8);
+        graphics.FillRectangle(glyphBrush, 18, 8, 6, 6);
+        graphics.FillRectangle(glyphBrush, 8, 18, 6, 6);
+        graphics.FillRectangle(glyphBrush, 16, 19, 8, 4);
+        graphics.FillEllipse(accentBrush, 19, 19, 9, 9);
 
         var iconHandle = bitmap.GetHicon();
         try

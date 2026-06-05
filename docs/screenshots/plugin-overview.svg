@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="1680" viewBox="0 0 980 1680" role="img" aria-labelledby="title desc">
+  <title id="title">Tools for Steam plugin overview</title>
+  <desc id="desc">A Steam Big Picture style side panel showing Tools for Steam and its built-in plugin list.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101720"/>
+      <stop offset="1" stop-color="#0a1118"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#394049"/>
+      <stop offset="1" stop-color="#303740"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#02070c" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect width="980" height="1680" fill="url(#bg)"/>
+  <rect x="0" y="0" width="132" height="1680" fill="#0b131b"/>
+  <rect x="132" y="0" width="3" height="1680" fill="#26313b"/>
+  <rect x="0" y="1120" width="132" height="182" fill="#242932"/>
+  <g fill="#aeb8c3" opacity="0.9">
+    <path d="M62 480c0-18 14-32 32-32s32 14 32 32v22l16 20h-96l16-20z"/>
+    <circle cx="94" cy="540" r="10"/>
+    <path d="M52 692c0-19 14-34 32-34s32 15 32 34v32H52zM104 670c9-10 24-13 36-7 13 6 21 18 21 32v29h-36v-32c0-8-2-15-6-22z"/>
+    <circle cx="84" cy="637" r="15"/><circle cx="131" cy="629" r="14"/>
+    <path d="M82 856h25l4 18 16 7 16-9 18 18-9 16 7 16 18 4v25l-18 4-7 16 9 16-18 18-16-9-16 7-4 18H82l-4-18-16-7-16 9-18-18 9-16-7-16-18-4v-25l18-4 7-16-9-16 18-18 16 9 16-7z"/>
+    <circle cx="94" cy="939" r="28" fill="#0b131b"/>
+    <circle cx="94" cy="939" r="16"/>
+    <circle cx="94" cy="1040" r="36"/>
+    <path d="M100 1003l-32 48h25l-6 31 33-49H96z" fill="#0b131b"/>
+    <path d="M73 1182h42v13h-42zM73 1210h42v13h-42zM73 1238h42v13h-42zM53 1182h13v13H53zM53 1210h13v13H53zM53 1238h13v13H53z"/>
+    <circle cx="94" cy="1394" r="38"/>
+    <text x="94" y="1410" text-anchor="middle" font-family="Arial, sans-serif" font-size="58" font-weight="700" fill="#0b131b">?</text>
+  </g>
+  <g transform="translate(180 94)">
+    <rect x="0" y="0" width="126" height="126" rx="34" fill="#1c252e"/>
+    <path d="M63 30c10 0 18 8 18 18v15h12v23H33V63h12V48c0-10 8-18 18-18zM58 86h10v16H58z" fill="#d9e0e8"/>
+    <text x="162" y="68" font-family="Arial, sans-serif" font-size="74" font-weight="800" fill="#f3f6f9">Tools for Steam</text>
+  </g>
+  <g transform="translate(180 264)" filter="url(#shadow)">
+    <g>
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <path d="M111 77l7 5 8-2 4 8-5 7 2 8-8 4-7-5-8 2-4-8 5-7-2-8 8-4zm0 15a9 9 0 100 18 9 9 0 000-18z" fill="#d7dee6"/>
+      <text x="184" y="72" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Settings</text>
+      <text x="184" y="118" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Global TFS behavior and startup</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <line x1="6" y1="228" x2="758" y2="228" stroke="#2a3540" stroke-width="2"/>
+    <g transform="translate(0 276)">
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <rect x="92" y="76" width="38" height="30" rx="4" fill="none" stroke="#d7dee6" stroke-width="4"/>
+      <path d="M101 95l8-8 8 6 10-13" fill="none" stroke="#d7dee6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect x="104" y="111" width="14" height="4" rx="2" fill="#d7dee6"/>
+      <text x="184" y="82" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Processes</text>
+      <text x="184" y="128" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Jump between currently open app windows</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(0 526)">
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <path d="M90 106h42v18H90zM96 82h30v19H96zM101 93h20M101 114l-11 10M121 114l11 10" fill="none" stroke="#d7dee6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="184" y="82" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Store Sync</text>
+      <text x="184" y="128" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Bring other PC launchers into Steam</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(0 776)">
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <path d="M91 91h18l22-18v68l-22-18H91zM140 89c8 8 8 22 0 30" fill="none" stroke="#d7dee6" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="184" y="82" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Audio</text>
+      <text x="184" y="128" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Output devices and audio tools</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(0 1026)">
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <rect x="91" y="79" width="42" height="30" rx="4" fill="none" stroke="#d7dee6" stroke-width="4"/>
+      <path d="M112 109v14M99 123h26" fill="none" stroke="#d7dee6" stroke-width="4" stroke-linecap="round"/>
+      <text x="184" y="70" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Display</text>
+      <text x="184" y="116" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Screen output, resolution,</text>
+      <text x="184" y="156" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">and refresh rate</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(0 1276)">
+      <rect width="764" height="188" rx="6" fill="url(#card)"/>
+      <rect x="68" y="50" width="86" height="86" rx="24" fill="#444b54"/>
+      <path d="M111 74v36M95 89a34 34 0 1032 0" fill="none" stroke="#d7dee6" stroke-width="5" stroke-linecap="round"/>
+      <text x="184" y="82" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#dce3eb">Power</text>
+      <text x="184" y="128" font-family="Arial, sans-serif" font-size="30" fill="#a9c0d4">Steam, Windows, and recovery actions</text>
+      <path d="M666 76l22 22-22 22" fill="none" stroke="#b5bec8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <rect x="0" y="1568" width="980" height="112" fill="#050608"/>
+  <circle cx="324" cy="1625" r="30" fill="#f7f7f7"/>
+  <text x="324" y="1642" text-anchor="middle" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#050608">A</text>
+  <text x="385" y="1640" font-family="Arial, sans-serif" font-size="32" font-weight="800" fill="#f7f7f7">SELECT</text>
+  <circle cx="695" cy="1625" r="30" fill="#f7f7f7"/>
+  <text x="695" y="1642" text-anchor="middle" font-family="Arial, sans-serif" font-size="44" font-weight="800" fill="#050608">B</text>
+  <text x="756" y="1640" font-family="Arial, sans-serif" font-size="32" font-weight="800" fill="#f7f7f7">BACK</text>
+</svg>

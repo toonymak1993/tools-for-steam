@@ -5,18 +5,19 @@ namespace SteamLoader.App.Services;
 public sealed class WindowsAutostartService
 {
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private readonly string _valueName;
+    private readonly string[] _valueNames;
 
-    public WindowsAutostartService(string valueName)
+    public WindowsAutostartService(string valueName, params string[] legacyValueNames)
     {
-        _valueName = valueName;
+        _valueNames = [valueName, .. legacyValueNames.Where(name => !string.IsNullOrWhiteSpace(name))];
     }
 
     public bool IsEnabled(string executablePath, string arguments)
     {
         using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
-        var currentValue = key?.GetValue(_valueName) as string;
-        return string.Equals(currentValue, BuildCommand(executablePath, arguments), StringComparison.OrdinalIgnoreCase);
+        var expectedCommand = BuildCommand(executablePath, arguments);
+        return _valueNames.Any(valueName =>
+            string.Equals(key?.GetValue(valueName) as string, expectedCommand, StringComparison.OrdinalIgnoreCase));
     }
 
     public void SetEnabled(string executablePath, string arguments, bool enabled)
@@ -25,11 +26,14 @@ public sealed class WindowsAutostartService
 
         if (enabled)
         {
-            key.SetValue(_valueName, BuildCommand(executablePath, arguments), RegistryValueKind.String);
+            key.SetValue(_valueNames[0], BuildCommand(executablePath, arguments), RegistryValueKind.String);
             return;
         }
 
-        key.DeleteValue(_valueName, throwOnMissingValue: false);
+        foreach (var valueName in _valueNames)
+        {
+            key.DeleteValue(valueName, throwOnMissingValue: false);
+        }
     }
 
     public int DisableSteamAutostartEntries()
@@ -43,7 +47,7 @@ public sealed class WindowsAutostartService
         var removedCount = 0;
         foreach (var valueName in key.GetValueNames())
         {
-            if (string.Equals(valueName, _valueName, StringComparison.OrdinalIgnoreCase))
+            if (_valueNames.Any(ownValueName => string.Equals(valueName, ownValueName, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }

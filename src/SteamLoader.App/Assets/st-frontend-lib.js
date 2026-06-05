@@ -15,7 +15,7 @@
   let steamToggleStyleAvailable = null;
 
   const defaultModel = Object.freeze({
-    title: "Steam Tools",
+    title: "Tools for Steam",
     subtitle: "",
     status: "",
     error: "",

@@ -51,6 +51,7 @@ public sealed class QuickAccessShellInjector
             }
             catch (Exception exception)
             {
+                ResetAttachedTargets($"Injector error: {exception.Message}");
                 _hostState.UpdateError($"Injector error: {exception.Message}");
             }
 
@@ -63,11 +64,7 @@ public sealed class QuickAccessShellInjector
         var launchState = await _steamClientLaunchService.EnsureDevToolsReadyAsync(cancellationToken);
         if (!launchState.DevToolsReady)
         {
-            _sharedReadyLogged = false;
-            _popupReadyLogged = false;
-            _sharedTargetId = null;
-            _quickAccessTargetId = null;
-            _hostState.UpdateSharedContext(false, launchState.Message);
+            ResetAttachedTargets(launchState.Message);
             return;
         }
 
@@ -198,5 +195,17 @@ public sealed class QuickAccessShellInjector
         }
 
         return readyLogged;
+    }
+
+    private void ResetAttachedTargets(string message)
+    {
+        _sharedReadyLogged = false;
+        _popupReadyLogged = false;
+        _themeSurfaceReadyLogged = false;
+        _sharedTargetId = null;
+        _quickAccessTargetId = null;
+        _themeSurfaceTargetIds.Clear();
+        _hostState.UpdateSharedContext(false, message);
+        _hostState.UpdateQuickAccess(false, message);
     }
 }
