@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 36;
+  const stateVersion = 44;
   const soundtrackTabKey = 7;
 
   if (window.__steamLoaderPopupTimer) {
@@ -55,11 +55,27 @@
             error: "",
             snapshot: null,
           },
+          appStart: {
+            loading: false,
+            catalogLoading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            catalog: null,
+          },
           hltb: {
             loading: false,
             saving: false,
             error: "",
             snapshot: null,
+          },
+          artwork: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            apiKeyDraft: "",
+            apiKeyInputVersion: 0,
           },
           storeSync: {
             loading: false,
@@ -85,6 +101,14 @@
             saving: false,
             error: "",
             snapshot: null,
+          },
+          autoSisir: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            pathDraft: "",
+            pathInputVersion: 0,
           },
           nativeUi: {
             dialogButtonType: null,
@@ -126,6 +150,18 @@
       pages: [],
     },
     {
+      id: "app-start",
+      title: "App Start",
+      description: "Launch selected Windows apps",
+      pages: [
+        {
+          id: "add-app",
+          title: "Add App",
+          description: "Choose an installed Start Menu app",
+        },
+      ],
+    },
+    {
       id: "store-sync",
       title: "Store Sync",
       description: "Bring other PC launchers into Steam",
@@ -136,6 +172,11 @@
           description: "Scan enabled stores and update Steam shortcuts",
         },
         {
+          id: "detected-games",
+          title: "Detected Games",
+          description: "Review games before they are synced",
+        },
+        {
           id: "settings",
           title: "Settings",
           description: "Artwork and sync behavior",
@@ -144,6 +185,41 @@
           id: "stores",
           title: "Stores",
           description: "Manage individual launcher sources and custom paths",
+        },
+      ],
+    },
+    {
+      id: "auto-sisr",
+      title: "Auto SISR",
+      description: "Run SISR marker mode with selected games",
+      defaultEnabled: false,
+      pages: [
+        {
+          id: "settings",
+          title: "Settings",
+          description: "Marker path and automatic Game Pass behavior",
+        },
+        {
+          id: "watched-games",
+          title: "Watched Games",
+          description: "Choose extra non-Steam games to watch",
+        },
+        {
+          id: "log",
+          title: "Log",
+          description: "Inspect marker detection and start/stop decisions",
+        },
+      ],
+    },
+    {
+      id: "artwork",
+      title: "SteamGridDB",
+      description: "Change game artwork from the context menu",
+      pages: [
+        {
+          id: "settings",
+          title: "Settings",
+          description: "Context menu and SteamGridDB behavior",
         },
       ],
     },
@@ -248,7 +324,12 @@
     }
 
     const entry = getPluginSettingsEntry(pluginId);
-    return entry ? entry.enabled !== false || entry.canDisable === false : true;
+    if (entry) {
+      return entry.enabled !== false || entry.canDisable === false;
+    }
+
+    const definition = plugins.find((plugin) => plugin.id === pluginId);
+    return definition ? definition.defaultEnabled !== false : true;
   }
 
   function getVisiblePlugins() {
@@ -372,6 +453,13 @@
       .steamloader-row-icon svg {
         width: 18px;
         height: 18px;
+      }
+
+      .steamloader-row-icon .steamloader-app-start-icon {
+        width: 100%;
+        height: 100%;
+        border-radius: inherit;
+        object-fit: cover;
       }
 
       .steamloader-row-shell-subtle .steamloader-row-icon {
@@ -1049,6 +1137,22 @@
         };
       }
 
+      if (route.pluginId === "store-sync" && route.pageId?.startsWith("detected-title-")) {
+        const titleId = route.pageId.replace(/^detected-title-/, "");
+        return {
+          route: parseRoute("page:store-sync:detected-games"),
+          fallbackIndex: getStoreSyncDetectedTitleIndex(titleId),
+        };
+      }
+
+      if (route.pluginId === "app-start" && route.pageId?.startsWith("app-")) {
+        const shortcutId = route.pageId.replace(/^app-/, "");
+        return {
+          route: parseRoute("plugin:app-start"),
+          fallbackIndex: getAppStartShortcutIndex(shortcutId),
+        };
+      }
+
       if (route.pluginId === "themes" && isThemesThemeOptionRoute(route)) {
         const themeId = getThemeIdFromRoute(route);
         const optionId = getThemeOptionIdFromRoute(route);
@@ -1509,6 +1613,45 @@
     );
   }
 
+  function ArtworkPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("rect", {
+          x: "8",
+          y: "9",
+          width: "20",
+          height: "18",
+          rx: "4",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+        }),
+        createElement("path", {
+          d: "M11.5 23L15.5 18.8L18.2 21.4L21.4 16.8L25 23",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("circle", {
+          cx: "14",
+          cy: "14",
+          r: "1.7",
+          fill: "currentColor",
+        }),
+        createElement("path", {
+          d: "M24.5 7.5L25.2 9.3L27 10L25.2 10.7L24.5 12.5L23.8 10.7L22 10L23.8 9.3L24.5 7.5Z",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
   function ThemesPluginIcon() {
     return createElement(
       "svg",
@@ -1648,6 +1791,88 @@
     );
   }
 
+  function AppStartPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("rect", {
+          x: "7",
+          y: "8",
+          width: "22",
+          height: "20",
+          rx: "4.5",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+        }),
+        createElement("path", {
+          d: "M15 14.5L22.5 18L15 21.5V14.5Z",
+          fill: "currentColor",
+        }),
+        createElement("path", {
+          d: "M11 28.5H25",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function AutoSisirPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M18 6.5V12.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M18 23.5V29.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M29.5 18H23.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M12.5 18H6.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("circle", {
+          cx: "18",
+          cy: "18",
+          r: "6.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+        createElement("circle", {
+          cx: "18",
+          cy: "18",
+          r: "2.2",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
   function getPluginIconComponent(pluginId) {
     switch (pluginId) {
       case "audio":
@@ -1658,10 +1883,16 @@
         return PowerPluginIcon;
       case "processes":
         return ProcessesPluginIcon;
+      case "app-start":
+        return AppStartPluginIcon;
       case "hltb":
         return HltbPluginIcon;
       case "store-sync":
         return StoreSyncPluginIcon;
+      case "auto-sisr":
+        return AutoSisirPluginIcon;
+      case "artwork":
+        return ArtworkPluginIcon;
       case "themes":
         return ThemesPluginIcon;
       case "settings":
@@ -2010,8 +2241,47 @@
     renderPanelState();
   }
 
+  function rerenderAppStartPanel() {
+    if (state.route.pluginId === "app-start") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
   function rerenderHltbPanel() {
     if (state.route.pluginId === "hltb") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
+  function rerenderArtworkPanel() {
+    if (state.route.pluginId === "artwork") {
+      const currentRoute = { ...state.route };
+      const focusedIndex = getFocusedSlotIndex();
+      requestFocusForRoute(currentRoute, focusedIndex);
+      setRoute(currentRoute);
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
+  function rerenderAutoSisirPanel() {
+    if (state.route.pluginId === "auto-sisr") {
       const currentRoute = { ...state.route };
       const focusedIndex = getFocusedSlotIndex();
       requestFocusForRoute(currentRoute, focusedIndex);
@@ -2337,17 +2607,93 @@
     return state.display.modesSnapshot;
   }
 
+  function getAppStartSnapshot() {
+    return state.appStart.snapshot;
+  }
+
+  function getAppStartCatalog() {
+    return state.appStart.catalog;
+  }
+
+  function getAppStartShortcut(shortcutId) {
+    const shortcuts = getAppStartSnapshot()?.shortcuts;
+    return Array.isArray(shortcuts) ? shortcuts.find((shortcut) => shortcut.id === shortcutId) || null : null;
+  }
+
+  function getAppStartShortcutIndex(shortcutId) {
+    const shortcuts = getAppStartSnapshot()?.shortcuts;
+    if (!Array.isArray(shortcuts)) {
+      return null;
+    }
+
+    const index = shortcuts.findIndex((shortcut) => shortcut.id === shortcutId);
+    return index >= 0 ? index + 1 : null;
+  }
+
   function getGeneralSettingsSnapshot() {
     return state.generalSettings.snapshot;
+  }
+
+  function getAutoSisirSnapshot() {
+    return state.autoSisir.snapshot;
+  }
+
+  function syncAutoSisirPathDraftFromSnapshot(force = false) {
+    const path = getAutoSisirSnapshot()?.settings?.executablePath || "";
+    if (force || !state.autoSisir.pathDraft) {
+      state.autoSisir.pathDraft = path;
+      state.autoSisir.pathInputVersion += 1;
+    }
   }
 
   function getGeneralPluginSettings() {
     return getPluginSettings().filter((plugin) => plugin.canDisable !== false);
   }
 
+  function getArtworkSnapshot() {
+    return state.artwork.snapshot;
+  }
+
   function getStoreSyncStore(storeId) {
     const stores = getStoreSyncSnapshot()?.stores;
     return Array.isArray(stores) ? stores.find((store) => store.id === storeId) || null : null;
+  }
+
+  function getStoreSyncDetectedTitles() {
+    const stores = getStoreSyncSnapshot()?.stores;
+    if (!Array.isArray(stores)) {
+      return [];
+    }
+
+    return stores
+      .flatMap((store) =>
+        Array.isArray(store.detectedTitles)
+          ? store.detectedTitles.map((title) => ({
+              ...title,
+              storeTitle: title.storeTitle || store.title,
+            }))
+          : [],
+      )
+      .sort((left, right) => left.title.localeCompare(right.title));
+  }
+
+  function getStoreSyncDetectedTitle(titleId) {
+    return getStoreSyncDetectedTitles().find((title) => title.id === titleId) || null;
+  }
+
+  function getStoreSyncDetectedTitleIndex(titleId) {
+    const titles = getStoreSyncDetectedTitles();
+    const index = titles.findIndex((title) => title.id === titleId);
+    return index >= 0 ? index : null;
+  }
+
+  function getPathFileName(pathValue) {
+    if (!pathValue) {
+      return "";
+    }
+
+    const parts = String(pathValue).split(/[\\/]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(pathValue);
   }
 
   function isCustomLocationsRoute(route = state.route) {
@@ -2387,8 +2733,56 @@
     return state.generalSettings.loading || state.generalSettings.saving;
   }
 
+  function isAutoSisirBusy() {
+    return state.autoSisir.loading || state.autoSisir.saving;
+  }
+
   function isHltbBusy() {
     return state.hltb.loading || state.hltb.saving;
+  }
+
+  function isArtworkBusy() {
+    return state.artwork.loading || state.artwork.saving;
+  }
+
+  function syncArtworkApiKeyDraft(forceRemount = false) {
+    if (!state.artwork.apiKeyDraft) {
+      state.artwork.apiKeyDraft = "";
+    }
+
+    if (forceRemount) {
+      state.artwork.apiKeyInputVersion += 1;
+    }
+  }
+
+  function isAppStartBusy() {
+    return state.appStart.loading || state.appStart.catalogLoading || state.appStart.saving;
+  }
+
+  function buildAppStartSummaryCard(shortcuts) {
+    const count = Array.isArray(shortcuts) ? shortcuts.length : 0;
+
+    return {
+      title: "App Shortcuts",
+      lines: [
+        count === 1 ? "1 app is ready to launch." : `${count} apps are ready to launch.`,
+        "Add apps from the Windows Start Menu, then launch them directly with the controller.",
+      ],
+    };
+  }
+
+  function buildAppStartIcon(iconDataUri) {
+    if (!iconDataUri) {
+      return AppStartPluginIcon;
+    }
+
+    return function AppStartShortcutIcon() {
+      return createElement("img", {
+        className: "steamloader-app-start-icon",
+        src: iconDataUri,
+        alt: "",
+      });
+    };
   }
 
   function buildSteamProfileCard(profile) {
@@ -2523,6 +2917,30 @@
     }
 
     return getHltbSnapshot()?.statusText || "";
+  }
+
+  function resolveArtworkStatusText() {
+    if (state.artwork.saving) {
+      return "Saving SteamGridDB settings...";
+    }
+
+    if (state.artwork.loading) {
+      return "Loading SteamGridDB settings...";
+    }
+
+    return getArtworkSnapshot()?.statusText || "";
+  }
+
+  function resolveAutoSisirStatusText() {
+    if (state.autoSisir.saving) {
+      return "Saving Auto SISR settings...";
+    }
+
+    if (state.autoSisir.loading) {
+      return "Loading Auto SISR settings...";
+    }
+
+    return getAutoSisirSnapshot()?.statusText || "";
   }
 
   function resolveGeneralSettingsStatusText() {
@@ -2722,6 +3140,29 @@
     }
   }
 
+  async function loadAutoSisirState() {
+    state.autoSisir.loading = true;
+    state.autoSisir.error = "";
+    rerenderAutoSisirPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/auto-sisr/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Auto SISR could not be loaded (${response.status}).`);
+      }
+
+      state.autoSisir.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncAutoSisirPathDraftFromSnapshot(true);
+    } catch (error) {
+      state.autoSisir.error = error instanceof Error ? error.message : String(error);
+      state.autoSisir.snapshot = null;
+    } finally {
+      state.autoSisir.loading = false;
+      rerenderAutoSisirPanel();
+    }
+  }
+
   async function loadDisplayModes() {
     state.display.modesLoading = true;
     state.display.error = "";
@@ -2767,6 +3208,29 @@
     }
   }
 
+  async function loadArtworkState() {
+    state.artwork.loading = true;
+    state.artwork.error = "";
+    rerenderArtworkPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/artwork/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `SteamGridDB settings could not be loaded (${response.status}).`);
+      }
+
+      state.artwork.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncArtworkApiKeyDraft(true);
+    } catch (error) {
+      state.artwork.error = error instanceof Error ? error.message : String(error);
+      state.artwork.snapshot = null;
+    } finally {
+      state.artwork.loading = false;
+      rerenderArtworkPanel();
+    }
+  }
+
   async function loadProcessesState() {
     if (state.processes.loading) {
       return;
@@ -2790,6 +3254,50 @@
     } finally {
       state.processes.loading = false;
       rerenderProcessesPanel();
+    }
+  }
+
+  async function loadAppStartState() {
+    state.appStart.loading = true;
+    state.appStart.error = "";
+    rerenderAppStartPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/app-start/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `App Start could not be loaded (${response.status}).`);
+      }
+
+      state.appStart.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.appStart.error = error instanceof Error ? error.message : String(error);
+      state.appStart.snapshot = null;
+    } finally {
+      state.appStart.loading = false;
+      rerenderAppStartPanel();
+    }
+  }
+
+  async function loadAppStartCatalog() {
+    state.appStart.catalogLoading = true;
+    state.appStart.error = "";
+    rerenderAppStartPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/app-start/catalog`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `App catalog could not be loaded (${response.status}).`);
+      }
+
+      state.appStart.catalog = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.appStart.error = error instanceof Error ? error.message : String(error);
+      state.appStart.catalog = null;
+    } finally {
+      state.appStart.catalogLoading = false;
+      rerenderAppStartPanel();
     }
   }
 
@@ -2851,6 +3359,7 @@
   }
 
   async function sendGeneralSettingsRequest(path, bodyPayload = null) {
+    let succeeded = false;
     state.generalSettings.saving = true;
     state.generalSettings.error = "";
     rerenderGeneralSettingsPanel();
@@ -2870,11 +3379,43 @@
       }
 
       state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
+      succeeded = true;
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.generalSettings.saving = false;
       rerenderGeneralSettingsPanel();
+    }
+
+    return succeeded;
+  }
+
+  async function sendAutoSisirRequest(path, bodyPayload = null) {
+    state.autoSisir.saving = true;
+    state.autoSisir.error = "";
+    rerenderAutoSisirPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.autoSisir.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncAutoSisirPathDraftFromSnapshot(true);
+    } catch (error) {
+      state.autoSisir.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.autoSisir.saving = false;
+      rerenderAutoSisirPanel();
     }
   }
 
@@ -2906,6 +3447,36 @@
     }
   }
 
+  async function sendArtworkRequest(path, bodyPayload = null) {
+    state.artwork.saving = true;
+    state.artwork.error = "";
+    rerenderArtworkPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.artwork.snapshot = payload && typeof payload === "object" ? payload : null;
+      return true;
+    } catch (error) {
+      state.artwork.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.artwork.saving = false;
+      rerenderArtworkPanel();
+    }
+  }
+
   async function sendProcessesRequest(path, bodyPayload = null) {
     state.processes.activating = true;
     state.processes.error = "";
@@ -2933,6 +3504,36 @@
     } finally {
       state.processes.activating = false;
       rerenderProcessesPanel();
+    }
+  }
+
+  async function sendAppStartRequest(path, bodyPayload = null) {
+    state.appStart.saving = true;
+    state.appStart.error = "";
+    rerenderAppStartPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      state.appStart.snapshot = payload && typeof payload === "object" ? payload : null;
+      return true;
+    } catch (error) {
+      state.appStart.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.appStart.saving = false;
+      rerenderAppStartPanel();
     }
   }
 
@@ -3046,14 +3647,77 @@
         state.hltb.snapshot = null;
       }
 
+      if (!enabled && pluginId === "artwork") {
+        state.artwork.snapshot = null;
+      }
+
+      if (!enabled && pluginId === "app-start") {
+        state.appStart.snapshot = null;
+        state.appStart.catalog = null;
+      }
+
+      if (!enabled && pluginId === "auto-sisr") {
+        state.autoSisir.snapshot = null;
+      }
+
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/plugins/enabled", { pluginId, enabled });
+    const saved = await sendGeneralSettingsRequest("api/settings/plugins/enabled", { pluginId, enabled });
+    if (saved && pluginId === "auto-sisr") {
+      state.autoSisir.snapshot = null;
+      state.autoSisir.error = "";
+      state.autoSisir.pathDraft = "";
+      state.autoSisir.pathInputVersion += 1;
+      if (enabled) {
+        void loadAutoSisirState();
+      } else {
+        renderPanelState();
+      }
+    }
   }
 
   async function openToolsForSteamManager() {
     await sendGeneralSettingsRequest("api/settings/open-manager");
+  }
+
+  async function toggleAutoSisirSetting(key) {
+    const snapshot = getAutoSisirSnapshot();
+    const propertyMap = {
+      enabled: "enabled",
+      "auto-start-game-pass": "autoStartForGamePass",
+    };
+    const propertyName = propertyMap[key];
+    if (snapshot?.settings && propertyName) {
+      state.autoSisir.snapshot = {
+        ...snapshot,
+        settings: {
+          ...snapshot.settings,
+          [propertyName]: !Boolean(snapshot.settings[propertyName]),
+        },
+      };
+      renderPanelState();
+    }
+
+    await sendAutoSisirRequest("api/auto-sisr/settings/toggle", { value: key });
+  }
+
+  async function saveAutoSisirPath() {
+    await sendAutoSisirRequest("api/auto-sisr/path", { value: state.autoSisir.pathDraft || "" });
+  }
+
+  async function resetAutoSisirPath() {
+    state.autoSisir.pathDraft = "";
+    state.autoSisir.pathInputVersion += 1;
+    await sendAutoSisirRequest("api/auto-sisr/path/reset");
+  }
+
+  async function toggleAutoSisirWatchedTitle(titleId) {
+    if (!titleId) {
+      return;
+    }
+
+    await sendAutoSisirRequest("api/auto-sisr/titles/toggle", { value: titleId });
   }
 
   async function toggleHltbSetting(key) {
@@ -3086,8 +3750,81 @@
     await sendHltbRequest("api/hltb/cache/clear");
   }
 
+  async function toggleArtworkSetting(key) {
+    const settings = getArtworkSnapshot()?.settings;
+    const propertyMap = {
+      "context-menu-enabled": "contextMenuEnabled",
+      "prefer-verified-matches": "preferVerifiedMatches",
+    };
+
+    const propertyName = propertyMap[key];
+    if (settings && propertyName && Object.prototype.hasOwnProperty.call(settings, propertyName)) {
+      state.artwork.snapshot = {
+        ...state.artwork.snapshot,
+        settings: {
+          ...settings,
+          [propertyName]: !Boolean(settings[propertyName]),
+        },
+      };
+      rerenderArtworkPanel();
+    }
+
+    await sendArtworkRequest("api/artwork/settings/toggle", { key });
+  }
+
+  async function saveArtworkApiKey() {
+    const value = state.artwork.apiKeyDraft || "";
+    await sendArtworkRequest("api/artwork/settings/api-key", { value });
+  }
+
+  async function clearArtworkApiKey() {
+    state.artwork.apiKeyDraft = "";
+    state.artwork.apiKeyInputVersion += 1;
+    await sendArtworkRequest("api/artwork/settings/api-key/clear");
+  }
+
+  async function setArtworkResultLimit(value) {
+    const normalizedValue = Math.max(12, Math.min(72, Number(value) || 36));
+    const snapshot = getArtworkSnapshot();
+    if (snapshot?.settings) {
+      state.artwork.snapshot = {
+        ...snapshot,
+        settings: {
+          ...snapshot.settings,
+          resultLimit: normalizedValue,
+        },
+      };
+      rerenderArtworkPanel();
+    }
+
+    await sendArtworkRequest("api/artwork/settings/result-limit", { value: normalizedValue });
+  }
+
   async function activateProcessWindow(handle) {
     await sendProcessesRequest("api/processes/activate", { value: handle });
+  }
+
+  async function addAppStartShortcut(appId) {
+    const succeeded = await sendAppStartRequest("api/app-start/apps/add", { value: appId });
+    if (succeeded) {
+      await loadAppStartCatalog();
+      const shortcut = getAppStartSnapshot()?.shortcuts?.find((entry) => entry.id === appId);
+      requestFocusForRoute(parseRoute("plugin:app-start"), getAppStartShortcutIndex(shortcut?.id || appId));
+      setRoute(parseRoute("plugin:app-start"));
+    }
+  }
+
+  async function launchAppStartShortcut(shortcutId) {
+    await sendAppStartRequest("api/app-start/apps/launch", { value: shortcutId });
+  }
+
+  async function removeAppStartShortcut(shortcutId) {
+    const succeeded = await sendAppStartRequest("api/app-start/apps/remove", { value: shortcutId });
+    if (succeeded) {
+      state.appStart.catalog = null;
+      requestFocusForRoute(parseRoute("plugin:app-start"), 0);
+      setRoute(parseRoute("plugin:app-start"));
+    }
   }
 
   async function toggleThemesSetting(key) {
@@ -3721,6 +4458,157 @@
       };
     }
 
+    if (state.route.screen === "plugin" && state.route.pluginId === "app-start") {
+      const shortcuts = Array.isArray(getAppStartSnapshot()?.shortcuts)
+        ? getAppStartSnapshot().shortcuts
+        : [];
+
+      return {
+        ...defaultModel,
+        title: "App Start",
+        subtitle: "Controller app launcher",
+        status: resolveAppStartStatusText(),
+        error: state.appStart.error,
+        note: "Add Windows apps once, then start them from Big Picture without reaching for the desktop.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: [buildAppStartSummaryCard(shortcuts)],
+        slots: [
+          makeNavigationSlot(
+            "Add App",
+            "Choose an installed Start Menu app and add it to this launcher.",
+            () => {
+              rememberCurrentRouteIndex(0);
+              setRoute({ screen: "page", pluginId: "app-start", pageId: "add-app" });
+            },
+            {
+              disabled: isAppStartBusy(),
+              leadingIcon: AppStartPluginIcon,
+            },
+          ),
+          ...shortcuts.map((shortcut, shortcutIndex) =>
+            makeNavigationSlot(
+              shortcut.name,
+              "Open launch and removal actions.",
+              () => {
+                rememberCurrentRouteIndex(shortcutIndex + 1);
+                setRoute({
+                  screen: "page",
+                  pluginId: "app-start",
+                  pageId: `app-${shortcut.id}`,
+                });
+              },
+              {
+                disabled: isAppStartBusy(),
+                leadingIcon: buildAppStartIcon(shortcut.iconDataUri),
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Apps",
+            "Reload saved shortcuts and the current Start Menu catalog.",
+            async () => {
+              state.appStart.catalog = null;
+              await loadAppStartState();
+            },
+            {
+              disabled: isAppStartBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "app-start" &&
+      state.route.pageId === "add-app"
+    ) {
+      const apps = Array.isArray(getAppStartCatalog()?.apps) ? getAppStartCatalog().apps : [];
+
+      return {
+        ...defaultModel,
+        title: "App Start",
+        subtitle: "Add App",
+        status: resolveAppStartStatusText(),
+        error: state.appStart.error,
+        note:
+          apps.length > 0
+            ? "Apps are discovered from the Windows Start Menu so helpers and uninstallers stay mostly out of the list."
+            : "Refresh the catalog if an app was installed while Tools for Steam was already running.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        slots: [
+          ...apps.map((app) =>
+            makeCommandSlot(
+              app.name,
+              app.added ? "Already added to App Start." : "Add this app to the launcher.",
+              () => addAppStartShortcut(app.id),
+              {
+                disabled: isAppStartBusy() || Boolean(app.added),
+                badge: app.added ? "Added" : "",
+                leadingIcon: buildAppStartIcon(app.iconDataUri),
+                trailing: app.added ? "none" : "chevron",
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh App List",
+            "Scan the Windows Start Menu again.",
+            () => loadAppStartCatalog(),
+            {
+              disabled: isAppStartBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "app-start" &&
+      state.route.pageId?.startsWith("app-")
+    ) {
+      const shortcutId = state.route.pageId.replace(/^app-/, "");
+      const shortcut = getAppStartShortcut(shortcutId);
+
+      return {
+        ...defaultModel,
+        title: "App Start",
+        subtitle: shortcut?.name || "App",
+        status: resolveAppStartStatusText(),
+        error: state.appStart.error,
+        note: shortcut ? shortcut.sourcePath : "The selected app shortcut could not be found.",
+        autoFocusIndex: resolveAutoFocusIndex(state.route),
+        cards: shortcut
+          ? [
+              {
+                title: shortcut.name,
+                lines: ["Ready to launch from Windows.", shortcut.sourcePath],
+              },
+            ]
+          : [],
+        slots: [
+          makeCommandSlot(
+            "Launch App",
+            "Start this app and keep Tools for Steam ready in the background.",
+            () => launchAppStartShortcut(shortcutId),
+            {
+              disabled: isAppStartBusy() || !shortcut,
+              leadingIcon: buildAppStartIcon(shortcut?.iconDataUri),
+              trailing: "chevron",
+            },
+          ),
+          makeCommandSlot(
+            "Remove App",
+            "Remove this shortcut from App Start. The app stays installed in Windows.",
+            () => removeAppStartShortcut(shortcutId),
+            {
+              disabled: isAppStartBusy() || !shortcut,
+            },
+          ),
+        ],
+      };
+    }
+
     if (
       state.route.screen === "page" &&
       state.route.pluginId === "hltb" &&
@@ -3825,6 +4713,313 @@
 
     if (
       state.route.screen === "page" &&
+      state.route.pluginId === "auto-sisr" &&
+      state.route.pageId === "settings"
+    ) {
+      const autoSisir = getAutoSisirSnapshot();
+      const settings = autoSisir?.settings;
+      const watchedTitles = Array.isArray(autoSisir?.watchableTitles) ? autoSisir.watchableTitles : [];
+      const watchedCount = watchedTitles.filter((title) => title.watched).length;
+
+      return {
+        ...defaultModel,
+        title: "Auto SISR",
+        subtitle: "Settings",
+        status: resolveAutoSisirStatusText(),
+        error: state.autoSisir.error,
+        note: "Start SISR in marker mode while selected non-Steam games are running. Wrong paths are reported here and will not crash Tools for Steam.",
+        cards: [
+          {
+            title: "Marker State",
+            lines: [
+              settings?.executablePath ? `Target: ${settings.executablePath}` : "Target: loading...",
+              `Start options: ${settings?.launchArguments || "--marker"}`,
+              autoSisir?.executableExists ? "SISR executable found." : "SISR executable not found.",
+              autoSisir?.activeGameTitle
+                ? `Active title: ${autoSisir.activeGameTitle} (${autoSisir.activeGameProcessId || "unknown pid"})`
+                : `${watchedCount} watched title${watchedCount === 1 ? "" : "s"} ready.`,
+            ],
+          },
+          {
+            title: "Steam Input Compatibility",
+            lines: [
+              "If SISR does not react while the marker is running, disable Steam Input for that game in Steam.",
+              "Steam can keep controller ownership active, which may block SISR from seeing the expected input mode.",
+            ],
+          },
+        ],
+        editor: {
+          label: "SISR Executable Path",
+          help: "Leave this as the default LocalAppData path, or enter the full path to your own SISR.exe.",
+          value: state.autoSisir.pathDraft || settings?.executablePath || "",
+          placeholder: settings?.defaultExecutablePath || "C:\\Users\\you\\AppData\\Local\\SISR\\SISR.exe",
+          inputKey: `auto-sisr-path-${state.autoSisir.pathInputVersion}`,
+          rows: 2,
+          onInput: (value) => {
+            state.autoSisir.pathDraft = value;
+          },
+        },
+        slots: [
+          makeSettingToggleSlot(
+            "auto-sisr",
+            "enabled",
+            "Enable Auto SISR",
+            "Allow Tools for Steam to start and stop SISR marker mode for watched games.",
+            Boolean(settings?.enabled),
+            () => toggleAutoSisirSetting("enabled"),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+          makeSettingToggleSlot(
+            "auto-sisr",
+            "auto-start-game-pass",
+            "Game Pass Auto Marker",
+            "Automatically watch every detected Xbox / Game Pass title.",
+            settings?.autoStartForGamePass !== false,
+            () => toggleAutoSisirSetting("auto-start-game-pass"),
+            {
+              disabled: isAutoSisirBusy() || !settings?.enabled,
+            },
+          ),
+          makeCommandSlot(
+            "Save SISR Path",
+            "Use the path above for future marker launches.",
+            () => saveAutoSisirPath(),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Reset SISR Path",
+            "Return to the default LocalAppData SISR.exe location.",
+            () => resetAutoSisirPath(),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Auto SISR",
+            "Reload the marker status and the detected non-Steam game list.",
+            () => loadAutoSisirState(),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "auto-sisr" &&
+      state.route.pageId === "watched-games"
+    ) {
+      const autoSisir = getAutoSisirSnapshot();
+      const settings = autoSisir?.settings;
+      const titles = Array.isArray(autoSisir?.watchableTitles) ? autoSisir.watchableTitles : [];
+      const manualCount = titles.filter((title) => title.selected).length;
+      const automaticCount = titles.filter((title) => title.automatic).length;
+
+      return {
+        ...defaultModel,
+        title: "Auto SISR",
+        subtitle: "Watched Games",
+        status: resolveAutoSisirStatusText(),
+        error: state.autoSisir.error,
+        note:
+          titles.length > 0
+            ? "Game Pass titles can be watched automatically. Select extra non-Steam games here when they should also start the SISR marker."
+            : "No detected non-Steam games are available yet. Run Store Sync once or refresh Auto SISR after adding games.",
+        cards: [
+          {
+            title: "Selection",
+            lines: [
+              `${automaticCount} automatic Game Pass title${automaticCount === 1 ? "" : "s"}.`,
+              `${manualCount} manually selected title${manualCount === 1 ? "" : "s"}.`,
+              settings?.enabled ? "Auto SISR is enabled." : "Auto SISR is disabled in Settings.",
+            ],
+          },
+        ],
+        slots: [
+          ...titles.map((title) =>
+            makeSettingToggleSlot(
+              "auto-sisr-title",
+              title.id,
+              title.title,
+              `${title.storeTitle}${title.executablePath ? ` - ${title.executablePath}` : ""}`,
+              Boolean(title.watched),
+              () => toggleAutoSisirWatchedTitle(title.id),
+              {
+                disabled: isAutoSisirBusy() || Boolean(title.automatic),
+                badge: title.automatic ? "Game Pass" : title.selected ? "Selected" : "",
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Game List",
+            "Scan Store Sync sources again and reload available non-Steam games.",
+            () => loadAutoSisirState(),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "auto-sisr" &&
+      state.route.pageId === "log"
+    ) {
+      const autoSisir = getAutoSisirSnapshot();
+      const logLines = Array.isArray(autoSisir?.recentLogLines) ? autoSisir.recentLogLines : [];
+      const visibleLines = logLines.slice(-40).reverse();
+
+      return {
+        ...defaultModel,
+        title: "Auto SISR",
+        subtitle: "Log",
+        status: resolveAutoSisirStatusText(),
+        error: state.autoSisir.error,
+        note: autoSisir?.logPath
+          ? `Log file: ${autoSisir.logPath}`
+          : "The log file will appear after Auto SISR writes its first trace entry.",
+        cards: visibleLines.length
+          ? visibleLines.map((line, index) => {
+              const parts = String(line).split(" | ");
+              return {
+                title: parts.length >= 2 ? `${parts[1]} - ${parts[0]}` : `Entry ${index + 1}`,
+                lines: [parts.slice(2).join(" | ") || line],
+              };
+            })
+          : [
+              {
+                title: "No Trace Entries",
+                lines: ["Start a watched game or refresh Auto SISR to generate log entries."],
+              },
+            ],
+        slots: [
+          makeCommandSlot(
+            "Refresh Log",
+            "Reload the latest Auto SISR trace entries.",
+            () => loadAutoSisirState(),
+            {
+              disabled: isAutoSisirBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "artwork" &&
+      state.route.pageId === "settings"
+    ) {
+      const settings = getArtworkSnapshot()?.settings;
+      const resultLimit = Number(settings?.resultLimit) || 36;
+
+      return {
+        ...defaultModel,
+        title: "SteamGridDB",
+        subtitle: "Settings",
+        status: resolveArtworkStatusText(),
+        error: state.artwork.error,
+        note: "Control the Change Artwork context-menu entry and the SteamGridDB key used for manual artwork browsing.",
+        cards: [
+          {
+            title: "Artwork Picker",
+            lines: [
+              "Open a game context menu in Big Picture and choose Change Artwork to browse SteamGridDB.",
+              `API key: ${settings?.steamGridDbApiKeyPreview || "Built-in key"}`,
+              `Results per tab: ${resultLimit}`,
+            ],
+          },
+        ],
+        editor: {
+          label: "SteamGridDB API Key",
+          help: "Optional. Leave this blank to keep using the built-in key, or paste your own key and save it.",
+          value: state.artwork.apiKeyDraft,
+          placeholder: "Paste your SteamGridDB API key",
+          inputKey: `steamgriddb-api-key-${state.artwork.apiKeyInputVersion}`,
+          rows: 2,
+          onInput: (value) => {
+            state.artwork.apiKeyDraft = value;
+          },
+        },
+        slots: [
+          makeSettingToggleSlot(
+            "artwork",
+            "context-menu-enabled",
+            "Context Menu Entry",
+            "Show Change Artwork in Steam game context menus.",
+            settings?.contextMenuEnabled !== false,
+            () => toggleArtworkSetting("context-menu-enabled"),
+            {
+              disabled: isArtworkBusy(),
+            },
+          ),
+          makeSettingToggleSlot(
+            "artwork",
+            "prefer-verified-matches",
+            "Prefer Verified Matches",
+            "Put verified SteamGridDB game matches first when a title has several results.",
+            settings?.preferVerifiedMatches !== false,
+            () => toggleArtworkSetting("prefer-verified-matches"),
+            {
+              disabled: isArtworkBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Save API Key",
+            "Use this key for SteamGridDB searches and artwork downloads. Empty values keep the built-in key.",
+            () => saveArtworkApiKey(),
+            {
+              disabled: isArtworkBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Clear API Key",
+            "Return to the built-in SteamGridDB key.",
+            () => clearArtworkApiKey(),
+            {
+              disabled: isArtworkBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Show Fewer Results",
+            "Reduce image results per artwork tab.",
+            () => setArtworkResultLimit(resultLimit - 12),
+            {
+              disabled: isArtworkBusy() || resultLimit <= 12,
+              badge: `${resultLimit}`,
+            },
+          ),
+          makeCommandSlot(
+            "Show More Results",
+            "Increase image results per artwork tab.",
+            () => setArtworkResultLimit(resultLimit + 12),
+            {
+              disabled: isArtworkBusy() || resultLimit >= 72,
+              badge: `${resultLimit}`,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Settings",
+            "Reload SteamGridDB settings from the background host.",
+            () => loadArtworkState(),
+            {
+              disabled: isArtworkBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
       state.route.pluginId === "audio" &&
       state.route.pageId === "output-device-changer"
     ) {
@@ -3909,6 +5104,121 @@
           makeCommandSlot(
             "Refresh State",
             "Reload store availability, detected titles, and Steam profile details.",
+            () => loadStoreSyncState(),
+            {
+              disabled: isStoreSyncBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "store-sync" &&
+      state.route.pageId === "detected-games"
+    ) {
+      const detectedTitles = getStoreSyncDetectedTitles();
+
+      return {
+        ...defaultModel,
+        title: "Store Sync",
+        subtitle: "Detected Games",
+        status: storeSyncStatus,
+        error: state.storeSync.error,
+        note:
+          detectedTitles.length > 0
+            ? "Review what Tools for Steam will import before running Sync Now."
+            : "No games are currently detected from enabled launcher sources.",
+        cards: [
+          {
+            title: "Detection Summary",
+            lines: [
+              detectedTitles.length === 1
+                ? "1 title is ready for sync."
+                : `${detectedTitles.length} titles are ready for sync.`,
+              "Open a title to inspect its executable path and launch details.",
+            ],
+          },
+        ],
+        slots: [
+          ...detectedTitles.map((title, titleIndex) =>
+            makeNavigationSlot(
+              title.title,
+              `${title.storeTitle} - ${getPathFileName(title.executablePath)}`,
+              () => {
+                rememberCurrentRouteIndex(titleIndex);
+                setRoute({
+                  screen: "page",
+                  pluginId: "store-sync",
+                  pageId: `detected-title-${title.id}`,
+                });
+              },
+              {
+                disabled: isStoreSyncBusy(),
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Detection",
+            "Rescan all stores and update this list.",
+            () => loadStoreSyncState(),
+            {
+              disabled: isStoreSyncBusy(),
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "store-sync" &&
+      state.route.pageId?.startsWith("detected-title-")
+    ) {
+      const titleId = state.route.pageId.replace(/^detected-title-/, "");
+      const detectedTitle = getStoreSyncDetectedTitle(titleId);
+
+      return {
+        ...defaultModel,
+        title: "Store Sync",
+        subtitle: detectedTitle?.title || "Detected Game",
+        status: storeSyncStatus,
+        error: state.storeSync.error,
+        note: "This is the exact entry Tools for Steam will write into Steam shortcuts.",
+        cards: detectedTitle
+          ? [
+              {
+                title: detectedTitle.title,
+                lines: [
+                  `Store: ${detectedTitle.storeTitle}`,
+                  `Executable: ${detectedTitle.executablePath}`,
+                  `Start Directory: ${detectedTitle.startDirectory}`,
+                  detectedTitle.launchOptions ? `Launch Options: ${detectedTitle.launchOptions}` : "Launch Options: none",
+                ],
+              },
+            ]
+          : [],
+        slots: [
+          makeCommandSlot(
+            "Run Sync Now",
+            "Import the current detected game list into Steam.",
+            () => runStoreSyncNow(),
+            {
+              disabled: isStoreSyncBusy() || !storeSyncSnapshot?.steamProfile,
+            },
+          ),
+          makeCommandSlot(
+            "Artwork Overrides",
+            "Hero, grid, logo, and icon selection will live here next.",
+            () => {},
+            {
+              disabled: true,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Detection",
+            "Rescan all stores and update this title.",
             () => loadStoreSyncState(),
             {
               disabled: isStoreSyncBusy(),
@@ -4729,7 +6039,11 @@
           error: plugin.id === "store-sync" ? state.storeSync.error : "",
           note:
             plugin.id === "store-sync"
-              ? "Use Sync Now, Settings, and Stores to bring other launchers into Steam."
+              ? "Use Sync Now, Detected Games, Settings, and Stores to bring other launchers into Steam."
+              : plugin.id === "auto-sisr"
+                ? "Configure SISR marker mode and choose which non-Steam games should trigger it."
+              : plugin.id === "artwork"
+                ? "Use Settings to control the SteamGridDB context menu and artwork search behavior."
               : plugin.id === "hltb"
                 ? "Use Settings to choose which HowLongToBeat values appear on the open game page."
               : plugin.id === "themes"
@@ -4759,6 +6073,8 @@
           setRoute(
             plugin.id === "settings"
               ? { screen: "page", pluginId: "settings", pageId: "general" }
+              : plugin.id === "artwork"
+                ? { screen: "page", pluginId: "artwork", pageId: "settings" }
               : plugin.id === "hltb"
                 ? { screen: "page", pluginId: "hltb", pageId: "settings" }
               : { screen: "plugin", pluginId: plugin.id, pageId: null },
@@ -4871,12 +6187,50 @@
     }
 
     if (
+      route.pluginId === "artwork" &&
+      !state.artwork.loading &&
+      !state.artwork.snapshot &&
+      !state.artwork.error
+    ) {
+      void loadArtworkState();
+    }
+
+    if (
+      route.pluginId === "auto-sisr" &&
+      !state.autoSisir.loading &&
+      !state.autoSisir.snapshot &&
+      !state.autoSisir.error
+    ) {
+      void loadAutoSisirState();
+    }
+
+    if (
       route.pluginId === "processes" &&
       !state.processes.loading &&
       !state.processes.snapshot &&
       !state.processes.error
     ) {
       void loadProcessesState();
+    }
+
+    if (
+      route.pluginId === "app-start" &&
+      !state.appStart.loading &&
+      !state.appStart.snapshot &&
+      !state.appStart.error
+    ) {
+      void loadAppStartState();
+    }
+
+    if (
+      route.screen === "page" &&
+      route.pluginId === "app-start" &&
+      route.pageId === "add-app" &&
+      !state.appStart.catalogLoading &&
+      !state.appStart.catalog &&
+      !state.appStart.error
+    ) {
+      void loadAppStartCatalog();
     }
 
     if (
@@ -5104,6 +6458,22 @@
     }
 
     return getProcessesSnapshot()?.statusText || "Live app windows will appear here.";
+  }
+
+  function resolveAppStartStatusText() {
+    if (state.appStart.saving) {
+      return "Updating App Start shortcuts...";
+    }
+
+    if (state.appStart.catalogLoading) {
+      return "Scanning installed Start Menu apps...";
+    }
+
+    if (state.appStart.loading) {
+      return "Loading App Start shortcuts...";
+    }
+
+    return getAppStartSnapshot()?.statusText || "Add apps to launch them from Steam.";
   }
 
   function updateProcessesPolling() {

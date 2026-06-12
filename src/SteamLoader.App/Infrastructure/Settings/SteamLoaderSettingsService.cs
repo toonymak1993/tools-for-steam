@@ -11,7 +11,10 @@ public sealed class SteamLoaderSettingsService
     private static readonly SteamLoaderPluginDefinition[] PluginDefinitions =
     [
         new("processes", "Processes", "Window switcher for visible app windows.", true),
+        new("app-start", "App Start", "Controller launcher for selected Windows apps.", true),
         new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, and artwork updates.", true),
+        new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
+        new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),
         new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),
         new("hltb", "HLTB", "HowLongToBeat game page estimates.", true),
@@ -242,7 +245,7 @@ public sealed class SteamLoaderSettingsService
     {
         var normalized = PluginDefinitions.ToDictionary(
             plugin => plugin.Id,
-            plugin => true,
+            plugin => plugin.DefaultEnabled,
             StringComparer.OrdinalIgnoreCase);
 
         if (savedStates is null)
@@ -271,7 +274,8 @@ public sealed class SteamLoaderSettingsService
         string Id,
         string Title,
         string Description,
-        bool CanDisable);
+        bool CanDisable,
+        bool DefaultEnabled = true);
 
     private sealed record SteamLoaderSettingsData
     {

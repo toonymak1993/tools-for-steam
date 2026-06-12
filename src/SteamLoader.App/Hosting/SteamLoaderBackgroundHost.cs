@@ -1,4 +1,7 @@
 using SteamLoader.App.Infrastructure.Assets;
+using SteamLoader.App.Infrastructure.Artwork;
+using SteamLoader.App.Infrastructure.AutoSisir;
+using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
@@ -51,6 +54,9 @@ public sealed class SteamLoaderBackgroundHost
             new SteamGridDbArtworkDownloader(),
             shellService,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+        var artworkService = new SteamGridDbManualArtworkService(
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"),
+            new ArtworkSettingsStore(Path.Combine(dataDirectory, "artwork.json")));
         var themesService = new ThemesService(
             new ThemesSettingsStore(Path.Combine(dataDirectory, "themes.json")),
             "Assets/themes-catalog.json",
@@ -91,12 +97,23 @@ public sealed class SteamLoaderBackgroundHost
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"));
+            EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"));
+
+        var appStartService = new AppStartService(Path.Combine(dataDirectory, "app-start.json"));
+        var autoSisirService = new AutoSisirService(
+            new AutoSisirSettingsStore(Path.Combine(dataDirectory, "auto-sisr.json")),
+            storeSyncService,
+            Path.Combine(dataDirectory, "auto-sisr.log"),
+            () => steamLoaderSettingsService.IsPluginEnabled("auto-sisr"));
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
             displaySwitchService,
             processWindowService,
+            artworkService,
+            autoSisirService,
+            appStartService,
             hltbService,
             storeSyncService,
             themesService,
@@ -119,6 +136,8 @@ public sealed class SteamLoaderBackgroundHost
         await apiServer.StartAsync(cancellationToken);
         using var shellGuardCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var shellGuardTask = shellGuardService.RunAsync(shellGuardCts.Token);
+        using var autoSisirCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var autoSisirTask = autoSisirService.RunAsync(autoSisirCts.Token);
 
         try
         {
@@ -126,6 +145,19 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await autoSisirCts.CancelAsync();
+            try
+            {
+                await autoSisirTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                autoSisirService.Stop();
+            }
+
             await shellGuardCts.CancelAsync();
             try
             {

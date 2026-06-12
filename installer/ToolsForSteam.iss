@@ -1,6 +1,6 @@
 #define MyAppName "Tools for Steam"
 #define MyAppShortName "TFS"
-#define MyAppVersion "0.2.0-preview.1"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "GCM - Gaming Console Mode"
 #define MyAppExeName "ToolsForSteam.exe"
 #define MyAppId "{{9A9F0B7E-4C79-4C7D-8E4B-0E0D766E0B72}"
@@ -66,6 +66,8 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync --shell-bo
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM ToolsForSteam.exe /T /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseToolsForSteam"
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM SteamLoader.exe /T /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseLegacySteamLoader"
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM steam.exe /T /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseSteam"
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM steamwebhelper.exe /T /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseSteamWebHelper"
 
 [Code]
 procedure CloseProcess(ImageName: string);
@@ -79,5 +81,7 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   CloseProcess('ToolsForSteam.exe');
   CloseProcess('SteamLoader.exe');
+  CloseProcess('steam.exe');
+  CloseProcess('steamwebhelper.exe');
   Result := '';
 end;

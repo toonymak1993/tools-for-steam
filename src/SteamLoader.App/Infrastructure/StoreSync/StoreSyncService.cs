@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Xml.Linq;
 using Microsoft.Win32;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
@@ -148,6 +149,45 @@ public sealed class StoreSyncService
         lock (_gate)
         {
             return BuildSnapshot(_settingsStore.Load());
+        }
+    }
+
+    public IReadOnlyList<StoreSyncDetectedTitleState> GetDetectedTitlesByStore(string storeId)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            var definition = StoreDefinitions.FirstOrDefault(item =>
+                string.Equals(item.Id, storeId, StringComparison.OrdinalIgnoreCase));
+            if (definition is null)
+            {
+                return [];
+            }
+
+            var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
+            if (!storeConfiguration.Enabled)
+            {
+                return [];
+            }
+
+            return ScanStore(definition, storeConfiguration)
+                .Games
+                .Select(game => ToDetectedTitleState(definition, game))
+                .ToArray();
+        }
+    }
+
+    public IReadOnlyList<StoreSyncDetectedTitleState> GetDetectedTitles()
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            return BuildStoreSnapshots(configuration)
+                .Where(snapshot => snapshot.Configuration.Enabled)
+                .SelectMany(snapshot => snapshot.Scan.Games.Select(game => ToDetectedTitleState(snapshot.Definition, game)))
+                .OrderBy(title => title.StoreTitle, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(title => title.Title, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
         }
     }
 
@@ -330,7 +370,11 @@ public sealed class StoreSyncService
                 snapshot.Scan.StatusText,
                 snapshot.Scan.DetailText,
                 snapshot.Configuration.ScanPath,
-                snapshot.Scan.Games.Count)).ToList(),
+                snapshot.Scan.Games.Count,
+                snapshot.Scan.Games
+                    .Select(game => ToDetectedTitleState(snapshot.Definition, game))
+                    .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
+                    .ToArray())).ToList(),
             configuration.LastSync);
     }
 
@@ -344,6 +388,18 @@ public sealed class StoreSyncService
                 return new StoreSnapshot(definition, storeConfiguration, scan);
             })
             .ToList();
+    }
+
+    private static StoreSyncDetectedTitleState ToDetectedTitleState(StoreDefinition definition, StoreGameEntry game)
+    {
+        return new StoreSyncDetectedTitleState(
+            CreateDetectedTitleId(game),
+            game.StoreId,
+            definition.Title,
+            game.Title,
+            game.ExecutablePath,
+            game.StartDirectory,
+            game.LaunchOptions);
     }
 
     private StoreScanResult ScanStore(StoreDefinition definition, StoreSyncStoreConfiguration configuration)
@@ -373,6 +429,7 @@ public sealed class StoreSyncService
 
         try
         {
+            var manifestEntries = LoadEpicManifestEntries();
             using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
             if (!document.RootElement.TryGetProperty("InstallationList", out var installationList) ||
                 installationList.ValueKind != JsonValueKind.Array)
@@ -385,21 +442,32 @@ public sealed class StoreSyncService
             foreach (var item in installationList.EnumerateArray())
             {
                 var installLocation = GetJsonString(item, "InstallLocation");
-                var title = GetJsonString(item, "DisplayName");
-                if (string.IsNullOrWhiteSpace(title))
-                {
-                    title = GetJsonString(item, "AppName");
-                }
+                var manifest = FindEpicManifest(item, installLocation, manifestEntries);
+                installLocation = FirstNonEmpty(installLocation, manifest?.InstallLocation);
 
-                var launchExecutable = GetJsonString(item, "LaunchExecutable");
+                var title = FirstNonEmpty(
+                    GetJsonString(item, "DisplayName"),
+                    manifest?.DisplayName,
+                    manifest?.VaultTitleText,
+                    manifest?.MandatoryAppFolderName,
+                    Path.GetFileName(installLocation ?? string.Empty),
+                    GetJsonString(item, "AppName"),
+                    manifest?.AppName);
+
+                var launchExecutable = FirstNonEmpty(GetJsonString(item, "LaunchExecutable"), manifest?.LaunchExecutable);
                 var executablePath = ResolveExecutablePath(installLocation ?? string.Empty, launchExecutable);
                 if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(executablePath))
                 {
                     continue;
                 }
 
-                var launchOptions = GetJsonString(item, "LaunchCommand") ?? string.Empty;
-                games.Add(new StoreGameEntry("epic-games", title, executablePath, Path.GetDirectoryName(executablePath) ?? installLocation ?? string.Empty, launchOptions));
+                var launchOptions = FirstNonEmpty(GetJsonString(item, "LaunchCommand"), manifest?.LaunchCommand) ?? string.Empty;
+                games.Add(new StoreGameEntry(
+                    "epic-games",
+                    PrettifyTitle(title),
+                    executablePath,
+                    Path.GetDirectoryName(executablePath) ?? installLocation ?? string.Empty,
+                    launchOptions));
             }
 
             return new StoreScanResult(
@@ -486,14 +554,7 @@ public sealed class StoreSyncService
     {
         try
         {
-            var libraryRoots = DriveInfo.GetDrives()
-                .Where(drive => drive.IsReady && drive.DriveType == DriveType.Fixed)
-                .SelectMany(drive => new[]
-                {
-                    Path.Combine(drive.RootDirectory.FullName, "XboxGames"),
-                    Path.Combine(drive.RootDirectory.FullName, "ModifiableWindowsApps"),
-                })
-                .Where(Directory.Exists)
+            var libraryRoots = GetXboxCandidateRoots()
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
@@ -503,19 +564,31 @@ public sealed class StoreSyncService
             }
 
             var games = new List<StoreGameEntry>();
+            var seenExecutables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var libraryRoot in libraryRoots)
             {
                 foreach (var folder in Directory.GetDirectories(libraryRoot))
                 {
+                    if (ShouldSkipCustomCandidateDirectory(folder))
+                    {
+                        continue;
+                    }
+
+                    if (TryCreateXboxGameFromConfig(folder, seenExecutables, out var configuredGame))
+                    {
+                        games.Add(configuredGame);
+                        continue;
+                    }
+
                     var executablePath = FindBestExecutable(folder);
-                    if (string.IsNullOrWhiteSpace(executablePath))
+                    if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
                     {
                         continue;
                     }
 
                     games.Add(new StoreGameEntry(
                         "xbox-game-pass",
-                        Path.GetFileName(folder),
+                        PrettifyTitle(Path.GetFileName(folder)),
                         executablePath,
                         Path.GetDirectoryName(executablePath) ?? folder,
                         string.Empty));
@@ -533,6 +606,115 @@ public sealed class StoreSyncService
         catch (Exception exception)
         {
             return new StoreScanResult(false, "Error", exception.Message, []);
+        }
+    }
+
+    private static IEnumerable<string> GetXboxCandidateRoots()
+    {
+        foreach (var drive in DriveInfo.GetDrives().Where(drive => drive.IsReady && drive.DriveType == DriveType.Fixed))
+        {
+            var root = drive.RootDirectory.FullName;
+            foreach (var candidate in new[]
+            {
+                Path.Combine(root, "XboxGames"),
+                Path.Combine(root, "ModifiableWindowsApps"),
+                Path.Combine(root, "Program Files", "ModifiableWindowsApps")
+            })
+            {
+                if (Directory.Exists(candidate))
+                {
+                    yield return candidate;
+                }
+            }
+        }
+    }
+
+    private static bool TryCreateXboxGameFromConfig(
+        string candidateRoot,
+        HashSet<string> seenExecutables,
+        out StoreGameEntry game)
+    {
+        game = default!;
+
+        var configPath = FindXboxConfig(candidateRoot);
+        if (string.IsNullOrWhiteSpace(configPath) || !File.Exists(configPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var document = XDocument.Load(configPath, LoadOptions.None);
+            var gameElement = document.Root;
+            if (gameElement is null)
+            {
+                return false;
+            }
+
+            var configDirectory = Path.GetDirectoryName(configPath) ?? candidateRoot;
+            var executableElement = gameElement
+                .Descendants("Executable")
+                .Where(element =>
+                    !string.Equals((string?)element.Attribute("IsDevOnly"), "true", StringComparison.OrdinalIgnoreCase)
+                    && (string.IsNullOrWhiteSpace((string?)element.Attribute("TargetDeviceFamily"))
+                        || string.Equals((string?)element.Attribute("TargetDeviceFamily"), "PC", StringComparison.OrdinalIgnoreCase)))
+                .FirstOrDefault();
+
+            var executableName = executableElement?.Attribute("Name")?.Value;
+            if (string.IsNullOrWhiteSpace(executableName))
+            {
+                return false;
+            }
+
+            var executablePath = ResolveExecutablePath(configDirectory, executableName);
+            if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
+            {
+                return false;
+            }
+
+            var shellVisuals = gameElement.Element("ShellVisuals");
+            var title = FirstNonEmpty(
+                executableElement?.Attribute("OverrideDisplayName")?.Value,
+                shellVisuals?.Attribute("DefaultDisplayName")?.Value,
+                shellVisuals?.Attribute("Description")?.Value,
+                Path.GetFileName(candidateRoot))!;
+
+            game = new StoreGameEntry(
+                "xbox-game-pass",
+                PrettifyTitle(title),
+                executablePath,
+                Path.GetDirectoryName(executablePath) ?? candidateRoot,
+                string.Empty);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? FindXboxConfig(string candidateRoot)
+    {
+        foreach (var configPath in new[]
+        {
+            Path.Combine(candidateRoot, "MicrosoftGame.Config"),
+            Path.Combine(candidateRoot, "Content", "MicrosoftGame.Config")
+        })
+        {
+            if (File.Exists(configPath))
+            {
+                return configPath;
+            }
+        }
+
+        try
+        {
+            return Directory.EnumerateFiles(candidateRoot, "MicrosoftGame.Config", SearchOption.AllDirectories)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -706,7 +888,10 @@ public sealed class StoreSyncService
                 artworkSummary = await _artworkDownloader.DownloadAsync(
                     gridDirectory,
                     managedEntries
-                        .Select(entry => new StoreSyncArtworkTarget(entry.Game.Title, entry.AppId))
+                        .Select(entry => new StoreSyncArtworkTarget(
+                            entry.Game.Title,
+                            entry.AppId,
+                            new[] { entry.Game.ExecutablePath, entry.Game.StartDirectory }))
                         .ToList(),
                     apiKey,
                     configuration.PreferAnimatedArtwork,
@@ -901,6 +1086,94 @@ public sealed class StoreSyncService
         return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString()
             : null;
+    }
+
+    private static IReadOnlyList<EpicManifestEntry> LoadEpicManifestEntries()
+    {
+        var manifestRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "Epic",
+            "EpicGamesLauncher",
+            "Data",
+            "Manifests");
+
+        if (!Directory.Exists(manifestRoot))
+        {
+            return [];
+        }
+
+        var entries = new List<EpicManifestEntry>();
+        foreach (var manifestPath in Directory.EnumerateFiles(manifestRoot, "*.item"))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+                var root = document.RootElement;
+                entries.Add(new EpicManifestEntry(
+                    AppName: GetJsonString(root, "AppName"),
+                    MainGameAppName: GetJsonString(root, "MainGameAppName"),
+                    CatalogNamespace: GetJsonString(root, "CatalogNamespace"),
+                    CatalogItemId: GetJsonString(root, "CatalogItemId"),
+                    InstallLocation: GetJsonString(root, "InstallLocation"),
+                    DisplayName: GetJsonString(root, "DisplayName"),
+                    VaultTitleText: GetJsonString(root, "VaultTitleText"),
+                    MandatoryAppFolderName: GetJsonString(root, "MandatoryAppFolderName"),
+                    LaunchExecutable: GetJsonString(root, "LaunchExecutable"),
+                    LaunchCommand: GetJsonString(root, "LaunchCommand")));
+            }
+            catch
+            {
+                // One broken Epic manifest should not hide the rest of the library.
+            }
+        }
+
+        return entries;
+    }
+
+    private static EpicManifestEntry? FindEpicManifest(
+        JsonElement launcherEntry,
+        string? installLocation,
+        IReadOnlyList<EpicManifestEntry> manifests)
+    {
+        if (manifests.Count == 0)
+        {
+            return null;
+        }
+
+        var normalizedInstallLocation = NormalizePath(installLocation);
+        if (!string.IsNullOrWhiteSpace(normalizedInstallLocation))
+        {
+            var installMatch = manifests.FirstOrDefault(manifest =>
+                string.Equals(NormalizePath(manifest.InstallLocation), normalizedInstallLocation, StringComparison.OrdinalIgnoreCase));
+            if (installMatch is not null)
+            {
+                return installMatch;
+            }
+        }
+
+        var appName = GetJsonString(launcherEntry, "AppName");
+        var artifactId = GetJsonString(launcherEntry, "ArtifactId");
+        var namespaceId = GetJsonString(launcherEntry, "NamespaceId");
+        var itemId = GetJsonString(launcherEntry, "ItemId");
+
+        return manifests.FirstOrDefault(manifest =>
+            StringsEqual(manifest.AppName, appName)
+            || StringsEqual(manifest.MainGameAppName, appName)
+            || StringsEqual(manifest.AppName, artifactId)
+            || StringsEqual(manifest.MainGameAppName, artifactId)
+            || (StringsEqual(manifest.CatalogNamespace, namespaceId) && StringsEqual(manifest.CatalogItemId, itemId)));
+    }
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
+    }
+
+    private static bool StringsEqual(string? left, string? right)
+    {
+        return !string.IsNullOrWhiteSpace(left)
+            && !string.IsNullOrWhiteSpace(right)
+            && string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ResolveExecutablePath(string installPath, string? executableHint)
@@ -1295,13 +1568,20 @@ public sealed class StoreSyncService
 
     private static string PrettifyTitle(string value)
     {
-        var cleaned = value.Replace('_', ' ').Replace('-', ' ').Trim();
+        var cleaned = value.Replace('_', ' ').Replace('-', ' ').Replace('.', ' ').Trim();
+        cleaned = Regex.Replace(cleaned, "(?<=[a-z0-9])(?=[A-Z])", " ");
+        cleaned = Regex.Replace(cleaned, "\\s+", " ").Trim();
         return string.IsNullOrWhiteSpace(cleaned) ? value : cleaned;
     }
 
     private static string NormalizeKey(string value)
     {
         return value.Trim().ToLowerInvariant();
+    }
+
+    private static string CreateDetectedTitleId(StoreGameEntry game)
+    {
+        return $"{game.StoreId}-{SteamShortcutIds.ComputeAppId(game.Title, game.ExecutablePath):x8}";
     }
 
     private static ManagedShortcutEntry CreateShortcutEntry(StoreGameEntry game)
@@ -1423,6 +1703,18 @@ public sealed class StoreSyncService
         string ExecutablePath,
         string StartDirectory,
         string LaunchOptions);
+
+    private sealed record EpicManifestEntry(
+        string? AppName,
+        string? MainGameAppName,
+        string? CatalogNamespace,
+        string? CatalogItemId,
+        string? InstallLocation,
+        string? DisplayName,
+        string? VaultTitleText,
+        string? MandatoryAppFolderName,
+        string? LaunchExecutable,
+        string? LaunchCommand);
 
     private readonly record struct ExecutableCandidate(string Path, int Score);
 

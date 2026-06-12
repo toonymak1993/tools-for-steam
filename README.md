@@ -1,6 +1,6 @@
 # Tools for Steam
 
-Tools for Steam (TFS) brings a SteamOS-style console experience to Windows PCs that are used mainly with Steam Big Picture. It adds a native-feeling Tools for Steam tab to Steam's Quick Access side panel and ships with built-in tools for audio, display control, launcher sync, themes, HLTB, window switching, and recovery actions.
+Tools for Steam (TFS) brings a SteamOS-style console experience to Windows PCs that are used mainly with Steam Big Picture. It adds a native-feeling Tools for Steam tab to Steam's Quick Access side panel and ships with built-in tools for audio, app launching, display control, launcher sync, themes, HLTB, window switching, and recovery actions.
 
 This release is part of **GCM - Gaming Console Mode**. The goal is simple: when a living-room PC boots, the first thing you should see is Steam Big Picture, not the Windows desktop.
 
@@ -28,6 +28,7 @@ This shell behavior is intentional and can be disabled again from `Tools for Ste
 
 - `Settings`: Global TFS startup behavior, desktop manager access, and plugin enable/disable controls.
 - `Processes`: See visible app windows and bring one to the foreground from the controller.
+- `App Start`: Add installed Windows apps from the Start Menu and launch them later from the controller.
 - `Store Sync`: Import supported launcher games and custom folders into Steam as non-Steam games, with SteamGridDB artwork support.
 - `Audio`: Switch Windows output devices and adjust system volume from Big Picture.
 - `Display`: Switch internal/external display output and choose supported resolution or refresh-rate presets.

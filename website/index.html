@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>Tools for Steam | Quick Access Toolkit for Steam Big Picture</title>
+  <meta
+    name="description"
+    content="Tools for Steam, or TFS, is a Windows utility for Steam Big Picture that brings audio switching, process handoff, theme controls, store sync, and recovery actions into Quick Access."
+  >
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css?v=20260605e">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Tools for Steam home">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+        </span>
+        <span class="brand-copy">
+          <strong>Tools for Steam</strong>
+          <small>TFS preview project</small>
+        </span>
+      </a>
+
+      <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Toggle navigation">
+        <span></span>
+        <span></span>
+      </button>
+
+      <nav id="site-nav" class="site-nav" aria-label="Primary navigation">
+        <a href="#overview">Overview</a>
+        <a href="#modules">Modules</a>
+        <a href="#workflow">Flow</a>
+        <a href="#download">Download</a>
+      </nav>
+
+      <div class="header-actions">
+        <a
+          class="github-link"
+          href="https://github.com/"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub placeholder link"
+          title="GitHub placeholder link"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.2c3.26-.36 6.68-1.6 6.68-7.12a5.56 5.56 0 0 0-1.5-3.84 5.2 5.2 0 0 0-.09-3.77s-1.18-.36-3.86 1.5a13.38 13.38 0 0 0-7 0c-2.68-1.86-3.86-1.5-3.86-1.5a5.2 5.2 0 0 0-.09 3.77 5.56 5.56 0 0 0-1.5 3.84c0 5.52 3.42 6.76 6.68 7.12A4.8 4.8 0 0 0 9 18v4" />
+            <path d="M9 18c-4.51 2-5-2-7-2" />
+          </svg>
+        </a>
+        <a class="button button-ghost header-cta" href="../dist/SteamTools-portable-win-x64.zip">
+          Download for Windows
+        </a>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero reveal">
+        <div class="hero-copy">
+          <p class="eyebrow">Unofficial Windows utility for Steam Big Picture</p>
+          <h1>Add practical Windows controls to Steam Quick Access.</h1>
+          <p class="hero-text">
+            Tools for Steam, or <strong>TFS</strong>, keeps the surface close to Steam's own Big Picture rhythm while exposing the actions
+            that are usually annoying to reach from a couch setup: audio switching, process handoff, display
+            routing, theme controls, store sync, and recovery actions.
+          </p>
+
+          <div class="hero-actions">
+            <a class="button button-primary" href="../dist/SteamTools-portable-win-x64.zip">Download Windows preview</a>
+            <a class="button button-secondary" href="#modules">Browse modules</a>
+          </div>
+
+          <div class="hero-notes">
+            <div>
+              <span class="note-label">Status</span>
+              <strong>Active preview</strong>
+            </div>
+            <div>
+              <span class="note-label">Platform</span>
+              <strong>Windows + Steam Big Picture</strong>
+            </div>
+            <div>
+              <span class="note-label">Design goal</span>
+              <strong>Controller-first utility UI</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="hero-visual">
+          <div class="control-surface">
+            <div class="surface-topline">
+              <span class="surface-meta">Quick Access surface preview</span>
+              <span class="status-pill">Preview build</span>
+            </div>
+
+            <div class="surface-grid">
+              <article class="qam-panel">
+                <div class="panel-header">
+                  <div>
+                    <p class="panel-label">Quick Access screenshot</p>
+                    <h2>TFS</h2>
+                  </div>
+                </div>
+
+                <div class="hero-shot-frame" aria-hidden="true">
+                  <div class="hero-shot-topbar">
+                    <span class="hero-shot-search"></span>
+                    <div class="hero-shot-status">
+                      <span class="hero-shot-controller"></span>
+                      <span class="hero-shot-battery"></span>
+                      <span class="hero-shot-signal"></span>
+                    </div>
+                    <span class="hero-shot-time">16:27</span>
+                  </div>
+
+                  <div class="hero-shot-body">
+                    <div class="hero-shot-sidebar">
+                      <span></span>
+                      <span></span>
+                      <span></span>
+                      <span class="is-active"></span>
+                      <span></span>
+                    </div>
+
+                    <div class="hero-shot-content">
+                      <div class="hero-shot-title">TFS</div>
+
+                      <div class="hero-shot-card">
+                        <strong>Settings</strong>
+                        <small>Startup behavior and global settings</small>
+                      </div>
+                      <div class="hero-shot-card">
+                        <strong>Store Sync</strong>
+                        <small>Bring other PC launchers into Steam</small>
+                      </div>
+                      <div class="hero-shot-card">
+                        <strong>Audio</strong>
+                        <small>Output devices and audio tools</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="detail-panel" id="hero-detail-panel">
+                <div class="detail-stage" id="detail-stage">
+                  <div class="surface-route" id="detail-route">Quick Access &gt; Audio</div>
+
+                  <div class="audio-widget detail-widget" id="detail-widget">
+                    <p id="detail-label">Default output</p>
+                    <strong id="detail-title">Living Room Speakers</strong>
+                    <div class="detail-visual detail-visual-audio" id="detail-visual" aria-hidden="true">
+                      <div class="level-meter">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="micro-cards">
+                    <div class="micro-card">
+                      <span id="detail-meta1-label">Visible windows</span>
+                      <strong id="detail-meta1-value">7 ready</strong>
+                    </div>
+                    <div class="micro-card">
+                      <span id="detail-meta2-label">Theme profile</span>
+                      <strong id="detail-meta2-value">Clean Gameview</strong>
+                    </div>
+                    <div class="micro-card">
+                      <span id="detail-meta3-label">Store Sync</span>
+                      <strong id="detail-meta3-value">Idle</strong>
+                    </div>
+                  </div>
+
+                </div>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="overview" class="value-grid reveal">
+        <article class="value-card">
+          <p class="value-kicker">01</p>
+          <h3>Fits the way Big Picture already works</h3>
+          <p>Tools for Steam is meant to feel adjacent to Steam's own side panels, not like a separate overlay ecosystem.</p>
+        </article>
+        <article class="value-card">
+          <p class="value-kicker">02</p>
+          <h3>Built for couch PCs and docked setups</h3>
+          <p>It focuses on the chores that matter in living room use: devices, windows, display output, and clean recovery paths.</p>
+        </article>
+        <article class="value-card">
+          <p class="value-kicker">03</p>
+          <h3>Utility first, plugin store second</h3>
+          <p>Instead of chasing a generic marketplace, the project ships with a curated set of built-in modules.</p>
+        </article>
+      </section>
+
+      <section id="modules" class="modules reveal">
+        <div class="section-heading">
+          <p class="eyebrow">Built-in modules</p>
+          <h2>A focused toolset for the things Steam does not handle well on its own.</h2>
+          <p>Each module solves a specific PC-to-couch problem without pushing the project into a noisy, over-designed plugin portal.</p>
+        </div>
+
+        <div class="modules-layout">
+          <div class="module-selector" role="tablist" aria-label="Tools for Steam modules">
+            <button class="module-tab is-selected" type="button" data-tool="audio" aria-pressed="true">Audio</button>
+            <button class="module-tab" type="button" data-tool="processes" aria-pressed="false">Processes</button>
+            <button class="module-tab" type="button" data-tool="store-sync" aria-pressed="false">Store Sync</button>
+            <button class="module-tab" type="button" data-tool="themes" aria-pressed="false">Themes</button>
+            <button class="module-tab" type="button" data-tool="display" aria-pressed="false">Display</button>
+            <button class="module-tab" type="button" data-tool="performance" aria-pressed="false">Performance</button>
+            <button class="module-tab" type="button" data-tool="hltb" aria-pressed="false">HLTB</button>
+            <button class="module-tab" type="button" data-tool="power" aria-pressed="false">Power</button>
+            <button class="module-tab" type="button" data-tool="settings" aria-pressed="false">Settings</button>
+          </div>
+
+          <article class="module-panel">
+            <div class="module-panel-top">
+              <p id="module-tag" class="panel-label">Audio controls</p>
+              <span id="module-badge" class="module-badge">Controller ready</span>
+            </div>
+            <h3 id="module-title">Audio</h3>
+            <p id="module-description" class="module-description">
+              Switch the Windows default output device and handle system volume from within Steam.
+            </p>
+            <ul id="module-points" class="module-points">
+              <li>Change default audio output without leaving Big Picture</li>
+              <li>Use fast controller-friendly volume actions</li>
+              <li>Useful for TV, headset, and docked living room setups</li>
+            </ul>
+            <div id="module-footnote" class="module-footnote">Useful whenever one Steam session needs to jump between multiple audio routes.</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="workflow" class="workflow reveal">
+        <div class="section-heading">
+          <p class="eyebrow">Launch flow</p>
+          <h2>From power-on to attached Big Picture in one readable sequence.</h2>
+          <p>The idea is simple: the PC starts, TFS comes up first, the Windows background host is ready, and Big Picture opens with Tools for Steam already attached.</p>
+        </div>
+
+        <div class="flow-rail">
+          <div class="flow-line" aria-hidden="true"></div>
+
+          <article class="flow-step-card">
+            <div class="flow-step-head">
+              <span class="flow-index">01</span>
+              <span class="flow-state">Boot</span>
+            </div>
+            <h3>PC starts</h3>
+            <p>The living room PC boots and hands control over to the startup chain.</p>
+            <div class="flow-screen flow-screen-boot" aria-hidden="true">
+              <div class="flow-screen-glyph power-glyph"></div>
+            </div>
+            <div class="flow-note">Replace this panel later with your startup screenshot.</div>
+          </article>
+
+          <article class="flow-step-card">
+            <div class="flow-step-head">
+              <span class="flow-index">02</span>
+              <span class="flow-state">Launch</span>
+            </div>
+            <h3>TFS launches first</h3>
+            <p>The tray app starts early, keeping the setup logic ready before Big Picture takes over the screen.</p>
+            <div class="flow-screen flow-screen-tools" aria-hidden="true">
+              <div class="flow-mini-card">
+                <strong>TFS</strong>
+                <small>Tray app ready</small>
+              </div>
+            </div>
+            <div class="flow-note">Good place for a tray or startup-state capture later.</div>
+          </article>
+
+          <article class="flow-step-card">
+            <div class="flow-step-head">
+              <span class="flow-index">03</span>
+              <span class="flow-state">Host</span>
+            </div>
+            <h3>Windows background host comes online</h3>
+            <p>The local background layer exposes the bridge and keeps the utility responsive behind the main Steam surface.</p>
+            <div class="flow-screen flow-screen-host" aria-hidden="true">
+              <div class="host-lines">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+            </div>
+            <div class="flow-note">This panel can later show the host or local API state.</div>
+          </article>
+
+          <article class="flow-step-card">
+            <div class="flow-step-head">
+              <span class="flow-index">04</span>
+              <span class="flow-state">Cleanup</span>
+            </div>
+            <h3>Desktop icons and taskbar are hidden</h3>
+            <p>Before the final handoff, TFS clears the regular Windows desktop so Big Picture becomes the only visible front layer.</p>
+            <div class="flow-screen flow-screen-cleanup" aria-hidden="true">
+              <div class="cleanup-desktop">
+                <div class="cleanup-icons">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
+                <div class="cleanup-fade"></div>
+                <div class="cleanup-taskbar"></div>
+              </div>
+            </div>
+            <div class="flow-note">The desktop and taskbar stay hidden until Big Picture is closed again.</div>
+          </article>
+
+          <article class="flow-step-card">
+            <div class="flow-step-head">
+              <span class="flow-index">05</span>
+              <span class="flow-state">Attach</span>
+            </div>
+            <h3>Big Picture opens with TFS attached</h3>
+            <p>By the time Steam fills the TV, Quick Access already has the Tools for Steam bridge sitting in place.</p>
+            <div class="flow-screen flow-screen-bigpicture" aria-hidden="true">
+              <div class="bigpicture-shell">
+                <div class="bigpicture-side"></div>
+                <div class="bigpicture-main">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
+              </div>
+            </div>
+            <div class="flow-note">Best future slot for the final attached Big Picture screenshot.</div>
+          </article>
+        </div>
+
+      </section>
+
+      <section id="download" class="download reveal">
+        <div class="download-card">
+          <div class="download-layout">
+            <article class="download-column">
+              <p class="eyebrow">Local preview</p>
+              <h2>One place to download, one place to keep polishing.</h2>
+              <p>
+                This site is intentionally kept static so you can keep refining copy, structure, and art direction
+                before choosing a host. It works as a local preview now and can move to a static host later.
+              </p>
+
+              <div class="download-actions">
+                <a class="button button-primary" href="../dist/SteamTools-portable-win-x64.zip">Download Windows preview</a>
+                <a class="button button-secondary" href="./README.md">View local notes</a>
+              </div>
+
+              <div class="download-meta">
+                <div>
+                  <span class="note-label">Website path</span>
+                  <strong><code>website/index.html</code></strong>
+                </div>
+                <div>
+                  <span class="note-label">Preview build</span>
+                  <strong><code>dist/SteamTools-portable-win-x64.zip</code></strong>
+                </div>
+                <div>
+                  <span class="note-label">Branding direction</span>
+                  <strong>Tools for Steam as the public name</strong>
+                </div>
+              </div>
+            </article>
+
+            <aside class="patreon-card">
+              <div class="patreon-topline">
+                <span class="note-label">Support development</span>
+                <span class="patreon-badge">Patreon</span>
+              </div>
+              <h3>Back TFS on Patreon</h3>
+              <p>
+                Placeholder support block for future monetization. The idea is simple: supporters help fund development,
+                testing hardware, and faster iteration on the living room experience.
+              </p>
+
+              <ul class="patreon-benefits">
+                <li>Early preview builds before public ZIP releases</li>
+                <li>Monthly dev logs and behind-the-scenes progress updates</li>
+                <li>Voting on upcoming modules, themes, and quality-of-life features</li>
+                <li>Patreon supporter credits on the website or inside the app later</li>
+              </ul>
+
+              <div class="patreon-actions">
+                <a class="button button-primary patreon-button" href="https://patreon.com/toolsforsteam" target="_blank" rel="noreferrer">Open Patreon placeholder</a>
+              </div>
+
+              <div class="patreon-footnote">
+                Replace the link, tier names, and reward copy once the real Patreon page exists.
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="site-footer">
+      <p>Tools for Steam is an unofficial preview project focused on controller-friendly utility workflows for Steam Big Picture on Windows.</p>
+      <p id="footer-year"></p>
+    </footer>
+  </div>
+
+  <script src="./app.js?v=20260605e"></script>
+</body>
+</html>

@@ -9,4 +9,5 @@ public sealed record StoreSyncStoreState(
     string StatusText,
     string DetailText,
     string PathValue,
-    int DetectedTitleCount);
+    int DetectedTitleCount,
+    IReadOnlyList<StoreSyncDetectedTitleState> DetectedTitles);

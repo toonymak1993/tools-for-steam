@@ -1,6 +1,9 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using SteamLoader.App.Infrastructure.Artwork;
+using SteamLoader.App.Infrastructure.AppStart;
+using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
@@ -21,6 +24,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly IAudioOutputDeviceService _audioOutputDeviceService;
     private readonly DisplaySwitchService _displaySwitchService;
     private readonly ProcessWindowService _processWindowService;
+    private readonly SteamGridDbManualArtworkService _artworkService;
+    private readonly AutoSisirService _autoSisirService;
+    private readonly AppStartService _appStartService;
     private readonly HltbService _hltbService;
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
@@ -30,12 +36,20 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly SteamLoaderHostState _hostState;
     private readonly HttpListener _listener;
     private readonly Action _requestShutdown;
+    private readonly object _artworkOpenRequestLock = new();
+    private ArtworkOpenRequest? _latestArtworkOpenRequest;
+    private DateTimeOffset _latestArtworkOpenRequestAt = DateTimeOffset.MinValue;
+    private string _latestArtworkOpenRequestKey = string.Empty;
+    private long _artworkOpenRequestNonce;
     private Task? _acceptLoopTask;
 
     public SteamLoaderApiServer(
         IAudioOutputDeviceService audioOutputDeviceService,
         DisplaySwitchService displaySwitchService,
         ProcessWindowService processWindowService,
+        SteamGridDbManualArtworkService artworkService,
+        AutoSisirService autoSisirService,
+        AppStartService appStartService,
         HltbService hltbService,
         StoreSyncService storeSyncService,
         ThemesService themesService,
@@ -49,6 +63,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _audioOutputDeviceService = audioOutputDeviceService;
         _displaySwitchService = displaySwitchService;
         _processWindowService = processWindowService;
+        _artworkService = artworkService;
+        _autoSisirService = autoSisirService;
+        _appStartService = appStartService;
         _hltbService = hltbService;
         _storeSyncService = storeSyncService;
         _themesService = themesService;
@@ -177,6 +194,253 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     request.Url?.AbsolutePath,
                     pluginId,
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/toggle")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<ToggleSettingRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Key))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A setting key is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.ToggleSetting(payload.Key),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/api-key")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An API key value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.SetApiKey(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/api-key/clear")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.ClearApiKey(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/result-limit")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A result limit is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.SetResultLimit(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/open-request")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<RequestArtworkOpenRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                var normalizedAppId = payload is null ? 0 : NormalizeSteamAppId(payload.AppId);
+                if (payload is null || normalizedAppId <= 0)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Steam app id is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!_artworkService.IsContextMenuEnabled())
+                {
+                    await WriteJsonAsync(response, HttpStatusCode.OK, new ArtworkOpenRequest(0, 0, string.Empty), cancellationToken);
+                    return;
+                }
+
+                var title = string.IsNullOrWhiteSpace(payload.Title) ? "Selected Game" : payload.Title.Trim();
+                var requestKey = $"{normalizedAppId}:{title.ToLowerInvariant()}";
+                var now = DateTimeOffset.UtcNow;
+                ArtworkOpenRequest openRequest;
+
+                lock (_artworkOpenRequestLock)
+                {
+                    if (
+                        _latestArtworkOpenRequest is not null &&
+                        string.Equals(_latestArtworkOpenRequestKey, requestKey, StringComparison.Ordinal) &&
+                        now - _latestArtworkOpenRequestAt < TimeSpan.FromMilliseconds(1600))
+                    {
+                        openRequest = _latestArtworkOpenRequest;
+                    }
+                    else
+                    {
+                        openRequest = new ArtworkOpenRequest(
+                            Interlocked.Increment(ref _artworkOpenRequestNonce),
+                            normalizedAppId,
+                            title);
+
+                        _latestArtworkOpenRequest = openRequest;
+                        _latestArtworkOpenRequestKey = requestKey;
+                        _latestArtworkOpenRequestAt = now;
+                    }
+                }
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, openRequest, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/open-request")
+            {
+                _ = long.TryParse(request.QueryString["after"], out var afterNonce);
+                var openRequest = _latestArtworkOpenRequest;
+                var requestIsFresh = DateTimeOffset.UtcNow - _latestArtworkOpenRequestAt < TimeSpan.FromSeconds(8);
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    requestIsFresh && openRequest is not null && openRequest.Nonce > afterNonce
+                        ? openRequest
+                        : new ArtworkOpenRequest(0, 0, string.Empty),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/search")
+            {
+                var term = request.QueryString["term"] ?? string.Empty;
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _artworkService.SearchGamesAsync(term, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/assets")
+            {
+                var gameIdValue = request.QueryString["gameId"];
+                var assetType = request.QueryString["type"] ?? "grid_p";
+                var pageValue = request.QueryString["page"];
+                _ = int.TryParse(pageValue, out var page);
+
+                if (!int.TryParse(gameIdValue, out var gameId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid SteamGridDB game id is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _artworkService.SearchAssetsAsync(gameId, assetType, page, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/apply")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<ApplyArtworkRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                var normalizedAppId = payload is null ? 0 : NormalizeSteamAppId(payload.AppId);
+                if (payload is null ||
+                    normalizedAppId <= 0 ||
+                    string.IsNullOrWhiteSpace(payload.AssetType) ||
+                    string.IsNullOrWhiteSpace(payload.Url))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Steam app id, artwork type, and URL are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var result = await _artworkService.ApplyAssetAsync(
+                    normalizedAppId,
+                    payload.AssetType,
+                    payload.Url,
+                    cancellationToken);
+
+                await WriteJsonAsync(
+                    response,
+                    result.Success ? HttpStatusCode.OK : HttpStatusCode.BadRequest,
+                    result,
                     cancellationToken);
                 return;
             }
@@ -413,6 +677,106 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/auto-sisr/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _autoSisirService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/auto-sisr/settings/toggle")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A setting key is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _autoSisirService.ToggleSetting(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/auto-sisr/path")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A path value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _autoSisirService.SetExecutablePath(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/auto-sisr/path/reset")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _autoSisirService.ResetExecutablePath(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/auto-sisr/titles/toggle")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A title id is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _autoSisirService.ToggleWatchedTitle(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/display/internal")
             {
@@ -531,6 +895,106 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _processWindowService.ActivateWindow(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/catalog")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.GetCatalog(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/apps/add")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An app ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.AddShortcut(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/apps/launch")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An app shortcut ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.LaunchShortcut(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/apps/remove")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An app shortcut ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.RemoveShortcut(payload.Value),
                     cancellationToken);
                 return;
             }
@@ -1266,6 +1730,13 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             cancellationToken);
     }
 
+    private static long NormalizeSteamAppId(long appId)
+    {
+        return appId < 0
+            ? unchecked((uint)appId)
+            : appId;
+    }
+
     private static bool TryResolvePluginId(string? path, out string pluginId)
     {
         pluginId = string.Empty;
@@ -1279,8 +1750,11 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         var pluginPrefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["/api/audio"] = "audio",
+            ["/api/app-start"] = "app-start",
+            ["/api/auto-sisr"] = "auto-sisr",
             ["/api/display"] = "display",
             ["/api/processes"] = "processes",
+            ["/api/artwork"] = "artwork",
             ["/api/hltb"] = "hltb",
             ["/api/store-sync"] = "store-sync",
             ["/api/themes"] = "themes",
@@ -1313,6 +1787,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetBooleanValueRequest(bool Value);
 
     private sealed record SetIntegerValueRequest(int Value);
+
+    private sealed record ApplyArtworkRequest(long AppId, string AssetType, string Url);
 
     private sealed record SetPluginEnabledRequest(string PluginId, bool Enabled);
 

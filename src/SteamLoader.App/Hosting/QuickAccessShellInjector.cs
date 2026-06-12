@@ -138,11 +138,6 @@ public sealed class QuickAccessShellInjector
 
             foreach (var themeSurfaceTarget in themeSurfaceTargets)
             {
-                if (_themeSurfaceTargetIds.Contains(themeSurfaceTarget.Id))
-                {
-                    continue;
-                }
-
                 var injected = await InjectIntoTargetAsync(
                     themeSurfaceTarget,
                     _themeSurfaceScriptTemplate,

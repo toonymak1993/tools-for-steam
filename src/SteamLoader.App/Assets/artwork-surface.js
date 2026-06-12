@@ -1,0 +1,2932 @@
+(() => {
+  const apiBase = "__STEAMLOADER_API_BASE__";
+  const version = 26;
+  const openRequestStorageKey = "ToolsForSteamArtworkOpenRequest";
+  const inputStorageKey = "ToolsForSteamArtworkInput";
+  const overlayStateStorageKey = "ToolsForSteamArtworkOverlayState";
+  const artworkChannelName = "ToolsForSteamArtworkChannel";
+
+  const existingArtworkRuntime = window.ToolsForSteamArtwork;
+  if (existingArtworkRuntime?.version >= version) {
+    existingArtworkRuntime.refresh?.();
+    return "injected";
+  }
+  existingArtworkRuntime?.destroy?.();
+
+  const assetTypes = [
+    { id: "grid_p", label: "Cover", hint: "Library portrait" },
+    { id: "hero", label: "Hero", hint: "Game detail header" },
+    { id: "logo", label: "Logo", hint: "Transparent title logo" },
+    { id: "icon", label: "Icon", hint: "Shortcut icon" },
+    { id: "grid_l", label: "Wide", hint: "Recent and library wide art" },
+  ];
+
+  const state = {
+    appId: 0,
+    title: "",
+    query: "",
+    activeType: "grid_p",
+    selectedGameId: 0,
+    games: [],
+    assets: [],
+    loadingGames: false,
+    loadingAssets: false,
+    applying: false,
+    lastAppliedAssetKey: "",
+    status: "",
+    error: "",
+    overlay: null,
+    currentOpenKey: "",
+    lastClosedKey: "",
+    lastClosedAt: 0,
+    lastPanelRequestKey: "",
+    lastPanelRequestAt: 0,
+    observer: null,
+    refreshTimer: null,
+    openRequestTimer: null,
+    localOpenRequestTimer: null,
+    openRequestStorageHandler: null,
+    artworkSettingsTimer: null,
+    lastOpenRequestNonce: 0,
+    lastLocalOpenRequestNonce: "",
+    reactPatchInstalled: false,
+    focusItems: [],
+    focusIndex: 0,
+    gamepadFrame: 0,
+    lastGamepadInput: "",
+    lastGamepadInputAt: 0,
+    lastSteamGamepadInput: "",
+    lastSteamGamepadInputAt: 0,
+    pressedGamepadButtons: new Set(),
+    ignoreOverlayInputUntil: 0,
+    artworkChannel: null,
+    artworkChannelHandler: null,
+    lastArtworkInputNonce: "",
+    inputPollTimer: null,
+    inputStorageHandler: null,
+    overlayAnnounceTimer: null,
+    remoteOverlayActive: false,
+    catchAllInstalled: false,
+    previousCatchAllGamepadInput: null,
+    catchAllButtonState: {},
+    rawSteamButtons: [],
+    catchAllReleaseTimer: null,
+    catchAllSuppressUntil: 0,
+    focusZone: "side",
+    pendingInitialAssetsFocus: false,
+    contextMenuEnabled: false,
+    artworkSettingsLoaded: false,
+  };
+
+  function getArtworkChannel() {
+    if (state.artworkChannel || typeof BroadcastChannel !== "function") {
+      return state.artworkChannel;
+    }
+
+    try {
+      state.artworkChannel = new BroadcastChannel(artworkChannelName);
+      state.artworkChannelHandler = (event) => {
+        handleArtworkChannelMessage(event.data);
+      };
+      state.artworkChannel.addEventListener("message", state.artworkChannelHandler);
+    } catch {
+      state.artworkChannel = null;
+    }
+
+    return state.artworkChannel;
+  }
+
+  function postArtworkMessage(message) {
+    const payload = {
+      nonce: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      ...message,
+    };
+
+    try {
+      getArtworkChannel()?.postMessage(payload);
+    } catch {
+    }
+
+    try {
+      const key = payload.type === "input" ? inputStorageKey : overlayStateStorageKey;
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch {
+    }
+  }
+
+  function normalizeSteamAppId(value) {
+    const numeric = Number(value || 0);
+    if (!Number.isFinite(numeric)) {
+      return 0;
+    }
+
+    const appId = Math.trunc(numeric);
+    if (appId < 0) {
+      return appId >>> 0;
+    }
+
+    return appId;
+  }
+
+  function getArtworkActionFromSteamButton(button) {
+    const namedButton = String(button || "").toUpperCase();
+    if (/(LEFT|L).*(BUMPER|SHOULDER|TRIGGER)|\b(LB|L1)\b/.test(namedButton)) {
+      return "previous-type";
+    }
+    if (/(RIGHT|R).*(BUMPER|SHOULDER|TRIGGER)|\b(RB|R1)\b/.test(namedButton)) {
+      return "next-type";
+    }
+
+    switch (Number(button)) {
+      case 1:
+        return "a";
+      case 2:
+        return "b";
+      case 5:
+      case 7:
+        return "previous-type";
+      case 6:
+      case 8:
+        return "next-type";
+      case 9:
+        return "up";
+      case 10:
+        return "down";
+      case 11:
+        return "left";
+      case 12:
+        return "right";
+      default:
+        return "";
+    }
+  }
+
+  function rememberRawSteamButton(button, action) {
+    state.rawSteamButtons.push({
+      button: typeof button === "number" || typeof button === "string" ? button : String(button),
+      action,
+      at: Date.now(),
+    });
+    if (state.rawSteamButtons.length > 24) {
+      state.rawSteamButtons.shift();
+    }
+  }
+
+  function shouldForwardSteamButton(button, action) {
+    const now = Date.now();
+    const repeatMs = action === "up" || action === "down" || action === "left" || action === "right"
+      ? 230
+      : 340;
+    const lastMs = state.catchAllButtonState[button] || 0;
+    if (now - lastMs < repeatMs) {
+      return false;
+    }
+
+    state.catchAllButtonState[button] = now;
+    return true;
+  }
+
+  function installArtworkCatchAllInput() {
+    const focusNav = window.FocusNavController;
+    if (!focusNav?.SetCatchAllGamepadInput || state.catchAllInstalled) {
+      return;
+    }
+
+    const previous = focusNav.m_fnCatchAllGamepadInput;
+    const callback = (button) => {
+      const action = getArtworkActionFromSteamButton(button);
+      const overlayInputActive = state.remoteOverlayActive || Boolean(state.overlay);
+      rememberRawSteamButton(button, action);
+
+      if (!overlayInputActive) {
+        if (action && Date.now() < state.catchAllSuppressUntil) {
+          return true;
+        }
+
+        return typeof previous === "function" ? previous(button) : false;
+      }
+
+      if (!action) {
+        return true;
+      }
+
+      if (shouldForwardSteamButton(button, action)) {
+        postArtworkMessage({ type: "input", action, source: "steam-catch-all" });
+      }
+
+      return true;
+    };
+
+    callback.__steamToolsArtworkCatchAll = true;
+    state.previousCatchAllGamepadInput = previous?.__steamToolsArtworkCatchAll ? null : previous;
+    focusNav.SetCatchAllGamepadInput(callback);
+    state.catchAllInstalled = true;
+  }
+
+  function uninstallArtworkCatchAllInput() {
+    const focusNav = window.FocusNavController;
+    if (!focusNav?.SetCatchAllGamepadInput || !state.catchAllInstalled) {
+      return;
+    }
+
+    if (focusNav.m_fnCatchAllGamepadInput?.__steamToolsArtworkCatchAll) {
+      focusNav.SetCatchAllGamepadInput(state.previousCatchAllGamepadInput || undefined);
+    }
+
+    state.catchAllInstalled = false;
+    state.previousCatchAllGamepadInput = null;
+    state.catchAllButtonState = {};
+    state.catchAllSuppressUntil = 0;
+  }
+
+  function releaseArtworkInputCapture() {
+    state.remoteOverlayActive = false;
+    if (state.catchAllReleaseTimer) {
+      window.clearTimeout(state.catchAllReleaseTimer);
+      state.catchAllReleaseTimer = null;
+    }
+    state.catchAllSuppressUntil = 0;
+    uninstallArtworkCatchAllInput();
+  }
+
+  function setRemoteOverlayActive(active) {
+    state.remoteOverlayActive = Boolean(active);
+    if (state.remoteOverlayActive) {
+      if (state.catchAllReleaseTimer) {
+        window.clearTimeout(state.catchAllReleaseTimer);
+        state.catchAllReleaseTimer = null;
+      }
+      state.catchAllSuppressUntil = 0;
+      installArtworkCatchAllInput();
+    } else {
+      releaseArtworkInputCapture();
+    }
+  }
+
+  function consumeArtworkInput(raw) {
+    if (!raw || !state.overlay) {
+      return;
+    }
+
+    try {
+      const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (payload?.type !== "input" || !payload.action || payload.nonce === state.lastArtworkInputNonce) {
+        return;
+      }
+
+      state.lastArtworkInputNonce = payload.nonce;
+      maybeRepeatGamepadAction(payload.action, String(payload.source || "remote"));
+    } catch {
+    }
+  }
+
+  function consumeArtworkOverlayState(raw) {
+    if (!raw) {
+      return;
+    }
+
+    try {
+      const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (payload?.type === "overlay-state") {
+        const stillFresh = !payload.expiresAt || Number(payload.expiresAt) > Date.now();
+        setRemoteOverlayActive(Boolean(payload.active) && stillFresh);
+      }
+    } catch {
+    }
+  }
+
+  function handleArtworkChannelMessage(payload) {
+    if (payload?.type === "input") {
+      consumeArtworkInput(payload);
+    } else if (payload?.type === "overlay-state") {
+      consumeArtworkOverlayState(payload);
+    }
+  }
+
+  function announceArtworkOverlayState(active) {
+    postArtworkMessage({
+      type: "overlay-state",
+      active: Boolean(active),
+      expiresAt: active ? Date.now() + 1800 : 0,
+    });
+  }
+
+  function startArtworkOverlayAnnouncements() {
+    stopArtworkOverlayAnnouncements();
+    announceArtworkOverlayState(true);
+    state.overlayAnnounceTimer = window.setInterval(() => {
+      if (state.overlay) {
+        announceArtworkOverlayState(true);
+      }
+    }, 700);
+  }
+
+  function stopArtworkOverlayAnnouncements() {
+    if (state.overlayAnnounceTimer) {
+      window.clearInterval(state.overlayAnnounceTimer);
+      state.overlayAnnounceTimer = null;
+    }
+    announceArtworkOverlayState(false);
+  }
+
+  function setupArtworkInputBridge() {
+    getArtworkChannel();
+
+    if (!state.inputStorageHandler) {
+      state.inputStorageHandler = (event) => {
+        if (event.key === inputStorageKey) {
+          consumeArtworkInput(event.newValue);
+        } else if (event.key === overlayStateStorageKey) {
+          consumeArtworkOverlayState(event.newValue);
+        }
+      };
+      window.addEventListener("storage", state.inputStorageHandler);
+    }
+
+    if (!state.inputPollTimer) {
+      state.inputPollTimer = window.setInterval(() => {
+        try {
+          consumeArtworkInput(localStorage.getItem(inputStorageKey));
+          consumeArtworkOverlayState(localStorage.getItem(overlayStateStorageKey));
+        } catch {
+        }
+      }, 100);
+    }
+  }
+
+  function injectStyles() {
+    if (document.getElementById("steamtools-artwork-style")) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = "steamtools-artwork-style";
+    style.textContent = `
+      .steamtools-artwork-context-row {
+        cursor: pointer;
+      }
+
+      .steamtools-artwork-context-row:hover,
+      .steamtools-artwork-context-row:focus,
+      .steamtools-artwork-context-row.gpfocus {
+        outline: none;
+      }
+
+      .steamtools-artwork-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483600;
+        background:
+          radial-gradient(circle at 18% 8%, rgba(71, 108, 140, 0.24), transparent 34%),
+          linear-gradient(180deg, rgba(9, 14, 20, 0.98), rgba(6, 10, 15, 0.98));
+        color: #f4f7fb;
+        font-family: "Motiva Sans", Arial, sans-serif;
+        overflow: hidden;
+      }
+
+      .steamtools-artwork-shell {
+        height: 100%;
+        box-sizing: border-box;
+        padding: clamp(18px, 2.8vw, 38px);
+        display: grid;
+        grid-template-rows: auto auto auto minmax(0, 1fr);
+        gap: 12px;
+      }
+
+      .steamtools-artwork-head {
+        min-height: 22px;
+      }
+
+      .steamtools-artwork-kicker {
+        color: #70c8ff;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      .steamtools-artwork-title {
+        margin-top: 8px;
+        font-size: clamp(34px, 5vw, 62px);
+        font-weight: 900;
+        line-height: 0.98;
+      }
+
+      .steamtools-artwork-subtitle {
+        margin-top: 12px;
+        max-width: 920px;
+        color: #a9bacb;
+        font-size: clamp(18px, 2.3vw, 27px);
+        line-height: 1.28;
+      }
+
+      .steamtools-artwork-close {
+        border: 0;
+        border-radius: 18px;
+        min-width: 112px;
+        min-height: 58px;
+        padding: 0 24px;
+        background: #303742;
+        color: #edf3f8;
+        font-size: 24px;
+        font-weight: 800;
+      }
+
+      .steamtools-artwork-close:focus,
+      .steamtools-artwork-close.is-controller-focus,
+      .steamtools-artwork-close:hover,
+      .steamtools-artwork-search button:focus,
+      .steamtools-artwork-search button.is-controller-focus,
+      .steamtools-artwork-search button:hover,
+      .steamtools-artwork-game:focus,
+      .steamtools-artwork-game.is-controller-focus,
+      .steamtools-artwork-game:hover,
+      .steamtools-artwork-tab:focus,
+      .steamtools-artwork-tab.is-controller-focus,
+      .steamtools-artwork-tab:hover,
+      .steamtools-artwork-type-chip:focus,
+      .steamtools-artwork-type-chip.is-controller-focus,
+      .steamtools-artwork-type-chip:hover,
+      .steamtools-artwork-type-shoulder:focus,
+      .steamtools-artwork-type-shoulder.is-controller-focus,
+      .steamtools-artwork-type-shoulder:hover,
+      .steamtools-artwork-asset:focus,
+      .steamtools-artwork-asset.is-controller-focus,
+      .steamtools-artwork-asset:hover {
+        outline: none;
+        background: #485261;
+        color: #ffffff;
+        box-shadow: inset 0 0 0 2px rgba(244, 247, 251, 0.78);
+      }
+
+      .steamtools-artwork-asset.is-applied {
+        background: rgba(47, 84, 58, 0.68);
+        box-shadow: inset 0 0 0 2px rgba(101, 226, 132, 0.85);
+      }
+
+      .steamtools-artwork-asset.is-applied .steamtools-artwork-asset-meta {
+        color: #9ce8ad;
+      }
+
+      .steamtools-artwork-search {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+      }
+
+      .steamtools-artwork-search input {
+        min-height: 52px;
+        border: 2px solid rgba(146, 165, 185, 0.26);
+        border-radius: 16px;
+        background: #0c1219;
+        color: #f3f7fb;
+        font-size: 21px;
+        padding: 0 18px;
+      }
+
+      .steamtools-artwork-search input:focus {
+        outline: none;
+        border-color: rgba(112, 200, 255, 0.72);
+      }
+
+      .steamtools-artwork-search button,
+      .steamtools-artwork-game,
+      .steamtools-artwork-tab,
+      .steamtools-artwork-type-chip,
+      .steamtools-artwork-type-shoulder,
+      .steamtools-artwork-asset {
+        border: 0;
+        color: #dce4ed;
+        background: #303742;
+        cursor: pointer;
+        font: inherit;
+      }
+
+      .steamtools-artwork-search button {
+        border-radius: 16px;
+        min-width: 132px;
+        font-size: 20px;
+        font-weight: 800;
+      }
+
+      .steamtools-artwork-body {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(190px, 260px) minmax(0, 1fr);
+        gap: 14px;
+      }
+
+      .steamtools-artwork-side,
+      .steamtools-artwork-results {
+        min-height: 0;
+        border-radius: 24px;
+        background: rgba(22, 29, 38, 0.82);
+        box-shadow: inset 0 0 0 1px rgba(140, 166, 190, 0.1);
+      }
+
+      .steamtools-artwork-side {
+        padding: 12px;
+        overflow: auto;
+      }
+
+      .steamtools-artwork-side-label {
+        padding: 6px 6px 10px;
+        color: #7f94aa;
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-game,
+      .steamtools-artwork-tab {
+        width: 100%;
+        min-height: 50px;
+        margin-bottom: 7px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        text-align: left;
+        font-size: 16px;
+        font-weight: 800;
+      }
+
+      .steamtools-artwork-game.is-active,
+      .steamtools-artwork-tab.is-active {
+        background: #3b4654;
+        color: #ffffff;
+      }
+
+      .steamtools-artwork-game span,
+      .steamtools-artwork-tab span {
+        display: block;
+        margin-top: 4px;
+        color: #9fb2c5;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .steamtools-artwork-results {
+        padding: 14px;
+        overflow: auto;
+      }
+
+      .steamtools-artwork-type-rail {
+        width: min(960px, 100%);
+        justify-self: end;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        margin: -2px 0 0;
+      }
+
+      .steamtools-artwork-type-stack {
+        min-width: 0;
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .steamtools-artwork-type-chip,
+      .steamtools-artwork-type-shoulder {
+        min-height: 38px;
+        border-radius: 12px;
+        padding: 0 10px;
+        font-size: 14px;
+        font-weight: 900;
+      }
+
+      .steamtools-artwork-type-chip {
+        color: #a9bacb;
+        background: rgba(48, 55, 66, 0.72);
+      }
+
+      .steamtools-artwork-type-chip.is-active {
+        color: #ffffff;
+        background: #4a5665;
+        box-shadow:
+          inset 0 0 0 2px rgba(112, 200, 255, 0.62),
+          0 0 18px rgba(112, 200, 255, 0.12);
+      }
+
+      .steamtools-artwork-type-chip span {
+        display: block;
+        margin-top: 1px;
+        color: #9fb2c5;
+        font-size: 10px;
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .steamtools-artwork-type-shoulder {
+        min-width: 58px;
+        color: #f4f7fb;
+        background: #303742;
+      }
+
+      .steamtools-artwork-type-center {
+        min-width: 0;
+      }
+
+      .steamtools-artwork-type-current {
+        min-height: 46px;
+        border-radius: 14px;
+        padding: 8px 14px;
+        display: grid;
+        grid-template-columns: auto auto minmax(0, 1fr);
+        align-items: center;
+        column-gap: 12px;
+        background:
+          linear-gradient(90deg, rgba(72, 82, 97, 0.92), rgba(48, 55, 66, 0.86));
+        box-shadow: inset 0 0 0 1px rgba(180, 201, 220, 0.14);
+      }
+
+      .steamtools-artwork-type-current span {
+        display: block;
+        color: #8fa6bd;
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-type-current strong {
+        display: block;
+        margin-top: 0;
+        color: #ffffff;
+        font-size: clamp(18px, 1.6vw, 24px);
+        font-weight: 950;
+        line-height: 1;
+      }
+
+      .steamtools-artwork-type-current em {
+        display: block;
+        margin-top: 0;
+        color: #a9bacb;
+        font-size: 13px;
+        font-style: normal;
+        font-weight: 700;
+      }
+
+      .steamtools-artwork-message {
+        margin-bottom: 16px;
+        border-radius: 18px;
+        padding: 16px 20px;
+        color: #b4c6d8;
+        background: rgba(255,255,255,0.045);
+        font-size: 21px;
+        line-height: 1.28;
+      }
+
+      .steamtools-artwork-message.is-error {
+        color: #ffd08d;
+        background: rgba(112, 55, 23, 0.72);
+      }
+
+      .steamtools-artwork-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(138px, 1fr));
+        gap: 11px;
+      }
+
+      .steamtools-artwork-grid.is-wide,
+      .steamtools-artwork-grid.is-hero {
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      }
+
+      .steamtools-artwork-asset {
+        min-width: 0;
+        border-radius: 15px;
+        padding: 8px;
+        text-align: left;
+      }
+
+      .steamtools-artwork-asset img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 2 / 3;
+        object-fit: cover;
+        border-radius: 10px;
+        background: #0c1118;
+      }
+
+      .steamtools-artwork-grid.is-wide .steamtools-artwork-asset img {
+        aspect-ratio: 92 / 43;
+      }
+
+      .steamtools-artwork-grid.is-hero .steamtools-artwork-asset img {
+        aspect-ratio: 192 / 62;
+      }
+
+      .steamtools-artwork-grid.is-logo .steamtools-artwork-asset img,
+      .steamtools-artwork-grid.is-icon .steamtools-artwork-asset img {
+        aspect-ratio: 1 / 1;
+        object-fit: contain;
+        padding: 16px;
+        box-sizing: border-box;
+      }
+
+      .steamtools-artwork-asset-meta {
+        margin-top: 7px;
+        color: #aebdcb;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .steamtools-artwork-controller-hint {
+        position: fixed;
+        right: clamp(24px, 3.5vw, 54px);
+        bottom: clamp(18px, 2.8vw, 42px);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        border-radius: 999px;
+        padding: 11px 18px;
+        color: #d8e0e8;
+        background: rgba(11, 16, 23, 0.78);
+        box-shadow: inset 0 0 0 1px rgba(180, 201, 220, 0.14);
+        font-size: clamp(14px, 1.45vw, 18px);
+        font-weight: 800;
+        letter-spacing: 0.01em;
+        pointer-events: none;
+      }
+
+      .steamtools-artwork-floating-status {
+        position: fixed;
+        left: clamp(24px, 3.5vw, 54px);
+        bottom: clamp(18px, 2.8vw, 42px);
+        max-width: min(640px, calc(100vw - 420px));
+        border-radius: 20px;
+        padding: 14px 20px;
+        color: #dbe8f4;
+        background: rgba(16, 24, 34, 0.88);
+        box-shadow: inset 0 0 0 1px rgba(180, 201, 220, 0.14);
+        font-size: clamp(15px, 1.6vw, 20px);
+        font-weight: 800;
+        line-height: 1.28;
+        pointer-events: none;
+      }
+
+      .steamtools-artwork-floating-status.is-error {
+        color: #ffd08d;
+        background: rgba(112, 55, 23, 0.88);
+      }
+
+      .steamtools-artwork-floating-status.is-success {
+        color: #dff8e7;
+        background: rgba(23, 83, 52, 0.88);
+      }
+
+      .steamtools-artwork-controller-key {
+        display: inline-grid;
+        min-width: 30px;
+        height: 30px;
+        padding: 0 8px;
+        place-items: center;
+        border-radius: 999px;
+        background: #f4f7fb;
+        color: #0b1017;
+        font-size: 19px;
+        font-weight: 950;
+      }
+
+      @media (max-width: 900px) {
+        .steamtools-artwork-body {
+          grid-template-columns: 1fr;
+        }
+
+        .steamtools-artwork-side {
+          max-height: 220px;
+        }
+
+        .steamtools-artwork-type-rail {
+          grid-template-columns: 1fr;
+        }
+
+        .steamtools-artwork-type-stack {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .steamtools-artwork-type-shoulder {
+          display: none;
+        }
+
+        .steamtools-artwork-floating-status {
+          max-width: calc(100vw - 48px);
+          bottom: 74px;
+        }
+      }
+    `;
+    document.head.append(style);
+  }
+
+  function getWebpackRequire() {
+    if (window.__steamToolsArtworkWebpackRequire) {
+      return window.__steamToolsArtworkWebpackRequire;
+    }
+
+    const chunk = window.webpackChunksteamui;
+    if (!Array.isArray(chunk) || typeof chunk.push !== "function") {
+      return null;
+    }
+
+    let runtimeRequire = null;
+    try {
+      chunk.push([[`steam-tools-artwork-${Date.now()}`], {}, (require) => {
+        runtimeRequire = require;
+        window.__steamToolsArtworkWebpackRequire = require;
+      }]);
+    } catch (error) {
+      console.warn("[Tools for Steam] Unable to capture Steam webpack runtime.", error);
+    }
+
+    return runtimeRequire;
+  }
+
+  function getFunctionSource(value) {
+    try {
+      if (typeof value === "function") {
+        return value.toString();
+      }
+
+      if (typeof value?.render === "function") {
+        return value.render.toString();
+      }
+    } catch {
+    }
+
+    return "";
+  }
+
+  function getSteamReact(runtimeRequire) {
+    if (window.__steamToolsArtworkReact) {
+      return window.__steamToolsArtworkReact;
+    }
+
+    if (!runtimeRequire?.m) {
+      return null;
+    }
+
+    for (const moduleId of Object.keys(runtimeRequire.m)) {
+      let exportsObject;
+      try {
+        exportsObject = runtimeRequire(moduleId);
+      } catch {
+        continue;
+      }
+
+      if (
+        exportsObject &&
+        typeof exportsObject === "object" &&
+        typeof exportsObject.useContext === "function" &&
+        typeof exportsObject.useState === "function" &&
+        typeof exportsObject.cloneElement === "function"
+      ) {
+        window.__steamToolsArtworkReact = exportsObject;
+        return exportsObject;
+      }
+    }
+
+    return null;
+  }
+
+  function createFakeHookDispatcher() {
+    const fakeNavigator = {
+      AppProperties() {},
+      Navigate() {},
+      SteamWeb() {},
+      location: { href: "" },
+    };
+
+    return {
+      readContext: () => fakeNavigator,
+      use: () => undefined,
+      useCallback: (callback) => callback,
+      useContext: () => fakeNavigator,
+      useEffect: () => undefined,
+      useImperativeHandle: () => undefined,
+      useLayoutEffect: () => undefined,
+      useInsertionEffect: () => undefined,
+      useMemo: (factory) => factory(),
+      useReducer: (_, initialValue) => [initialValue, () => undefined],
+      useRef: (value) => ({ current: value }),
+      useState: (value) => [typeof value === "function" ? value() : value, () => undefined],
+      useDebugValue: () => undefined,
+      useDeferredValue: (value) => value,
+      useTransition: () => [false, (callback) => callback()],
+      useSyncExternalStore: (_, getSnapshot) => getSnapshot?.(),
+      useId: () => `steamtools-artwork-${Date.now()}`,
+      useHostTransitionStatus: () => null,
+      useFormState: (_, initialValue) => [initialValue, () => undefined],
+      useActionState: (_, initialValue) => [initialValue, () => undefined, false],
+      useOptimistic: (value) => [value, () => undefined],
+    };
+  }
+
+  function withFakeReactDispatcher(runtimeRequire, callback) {
+    const react = getSteamReact(runtimeRequire);
+    const internals = react?.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+    if (!internals || !Object.prototype.hasOwnProperty.call(internals, "H")) {
+      return callback();
+    }
+
+    const originalDispatcher = internals.H;
+    try {
+      internals.H = createFakeHookDispatcher();
+      return callback();
+    } finally {
+      internals.H = originalDispatcher;
+    }
+  }
+
+  function getModuleExports(runtimeRequire, moduleId) {
+    try {
+      const exportsObject = runtimeRequire(moduleId);
+      return exportsObject && typeof exportsObject === "object"
+        ? Object.entries(exportsObject)
+        : [["default", exportsObject]];
+    } catch {
+      return [];
+    }
+  }
+
+  function findReactTree(root, predicate, maxDepth = 8) {
+    const seen = new Set();
+    const stack = [{ value: root, depth: 0 }];
+
+    while (stack.length) {
+      const { value, depth } = stack.pop();
+      if (!value || depth > maxDepth || seen.has(value)) {
+        continue;
+      }
+
+      if (typeof value === "object" || typeof value === "function") {
+        seen.add(value);
+      }
+
+      try {
+        if (predicate(value)) {
+          return value;
+        }
+      } catch {
+      }
+
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          stack.push({ value: item, depth: depth + 1 });
+        }
+        continue;
+      }
+
+      if (typeof value !== "object" && typeof value !== "function") {
+        continue;
+      }
+
+      const props = value.props;
+      if (props) {
+        stack.push({ value: props.app, depth: depth + 1 });
+        stack.push({ value: props.overview, depth: depth + 1 });
+        stack.push({ value: props.children, depth: depth + 1 });
+      }
+
+      const pendingProps = value.pendingProps || value.memoizedProps || value._owner?.pendingProps;
+      if (pendingProps) {
+        stack.push({ value: pendingProps, depth: depth + 1 });
+        stack.push({ value: pendingProps.app, depth: depth + 1 });
+        stack.push({ value: pendingProps.overview, depth: depth + 1 });
+        stack.push({ value: pendingProps.children, depth: depth + 1 });
+      }
+
+      if (value.app) {
+        stack.push({ value: value.app, depth: depth + 1 });
+      }
+
+      if (value.overview) {
+        stack.push({ value: value.overview, depth: depth + 1 });
+      }
+    }
+
+    return null;
+  }
+
+  function getTitleFromValue(value) {
+    return (
+      value?.display_name ||
+      value?.displayName ||
+      value?.strDisplayName ||
+      value?.name ||
+      value?.title ||
+      ""
+    );
+  }
+
+  function isUsableGameTitle(value) {
+    if (typeof value !== "string") {
+      return false;
+    }
+
+    const title = value.trim();
+    if (title.length < 3) {
+      return false;
+    }
+
+    return /[a-z0-9]/i.test(title) && !/^[a-z]{1,3}$/i.test(title);
+  }
+
+  function getBestTitleFromValue(value) {
+    const preferred =
+      value?.display_name ||
+      value?.displayName ||
+      value?.strDisplayName ||
+      value?.title ||
+      "";
+    if (isUsableGameTitle(preferred)) {
+      return preferred.trim();
+    }
+
+    const fallback = value?.name || "";
+    return isUsableGameTitle(fallback) ? fallback.trim() : "";
+  }
+
+  function getArtworkContextFromReact(instance, root) {
+    const props = instance?.props || {};
+    const ownerProps = root?._owner?.pendingProps || {};
+    const overview =
+      props.overview ||
+      ownerProps.overview ||
+      findReactTree(root, (value) => value?.overview?.appid)?.overview ||
+      findReactTree(root, (value) => value?.app?.appid)?.app ||
+      findReactTree(root, (value) => value?.appid && getTitleFromValue(value));
+
+    const rawAppId =
+      overview?.appid ??
+      overview?.appId ??
+      overview?.unAppID ??
+      props.appid ??
+      props.appId ??
+      props.unAppID ??
+      ownerProps.appid ??
+      ownerProps.appId ??
+      ownerProps.unAppID;
+
+    const appId = normalizeSteamAppId(rawAppId);
+    const title =
+      getBestTitleFromValue(overview) ||
+      getBestTitleFromValue(props) ||
+      getBestTitleFromValue(ownerProps) ||
+      "Selected Game";
+
+    return { appId, title };
+  }
+
+  function isOpeningAppContextMenu(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return false;
+    }
+
+    return Boolean(findReactTree(
+      items,
+      (value) => {
+        const source = getFunctionSource(value?.props?.onSelected || value?.props?.onClick || value?.onSelected);
+        return source.includes("launchSource");
+      },
+      9,
+    ));
+  }
+
+  function findPropertiesMenuIndex(items) {
+    return items.findIndex((item) => {
+      const source = getFunctionSource(item?.props?.onSelected || item?.props?.onClick || item?.onSelected);
+      const key = String(item?.key || "").toLowerCase();
+      const label = getMenuItemText(item).toLowerCase();
+
+      return (
+        source.includes("AppProperties") ||
+        key === "properties" ||
+        label === "properties" ||
+        label === "eigenschaften"
+      );
+    });
+  }
+
+  function getMenuItemText(item) {
+    const children = item?.props?.children ?? item?.children;
+    if (typeof children === "string") {
+      return children.trim();
+    }
+
+    if (Array.isArray(children)) {
+      return children
+        .map((child) => (typeof child === "string" ? child : getMenuItemText(child)))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    if (children && typeof children === "object") {
+      return getMenuItemText(children);
+    }
+
+    return "";
+  }
+
+  function removeArtworkContextRows() {
+    for (const row of document.querySelectorAll(".steamtools-artwork-context-row")) {
+      row.remove();
+    }
+  }
+
+  async function loadArtworkSettings() {
+    try {
+      const response = await fetch(`${apiBase}api/artwork/state`, { cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+      const enabled = response.ok && payload?.settings?.contextMenuEnabled !== false;
+      const changed = state.contextMenuEnabled !== enabled || !state.artworkSettingsLoaded;
+
+      state.contextMenuEnabled = enabled;
+      state.artworkSettingsLoaded = true;
+
+      if (!enabled) {
+        removeArtworkContextRows();
+      } else if (changed) {
+        patchMenus();
+      }
+    } catch {
+      state.contextMenuEnabled = false;
+      state.artworkSettingsLoaded = true;
+      removeArtworkContextRows();
+    }
+  }
+
+  function startArtworkSettingsPolling() {
+    if (state.artworkSettingsTimer) {
+      return;
+    }
+
+    void loadArtworkSettings();
+    state.artworkSettingsTimer = window.setInterval(() => {
+      void loadArtworkSettings();
+    }, 2500);
+  }
+
+  function requestArtworkPanel(context) {
+    const appId = normalizeSteamAppId(context?.appId);
+    if (!appId || !state.contextMenuEnabled) {
+      return;
+    }
+
+    const title = context?.title || "Selected Game";
+    const requestKey = getOpenRequestKey(appId, title);
+    const now = Date.now();
+    if (
+      (state.overlay && state.currentOpenKey === requestKey) ||
+      (state.lastPanelRequestKey === requestKey && now - state.lastPanelRequestAt < 1600)
+    ) {
+      return;
+    }
+
+    state.lastPanelRequestKey = requestKey;
+    state.lastPanelRequestAt = now;
+
+    const request = {
+      nonce: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      appId,
+      title,
+    };
+
+    try {
+      localStorage.setItem(openRequestStorageKey, JSON.stringify(request));
+    } catch {
+    }
+
+    const payload = {
+      appId,
+      title: request.title,
+    };
+
+    fetch(`${apiBase}api/artwork/open-request`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch((error) => {
+      console.warn("[Tools for Steam] Unable to request artwork panel.", error);
+    });
+  }
+
+  function createReactArtworkMenuItem(template, context) {
+    const onSelected = (event) => {
+      if (event?.preventDefault) {
+        event.preventDefault();
+      }
+      if (event?.stopPropagation) {
+        event.stopPropagation();
+      }
+      requestArtworkPanel(context);
+    };
+
+    return {
+      ...template,
+      key: "tfs-change-artwork",
+      props: {
+        ...(template?.props || {}),
+        disabled: false,
+        onClick: onSelected,
+        onSelected,
+        children: "Change Artwork...",
+      },
+    };
+  }
+
+  function isFocusableReactMenuTemplate(item) {
+    return Boolean(
+      item?.props &&
+      typeof item.props.onSelected === "function" &&
+      typeof item.type !== "symbol",
+    );
+  }
+
+  function getReactMenuItemTemplate(items, beforeIndex) {
+    for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+      if (isFocusableReactMenuTemplate(items[index]) && getMenuItemText(items[index])) {
+        return items[index];
+      }
+    }
+
+    return items.find(isFocusableReactMenuTemplate) || items[beforeIndex];
+  }
+
+  function patchReactMenuItems(items, context) {
+    if (!isOpeningAppContextMenu(items)) {
+      return false;
+    }
+
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (items[index]?.key === "tfs-change-artwork") {
+        items.splice(index, 1);
+      }
+    }
+
+    if (!state.contextMenuEnabled) {
+      return false;
+    }
+
+    const propertiesIndex = findPropertiesMenuIndex(items);
+    if (propertiesIndex < 0) {
+      return false;
+    }
+
+    const template = getReactMenuItemTemplate(items, propertiesIndex);
+    if (!template) {
+      return false;
+    }
+
+    const itemContext = getArtworkContextFromReact(null, items);
+    const resolvedContext = {
+      appId: itemContext.appId || context.appId,
+      title: itemContext.title && itemContext.title !== "Selected Game" ? itemContext.title : context.title,
+    };
+
+    if (!resolvedContext.appId) {
+      return false;
+    }
+
+    items.splice(propertiesIndex, 0, createReactArtworkMenuItem(template, resolvedContext));
+    return true;
+  }
+
+  function patchMenuRenderOutput(rendered, context) {
+    const resolvedContext = getArtworkContextFromReact(null, rendered);
+    const mergedContext = {
+      appId: resolvedContext.appId || context?.appId || 0,
+      title:
+        resolvedContext.title && resolvedContext.title !== "Selected Game"
+          ? resolvedContext.title
+          : context?.title || "Selected Game",
+    };
+
+    return patchReactElementTree(rendered, mergedContext);
+  }
+
+  function patchReactElementTree(root, context) {
+    const seen = new Set();
+    let patched = false;
+
+    const visit = (value, depth = 0) => {
+      if (!value || depth > 10) {
+        return;
+      }
+
+      if (Array.isArray(value)) {
+        patched = patchReactMenuItems(value, context) || patched;
+        for (const item of value) {
+          visit(item, depth + 1);
+        }
+        return;
+      }
+
+      if (typeof value !== "object" && typeof value !== "function") {
+        return;
+      }
+
+      if (seen.has(value)) {
+        return;
+      }
+      seen.add(value);
+
+      const children = value.props?.children;
+      if (Array.isArray(children)) {
+        patched = patchReactMenuItems(children, context) || patched;
+      }
+      visit(children, depth + 1);
+    };
+
+    visit(root);
+    return patched;
+  }
+
+  function patchInnerMenuClass(element, context) {
+    const prototype = element?.type?.prototype;
+    if (!prototype?.render) {
+      return false;
+    }
+
+    if ((prototype.render.__steamToolsArtworkInnerPatchVersion || 0) < version) {
+      const originalRender = prototype.render;
+      prototype.render = function patchedArtworkInnerMenuRender(...args) {
+        const rendered = originalRender.apply(this, args);
+        try {
+          patchMenuRenderOutput(rendered, getArtworkContextFromReact(this, rendered) || context);
+        } catch (error) {
+          console.warn("[Tools for Steam] Unable to patch inner artwork menu render.", error);
+        }
+        return rendered;
+      };
+      prototype.render.__steamToolsArtworkInnerPatchVersion = version;
+    }
+
+    if (
+      typeof prototype.shouldComponentUpdate === "function" &&
+      (prototype.shouldComponentUpdate.__steamToolsArtworkInnerPatchVersion || 0) < version
+    ) {
+      const originalShouldComponentUpdate = prototype.shouldComponentUpdate;
+      prototype.shouldComponentUpdate = function patchedArtworkInnerMenuUpdate(nextProps, ...args) {
+        const shouldUpdate = originalShouldComponentUpdate.apply(this, [nextProps, ...args]);
+        try {
+          const nextChildren = nextProps?.children;
+          if (Array.isArray(nextChildren)) {
+            patchReactMenuItems(nextChildren, context);
+          }
+        } catch {
+        }
+        return shouldUpdate;
+      };
+      prototype.shouldComponentUpdate.__steamToolsArtworkInnerPatchVersion = version;
+    }
+
+    return true;
+  }
+
+  function patchReturnedMenuComponent(component, context) {
+    if (!component || typeof component !== "object" || typeof component.type !== "function") {
+      return false;
+    }
+
+    patchInnerMenuClass(component, context);
+
+    if (component.type.prototype?.render) {
+      return true;
+    }
+
+    if ((component.type.__steamToolsArtworkPatchVersion || 0) >= version) {
+      return true;
+    }
+
+    const originalType = component.type;
+    const patchedType = function patchedArtworkMenuType(...args) {
+      const rendered = originalType.apply(this, args);
+      try {
+        patchInnerMenuClass(rendered, context);
+        patchMenuRenderOutput(rendered, context);
+      } catch (error) {
+        console.warn("[Tools for Steam] Unable to patch returned artwork menu component.", error);
+      }
+      return rendered;
+    };
+
+    try {
+      Object.defineProperty(patchedType, "name", { value: originalType.name, configurable: true });
+    } catch {
+    }
+    patchedType.prototype = originalType.prototype;
+    patchedType.displayName = originalType.displayName;
+    patchedType.__steamToolsArtworkPatchVersion = version;
+    component.type = patchedType;
+    return true;
+  }
+
+  function findLibraryContextMenuType(runtimeRequire) {
+    if (window.__steamToolsArtworkLibraryContextMenuType) {
+      return window.__steamToolsArtworkLibraryContextMenuType;
+    }
+
+    if (!runtimeRequire?.m) {
+      return null;
+    }
+
+    for (const moduleId of Object.keys(runtimeRequire.m)) {
+      const exportsList = getModuleExports(runtimeRequire, moduleId);
+      if (!exportsList.some(([, value]) => getFunctionSource(value).includes("().LibraryContextMenu"))) {
+        continue;
+      }
+
+      const wrapper = exportsList
+        .map(([, value]) => value)
+        .find((value) => getFunctionSource(value).includes("navigator:"));
+
+      if (typeof wrapper !== "function") {
+        continue;
+      }
+
+      try {
+        const element = withFakeReactDispatcher(runtimeRequire, () => wrapper({}));
+        if (typeof element?.type === "function" && element.type.prototype?.render) {
+          window.__steamToolsArtworkLibraryContextMenuType = element.type;
+          return element.type;
+        }
+      } catch (error) {
+        console.warn("[Tools for Steam] Unable to fake-render LibraryContextMenu.", error);
+      }
+    }
+
+    return null;
+  }
+
+  function installReactContextMenuPatch() {
+    if (state.reactPatchInstalled) {
+      return true;
+    }
+
+    const runtimeRequire = getWebpackRequire();
+    const LibraryContextMenu = findLibraryContextMenuType(runtimeRequire);
+    const prototype = LibraryContextMenu?.prototype;
+    if (!prototype?.render) {
+      state.reactPatchInstalled = false;
+      return state.reactPatchInstalled;
+    }
+
+    if ((prototype.render.__steamToolsArtworkPatchVersion || 0) >= version) {
+      state.reactPatchInstalled = true;
+      return true;
+    }
+
+    const originalRender = prototype.render;
+    prototype.render = function patchedArtworkContextMenuRender(...args) {
+      const rendered = originalRender.apply(this, args);
+      try {
+        const context = getArtworkContextFromReact(this, rendered);
+        patchReturnedMenuComponent(rendered, context);
+        patchMenuRenderOutput(rendered, context);
+      } catch (error) {
+        console.warn("[Tools for Steam] Unable to patch the Steam game context menu.", error);
+      }
+      return rendered;
+    };
+    prototype.render.__steamToolsArtworkPatched = true;
+    prototype.render.__steamToolsArtworkPatchVersion = version;
+    state.reactPatchInstalled = true;
+    return true;
+  }
+
+  function getReactPropertyKey(element, prefix) {
+    return element
+      ? Object.getOwnPropertyNames(element).find((name) => name.startsWith(prefix))
+      : null;
+  }
+
+  function getReactFiber(element) {
+    const key = getReactPropertyKey(element, "__reactFiber");
+    return key ? element[key] : null;
+  }
+
+  function findInObject(root, predicate, maxDepth = 7) {
+    const seen = new Set();
+    const stack = [{ value: root, depth: 0 }];
+    while (stack.length) {
+      const { value, depth } = stack.pop();
+      if (!value || depth > maxDepth || seen.has(value)) {
+        continue;
+      }
+      seen.add(value);
+
+      try {
+        if (predicate(value)) {
+          return value;
+        }
+      } catch {
+      }
+
+      if (typeof value !== "object" && typeof value !== "function") {
+        continue;
+      }
+
+      for (const key of Object.keys(value)) {
+        if (key === "_owner" || key === "return" || key === "child" || key === "sibling") {
+          continue;
+        }
+
+        try {
+          const next = value[key];
+          if (next && (typeof next === "object" || typeof next === "function")) {
+            stack.push({ value: next, depth: depth + 1 });
+          }
+        } catch {
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getContextDataFromNode(node) {
+    let current = node;
+    let appId = 0;
+    let title = "";
+
+    for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+      const fiber = getReactFiber(current);
+      if (!fiber) {
+        continue;
+      }
+
+      const appObject = findInObject(
+        fiber,
+        (value) =>
+          (Number.isFinite(Number(value?.appid)) ||
+            Number.isFinite(Number(value?.appId)) ||
+            Number.isFinite(Number(value?.unAppID))) &&
+          isUsableGameTitle(getBestTitleFromValue(value)),
+      );
+      const rawAppId = appObject?.appid ?? appObject?.appId ?? appObject?.unAppID;
+      if (Number.isFinite(Number(rawAppId))) {
+        appId = normalizeSteamAppId(rawAppId);
+        title = getBestTitleFromValue(appObject) || title;
+      }
+
+      if (!title) {
+        const titleObject = findInObject(fiber, (value) => isUsableGameTitle(getBestTitleFromValue(value)));
+        title = getBestTitleFromValue(titleObject) || title;
+      }
+
+      if (appId && title) {
+        break;
+      }
+    }
+
+    if (!appId) {
+      const match = location.href.match(/\/appdetails\/(\d+)/i);
+      if (match) {
+        appId = normalizeSteamAppId(match[1]);
+      }
+    }
+
+    if (!title) {
+      const textBlocks = [...document.querySelectorAll("h1, h2, [class*='AppTitle'], [class*='Title']")]
+        .map((item) => item.textContent?.trim())
+        .filter(Boolean);
+      title = textBlocks[0] || document.title.replace(/\s*-\s*Steam.*$/i, "").trim();
+    }
+
+    return { appId, title: title || "Selected Game" };
+  }
+
+  function textOf(node) {
+    return (node?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isPropertiesRow(node) {
+    const text = textOf(node).toLowerCase();
+    return text === "properties" || text === "eigenschaften";
+  }
+
+  function isGameContextMenu(menu) {
+    const text = textOf(menu).toLowerCase();
+    return (
+      (text.includes("properties") || text.includes("eigenschaften")) &&
+      (text.includes("play") || text.includes("spielen") || text.includes("manage") || text.includes("verwalten"))
+    );
+  }
+
+  function findMenuCandidates() {
+    return [...document.querySelectorAll("[role='menu'], [class*='contextmenu'], [class*='ContextMenu'], div")]
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => node.offsetParent !== null)
+      .filter((node) => {
+        const rect = node.getBoundingClientRect();
+        if (rect.width < 240 || rect.width > Math.min(window.innerWidth, 1100) || rect.height < 180) {
+          return false;
+        }
+
+        const textLength = textOf(node).length;
+        return textLength > 30 && textLength < 1200;
+      })
+      .filter(isGameContextMenu)
+      .slice(0, 6);
+  }
+
+  function findPropertiesRow(menu) {
+    for (const node of [...menu.querySelectorAll("div, button, [role='menuitem']")]) {
+      if (!(node instanceof HTMLElement) || !isPropertiesRow(node)) {
+        continue;
+      }
+
+      return resolveMenuItemRow(node, menu);
+    }
+
+    return null;
+  }
+
+  function resolveMenuItemRow(node, menu) {
+    let row = node;
+    let current = node;
+
+    while (current.parentElement && current.parentElement !== menu) {
+      const parent = current.parentElement;
+      const parentText = textOf(parent).toLowerCase();
+      const currentText = textOf(current).toLowerCase();
+      const parentLooksLikeSameRow =
+        parentText === currentText ||
+        parent.getAttribute("role") === "menuitem" ||
+        parent.tabIndex >= 0 ||
+        parent.matches("button");
+
+      if (!parentLooksLikeSameRow) {
+        break;
+      }
+
+      row = parent;
+      current = parent;
+    }
+
+    return row;
+  }
+
+  function replaceRowText(row, text) {
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    let replaced = false;
+    let node = walker.nextNode();
+
+    while (node) {
+      const value = (node.nodeValue || "").trim().toLowerCase();
+      if (value === "properties" || value === "eigenschaften") {
+        node.nodeValue = (node.nodeValue || "").replace(/properties|eigenschaften/i, text);
+        replaced = true;
+      }
+
+      node = walker.nextNode();
+    }
+
+    if (!replaced) {
+      row.textContent = text;
+    }
+  }
+
+  function sanitizeClonedRow(node) {
+    if (!(node instanceof HTMLElement)) {
+      return;
+    }
+
+    node.removeAttribute("id");
+    node.classList.remove("gpfocus");
+    node.classList.remove("focus");
+    node.classList.remove("Focused");
+    node.removeAttribute("aria-current");
+    node.removeAttribute("aria-selected");
+    node.removeAttribute("data-focusable-child");
+    node.removeAttribute("data-focusable-id");
+
+    for (const child of node.children) {
+      sanitizeClonedRow(child);
+    }
+  }
+
+  function bindContextRowAction(row, menu) {
+    const open = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      requestArtworkPanel(getContextDataFromNode(menu));
+    };
+
+    const handleKeys = (event) => {
+      if (
+        event.key === "Enter" ||
+        event.key === " " ||
+        event.key === "GamepadA" ||
+        event.code === "Enter" ||
+        event.code === "Space"
+      ) {
+        open(event);
+      }
+    };
+
+    row.addEventListener("click", open, true);
+    row.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+    }, true);
+    row.addEventListener("keydown", handleKeys, true);
+  }
+
+  function createArtworkContextRow(propertiesRow, menu) {
+    const row = propertiesRow.cloneNode(true);
+    sanitizeClonedRow(row);
+    row.classList.add("steamtools-artwork-context-row");
+    row.setAttribute("role", propertiesRow.getAttribute("role") || "menuitem");
+    row.setAttribute("tabindex", propertiesRow.getAttribute("tabindex") || "0");
+    row.setAttribute("data-steamtools-artwork-row", "true");
+    replaceRowText(row, "Change Artwork...");
+    bindContextRowAction(row, menu);
+    return row;
+  }
+
+  function patchMenus() {
+    if (!state.contextMenuEnabled) {
+      removeArtworkContextRows();
+      return;
+    }
+
+    for (const menu of findMenuCandidates()) {
+      if (menu.querySelector(".steamtools-artwork-context-row") || textOf(menu).toLowerCase().includes("change artwork")) {
+        continue;
+      }
+
+      const propertiesRow = findPropertiesRow(menu);
+      const parent = propertiesRow?.parentElement;
+      if (!propertiesRow || !parent) {
+        continue;
+      }
+
+      const row = createArtworkContextRow(propertiesRow, menu);
+      parent.insertBefore(row, propertiesRow);
+    }
+  }
+
+  function canHostArtworkOverlay() {
+    if (location.href.includes("/routes/")) {
+      return false;
+    }
+
+    return Boolean(
+      document.body &&
+      window.innerWidth >= 500 &&
+      window.innerHeight >= 300,
+    );
+  }
+
+  function getOpenRequestKey(appId, title) {
+    return `${normalizeSteamAppId(appId)}:${String(title || "").trim().toLowerCase()}`;
+  }
+
+  function shouldIgnoreDuplicateOpen(appId, title) {
+    const key = getOpenRequestKey(appId, title);
+    if (state.overlay && state.currentOpenKey === key) {
+      return true;
+    }
+
+    return state.lastClosedKey === key && Date.now() - state.lastClosedAt < 1400;
+  }
+
+  async function pollArtworkOpenRequest() {
+    if (!canHostArtworkOverlay()) {
+      return;
+    }
+
+    try {
+      const request = await fetchJson(`api/artwork/open-request?after=${state.lastOpenRequestNonce}`);
+      if (!request?.nonce || Number(request.nonce) <= state.lastOpenRequestNonce) {
+        return;
+      }
+
+      state.lastOpenRequestNonce = Number(request.nonce);
+      if (shouldIgnoreDuplicateOpen(request.appId, request.title)) {
+        return;
+      }
+      openOverlay({
+        appId: normalizeSteamAppId(request.appId),
+        title: request.title || "Selected Game",
+      });
+    } catch {
+      // Steam recreates surfaces often; the next poll will recover quietly.
+    }
+  }
+
+  function consumeLocalArtworkOpenRequest(raw) {
+    if (!raw || !canHostArtworkOverlay()) {
+      return;
+    }
+
+    try {
+      const request = JSON.parse(raw);
+      const nonce = String(request?.nonce || "");
+      const appId = normalizeSteamAppId(request?.appId);
+      if (!nonce || !appId || nonce === state.lastLocalOpenRequestNonce) {
+        return;
+      }
+
+      state.lastLocalOpenRequestNonce = nonce;
+      try {
+        localStorage.removeItem(openRequestStorageKey);
+      } catch {
+      }
+      if (shouldIgnoreDuplicateOpen(appId, request.title)) {
+        return;
+      }
+      openOverlay({
+        appId,
+        title: request.title || "Selected Game",
+      });
+    } catch {
+    }
+  }
+
+  function pollLocalArtworkOpenRequest() {
+    try {
+      consumeLocalArtworkOpenRequest(localStorage.getItem(openRequestStorageKey));
+    } catch {
+    }
+  }
+
+  function startOpenRequestPolling() {
+    if (state.openRequestTimer) {
+      return;
+    }
+
+    state.openRequestTimer = window.setInterval(() => {
+      void pollArtworkOpenRequest();
+    }, 350);
+    state.localOpenRequestTimer = window.setInterval(pollLocalArtworkOpenRequest, 250);
+    if (!state.openRequestStorageHandler) {
+      state.openRequestStorageHandler = (event) => {
+        if (event.key === openRequestStorageKey) {
+          consumeLocalArtworkOpenRequest(event.newValue);
+        }
+      };
+      window.addEventListener("storage", state.openRequestStorageHandler);
+    }
+    void pollArtworkOpenRequest();
+    pollLocalArtworkOpenRequest();
+  }
+
+  function setMessage(status, error = "") {
+    state.status = status || "";
+    state.error = error || "";
+    renderOverlay();
+  }
+
+  async function fetchJson(path, options = {}) {
+    const response = await fetch(`${apiBase}${path}`, {
+      cache: "no-store",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    });
+
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(payload?.message || `Request failed with ${response.status}`);
+    }
+
+    return payload;
+  }
+
+  async function searchGames(term) {
+    state.loadingGames = true;
+    state.error = "";
+    state.pendingInitialAssetsFocus = true;
+    renderOverlay();
+
+    try {
+      const query = encodeURIComponent(term || state.title || "");
+      state.games = await fetchJson(`api/artwork/search?term=${query}`);
+      state.selectedGameId = Number(state.games?.[0]?.id || 0);
+      state.status = state.games.length
+        ? `Found ${state.games.length} SteamGridDB match${state.games.length === 1 ? "" : "es"}.`
+        : "No SteamGridDB matches found. Try a shorter title.";
+      await loadAssets();
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.loadingGames = false;
+      renderOverlay();
+    }
+  }
+
+  async function loadAssets() {
+    if (!state.selectedGameId) {
+      state.assets = [];
+      renderOverlay();
+      return;
+    }
+
+    state.loadingAssets = true;
+    state.error = "";
+    state.assets = [];
+    renderOverlay();
+
+    try {
+      const query = new URLSearchParams({
+        gameId: String(state.selectedGameId),
+        type: state.activeType,
+        page: "0",
+      });
+      state.assets = await fetchJson(`api/artwork/assets?${query.toString()}`);
+      state.status = state.assets.length
+        ? `Showing ${state.assets.length} ${getActiveType().label.toLowerCase()} result${state.assets.length === 1 ? "" : "s"}.`
+        : "No artwork found for this tab.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.loadingAssets = false;
+      renderOverlay();
+    }
+  }
+
+  async function applyAsset(asset) {
+    if (!state.appId || !asset?.url) {
+      return;
+    }
+
+    state.applying = true;
+    setMessage("Applying artwork...");
+
+    try {
+      const result = await fetchJson("api/artwork/apply", {
+        method: "POST",
+        body: JSON.stringify({
+          appId: state.appId,
+          assetType: state.activeType,
+          url: asset.url,
+        }),
+      });
+
+      let liveApplied = false;
+      const steamApps = window.SteamClient?.Apps;
+      if (result?.success && steamApps?.SetCustomArtworkForApp && result.base64Data) {
+        try {
+          await steamApps.SetCustomArtworkForApp(
+            Number(result.appId),
+            result.base64Data,
+            result.extension || "png",
+            Number(result.steamAssetType),
+          );
+          liveApplied = true;
+        } catch (error) {
+          console.warn("[Tools for Steam] Steam live artwork apply failed; file fallback was still written.", error);
+        }
+      }
+
+      state.status = liveApplied
+        ? "Artwork applied through Steam."
+        : result.message || "Artwork written. Steam may need to refresh the game page.";
+      state.error = "";
+      state.lastAppliedAssetKey = `${state.activeType}:${asset.id || asset.url}`;
+      refreshSteamArtworkAfterApply(result);
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.applying = false;
+      renderOverlay();
+    }
+  }
+
+  function getActiveType() {
+    return assetTypes.find((type) => type.id === state.activeType) || assetTypes[0];
+  }
+
+  function getSteamGridStem(appId, assetType) {
+    switch (assetType) {
+      case "grid_p":
+        return `${appId}p`;
+      case "hero":
+        return `${appId}_hero`;
+      case "logo":
+        return `${appId}_logo`;
+      case "icon":
+        return `${appId}-icon`;
+      case "grid_l":
+      default:
+        return String(appId);
+    }
+  }
+
+  function nudgeSteamArtworkStores(appId) {
+    const numericAppId = normalizeSteamAppId(appId);
+    if (!numericAppId) {
+      return;
+    }
+
+    const overview = window.appStore?.GetAppOverviewByAppID?.(numericAppId);
+    const timestamp = Math.floor(Date.now() / 1000);
+    if (overview) {
+      try {
+        overview.rt_custom_image_mtime = Math.max(Number(overview.rt_custom_image_mtime || 0), timestamp);
+      } catch {
+      }
+
+      try {
+        overview.rt_last_time_locally_modified = Math.max(Number(overview.rt_last_time_locally_modified || 0), timestamp);
+      } catch {
+      }
+    }
+
+    try {
+      const appData = window.appDetailsStore?.GetAppData?.(numericAppId);
+      if (appData && "customImageInfo" in appData) {
+        appData.customImageInfo = null;
+      }
+      if (appData && "customImageInfoPromise" in appData) {
+        appData.customImageInfoPromise = null;
+      }
+    } catch {
+    }
+
+    try {
+      if (overview) {
+        void window.appDetailsStore?.RequestCustomImageInfo?.(overview);
+      }
+    } catch {
+    }
+
+    try {
+      void window.appDetailsStore?.RequestAppDetails?.(numericAppId);
+    } catch {
+    }
+
+    try {
+      void window.SteamClient?.Apps?.GetCachedAppDetails?.(numericAppId);
+    } catch {
+    }
+
+    try {
+      void window.SteamClient?.Apps?.RequestIconDataForApp?.(numericAppId);
+    } catch {
+    }
+  }
+
+  function cacheBustUrl(value, token) {
+    if (!value || /^data:|^blob:/i.test(value)) {
+      return value;
+    }
+
+    try {
+      const url = new URL(value, window.location.href);
+      url.searchParams.set("tfs_artwork", token);
+      return url.toString();
+    } catch {
+      const separator = value.includes("?") ? "&" : "?";
+      return `${value}${separator}tfs_artwork=${encodeURIComponent(token)}`;
+    }
+  }
+
+  function extractStyleUrls(value) {
+    const urls = [];
+    const regex = /url\((['"]?)(.*?)\1\)/gi;
+    let match;
+    while ((match = regex.exec(value || "")) !== null) {
+      if (match[2]) {
+        urls.push(match[2]);
+      }
+    }
+    return urls;
+  }
+
+  function imageUrlMatchesAppliedAsset(value, appId, assetType) {
+    if (!value || /^data:|^blob:/i.test(value)) {
+      return false;
+    }
+
+    const stem = getSteamGridStem(appId, assetType).toLowerCase();
+    const normalized = String(value).toLowerCase();
+    if (!normalized.includes(String(appId).toLowerCase())) {
+      return false;
+    }
+
+    try {
+      const url = new URL(value, window.location.href);
+      const fileName = decodeURIComponent(url.pathname.split("/").pop() || "").toLowerCase();
+      return fileName === stem || fileName.startsWith(`${stem}.`);
+    } catch {
+      return normalized.includes(`/${stem}.`) || normalized.includes(`\\${stem}.`);
+    }
+  }
+
+  function refreshVisibleSteamArtworkUrls(appId, assetType) {
+    const token = String(Date.now());
+
+    for (const image of document.querySelectorAll("img, source")) {
+      const source = image.currentSrc || image.src || image.srcset || "";
+      if (!imageUrlMatchesAppliedAsset(source, appId, assetType)) {
+        continue;
+      }
+
+      if (image.srcset) {
+        image.srcset = image.srcset
+          .split(",")
+          .map((entry) => {
+            const parts = entry.trim().split(/\s+/);
+            return parts.length ? [cacheBustUrl(parts[0], token), ...parts.slice(1)].join(" ") : entry;
+          })
+          .join(", ");
+      } else if (image.src) {
+        image.src = cacheBustUrl(image.src, token);
+      }
+    }
+
+    for (const element of document.querySelectorAll("[style*='url(']")) {
+      const background = element.style.backgroundImage;
+      if (!background || !extractStyleUrls(background).some((url) => imageUrlMatchesAppliedAsset(url, appId, assetType))) {
+        continue;
+      }
+
+      element.style.backgroundImage = background.replace(/url\((['"]?)(.*?)\1\)/gi, (_match, quote, url) => {
+        return `url(${quote || "\""}${cacheBustUrl(url, token)}${quote || "\""})`;
+      });
+    }
+  }
+
+  function refreshSteamArtworkAfterApply(result) {
+    const appId = normalizeSteamAppId(result?.appId);
+    const assetType = result?.assetType || state.activeType;
+    if (!appId || !assetType) {
+      return;
+    }
+
+    nudgeSteamArtworkStores(appId);
+    refreshVisibleSteamArtworkUrls(appId, assetType);
+
+    window.setTimeout(() => {
+      nudgeSteamArtworkStores(appId);
+      refreshVisibleSteamArtworkUrls(appId, assetType);
+    }, 150);
+
+    window.setTimeout(() => {
+      nudgeSteamArtworkStores(appId);
+      refreshVisibleSteamArtworkUrls(appId, assetType);
+    }, 550);
+
+    window.setTimeout(() => {
+      nudgeSteamArtworkStores(appId);
+      refreshVisibleSteamArtworkUrls(appId, assetType);
+    }, 1400);
+  }
+
+  function getActiveTypeIndex() {
+    return Math.max(0, assetTypes.findIndex((type) => type.id === state.activeType));
+  }
+
+  function setArtworkType(typeId) {
+    if (!assetTypes.some((type) => type.id === typeId) || typeId === state.activeType) {
+      return;
+    }
+
+    state.activeType = typeId;
+    state.pendingInitialAssetsFocus = true;
+    state.status = `Loading ${getActiveType().label.toLowerCase()} artwork...`;
+    state.error = "";
+    void loadAssets();
+  }
+
+  function cycleArtworkType(direction) {
+    const index = getActiveTypeIndex();
+    const next = assetTypes[(index + direction + assetTypes.length) % assetTypes.length];
+    if (next) {
+      setArtworkType(next.id);
+    }
+  }
+
+  function createElement(tag, className, text) {
+    const element = document.createElement(tag);
+    if (className) {
+      element.className = className;
+    }
+    if (text !== undefined && text !== null) {
+      element.textContent = text;
+    }
+    return element;
+  }
+
+  function button(className, text, onClick) {
+    const element = createElement("button", className, text);
+    element.type = "button";
+    element.setAttribute("data-steamtools-artwork-focusable", "true");
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick(event);
+    });
+    element.addEventListener("focus", () => {
+      const index = state.focusItems.indexOf(element);
+      if (index >= 0) {
+        state.focusIndex = index;
+        applyArtworkFocus(false);
+      }
+    });
+    element.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeOverlay();
+      }
+    });
+    return element;
+  }
+
+  function getVisibleArtworkFocusItems() {
+    if (!state.overlay) {
+      return [];
+    }
+
+    return [...state.overlay.querySelectorAll("[data-steamtools-artwork-focusable='true']")]
+      .filter((element) => element instanceof HTMLElement)
+      .filter((element) => !element.disabled && element.offsetParent !== null);
+  }
+
+  function getArtworkItemZone(item) {
+    return item?.classList?.contains("steamtools-artwork-asset") ? "assets" : "side";
+  }
+
+  function getArtworkZoneItems(zone = state.focusZone) {
+    return state.focusItems.filter((item) => getArtworkItemZone(item) === zone);
+  }
+
+  function getFirstArtworkZoneWithItems(preferredZone = state.focusZone) {
+    if (getArtworkZoneItems(preferredZone).length) {
+      return preferredZone;
+    }
+
+    return getArtworkZoneItems("side").length ? "side" : "assets";
+  }
+
+  function applyArtworkFocus(shouldFocus = true) {
+    for (const item of state.focusItems) {
+      item.classList.remove("is-controller-focus");
+      item.removeAttribute("aria-selected");
+    }
+
+    const item = state.focusItems[state.focusIndex];
+    if (!item) {
+      return;
+    }
+
+    item.classList.add("is-controller-focus");
+    item.setAttribute("aria-selected", "true");
+    if (shouldFocus) {
+      item.focus({ preventScroll: true });
+    }
+    item.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  function refreshArtworkFocus(preferredElement = null) {
+    const previous = preferredElement || state.focusItems[state.focusIndex] || document.activeElement;
+    state.focusItems = getVisibleArtworkFocusItems();
+
+    if (!state.focusItems.length) {
+      state.focusIndex = 0;
+      return;
+    }
+
+    state.focusZone = getFirstArtworkZoneWithItems(getArtworkItemZone(previous) || state.focusZone);
+    const zoneItems = getArtworkZoneItems();
+    const previousIndex = zoneItems.indexOf(previous);
+    const selected = previousIndex >= 0
+      ? previous
+      : zoneItems[Math.min(Math.max(0, state.focusIndex), zoneItems.length - 1)] || zoneItems[0];
+    state.focusIndex = Math.max(0, state.focusItems.indexOf(selected));
+    applyArtworkFocus();
+  }
+
+  function focusFirstArtworkAsset() {
+    state.focusItems = getVisibleArtworkFocusItems();
+    const firstAsset = state.focusItems.find((item) => getArtworkItemZone(item) === "assets");
+    if (!firstAsset) {
+      refreshArtworkFocus();
+      return;
+    }
+
+    state.focusZone = "assets";
+    state.focusIndex = state.focusItems.indexOf(firstAsset);
+    state.pendingInitialAssetsFocus = false;
+    const results = state.overlay?.querySelector(".steamtools-artwork-results");
+    if (results) {
+      results.scrollTop = 0;
+    }
+    applyArtworkFocus();
+    firstAsset.scrollIntoView({ block: "start", inline: "nearest" });
+  }
+
+  function getArtworkGridStep() {
+    const current = state.focusItems[state.focusIndex];
+    if (!current?.classList.contains("steamtools-artwork-asset")) {
+      return 1;
+    }
+
+    const grid = current.closest(".steamtools-artwork-grid");
+    const firstAsset = grid?.querySelector(".steamtools-artwork-asset");
+    const gridWidth = grid?.getBoundingClientRect().width || 0;
+    const itemWidth = firstAsset?.getBoundingClientRect().width || 0;
+    return Math.max(1, Math.floor(gridWidth / Math.max(1, itemWidth + 8)));
+  }
+
+  function moveArtworkFocus(direction) {
+    refreshArtworkFocus();
+    if (!state.focusItems.length) {
+      return;
+    }
+
+    const zoneItems = getArtworkZoneItems();
+    if (!zoneItems.length) {
+      return;
+    }
+
+    const current = state.focusItems[state.focusIndex];
+    const zoneIndex = Math.max(0, zoneItems.indexOf(current));
+    const step =
+      state.focusZone === "side"
+        ? direction === "up" || direction === "left"
+          ? -1
+          : 1
+        : direction === "up"
+        ? -getArtworkGridStep()
+        : direction === "down"
+          ? getArtworkGridStep()
+          : direction === "left"
+            ? -1
+            : 1;
+    const nextZoneIndex = (zoneIndex + step + zoneItems.length) % zoneItems.length;
+    state.focusIndex = state.focusItems.indexOf(zoneItems[nextZoneIndex]);
+    applyArtworkFocus();
+  }
+
+  function toggleArtworkFocusZone() {
+    refreshArtworkFocus();
+    const nextZone = state.focusZone === "assets" ? "side" : "assets";
+    const nextItems = getArtworkZoneItems(nextZone);
+    if (!nextItems.length) {
+      return;
+    }
+
+    state.focusZone = nextZone;
+    state.focusIndex = state.focusItems.indexOf(nextItems[0]);
+    applyArtworkFocus();
+  }
+
+  function activateArtworkFocus() {
+    refreshArtworkFocus();
+    const item = state.focusItems[state.focusIndex];
+    if (item) {
+      item.click();
+    }
+  }
+
+  function handleOverlayKeyDown(event) {
+    if (!state.overlay) {
+      return;
+    }
+
+    const key = event.key || event.code || "";
+    const lowerKey = key.toLowerCase?.() || "";
+    const isPreviousTypeKey =
+      key === "PageUp" ||
+      key === "GamepadLB" ||
+      key === "GamepadL1" ||
+      key === "GamepadLeftShoulder" ||
+      lowerKey === "[";
+    const isNextTypeKey =
+      key === "PageDown" ||
+      key === "GamepadRB" ||
+      key === "GamepadR1" ||
+      key === "GamepadRightShoulder" ||
+      lowerKey === "]";
+    const handled =
+      key === "ArrowUp" ||
+      key === "ArrowDown" ||
+      key === "ArrowLeft" ||
+      key === "ArrowRight" ||
+      key === "Enter" ||
+      key === " " ||
+      key === "Space" ||
+      key === "Escape" ||
+      key === "GamepadA" ||
+      key === "GamepadB" ||
+      isPreviousTypeKey ||
+      isNextTypeKey;
+
+    if (!handled) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+
+    if (Date.now() < state.ignoreOverlayInputUntil) {
+      return;
+    }
+
+    const source = key.startsWith("Gamepad") ? "steam-key" : "keyboard";
+    if (key === "ArrowUp") {
+      maybeRepeatGamepadAction("up", source);
+    } else if (key === "ArrowDown") {
+      maybeRepeatGamepadAction("down", source);
+    } else if (key === "ArrowLeft") {
+      maybeRepeatGamepadAction("left", source);
+    } else if (key === "ArrowRight") {
+      maybeRepeatGamepadAction("right", source);
+    } else if (key === "Escape" || key === "GamepadB") {
+      maybeRepeatGamepadAction("b", source);
+    } else if (isPreviousTypeKey) {
+      maybeRepeatGamepadAction("previous-type", source);
+    } else if (isNextTypeKey) {
+      maybeRepeatGamepadAction("next-type", source);
+    } else {
+      maybeRepeatGamepadAction("a", source);
+    }
+  }
+
+  function swallowOverlayInput(event) {
+    if (!state.overlay) {
+      return;
+    }
+
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+  }
+
+  function handleGamepadAction(action) {
+    if (Date.now() < state.ignoreOverlayInputUntil) {
+      return;
+    }
+
+    if (action === "a") {
+      activateArtworkFocus();
+    } else if (action === "b") {
+      closeOverlay();
+    } else if (action === "previous-type") {
+      cycleArtworkType(-1);
+    } else if (action === "next-type") {
+      cycleArtworkType(1);
+    } else {
+      moveArtworkFocus(action);
+    }
+  }
+
+  function maybeRepeatGamepadAction(action, source = "browser-gamepad") {
+    const now = Date.now();
+    if (now < state.ignoreOverlayInputUntil) {
+      return;
+    }
+
+    const isSteamSource = source.includes("steam") || source === "remote";
+    if (isSteamSource) {
+      state.lastSteamGamepadInput = action;
+      state.lastSteamGamepadInputAt = now;
+    } else if (
+      action === state.lastSteamGamepadInput &&
+      now - state.lastSteamGamepadInputAt < 220
+    ) {
+      return;
+    }
+
+    const repeatDelay = state.lastGamepadInput === action ? 170 : 260;
+    if (state.lastGamepadInput === action && now - state.lastGamepadInputAt < repeatDelay) {
+      return;
+    }
+
+    state.lastGamepadInput = action;
+    state.lastGamepadInputAt = now;
+    handleGamepadAction(action);
+  }
+
+  function getPressedArtworkGamepadActions() {
+    const gamepads = typeof navigator.getGamepads === "function" ? navigator.getGamepads() : [];
+    const gamepad = [...gamepads].find(Boolean);
+    const pressed = new Set();
+    if (!gamepad) {
+      return pressed;
+    }
+
+    const buttonMap = [
+      [0, "a"],
+      [1, "b"],
+      [4, "previous-type"],
+      [5, "next-type"],
+      [12, "up"],
+      [13, "down"],
+      [14, "left"],
+      [15, "right"],
+    ];
+
+    for (const [index, action] of buttonMap) {
+      if (gamepad.buttons[index]?.pressed) {
+        pressed.add(action);
+      }
+    }
+
+    return pressed;
+  }
+
+  function pollArtworkGamepad() {
+    if (!state.overlay) {
+      stopArtworkGamepadLoop();
+      return;
+    }
+
+    const gamepads = typeof navigator.getGamepads === "function" ? navigator.getGamepads() : [];
+    const gamepad = [...gamepads].find(Boolean);
+    if (gamepad) {
+      const pressed = new Set();
+      const buttonMap = [
+        [0, "a"],
+        [1, "b"],
+        [4, "previous-type"],
+        [5, "next-type"],
+        [12, "up"],
+        [13, "down"],
+        [14, "left"],
+        [15, "right"],
+      ];
+
+      for (const [index, action] of buttonMap) {
+        if (gamepad.buttons[index]?.pressed) {
+          pressed.add(action);
+          if (!state.pressedGamepadButtons.has(action) || action === "up" || action === "down" || action === "left" || action === "right") {
+            maybeRepeatGamepadAction(action, "browser-gamepad");
+          }
+        }
+      }
+
+      const axisX = Math.abs(gamepad.axes[0] || 0) > 0.55 ? gamepad.axes[0] : 0;
+      const axisY = Math.abs(gamepad.axes[1] || 0) > 0.55 ? gamepad.axes[1] : 0;
+      if (Math.abs(axisY) >= Math.abs(axisX) && axisY) {
+        maybeRepeatGamepadAction(axisY > 0 ? "down" : "up", "browser-gamepad");
+      } else if (axisX) {
+        maybeRepeatGamepadAction(axisX > 0 ? "right" : "left", "browser-gamepad");
+      } else if (!pressed.size) {
+        state.lastGamepadInput = "";
+      }
+
+      state.pressedGamepadButtons = pressed;
+    }
+
+    state.gamepadFrame = window.requestAnimationFrame(pollArtworkGamepad);
+  }
+
+  function startArtworkGamepadLoop() {
+    stopArtworkGamepadLoop();
+    state.lastGamepadInput = "";
+    state.pressedGamepadButtons = getPressedArtworkGamepadActions();
+    state.gamepadFrame = window.requestAnimationFrame(pollArtworkGamepad);
+  }
+
+  function stopArtworkGamepadLoop() {
+    if (state.gamepadFrame) {
+      window.cancelAnimationFrame(state.gamepadFrame);
+      state.gamepadFrame = 0;
+    }
+  }
+
+  function attachOverlayInputTrap() {
+    window.addEventListener("keydown", handleOverlayKeyDown, true);
+    window.addEventListener("keyup", swallowOverlayInput, true);
+    window.addEventListener("keypress", swallowOverlayInput, true);
+  }
+
+  function detachOverlayInputTrap() {
+    window.removeEventListener("keydown", handleOverlayKeyDown, true);
+    window.removeEventListener("keyup", swallowOverlayInput, true);
+    window.removeEventListener("keypress", swallowOverlayInput, true);
+  }
+
+  function renderOverlay() {
+    if (!state.overlay) {
+      return;
+    }
+
+    const activeType = getActiveType();
+    state.overlay.textContent = "";
+
+    const shell = createElement("div", "steamtools-artwork-shell");
+    const head = createElement("div", "steamtools-artwork-head");
+    const titleWrap = createElement("div");
+    titleWrap.append(createElement("div", "steamtools-artwork-kicker", "SteamGridDB"));
+    head.append(titleWrap);
+
+    const search = createElement("div", "steamtools-artwork-search");
+    const input = createElement("input");
+    input.value = state.query;
+    input.placeholder = "Search SteamGridDB";
+    input.addEventListener("input", () => {
+      state.query = input.value;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        void searchGames(state.query);
+      } else if (event.key === "Escape") {
+        closeOverlay();
+      }
+    });
+    search.append(input);
+    search.append(button("steamtools-artwork-search-button", "Search", () => {
+      void searchGames(state.query);
+    }));
+
+    const body = createElement("div", "steamtools-artwork-body");
+    const side = createElement("div", "steamtools-artwork-side");
+    side.append(createElement("div", "steamtools-artwork-side-label", "Game Match"));
+    for (const game of state.games) {
+      const gameButton = button(
+        `steamtools-artwork-game${Number(game.id) === Number(state.selectedGameId) ? " is-active" : ""}`,
+        game.name,
+        () => {
+          state.selectedGameId = Number(game.id);
+          state.pendingInitialAssetsFocus = true;
+          void loadAssets();
+        },
+      );
+      const detail = createElement("span", null, game.verified ? "Verified" : "Community match");
+      gameButton.append(detail);
+      side.append(gameButton);
+    }
+
+    const results = createElement("div", "steamtools-artwork-results");
+    const typeRail = createElement("div", "steamtools-artwork-type-rail");
+    typeRail.append(button("steamtools-artwork-type-shoulder", "LB", () => {
+      cycleArtworkType(-1);
+    }));
+
+    const typeCenter = createElement("div", "steamtools-artwork-type-center");
+    const currentType = createElement("div", "steamtools-artwork-type-current");
+    currentType.append(createElement("span", null, "Artwork Type"));
+    currentType.append(createElement("strong", null, activeType.label));
+    currentType.append(createElement("em", null, `${getActiveTypeIndex() + 1} of ${assetTypes.length} - ${activeType.hint}`));
+    typeCenter.append(currentType);
+
+    const typeStack = createElement("div", "steamtools-artwork-type-stack");
+    for (const type of assetTypes) {
+      const chip = button(
+        `steamtools-artwork-type-chip${type.id === state.activeType ? " is-active" : ""}`,
+        type.label,
+        () => {
+          setArtworkType(type.id);
+        },
+      );
+      chip.append(createElement("span", null, type.hint));
+      typeStack.append(chip);
+    }
+    typeCenter.append(typeStack);
+    typeRail.append(typeCenter);
+    typeRail.append(button("steamtools-artwork-type-shoulder", "RB", () => {
+      cycleArtworkType(1);
+    }));
+
+    const showInlineMessage =
+      state.error ||
+      state.loadingGames ||
+      state.loadingAssets ||
+      state.applying ||
+      (!state.assets.length && state.status);
+    if (showInlineMessage) {
+      results.append(createElement(
+        "div",
+        `steamtools-artwork-message${state.error ? " is-error" : ""}`,
+        state.error ||
+          (state.applying ? "Applying artwork..." : "") ||
+          (state.loadingGames ? "Searching SteamGridDB..." : "") ||
+          (state.loadingAssets ? "Loading artwork..." : "") ||
+          state.status,
+      ));
+    }
+
+    const gridClass =
+      state.activeType === "grid_l"
+        ? "steamtools-artwork-grid is-wide"
+        : state.activeType === "hero"
+          ? "steamtools-artwork-grid is-hero"
+          : state.activeType === "logo"
+            ? "steamtools-artwork-grid is-logo"
+            : state.activeType === "icon"
+              ? "steamtools-artwork-grid is-icon"
+              : "steamtools-artwork-grid";
+    const grid = createElement("div", gridClass);
+    for (const asset of state.assets) {
+      const assetKey = `${state.activeType}:${asset.id || asset.url}`;
+      const isApplied = assetKey === state.lastAppliedAssetKey;
+      const assetButton = button(`steamtools-artwork-asset${isApplied ? " is-applied" : ""}`, "", () => {
+        void applyAsset(asset);
+      });
+      const image = document.createElement("img");
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.src = asset.thumbnailUrl || asset.url;
+      image.alt = `${activeType.label} artwork`;
+      assetButton.append(image);
+      const dimensions = asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown size";
+      assetButton.append(createElement("div", "steamtools-artwork-asset-meta", `${dimensions} · ${isApplied ? "Applied" : "Apply"}`));
+      grid.append(assetButton);
+    }
+    results.append(grid);
+
+    body.append(side);
+    body.append(results);
+    shell.append(head);
+    shell.append(search);
+    shell.append(typeRail);
+    shell.append(body);
+    state.overlay.append(shell);
+
+    const hint = createElement("div", "steamtools-artwork-controller-hint");
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "LB/RB"));
+    hint.append(createElement("span", null, "Artwork type"));
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "A"));
+    hint.append(createElement("span", null, "Apply"));
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "B"));
+    hint.append(createElement("span", null, "Close"));
+    state.overlay.append(hint);
+
+    if (state.error || state.status || state.applying) {
+      const statusText =
+        state.error ||
+        (state.applying ? "Applying artwork..." : "") ||
+        state.status;
+      const isSuccess = /applied|written/i.test(statusText || "") && !state.error && !state.applying;
+      state.overlay.append(createElement(
+        "div",
+        `steamtools-artwork-floating-status${state.error ? " is-error" : ""}${isSuccess ? " is-success" : ""}`,
+        statusText,
+      ));
+    }
+
+    window.requestAnimationFrame(() => {
+      if (state.pendingInitialAssetsFocus && state.assets.length) {
+        focusFirstArtworkAsset();
+      } else {
+        refreshArtworkFocus();
+      }
+    });
+  }
+
+  function openOverlay(context) {
+    injectStyles();
+
+    state.appId = normalizeSteamAppId(context?.appId);
+    state.title = context?.title || "Selected Game";
+    state.query = state.title;
+    state.activeType = "grid_p";
+    state.selectedGameId = 0;
+    state.games = [];
+    state.assets = [];
+    state.status = "";
+    state.error = "";
+    state.focusZone = "side";
+    state.pendingInitialAssetsFocus = true;
+
+    closeOverlay();
+    state.ignoreOverlayInputUntil = Date.now() + 700;
+    state.currentOpenKey = getOpenRequestKey(state.appId, state.title);
+    state.overlay = createElement("div", "steamtools-artwork-overlay");
+    state.overlay.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeOverlay();
+      }
+    });
+    document.body.append(state.overlay);
+    setRemoteOverlayActive(true);
+    attachOverlayInputTrap();
+    renderOverlay();
+    startArtworkGamepadLoop();
+    startArtworkOverlayAnnouncements();
+    void searchGames(state.query);
+  }
+
+  function closeOverlay() {
+    if (state.currentOpenKey) {
+      state.lastClosedKey = state.currentOpenKey;
+      state.lastClosedAt = Date.now();
+    }
+    stopArtworkGamepadLoop();
+    stopArtworkOverlayAnnouncements();
+    setRemoteOverlayActive(false);
+    detachOverlayInputTrap();
+    for (const overlay of document.querySelectorAll(".steamtools-artwork-overlay")) {
+      overlay.remove();
+    }
+    state.overlay = null;
+    state.currentOpenKey = "";
+    state.focusItems = [];
+    state.focusIndex = 0;
+  }
+
+  function destroy() {
+    closeOverlay();
+    uninstallArtworkCatchAllInput();
+
+    if (state.catchAllReleaseTimer) {
+      window.clearTimeout(state.catchAllReleaseTimer);
+      state.catchAllReleaseTimer = null;
+    }
+
+    if (state.openRequestTimer) {
+      window.clearInterval(state.openRequestTimer);
+      state.openRequestTimer = null;
+    }
+
+    if (state.localOpenRequestTimer) {
+      window.clearInterval(state.localOpenRequestTimer);
+      state.localOpenRequestTimer = null;
+    }
+
+    if (state.artworkSettingsTimer) {
+      window.clearInterval(state.artworkSettingsTimer);
+      state.artworkSettingsTimer = null;
+    }
+
+    if (state.inputPollTimer) {
+      window.clearInterval(state.inputPollTimer);
+      state.inputPollTimer = null;
+    }
+
+    if (state.refreshTimer) {
+      window.clearTimeout(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+
+    state.observer?.disconnect();
+    state.observer = null;
+
+    if (state.openRequestStorageHandler) {
+      window.removeEventListener("storage", state.openRequestStorageHandler);
+      state.openRequestStorageHandler = null;
+    }
+
+    if (state.inputStorageHandler) {
+      window.removeEventListener("storage", state.inputStorageHandler);
+      state.inputStorageHandler = null;
+    }
+
+    if (state.artworkChannel && state.artworkChannelHandler) {
+      state.artworkChannel.removeEventListener("message", state.artworkChannelHandler);
+    }
+    try {
+      state.artworkChannel?.close();
+    } catch {
+    }
+    state.artworkChannel = null;
+    state.artworkChannelHandler = null;
+  }
+
+  function refresh() {
+    setupArtworkInputBridge();
+    injectStyles();
+    installReactContextMenuPatch();
+    void loadArtworkSettings();
+  }
+
+  function start() {
+    setupArtworkInputBridge();
+    injectStyles();
+    installReactContextMenuPatch();
+    startArtworkSettingsPolling();
+    startOpenRequestPolling();
+    state.observer = new MutationObserver(() => {
+      window.clearTimeout(state.refreshTimer);
+      state.refreshTimer = window.setTimeout(patchMenus, 80);
+    });
+    state.observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  window.ToolsForSteamArtwork = {
+    version,
+    refresh,
+    open: openOverlay,
+    close: closeOverlay,
+    destroy,
+    debug: () => ({
+      overlayCount: document.querySelectorAll(".steamtools-artwork-overlay").length,
+      remoteOverlayActive: state.remoteOverlayActive,
+      focusZone: state.focusZone,
+      focusIndex: state.focusIndex,
+      activeType: state.activeType,
+      activeTypeLabel: getActiveType().label,
+      rawSteamButtons: state.rawSteamButtons,
+    }),
+  };
+
+  start();
+  return "injected";
+})();

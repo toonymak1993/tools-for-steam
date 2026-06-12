@@ -14,25 +14,86 @@ internal sealed class SteamGridDbArtworkDownloader
     [
         new(
             SlotName: "library capsule",
-            RequestPath: "grids/game/{0}?types=static&dimensions=920x430&mimes=image/png,image/jpeg",
-            FileStemBuilder: gridId => gridId),
+            RequestPaths:
+            [
+                "grids/game/{0}?types=static&dimensions=920x430&mimes=image/png,image/jpeg",
+                "grids/game/{0}?types=static&mimes=image/png,image/jpeg"
+            ],
+            FileStemBuilder: gridId => gridId,
+            PreferredWidth: 920,
+            PreferredHeight: 430),
         new(
             SlotName: "portrait",
-            RequestPath: "grids/game/{0}?types=static&dimensions=600x900&mimes=image/png,image/jpeg",
-            FileStemBuilder: gridId => $"{gridId}p"),
+            RequestPaths:
+            [
+                "grids/game/{0}?types=static&dimensions=600x900&mimes=image/png,image/jpeg",
+                "grids/game/{0}?types=static&mimes=image/png,image/jpeg"
+            ],
+            FileStemBuilder: gridId => $"{gridId}p",
+            PreferredWidth: 600,
+            PreferredHeight: 900),
         new(
             SlotName: "hero",
-            RequestPath: "heroes/game/{0}?types=static&dimensions=1920x620&mimes=image/png,image/jpeg",
-            FileStemBuilder: gridId => $"{gridId}_hero"),
+            RequestPaths:
+            [
+                "heroes/game/{0}?types=static&dimensions=1920x620&mimes=image/png,image/jpeg",
+                "heroes/game/{0}?types=static&mimes=image/png,image/jpeg"
+            ],
+            FileStemBuilder: gridId => $"{gridId}_hero",
+            PreferredWidth: 1920,
+            PreferredHeight: 620),
         new(
             SlotName: "logo",
-            RequestPath: "logos/game/{0}?types=static&mimes=image/png",
-            FileStemBuilder: gridId => $"{gridId}_logo"),
+            RequestPaths:
+            [
+                "logos/game/{0}?types=static&mimes=image/png"
+            ],
+            FileStemBuilder: gridId => $"{gridId}_logo",
+            PreferredWidth: null,
+            PreferredHeight: null),
         new(
             SlotName: "icon",
-            RequestPath: "icons/game/{0}?types=static&dimensions=256&mimes=image/png,image/vnd.microsoft.icon",
-            FileStemBuilder: gridId => $"{gridId}-icon"),
+            RequestPaths:
+            [
+                "icons/game/{0}?types=static&dimensions=256&mimes=image/png,image/vnd.microsoft.icon",
+                "icons/game/{0}?types=static&mimes=image/png,image/vnd.microsoft.icon"
+            ],
+            FileStemBuilder: gridId => $"{gridId}-icon",
+            PreferredWidth: 256,
+            PreferredHeight: 256),
     ];
+
+    private static readonly IReadOnlyDictionary<string, string[]> KnownTitleAliases =
+        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["speedwell"] = ["Metro: Last Light Redux", "Metro Last Light Redux"],
+        };
+
+    private static readonly HashSet<string> IgnoredSearchHints = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "app",
+        "apps",
+        "binaries",
+        "binary",
+        "bin",
+        "content",
+        "engine",
+        "epic games",
+        "games",
+        "launcher",
+        "program files",
+        "program files x86",
+        "redist",
+        "redistributables",
+        "shipping",
+        "steamapps",
+        "tools",
+        "win64",
+        "win32",
+        "windows",
+        "x64",
+        "x86",
+    };
 
     public async Task<StoreSyncArtworkSummary> DownloadAsync(
         string gridDirectory,
@@ -69,7 +130,12 @@ internal sealed class SteamGridDbArtworkDownloader
 
             try
             {
-                var gameId = await FindGameIdAsync(httpClient, target.Title, searchCache, cancellationToken);
+                var gameId = await FindGameIdAsync(
+                    httpClient,
+                    target.Title,
+                    target.SearchHints,
+                    searchCache,
+                    cancellationToken);
                 if (!gameId.HasValue)
                 {
                     continue;
@@ -119,10 +185,18 @@ internal sealed class SteamGridDbArtworkDownloader
     private async Task<int?> FindGameIdAsync(
         HttpClient httpClient,
         string title,
+        IReadOnlyList<string> searchHints,
         IDictionary<string, int?> searchCache,
         CancellationToken cancellationToken)
     {
-        foreach (var term in BuildSearchTerms(title))
+        var searchTerms = BuildSearchTerms(title, searchHints).ToList();
+        var comparisonTitles = searchTerms
+            .Select(NormalizeTitle)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var term in searchTerms)
         {
             if (searchCache.TryGetValue(term, out var cachedValue))
             {
@@ -150,7 +224,7 @@ internal sealed class SteamGridDbArtworkDownloader
                 JsonOptions,
                 cancellationToken);
 
-            var selectedMatch = SelectBestMatch(title, payload?.Data);
+            var selectedMatch = SelectBestMatch(comparisonTitles, payload?.Data);
             searchCache[term] = selectedMatch?.Id;
 
             if (selectedMatch is not null)
@@ -202,24 +276,31 @@ internal sealed class SteamGridDbArtworkDownloader
         int gameId,
         CancellationToken cancellationToken)
     {
-        var response = await httpClient.GetAsync(
-            string.Format(slot.RequestPath, gameId),
-            cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
+        foreach (var requestPath in slot.RequestPaths)
         {
-            return null;
+            var response = await httpClient.GetAsync(
+                string.Format(requestPath, gameId),
+                cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                continue;
+            }
+
+            await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var payload = await JsonSerializer.DeserializeAsync<SteamGridDbListResponse<SteamGridDbAsset>>(
+                responseStream,
+                JsonOptions,
+                cancellationToken);
+
+            var assetUrl = SelectTopAssetUrl(slot, payload?.Data);
+            if (!string.IsNullOrWhiteSpace(assetUrl))
+            {
+                return assetUrl;
+            }
         }
 
-        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var payload = await JsonSerializer.DeserializeAsync<SteamGridDbListResponse<SteamGridDbAsset>>(
-            responseStream,
-            JsonOptions,
-            cancellationToken);
-
-        return payload?.Data?
-            .Select(asset => asset.Url)
-            .FirstOrDefault(url => !string.IsNullOrWhiteSpace(url));
+        return null;
     }
 
     private static async Task DownloadFileAsync(
@@ -240,54 +321,180 @@ internal sealed class SteamGridDbArtworkDownloader
     }
 
     private static SteamGridDbGameMatch? SelectBestMatch(
-        string requestedTitle,
+        IReadOnlyList<string> normalizedRequestedTitles,
         IReadOnlyList<SteamGridDbGameMatch>? matches)
     {
-        if (matches is null || matches.Count == 0)
+        if (matches is null || matches.Count == 0 || normalizedRequestedTitles.Count == 0)
         {
             return null;
         }
 
-        var normalizedRequestedTitle = NormalizeTitle(requestedTitle);
-
-        return matches
-            .OrderBy(match => ScoreMatch(normalizedRequestedTitle, NormalizeTitle(match.Name)))
-            .ThenBy(match => match.Verified ? 0 : 1)
-            .ThenBy(match => Math.Abs((match.Name ?? string.Empty).Length - requestedTitle.Length))
+        var selected = matches
+            .Select(match => new
+            {
+                Match = match,
+                Score = normalizedRequestedTitles
+                    .Select(requestedTitle => ScoreMatch(requestedTitle, NormalizeTitle(match.Name)))
+                    .DefaultIfEmpty(3)
+                    .Min()
+            })
+            .OrderBy(item => item.Score)
+            .ThenBy(item => item.Match.Verified ? 0 : 1)
+            .ThenBy(item => Math.Abs((item.Match.Name ?? string.Empty).Length - normalizedRequestedTitles[0].Length))
             .FirstOrDefault();
+
+        return selected?.Score <= 2
+            ? selected.Match
+            : null;
     }
 
-    private static IEnumerable<string> BuildSearchTerms(string title)
+    private static IEnumerable<string> BuildSearchTerms(string title, IReadOnlyList<string> searchHints)
     {
         var terms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seedTerms = new List<string>();
 
         void AddTerm(string? value)
         {
             var trimmedValue = value?.Trim();
             if (!string.IsNullOrWhiteSpace(trimmedValue))
             {
-                terms.Add(trimmedValue);
+                var cleanedValue = Regex.Replace(trimmedValue, @"\s{2,}", " ");
+                if (terms.Add(cleanedValue))
+                {
+                    seedTerms.Add(cleanedValue);
+                }
             }
         }
 
         AddTerm(title);
+        AddKnownAliases(title, AddTerm);
+        foreach (var searchHint in searchHints)
+        {
+            foreach (var extractedHint in ExtractSearchHints(searchHint))
+            {
+                AddTerm(extractedHint);
+                AddKnownAliases(extractedHint, AddTerm);
+            }
+        }
 
+        foreach (var seedTerm in seedTerms.ToArray())
+        {
+            AddTitleVariants(seedTerm, AddTerm);
+        }
+
+        return terms.Take(18);
+    }
+
+    private static void AddKnownAliases(string value, Action<string?> addTerm)
+    {
+        if (KnownTitleAliases.TryGetValue(NormalizeTitle(value), out var aliases))
+        {
+            foreach (var alias in aliases)
+            {
+                addTerm(alias);
+            }
+        }
+    }
+
+    private static void AddTitleVariants(string title, Action<string?> addTerm)
+    {
         var withoutBrackets = Regex.Replace(title, @"\s*[\(\[].*?[\)\]]\s*", " ").Trim();
-        AddTerm(withoutBrackets);
+        addTerm(withoutBrackets);
+
+        var readableTitle = PrettifySearchHint(withoutBrackets);
+        addTerm(readableTitle);
+
+        if (readableTitle.Contains('&', StringComparison.Ordinal))
+        {
+            addTerm(readableTitle.Replace("&", "and", StringComparison.Ordinal));
+        }
+
+        if (Regex.IsMatch(readableTitle, @"\band\b", RegexOptions.IgnoreCase))
+        {
+            addTerm(Regex.Replace(readableTitle, @"\band\b", "&", RegexOptions.IgnoreCase));
+        }
 
         var withoutEditionSuffix = Regex.Replace(
-            withoutBrackets,
+            readableTitle,
             @"\b(game of the year|goty|ultimate|definitive|complete|deluxe|enhanced|remastered|anniversary|collector'?s|director'?s cut|edition)\b",
             string.Empty,
             RegexOptions.IgnoreCase);
-        AddTerm(Regex.Replace(withoutEditionSuffix, @"\s{2,}", " ").Trim(' ', '-', ':'));
+        addTerm(Regex.Replace(withoutEditionSuffix, @"\s{2,}", " ").Trim(' ', '-', ':'));
 
         if (withoutEditionSuffix.Contains(" - ", StringComparison.Ordinal))
         {
-            AddTerm(withoutEditionSuffix.Split(" - ", 2, StringSplitOptions.TrimEntries)[0]);
+            addTerm(withoutEditionSuffix.Split(" - ", 2, StringSplitOptions.TrimEntries)[0]);
         }
 
-        return terms;
+        AddColonVariants(readableTitle, addTerm);
+    }
+
+    private static void AddColonVariants(string title, Action<string?> addTerm)
+    {
+        if (title.Contains(':', StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var words = title.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (words.Length < 3)
+        {
+            return;
+        }
+
+        addTerm($"{words[0]}: {string.Join(' ', words.Skip(1))}");
+        addTerm($"{words[0]} {words[1]}: {string.Join(' ', words.Skip(2))}");
+    }
+
+    private static IEnumerable<string> ExtractSearchHints(string value)
+    {
+        var cleanedValue = value.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(cleanedValue))
+        {
+            yield break;
+        }
+
+        if (Path.HasExtension(cleanedValue))
+        {
+            var fileName = Path.GetFileNameWithoutExtension(cleanedValue);
+            if (IsUsefulSearchHint(fileName))
+            {
+                yield return PrettifySearchHint(fileName);
+            }
+
+            cleanedValue = Path.GetDirectoryName(cleanedValue) ?? string.Empty;
+        }
+
+        for (var index = 0; index < 5 && !string.IsNullOrWhiteSpace(cleanedValue); index++)
+        {
+            var directoryName = Path.GetFileName(cleanedValue.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            if (IsUsefulSearchHint(directoryName))
+            {
+                yield return PrettifySearchHint(directoryName);
+            }
+
+            cleanedValue = Path.GetDirectoryName(cleanedValue) ?? string.Empty;
+        }
+    }
+
+    private static bool IsUsefulSearchHint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var hint = PrettifySearchHint(value);
+        return hint.Length >= 3 && !IgnoredSearchHints.Contains(hint);
+    }
+
+    private static string PrettifySearchHint(string value)
+    {
+        var cleaned = Regex.Replace(value, @"[_\.-]+", " ");
+        cleaned = Regex.Replace(cleaned, "(?<=[a-z])(?=[A-Z0-9])", " ");
+        cleaned = Regex.Replace(cleaned, "(?<=[0-9])(?=[A-Za-z])", " ");
+        cleaned = Regex.Replace(cleaned, "\\s+", " ").Trim();
+        return cleaned;
     }
 
     private static string NormalizeTitle(string? value)
@@ -318,6 +525,36 @@ internal sealed class SteamGridDbArtworkDownloader
         return 3;
     }
 
+    private static string? SelectTopAssetUrl(ArtworkSlot slot, IReadOnlyList<SteamGridDbAsset>? assets)
+    {
+        return assets?
+            .Where(asset => !string.IsNullOrWhiteSpace(asset.Url))
+            .OrderBy(asset => ScoreAsset(slot, asset))
+            .Select(asset => asset.Url)
+            .FirstOrDefault();
+    }
+
+    private static double ScoreAsset(ArtworkSlot slot, SteamGridDbAsset asset)
+    {
+        if (!slot.PreferredWidth.HasValue ||
+            !slot.PreferredHeight.HasValue ||
+            !asset.Width.HasValue ||
+            !asset.Height.HasValue ||
+            asset.Height.Value <= 0)
+        {
+            return 0;
+        }
+
+        var preferredRatio = (double)slot.PreferredWidth.Value / slot.PreferredHeight.Value;
+        var actualRatio = (double)asset.Width.Value / asset.Height.Value;
+        var ratioScore = Math.Abs(preferredRatio - actualRatio) * 1000;
+        var preferredArea = slot.PreferredWidth.Value * slot.PreferredHeight.Value;
+        var actualArea = Math.Max(1, asset.Width.Value * asset.Height.Value);
+        var areaScore = Math.Abs(Math.Log((double)actualArea / preferredArea));
+
+        return ratioScore + areaScore;
+    }
+
     private static string? ResolveFileExtension(string assetUrl)
     {
         if (!Uri.TryCreate(assetUrl, UriKind.Absolute, out var assetUri))
@@ -345,8 +582,10 @@ internal sealed class SteamGridDbArtworkDownloader
 
     private sealed record ArtworkSlot(
         string SlotName,
-        string RequestPath,
-        Func<string, string> FileStemBuilder);
+        IReadOnlyList<string> RequestPaths,
+        Func<string, string> FileStemBuilder,
+        int? PreferredWidth,
+        int? PreferredHeight);
 
     private sealed record SteamGridDbListResponse<T>(
         bool Success,
@@ -358,12 +597,15 @@ internal sealed class SteamGridDbArtworkDownloader
         bool Verified);
 
     private sealed record SteamGridDbAsset(
-        string Url);
+        string Url,
+        int? Width,
+        int? Height);
 }
 
 internal sealed record StoreSyncArtworkTarget(
     string Title,
-    uint AppId);
+    uint AppId,
+    IReadOnlyList<string> SearchHints);
 
 internal sealed record StoreSyncArtworkSummary(
     int UpdatedTitleCount,
