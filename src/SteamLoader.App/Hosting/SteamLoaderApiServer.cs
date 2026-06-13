@@ -602,6 +602,32 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/startup-mode")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStartupModeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Mode))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A startup mode is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetStartupMode(payload.Mode),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/hide-windows-shell")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
@@ -623,6 +649,136 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _steamLoaderSettingsService.SetHideWindowsShellInConsoleMode(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetSplashScreenEnabled(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/show-text")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetSplashScreenShowText(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/wallpaper")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A wallpaper path is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetSplashScreenWallpaperPath(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/icon")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An icon path is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetSplashScreenIconPath(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/extra-delay")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A delay value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetSplashScreenExtraCloseDelaySeconds(payload.Value),
                     cancellationToken);
                 return;
             }
@@ -667,6 +823,31 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     FileName = executablePath,
                     Arguments = SteamLoaderRuntime.ManagerArgument,
                     UseShellExecute = true,
+                })?.Dispose();
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/preview")
+            {
+                var executablePath = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(executablePath))
+                {
+                    throw new InvalidOperationException("Tools for Steam preview path could not be resolved.");
+                }
+
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = executablePath,
+                    Arguments = $"{SteamLoaderRuntime.PreviewSplashArgument} {SteamLoaderRuntime.PreviewSplashDurationArgument}=5",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
                 })?.Dispose();
 
                 await WriteJsonAsync(
@@ -1787,6 +1968,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetBooleanValueRequest(bool Value);
 
     private sealed record SetIntegerValueRequest(int Value);
+
+    private sealed record SetStartupModeRequest(string Mode);
 
     private sealed record ApplyArtworkRequest(long AppId, string AssetType, string Url);
 

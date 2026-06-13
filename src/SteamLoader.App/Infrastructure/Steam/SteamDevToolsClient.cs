@@ -50,7 +50,8 @@ public sealed class SteamDevToolsClient
             .Where(target =>
                 string.Equals(target.Type, "page", StringComparison.OrdinalIgnoreCase) &&
                 (string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase) ||
-                 target.Title.Contains("Big-Picture", StringComparison.OrdinalIgnoreCase) ||
+                 IsBigPictureMainTarget(target) ||
+                 IsSteamMenuSurfaceTarget(target) ||
                  target.Url.Contains("steamloopback.host", StringComparison.OrdinalIgnoreCase)))
             .ToArray();
     }
@@ -92,6 +93,12 @@ public sealed class SteamDevToolsClient
     {
         return IsBigPictureMainTarget(target) ||
             IsQuickAccessTarget(target) ||
+            target.Title.StartsWith("MainMenu", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSteamMenuSurfaceTarget(SteamDevToolsTarget target)
+    {
+        return target.Title.Equals("Menu", StringComparison.OrdinalIgnoreCase) ||
             target.Title.StartsWith("MainMenu", StringComparison.OrdinalIgnoreCase);
     }
 

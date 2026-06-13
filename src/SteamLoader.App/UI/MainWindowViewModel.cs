@@ -21,6 +21,7 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _isBusy;
     private bool _isRunning;
     private bool _autostartEnabled;
+    private string _startupMode = SteamLoaderRuntime.StartupModeManual;
     private bool _initialized;
     private bool _startupSyncTriggered;
     private bool _showStartupSplash;
@@ -38,6 +39,11 @@ public sealed class MainWindowViewModel : BindableBase
     private string _updateStateText = "Updates have not been checked yet.";
     private string _supportBundleText = "No support bundle has been exported yet.";
     private string _errorText = string.Empty;
+    private bool _splashScreenEnabled = true;
+    private bool _showStartupSplashText = true;
+    private string _splashWallpaperPath = string.Empty;
+    private string _splashIconPath = string.Empty;
+    private int _splashExtraCloseDelaySeconds;
     private UpdateCheckSnapshot? _updateSnapshot;
 
     public MainWindowViewModel(
@@ -60,7 +66,8 @@ public sealed class MainWindowViewModel : BindableBase
         _shellLaunchArguments = shellLaunchArguments;
         _shellBootstrapMode = shellBootstrapMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
-        _showStartupSplash = shellBootstrapMode;
+        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
+        _showStartupSplash = shellBootstrapMode && _splashScreenEnabled;
         if (shellBootstrapMode)
         {
             _serviceStateText = "Preparing Tools for Steam";
@@ -188,6 +195,20 @@ public sealed class MainWindowViewModel : BindableBase
             if (SetProperty(ref _autostartEnabled, value))
             {
                 RaisePropertyChanged(nameof(AutostartButtonText));
+                RaisePropertyChanged(nameof(AutostartMenuText));
+            }
+        }
+    }
+
+    public string StartupMode
+    {
+        get => _startupMode;
+        private set
+        {
+            if (SetProperty(ref _startupMode, value))
+            {
+                RaisePropertyChanged(nameof(AutostartButtonText));
+                RaisePropertyChanged(nameof(AutostartMenuText));
             }
         }
     }
@@ -198,6 +219,46 @@ public sealed class MainWindowViewModel : BindableBase
         private set => SetProperty(ref _showStartupSplash, value);
     }
 
+    public bool ShowStartupSplashText
+    {
+        get => _showStartupSplashText;
+        private set => SetProperty(ref _showStartupSplashText, value);
+    }
+
+    public string SplashWallpaperPath
+    {
+        get => _splashWallpaperPath;
+        private set
+        {
+            if (SetProperty(ref _splashWallpaperPath, value))
+            {
+                RaisePropertyChanged(nameof(HasSplashWallpaper));
+            }
+        }
+    }
+
+    public bool HasSplashWallpaper => !string.IsNullOrWhiteSpace(SplashWallpaperPath);
+
+    public string SplashIconPath
+    {
+        get => _splashIconPath;
+        private set
+        {
+            if (SetProperty(ref _splashIconPath, value))
+            {
+                RaisePropertyChanged(nameof(HasCustomSplashIcon));
+            }
+        }
+    }
+
+    public bool HasCustomSplashIcon => !string.IsNullOrWhiteSpace(SplashIconPath);
+
+    public int SplashExtraCloseDelaySeconds
+    {
+        get => _splashExtraCloseDelaySeconds;
+        private set => SetProperty(ref _splashExtraCloseDelaySeconds, value);
+    }
+
     public bool ShowFirstRunSetup
     {
         get => _showFirstRunSetup;
@@ -206,7 +267,14 @@ public sealed class MainWindowViewModel : BindableBase
 
     public string StatusPillText => IsRunning ? "Running" : "Stopped";
 
-    public string AutostartButtonText => AutostartEnabled ? "Disable Autostart" : "Enable Autostart";
+    public string AutostartButtonText => AutostartEnabled ? "Disable Startup" : "Enable Shell Startup";
+
+    public string AutostartMenuText => StartupMode switch
+    {
+        SteamLoaderRuntime.StartupModeShell => "Startup Mode: Shell takeover",
+        SteamLoaderRuntime.StartupModeTray => "Startup Mode: Tray app",
+        _ => "Startup Mode: Manual"
+    };
 
     public AsyncRelayCommand StartCommand { get; }
 
@@ -258,6 +326,18 @@ public sealed class MainWindowViewModel : BindableBase
         }
     }
 
+    public void StartSplashPreview(TimeSpan duration)
+    {
+        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
+        ShowStartupSplash = true;
+        ShowFirstRunSetup = false;
+        ServiceStateText = "Splash preview";
+        ServiceDetailText = $"Preview closes automatically in {Math.Ceiling(duration.TotalSeconds)} seconds.";
+        SteamStateText = "No startup actions are running.";
+        ApiStateText = "Preview mode";
+        ErrorText = string.Empty;
+    }
+
     public async Task RefreshAsync()
     {
         if (IsBusy)
@@ -273,6 +353,7 @@ public sealed class MainWindowViewModel : BindableBase
 
             var status = await _processManager.GetStatusAsync();
             var settings = _settingsService.GetSnapshot();
+            ApplySplashScreenSettings(settings.SplashScreen);
             _lastKnownStatus = status;
             IsRunning = status is not null;
             ShowFirstRunSetup = false;
@@ -300,8 +381,9 @@ public sealed class MainWindowViewModel : BindableBase
             SetupChecklistText = BuildSetupChecklistText(status);
             RecoveryHintText = BuildRecoveryHintText(status);
 
+            StartupMode = settings.StartupMode;
             AutostartEnabled = settings.RunOnWindowsSignIn;
-            AutostartStateText = BuildAutostartStateText(AutostartEnabled);
+            AutostartStateText = BuildAutostartStateText(settings.StartupMode);
         }
         catch (Exception exception)
         {
@@ -366,15 +448,12 @@ public sealed class MainWindowViewModel : BindableBase
     {
         try
         {
-            var nextState = !AutostartEnabled;
-            if (nextState)
-            {
-                _autostartService.DisableSteamAutostartEntries();
-            }
-
-            var settings = _settingsService.SetRunOnWindowsSignIn(nextState);
+            var settings = AutostartEnabled
+                ? _settingsService.SetStartupMode(SteamLoaderRuntime.StartupModeManual)
+                : _settingsService.SetRunOnWindowsSignIn(true);
+            StartupMode = settings.StartupMode;
             AutostartEnabled = settings.RunOnWindowsSignIn;
-            AutostartStateText = BuildAutostartStateText(settings.RunOnWindowsSignIn);
+            AutostartStateText = BuildAutostartStateText(settings.StartupMode);
             ErrorText = string.Empty;
         }
         catch (Exception exception)
@@ -679,6 +758,7 @@ public sealed class MainWindowViewModel : BindableBase
             SteamStateText = "Steam was not ready before the console-mode timeout.";
         }
 
+        await HoldSplashBeforeShellHandoffAsync();
         CompleteShellBootstrap();
     }
 
@@ -699,6 +779,19 @@ public sealed class MainWindowViewModel : BindableBase
         _shellService.StartWindowsShellIfNeeded();
         ShowStartupSplash = false;
         ShowFirstRunSetup = false;
+    }
+
+    private async Task HoldSplashBeforeShellHandoffAsync()
+    {
+        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
+        if (!ShowStartupSplash || SplashExtraCloseDelaySeconds <= 0)
+        {
+            return;
+        }
+
+        ServiceStateText = "Steam is ready";
+        ServiceDetailText = $"Keeping the splash screen visible for {SplashExtraCloseDelaySeconds}s.";
+        await Task.Delay(TimeSpan.FromSeconds(SplashExtraCloseDelaySeconds));
     }
 
     private void ApplyShellBootstrapStatus(SteamLoaderHostStatus? status)
@@ -737,10 +830,24 @@ public sealed class MainWindowViewModel : BindableBase
         SteamStateText = "Waiting for Steam to finish booting.";
     }
 
-    private static string BuildAutostartStateText(bool enabled)
+    private static string BuildAutostartStateText(string? startupMode)
     {
-        return enabled
-            ? "Tools for Steam takes over the sign-in shell, syncs your launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
-            : "Tools for Steam only starts when you launch it manually.";
+        return startupMode switch
+        {
+            SteamLoaderRuntime.StartupModeShell =>
+                "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer.",
+            SteamLoaderRuntime.StartupModeTray =>
+                "Tray app mode is active. Windows starts normally, then Tools for Steam runs from the tray, syncs launchers, and starts Steam in dev mode.",
+            _ => "Tools for Steam only starts when you launch it manually."
+        };
+    }
+
+    private void ApplySplashScreenSettings(SteamLoaderSplashScreenSettingsSnapshot settings)
+    {
+        _splashScreenEnabled = settings.Enabled;
+        ShowStartupSplashText = settings.ShowText;
+        SplashWallpaperPath = settings.WallpaperExists ? settings.WallpaperPath : string.Empty;
+        SplashIconPath = settings.IconExists ? settings.IconPath : string.Empty;
+        SplashExtraCloseDelaySeconds = settings.ExtraCloseDelaySeconds;
     }
 }

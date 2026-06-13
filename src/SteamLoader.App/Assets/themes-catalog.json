@@ -24,6 +24,9 @@
         {
           "targets": [ "SP", "Steam Big Picture Mode", "~https://steamloopback.host/routes/library/~", "~https://steamloopback.host/index.html~" ],
           "cssLines": [
+            "._1R9r2OBCxAmtuUVrgBEUBw, ._2E7G8grj_-tgxXbTXs1t2E { border-radius: {{panel-radius}}px !important; overflow: hidden !important; }",
+            "[role='link']:has(img._24_AuLm54JVe1Zc0AApCDR), [role='link']:has(img._3d_bT685lnWotXxgzKW6am), [role='link']:has(img[src^='/customimages/'][src*='p.']), [role='link']:has(img[src*='library_600x900']), [role='link']:has(img._24_AuLm54JVe1Zc0AApCDR)::before, [role='link']:has(img._3d_bT685lnWotXxgzKW6am)::before, [role='link']:has(img[src^='/customimages/'][src*='p.'])::before, [role='link']:has(img[src*='library_600x900'])::before, [role='link']:has(img._24_AuLm54JVe1Zc0AApCDR)::after, [role='link']:has(img._3d_bT685lnWotXxgzKW6am)::after, [role='link']:has(img[src^='/customimages/'][src*='p.'])::after, [role='link']:has(img[src*='library_600x900'])::after { border-radius: calc({{panel-radius}}px + 4px) !important; }",
+            "img._24_AuLm54JVe1Zc0AApCDR, img._3d_bT685lnWotXxgzKW6am, img[src^='/customimages/'][src*='p.'], img[src*='library_600x900'] { border-radius: {{panel-radius}}px !important; clip-path: inset(0 round {{panel-radius}}px) !important; }",
             ".steamloader-theme-artwork-host, .steamloader-theme-artwork-bg { border-radius: {{panel-radius}}px !important; overflow: hidden !important; }",
             ".steamloader-theme-artwork { border-radius: {{panel-radius}}px !important; clip-path: inset(0 round {{panel-radius}}px); }",
             ".steamloader-theme-portrait-host, .steamloader-theme-portrait-bg { border-radius: {{panel-radius}}px !important; overflow: hidden !important; }",

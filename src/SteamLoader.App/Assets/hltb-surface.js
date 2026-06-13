@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 2;
+  const stateVersion = 6;
   const themeScanEventName = "steamtools:theme-scan-complete";
   const titleNoiseMarkers = [
     "PLAY",
@@ -25,6 +25,11 @@
     "ALL STYLES",
     "VIEW DETAILS",
     "DETAILS",
+    "RECENT GAMES",
+    "VIEW MORE IN YOUR LIBRARY",
+    "WHAT'S NEW",
+    "RECOMMENDED",
+    "SP BPM",
   ];
   const appIdPatterns = [
     /\/apps\/(\d+)\//i,
@@ -33,6 +38,13 @@
     /[?&]appid=(\d+)/i,
     /\/appdetails\/(\d+)/i,
   ];
+  const detailClassFragments = [
+    "sharedappdetailsheader_",
+    "basicappdetailssectionstyler_",
+    "appdetailsplaysection_",
+  ];
+  const detailTextPattern =
+    /PLAY TIME|PLAYTIME|SPIELZEIT|LAST PLAYED|ZULETZT GESPIELT|STEAM CLOUD|CONTROLLER|ACTIVITY|AKTIVITAT|AKTIVITÄT|YOUR STUFF|IHRE DINGE|COMMUNITY|GAME INFO|SPIELINFO/i;
 
   const previousState = window.__steamToolsHltbSurfaceState;
   if (previousState?.version !== stateVersion) {
@@ -67,6 +79,7 @@
           lastRequestKey: "",
           lastSnapshot: null,
           lastFetchAt: 0,
+          lastRefreshAt: 0,
         });
 
   function ensureStyleElement() {
@@ -180,6 +193,14 @@
       .toUpperCase();
   }
 
+  function classText(node) {
+    return String(node?.className || "").toLowerCase();
+  }
+
+  function hasClassFragment(node, fragment) {
+    return classText(node).includes(fragment.toLowerCase());
+  }
+
   function isVisibleElement(node) {
     return (
       node instanceof HTMLElement &&
@@ -189,12 +210,271 @@
     );
   }
 
+  function getElementUrlishValues(node) {
+    const values = [
+      node?.getAttribute?.("href"),
+      node?.getAttribute?.("src"),
+      node?.getAttribute?.("style"),
+      node instanceof HTMLImageElement ? node.currentSrc : "",
+      node instanceof HTMLImageElement ? node.src : "",
+      node instanceof HTMLImageElement ? node.alt : "",
+      node instanceof HTMLElement ? node.style.backgroundImage : "",
+    ];
+
+    return values.filter(Boolean);
+  }
+
+  function findAppIdInElement(node) {
+    if (!(node instanceof Element)) {
+      return null;
+    }
+
+    for (const value of getElementUrlishValues(node)) {
+      const appId = extractAppIdFromUrlish(value);
+      if (appId) {
+        return appId;
+      }
+    }
+
+    for (const candidate of node.querySelectorAll("img, a, [style], [href], [src]")) {
+      for (const value of getElementUrlishValues(candidate)) {
+        const appId = extractAppIdFromUrlish(value);
+        if (appId) {
+          return appId;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getSemanticDetailScore(container) {
+    if (!(container instanceof Element)) {
+      return 0;
+    }
+
+    const matches = new Set();
+    for (const fragment of detailClassFragments) {
+      if (hasClassFragment(container, fragment)) {
+        matches.add(fragment);
+      }
+    }
+
+    for (const node of container.querySelectorAll("[class]")) {
+      for (const fragment of detailClassFragments) {
+        if (hasClassFragment(node, fragment)) {
+          matches.add(fragment);
+        }
+      }
+    }
+
+    return matches.size;
+  }
+
+  function getAppDetailRouteId() {
+    const match = String(location.href || "").match(/\/appdetails\/(\d+)/i);
+    if (!match) {
+      return null;
+    }
+
+    const parsed = Number(match[1]);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  function hasNativeDetailPlaySection(container) {
+    if (!(container instanceof Element)) {
+      return false;
+    }
+
+    if (container.querySelector(".steamloader-theme-game-detail-playbar")) {
+      return true;
+    }
+
+    return [...container.querySelectorAll("[class]")].some((node) => {
+      return (
+        node instanceof HTMLElement &&
+        (hasClassFragment(node, "basicappdetailssectionstyler_playsection_") ||
+          hasClassFragment(node, "appdetailsplaysection_"))
+      );
+    });
+  }
+
+  function getDetailTextSignalCount(container) {
+    const text = normalizeTitleScore(container?.innerText || "");
+    if (!text) {
+      return 0;
+    }
+
+    const signals = [
+      "PLAY TIME",
+      "PLAYTIME",
+      "SPIELZEIT",
+      "LAST PLAYED",
+      "ZULETZT GESPIELT",
+      "STEAM CLOUD",
+      "CONTROLLER",
+      "ACTIVITY",
+      "AKTIVITAT",
+      "AKTIVITÄT",
+      "YOUR STUFF",
+      "IHRE DINGE",
+      "COMMUNITY",
+      "GAME INFO",
+      "SPIELINFO",
+      "ACHIEVEMENTS",
+      "ERFOLGE",
+      "SPACE REQUIRED",
+      "SPEICHERPLATZ",
+    ];
+
+    return signals.reduce((count, signal) => count + (text.includes(signal) ? 1 : 0), 0);
+  }
+
+  function isHomeOrLibraryHub(container) {
+    const text = normalizeTitleScore(container?.innerText || "");
+    if (!text) {
+      return false;
+    }
+
+    const hubSignals = [
+      "RECENT GAMES",
+      "VOR KURZEM GESPIELT",
+      "VIEW MORE IN YOUR LIBRARY",
+      "MEHR IN IHRER BIBLIOTHEK",
+      "WHAT'S NEW",
+      "WAS IST NEU",
+      "RECOMMENDED",
+      "EMPFOHLEN",
+    ];
+
+    const detailSignals = getDetailTextSignalCount(container);
+    const hasCloudOrTabs =
+      text.includes("STEAM CLOUD") ||
+      text.includes("YOUR STUFF") ||
+      text.includes("IHRE DINGE") ||
+      text.includes("GAME INFO") ||
+      text.includes("SPIELINFO");
+
+    return hubSignals.some((signal) => text.includes(signal)) && (!hasCloudOrTabs || detailSignals < 3);
+  }
+
+  function hasReliableDetailSignal(container) {
+    if (isHomeOrLibraryHub(container)) {
+      return false;
+    }
+
+    return hasNativeDetailPlaySection(container) || getDetailTextSignalCount(container) >= 2;
+  }
+
+  function hasLargeDetailHero(container, containerRect) {
+    for (const candidate of container.querySelectorAll("img, canvas, video, [style*='background']")) {
+      if (!(candidate instanceof HTMLElement)) {
+        continue;
+      }
+
+      const rect = candidate.getBoundingClientRect();
+      if (
+        rect.width >= Math.min(520, containerRect.width * 0.5) &&
+        rect.height >= 180 &&
+        rect.top <= containerRect.top + Math.max(180, containerRect.height * 0.35)
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isLikelyDetailContainer(container) {
+    if (!isVisibleElement(container)) {
+      return false;
+    }
+
+    if (container === document.body || container === document.documentElement) {
+      return false;
+    }
+
+    const rect = container.getBoundingClientRect();
+    if (rect.width < 480 || rect.height < 260) {
+      return false;
+    }
+
+    if (isHomeOrLibraryHub(container)) {
+      return false;
+    }
+
+    if (
+      container.classList.contains("steamloader-theme-game-detail") &&
+      hasReliableDetailSignal(container) &&
+      hasLargeDetailHero(container, rect)
+    ) {
+      return true;
+    }
+
+    const semanticScore = getSemanticDetailScore(container);
+    if (semanticScore >= 2 && hasReliableDetailSignal(container)) {
+      return true;
+    }
+
+    const routeAppId = getAppDetailRouteId();
+    const containedAppId = findAppIdInElement(container);
+    if (!routeAppId && !containedAppId) {
+      return false;
+    }
+
+    const hasAnyAppId = Boolean(routeAppId || containedAppId);
+    if (hasAnyAppId && hasReliableDetailSignal(container) && hasLargeDetailHero(container, rect)) {
+      return true;
+    }
+
+    return semanticScore >= 1 && hasReliableDetailSignal(container) && hasLargeDetailHero(container, rect);
+  }
+
+  function collectDetailContainerCandidates() {
+    const candidates = new Set(
+      [...document.querySelectorAll(".steamloader-theme-game-detail")]
+        .filter((node) => !isHomeOrLibraryHub(node)),
+    );
+    const semanticNodes = [...document.querySelectorAll("[class]")]
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => detailClassFragments.some((fragment) => hasClassFragment(node, fragment)));
+
+    for (const node of semanticNodes) {
+      let current = node;
+      for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+        if (isLikelyDetailContainer(current)) {
+          candidates.add(current);
+        }
+      }
+    }
+
+    const textSignalNodes = [...document.querySelectorAll("div, section, main")]
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.width >= 320 && rect.height >= 80 && rect.height <= Math.max(760, window.innerHeight * 0.82);
+      })
+      .filter((node) => detailTextPattern.test(node.innerText || ""));
+
+    for (const node of textSignalNodes) {
+      let current = node;
+      for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+        if (isLikelyDetailContainer(current)) {
+          candidates.add(current);
+          break;
+        }
+      }
+    }
+
+    return [...candidates];
+  }
+
   function getActiveDetailContainer() {
-    const containers = [...document.querySelectorAll(".steamloader-theme-game-detail")]
+    const containers = collectDetailContainerCandidates()
       .filter((node) => isVisibleElement(node))
       .filter((node) => {
         const rect = node.getBoundingClientRect();
-        return rect.width >= 320 && rect.height >= 200;
+        return rect.width >= 320 && rect.height >= 200 && isLikelyDetailContainer(node);
       })
       .sort((left, right) => {
         const leftRect = left.getBoundingClientRect();
@@ -220,6 +500,10 @@
   function isNoiseTitle(value) {
     const text = normalizeTitleScore(value);
     if (!text || text.length < 2 || text.length > 120) {
+      return true;
+    }
+
+    if (/^SP\s+BPM(?:_|$)/i.test(text) || /_UID\d+$/i.test(text)) {
       return true;
     }
 
@@ -468,8 +752,9 @@
   function extractGameContext(container) {
     const reactInfo = extractGameInfoFromReact(container);
     const titleCandidates = collectTitleCandidates(container);
+    const reactTitle = !isNoiseTitle(reactInfo.title) ? reactInfo.title : "";
     const bestTitle =
-      reactInfo.title ||
+      reactTitle ||
       (titleCandidates.length > 0 ? titleCandidates[0].value : "");
     const bestAppId = reactInfo.appId || findAppId(container);
 
@@ -483,6 +768,12 @@
     const playbar = container.querySelector(".steamloader-theme-game-detail-playbar");
     if (playbar instanceof HTMLElement) {
       return playbar;
+    }
+
+    for (const candidate of container.querySelectorAll("[class]")) {
+      if (candidate instanceof HTMLElement && hasClassFragment(candidate, "basicappdetailssectionstyler_playsection_")) {
+        return candidate;
+      }
     }
 
     const fallback = [...container.querySelectorAll("div, section")]
@@ -526,7 +817,7 @@
       panel.className = "steamtools-hltb-panel";
     }
 
-    if (anchor && panel !== anchor.previousElementSibling) {
+    if (anchor?.parentElement && panel !== anchor.previousElementSibling) {
       anchor.parentElement.insertBefore(panel, anchor);
     } else if (!panel.isConnected) {
       container.append(panel);
@@ -638,6 +929,13 @@
       return;
     }
 
+    const now = Date.now();
+    if (now - (state.lastRefreshAt || 0) < 650) {
+      queueRefresh(650);
+      return;
+    }
+    state.lastRefreshAt = now;
+
     const container = getActiveDetailContainer();
     removeDetachedPanels(container);
 
@@ -654,7 +952,6 @@
       return;
     }
 
-    const now = Date.now();
     if (
       state.lastSnapshot &&
       state.lastRequestKey === requestKey &&
@@ -684,14 +981,14 @@
     }
   }
 
-  function queueRefresh() {
+  function queueRefresh(delay = 320) {
     if (state.refreshHandle) {
       return;
     }
 
     state.refreshHandle = window.setTimeout(() => {
       void refreshHltb();
-    }, 220);
+    }, delay);
   }
 
   function install() {
@@ -702,7 +999,7 @@
       state.observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
           if (mutation.type === "childList" && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
-            queueRefresh();
+            queueRefresh(480);
             break;
           }
         }
@@ -716,7 +1013,7 @@
 
     if (typeof state.themeScanHandler !== "function") {
       state.themeScanHandler = () => {
-        queueRefresh();
+        queueRefresh(520);
       };
       window.addEventListener(themeScanEventName, state.themeScanHandler);
     }
@@ -727,7 +1024,7 @@
 
     state.timerHandle = window.setInterval(() => {
       if (!document.hidden) {
-        queueRefresh();
+        queueRefresh(900);
       }
     }, 12000);
 

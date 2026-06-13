@@ -385,13 +385,44 @@
                 Background="#081019"
                 Panel.ZIndex="100"
                 Visibility="{Binding ShowStartupSplash, Converter={StaticResource BooleanToVisibilityConverter}}">
-            <Grid Margin="64">
+            <Grid>
+                <Image Source="{Binding SplashWallpaperPath}"
+                       Stretch="UniformToFill"
+                       Opacity="0.52"
+                       Visibility="{Binding HasSplashWallpaper, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                <Rectangle Fill="#B0081019" />
+                <Rectangle>
+                    <Rectangle.Fill>
+                        <RadialGradientBrush Center="0.5,0.48"
+                                             GradientOrigin="0.5,0.48"
+                                             RadiusX="0.72"
+                                             RadiusY="0.72">
+                            <GradientStop Color="#401C2C3A"
+                                          Offset="0" />
+                            <GradientStop Color="#DA081019"
+                                          Offset="1" />
+                        </RadialGradientBrush>
+                    </Rectangle.Fill>
+                </Rectangle>
+
+                <Grid Margin="64">
                 <StackPanel HorizontalAlignment="Center"
                             VerticalAlignment="Center"
                             MaxWidth="720">
                     <Viewbox Width="150"
                              Height="150"
                              HorizontalAlignment="Center">
+                        <Viewbox.Style>
+                            <Style TargetType="Viewbox">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasCustomSplashIcon}"
+                                                 Value="True">
+                                        <Setter Property="Visibility"
+                                                Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Viewbox.Style>
                         <Canvas Width="160" Height="160">
                             <Ellipse Width="160"
                                      Height="160"
@@ -421,19 +452,34 @@
                         </Canvas>
                     </Viewbox>
 
+                    <Border Width="150"
+                            Height="150"
+                            HorizontalAlignment="Center"
+                            Background="#0F1823"
+                            BorderBrush="#243244"
+                            BorderThickness="4"
+                            CornerRadius="36"
+                            ClipToBounds="True"
+                            Visibility="{Binding HasCustomSplashIcon, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <Image Source="{Binding SplashIconPath}"
+                               Stretch="UniformToFill" />
+                    </Border>
+
                     <TextBlock Text="Tools for Steam"
                                Margin="0,28,0,0"
                                HorizontalAlignment="Center"
                                Foreground="#F1F6FB"
                                FontSize="52"
-                               FontWeight="Bold" />
+                               FontWeight="Bold"
+                               Visibility="{Binding ShowStartupSplashText, Converter={StaticResource BooleanToVisibilityConverter}}" />
 
                     <TextBlock Text="Preparing Steam"
                                Margin="0,18,0,0"
                                HorizontalAlignment="Center"
                                Foreground="#D8E3EE"
                                FontSize="24"
-                               FontWeight="SemiBold" />
+                               FontWeight="SemiBold"
+                               Visibility="{Binding ShowStartupSplashText, Converter={StaticResource BooleanToVisibilityConverter}}" />
 
                     <TextBlock Text="{Binding ServiceDetailText}"
                                Margin="0,14,0,0"
@@ -441,7 +487,8 @@
                                Foreground="#AAB8C6"
                                FontSize="16"
                                TextAlignment="Center"
-                               TextWrapping="Wrap" />
+                               TextWrapping="Wrap"
+                               Visibility="{Binding ShowStartupSplashText, Converter={StaticResource BooleanToVisibilityConverter}}" />
 
                     <TextBlock Text="{Binding SteamStateText}"
                                Margin="0,10,0,0"
@@ -449,8 +496,10 @@
                                Foreground="#8091A3"
                                FontSize="14"
                                TextAlignment="Center"
-                               TextWrapping="Wrap" />
+                               TextWrapping="Wrap"
+                               Visibility="{Binding ShowStartupSplashText, Converter={StaticResource BooleanToVisibilityConverter}}" />
                 </StackPanel>
+                </Grid>
             </Grid>
         </Border>
     </Grid>

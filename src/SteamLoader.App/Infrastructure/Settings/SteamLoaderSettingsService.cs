@@ -26,6 +26,7 @@ public sealed class SteamLoaderSettingsService
     {
         WriteIndented = true
     };
+    private const int MaximumSplashCloseDelaySeconds = 30;
 
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
@@ -51,11 +52,14 @@ public sealed class SteamLoaderSettingsService
     public SteamLoaderGeneralSettingsSnapshot GetSnapshot()
     {
         var settings = LoadSettings();
+        var startupMode = ResolveStartupMode(settings);
         return new SteamLoaderGeneralSettingsSnapshot(
-            RunOnWindowsSignIn: _shellService.IsEnabled(_executablePath, _shellLaunchArguments),
+            RunOnWindowsSignIn: !string.Equals(startupMode, SteamLoaderRuntime.StartupModeManual, StringComparison.OrdinalIgnoreCase),
+            StartupMode: startupMode,
             HideWindowsShellInConsoleMode: settings.HideWindowsShellInConsoleMode ?? true,
             FirstRunCompleted: settings.FirstRunCompleted == true,
             ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
+            SplashScreen: BuildSplashScreenSettings(settings),
             ProductVersion: GetProductVersion(),
             InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
             Plugins: BuildPluginStates(settings));
@@ -69,9 +73,10 @@ public sealed class SteamLoaderSettingsService
             return GetSnapshot();
         }
 
-        ApplyRunOnWindowsSignIn(true);
+        ApplyStartupMode(SteamLoaderRuntime.StartupModeShell);
         SaveSettings(settings with
         {
+            StartupMode = SteamLoaderRuntime.StartupModeShell,
             ConsoleModeDefaultApplied = true,
             HideWindowsShellInConsoleMode = settings.HideWindowsShellInConsoleMode ?? true
         });
@@ -81,11 +86,13 @@ public sealed class SteamLoaderSettingsService
 
     public SteamLoaderGeneralSettingsSnapshot SetRunOnWindowsSignIn(bool enabled)
     {
-        ApplyRunOnWindowsSignIn(enabled);
+        var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeManual;
+        ApplyStartupMode(mode);
 
         var settings = LoadSettings();
         SaveSettings(settings with
         {
+            StartupMode = mode,
             ConsoleModeDefaultApplied = true,
             RunOnWindowsSignInUserConfigured = true
         });
@@ -93,15 +100,44 @@ public sealed class SteamLoaderSettingsService
         return GetSnapshot();
     }
 
-    private void ApplyRunOnWindowsSignIn(bool enabled)
+    public SteamLoaderGeneralSettingsSnapshot SetStartupMode(string mode)
     {
-        if (enabled)
+        var normalizedMode = NormalizeStartupMode(mode);
+        ApplyStartupMode(normalizedMode);
+
+        var settings = LoadSettings();
+        SaveSettings(settings with
+        {
+            StartupMode = normalizedMode,
+            ConsoleModeDefaultApplied = true,
+            RunOnWindowsSignInUserConfigured = true
+        });
+
+        return GetSnapshot();
+    }
+
+    private void ApplyStartupMode(string mode)
+    {
+        if (!string.Equals(mode, SteamLoaderRuntime.StartupModeManual, StringComparison.OrdinalIgnoreCase))
         {
             _autostartService.DisableSteamAutostartEntries();
         }
 
-        _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
-        _shellService.SetEnabled(_executablePath, _shellLaunchArguments, enabled);
+        switch (NormalizeStartupMode(mode))
+        {
+            case SteamLoaderRuntime.StartupModeShell:
+                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
+                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
+                break;
+            case SteamLoaderRuntime.StartupModeTray:
+                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, false);
+                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, true);
+                break;
+            default:
+                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
+                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, false);
+                break;
+        }
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetHideWindowsShellInConsoleMode(bool enabled)
@@ -113,6 +149,71 @@ public sealed class SteamLoaderSettingsService
 
         SaveSettings(settings);
         return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenEnabled(bool enabled)
+    {
+        var settings = LoadSettings();
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        {
+            Enabled = enabled
+        };
+
+        SaveSettings(settings with { SplashScreen = splashScreen });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenShowText(bool enabled)
+    {
+        var settings = LoadSettings();
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        {
+            ShowText = enabled
+        };
+
+        SaveSettings(settings with { SplashScreen = splashScreen });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenWallpaperPath(string? path)
+    {
+        var settings = LoadSettings();
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        {
+            WallpaperPath = NormalizeOptionalPath(path)
+        };
+
+        SaveSettings(settings with { SplashScreen = splashScreen });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenIconPath(string? path)
+    {
+        var settings = LoadSettings();
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        {
+            IconPath = NormalizeOptionalPath(path)
+        };
+
+        SaveSettings(settings with { SplashScreen = splashScreen });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenExtraCloseDelaySeconds(int seconds)
+    {
+        var settings = LoadSettings();
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        {
+            ExtraCloseDelaySeconds = ClampSplashCloseDelay(seconds)
+        };
+
+        SaveSettings(settings with { SplashScreen = splashScreen });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderSplashScreenSettingsSnapshot GetSplashScreenSettings()
+    {
+        return BuildSplashScreenSettings(LoadSettings());
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetPluginEnabled(string pluginId, bool enabled)
@@ -182,6 +283,11 @@ public sealed class SteamLoaderSettingsService
         return LoadSettings().HideWindowsShellInConsoleMode ?? true;
     }
 
+    public bool ShouldShowSplashScreen()
+    {
+        return NormalizeSplashScreenSettings(LoadSettings().SplashScreen).Enabled == true;
+    }
+
     private SteamLoaderSettingsData LoadSettings()
     {
         lock (_gate)
@@ -241,6 +347,71 @@ public sealed class SteamLoaderSettingsService
             .ToArray();
     }
 
+    private static SteamLoaderSplashScreenSettingsSnapshot BuildSplashScreenSettings(SteamLoaderSettingsData settings)
+    {
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen);
+        var wallpaperPath = splashScreen.WallpaperPath ?? string.Empty;
+        var iconPath = splashScreen.IconPath ?? string.Empty;
+
+        return new SteamLoaderSplashScreenSettingsSnapshot(
+            splashScreen.Enabled ?? true,
+            splashScreen.ShowText ?? true,
+            wallpaperPath,
+            !string.IsNullOrWhiteSpace(wallpaperPath) && File.Exists(wallpaperPath),
+            iconPath,
+            !string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath),
+            ClampSplashCloseDelay(splashScreen.ExtraCloseDelaySeconds ?? 0));
+    }
+
+    private static SteamLoaderSplashScreenSettingsData NormalizeSplashScreenSettings(
+        SteamLoaderSplashScreenSettingsData? settings)
+    {
+        return new SteamLoaderSplashScreenSettingsData
+        {
+            Enabled = settings?.Enabled ?? true,
+            ShowText = settings?.ShowText ?? true,
+            WallpaperPath = NormalizeOptionalPath(settings?.WallpaperPath ?? string.Empty),
+            IconPath = NormalizeOptionalPath(settings?.IconPath ?? string.Empty),
+            ExtraCloseDelaySeconds = ClampSplashCloseDelay(settings?.ExtraCloseDelaySeconds ?? 0)
+        };
+    }
+
+    private static string NormalizeOptionalPath(string? path)
+    {
+        return (path ?? string.Empty).Trim().Trim('"');
+    }
+
+    private string ResolveStartupMode(SteamLoaderSettingsData settings)
+    {
+        if (_shellService.IsEnabled(_executablePath, _shellLaunchArguments))
+        {
+            return SteamLoaderRuntime.StartupModeShell;
+        }
+
+        if (_autostartService.IsEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments))
+        {
+            return SteamLoaderRuntime.StartupModeTray;
+        }
+
+        return NormalizeStartupMode(settings.StartupMode);
+    }
+
+    private static string NormalizeStartupMode(string? mode)
+    {
+        return mode?.Trim().ToLowerInvariant() switch
+        {
+            SteamLoaderRuntime.StartupModeShell => SteamLoaderRuntime.StartupModeShell,
+            SteamLoaderRuntime.StartupModeTray => SteamLoaderRuntime.StartupModeTray,
+            SteamLoaderRuntime.StartupModeManual => SteamLoaderRuntime.StartupModeManual,
+            _ => SteamLoaderRuntime.StartupModeManual
+        };
+    }
+
+    private static int ClampSplashCloseDelay(int seconds)
+    {
+        return Math.Clamp(seconds, 0, MaximumSplashCloseDelaySeconds);
+    }
+
     private static Dictionary<string, bool> NormalizePluginStates(Dictionary<string, bool>? savedStates)
     {
         var normalized = PluginDefinitions.ToDictionary(
@@ -283,6 +454,8 @@ public sealed class SteamLoaderSettingsService
 
         public bool? RunOnWindowsSignInUserConfigured { get; init; }
 
+        public string? StartupMode { get; init; }
+
         public bool? HideWindowsShellInConsoleMode { get; init; }
 
         public bool? FirstRunCompleted { get; init; }
@@ -290,5 +463,20 @@ public sealed class SteamLoaderSettingsService
         public DateTimeOffset? FirstRunCompletedAtUtc { get; init; }
 
         public Dictionary<string, bool>? PluginEnabled { get; init; }
+
+        public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
+    }
+
+    private sealed record SteamLoaderSplashScreenSettingsData
+    {
+        public bool? Enabled { get; init; }
+
+        public bool? ShowText { get; init; }
+
+        public string? WallpaperPath { get; init; }
+
+        public string? IconPath { get; init; }
+
+        public int? ExtraCloseDelaySeconds { get; init; }
     }
 }

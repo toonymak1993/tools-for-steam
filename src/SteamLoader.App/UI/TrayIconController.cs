@@ -58,7 +58,7 @@ public sealed class TrayIconController : IDisposable
         _startHostItem = new Forms.ToolStripMenuItem("Start Background Host", null, (_, _) => _viewModel.StartCommand.Execute(null));
         _restartHostItem = new Forms.ToolStripMenuItem("Restart Background Host", null, (_, _) => _viewModel.RestartCommand.Execute(null));
         _stopHostItem = new Forms.ToolStripMenuItem("Stop Background Host", null, (_, _) => _viewModel.StopCommand.Execute(null));
-        _autostartItem = new Forms.ToolStripMenuItem("Run on Windows Sign-In (shell + sync + Steam)", null, (_, _) => _viewModel.ToggleAutostartSetting())
+        _autostartItem = new Forms.ToolStripMenuItem("Startup Mode: Manual", null, (_, _) => _viewModel.ToggleAutostartSetting())
         {
             CheckOnClick = false
         };
@@ -143,6 +143,7 @@ public sealed class TrayIconController : IDisposable
             case nameof(MainWindowViewModel.IsRunning):
             case nameof(MainWindowViewModel.SteamStateText):
             case nameof(MainWindowViewModel.AutostartEnabled):
+            case nameof(MainWindowViewModel.StartupMode):
             case nameof(MainWindowViewModel.ErrorText):
             case nameof(MainWindowViewModel.ServiceDetailText):
                 UpdateTrayState();
@@ -180,6 +181,7 @@ public sealed class TrayIconController : IDisposable
         _refreshItem.Enabled = _viewModel.RefreshCommand.CanExecute(null);
         _autostartItem.Enabled = _viewModel.ToggleAutostartCommand.CanExecute(null);
         _autostartItem.Checked = _viewModel.AutostartEnabled;
+        _autostartItem.Text = _viewModel.AutostartMenuText;
         _startDesktopItem.Enabled = _viewModel.StartDesktopCommand.CanExecute(null);
         _checkUpdatesItem.Enabled = _viewModel.CheckForUpdatesCommand.CanExecute(null);
         _exportSupportBundleItem.Enabled = _viewModel.ExportSupportBundleCommand.CanExecute(null);

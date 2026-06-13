@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const version = 26;
+  const version = 33;
   const openRequestStorageKey = "ToolsForSteamArtworkOpenRequest";
   const inputStorageKey = "ToolsForSteamArtworkInput";
   const overlayStateStorageKey = "ToolsForSteamArtworkOverlayState";
@@ -76,6 +76,12 @@
     pendingInitialAssetsFocus: false,
     contextMenuEnabled: false,
     artworkSettingsLoaded: false,
+    lastContextMenuContext: null,
+    lastContextMenuContextAt: 0,
+    contextActivationCaptureInstalled: false,
+    contextTrackingInstalled: false,
+    contextTrackingHandler: null,
+    contextActivationHandler: null,
   };
 
   function getArtworkChannel() {
@@ -1023,6 +1029,14 @@
     );
   }
 
+  function getRawAppIdFromValue(value) {
+    return value?.appid ?? value?.appId ?? value?.unAppID ?? value?.app_id ?? value?.app_id64;
+  }
+
+  function hasFiniteAppId(value) {
+    return Number.isFinite(Number(getRawAppIdFromValue(value)));
+  }
+
   function isUsableGameTitle(value) {
     if (typeof value !== "string") {
       return false;
@@ -1059,24 +1073,25 @@
       ownerProps.overview ||
       findReactTree(root, (value) => value?.overview?.appid)?.overview ||
       findReactTree(root, (value) => value?.app?.appid)?.app ||
-      findReactTree(root, (value) => value?.appid && getTitleFromValue(value));
+      findReactTree(root, (value) => hasFiniteAppId(value) && getTitleFromValue(value)) ||
+      findReactTree(root, hasFiniteAppId, 10);
 
     const rawAppId =
-      overview?.appid ??
-      overview?.appId ??
-      overview?.unAppID ??
-      props.appid ??
-      props.appId ??
-      props.unAppID ??
-      ownerProps.appid ??
-      ownerProps.appId ??
-      ownerProps.unAppID;
+      getRawAppIdFromValue(overview) ??
+      getRawAppIdFromValue(props) ??
+      getRawAppIdFromValue(ownerProps);
 
     const appId = normalizeSteamAppId(rawAppId);
+    const titleObject =
+      findReactTree(root, (value) => isUsableGameTitle(getBestTitleFromValue(value)), 10) ||
+      overview ||
+      props ||
+      ownerProps;
     const title =
       getBestTitleFromValue(overview) ||
       getBestTitleFromValue(props) ||
       getBestTitleFromValue(ownerProps) ||
+      getBestTitleFromValue(titleObject) ||
       "Selected Game";
 
     return { appId, title };
@@ -1097,17 +1112,37 @@
     ));
   }
 
+  function normalizeMenuText(value) {
+    return String(value || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\u2026/g, "...")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[.\s]+$/g, "")
+      .trim()
+      .toLowerCase();
+  }
+
+  function isPropertiesText(value) {
+    const text = normalizeMenuText(value);
+    return text === "properties" || text === "eigenschaften";
+  }
+
+  function isCancelText(value) {
+    const text = normalizeMenuText(value);
+    return text === "cancel" || text === "abbrechen";
+  }
+
   function findPropertiesMenuIndex(items) {
     return items.findIndex((item) => {
       const source = getFunctionSource(item?.props?.onSelected || item?.props?.onClick || item?.onSelected);
       const key = String(item?.key || "").toLowerCase();
-      const label = getMenuItemText(item).toLowerCase();
+      const label = getMenuItemText(item);
 
       return (
         source.includes("AppProperties") ||
         key === "properties" ||
-        label === "properties" ||
-        label === "eigenschaften"
+        isPropertiesText(label)
       );
     });
   }
@@ -1133,8 +1168,8 @@
     return "";
   }
 
-  function removeArtworkContextRows() {
-    for (const row of document.querySelectorAll(".steamtools-artwork-context-row")) {
+  function removeArtworkContextRows(root = document) {
+    for (const row of root.querySelectorAll(".steamtools-artwork-context-row")) {
       row.remove();
     }
   }
@@ -1173,12 +1208,17 @@
   }
 
   function requestArtworkPanel(context) {
-    const appId = normalizeSteamAppId(context?.appId);
+    const normalizedContext = normalizeArtworkContext(context) || getRememberedArtworkContext();
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
     if (!appId || !state.contextMenuEnabled) {
+      if (!appId) {
+        console.warn("[Tools for Steam] Artwork panel was requested without a Steam app id.", context, getRememberedArtworkContext());
+      }
       return;
     }
 
-    const title = context?.title || "Selected Game";
+    const title = normalizedContext?.title || "Selected Game";
+    rememberArtworkContext({ appId, title });
     const requestKey = getOpenRequestKey(appId, title);
     const now = Date.now();
     if (
@@ -1218,6 +1258,7 @@
   }
 
   function createReactArtworkMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
     const onSelected = (event) => {
       if (event?.preventDefault) {
         event.preventDefault();
@@ -1225,16 +1266,26 @@
       if (event?.stopPropagation) {
         event.stopPropagation();
       }
-      requestArtworkPanel(context);
+      requestArtworkPanel(normalizedContext);
     };
+    const templateProps = template?.props || {};
+    const className = [templateProps.className, "steamtools-artwork-context-row"]
+      .filter(Boolean)
+      .join(" ");
 
     return {
       ...template,
       key: "tfs-change-artwork",
       props: {
-        ...(template?.props || {}),
+        ...templateProps,
         disabled: false,
+        className,
+        "data-steamtools-artwork-row": "true",
+        "data-steamtools-artwork-app-id": String(normalizeSteamAppId(normalizedContext?.appId) || ""),
+        "data-steamtools-artwork-title": normalizedContext?.title || "Selected Game",
         onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
         onSelected,
         children: "Change Artwork...",
       },
@@ -1286,14 +1337,15 @@
 
     const itemContext = getArtworkContextFromReact(null, items);
     const resolvedContext = {
-      appId: itemContext.appId || context.appId,
-      title: itemContext.title && itemContext.title !== "Selected Game" ? itemContext.title : context.title,
+      appId: itemContext.appId || context?.appId || 0,
+      title: itemContext.title && itemContext.title !== "Selected Game" ? itemContext.title : context?.title || "Selected Game",
     };
 
     if (!resolvedContext.appId) {
       return false;
     }
 
+    rememberArtworkContext(resolvedContext);
     items.splice(propertiesIndex, 0, createReactArtworkMenuItem(template, resolvedContext));
     return true;
   }
@@ -1551,7 +1603,118 @@
     return null;
   }
 
-  function getContextDataFromNode(node) {
+  function extractAppIdFromText(value) {
+    const text = String(value || "");
+    const patterns = [
+      /(?:appdetails|app|rungameid)\/(-?\d+)/i,
+      /(?:appid|app_id|unAppID)[=:/"]+(-?\d+)/i,
+      /steam:\/\/rungameid\/(-?\d+)/i,
+    ];
+
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) {
+        return normalizeSteamAppId(match[1]);
+      }
+    }
+
+    return 0;
+  }
+
+  function extractAppIdFromElement(element) {
+    if (!(element instanceof HTMLElement)) {
+      return 0;
+    }
+
+    const attributeNames = [
+      "href",
+      "src",
+      "data-appid",
+      "data-app-id",
+      "data-ds-appid",
+      "data-steam-appid",
+      "data-steam-app-id",
+    ];
+
+    for (const name of attributeNames) {
+      const value = element.getAttribute(name);
+      const appId = /^\s*-?\d+\s*$/.test(value || "")
+        ? normalizeSteamAppId(value)
+        : extractAppIdFromText(value);
+      if (appId) {
+        return appId;
+      }
+    }
+
+    const styleAppId = extractAppIdFromText(element.getAttribute("style") || element.style?.backgroundImage || "");
+    if (styleAppId) {
+      return styleAppId;
+    }
+
+    return 0;
+  }
+
+  function findAppIdNearElement(node) {
+    let current = node instanceof HTMLElement ? node : node?.parentElement;
+    for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+      const ownAppId = extractAppIdFromElement(current);
+      if (ownAppId) {
+        return ownAppId;
+      }
+
+      const linkedElement = current.querySelector?.("[href*='/app/'], [href*='appdetails'], [href*='rungameid'], [data-appid], [data-app-id], [data-steam-appid]");
+      const linkedAppId = extractAppIdFromElement(linkedElement);
+      if (linkedAppId) {
+        return linkedAppId;
+      }
+    }
+
+    return extractAppIdFromText(location.href);
+  }
+
+  function getContextMenuTitle(menu) {
+    if (!(menu instanceof HTMLElement)) {
+      return "";
+    }
+
+    const commandLabels = new Set([
+      "play",
+      "spielen",
+      "add to favorites",
+      "zu favoriten hinzufugen",
+      "add to",
+      "hinzufugen zu",
+      "manage",
+      "verwalten",
+      "properties",
+      "eigenschaften",
+      "cancel",
+      "abbrechen",
+      "change artwork",
+    ]);
+
+    const candidates = [...menu.querySelectorAll("h1, h2, [class*='title'], [class*='Title'], div, span")]
+      .filter((item) => item instanceof HTMLElement)
+      .map((item) => ({
+        text: textOf(item),
+        rect: item.getBoundingClientRect(),
+      }))
+      .filter((item) => {
+        const normalized = normalizeMenuText(item.text);
+        return (
+          item.text.length >= 3 &&
+          item.text.length <= 140 &&
+          item.rect.width > 80 &&
+          item.rect.height > 10 &&
+          !commandLabels.has(normalized)
+        );
+      })
+      .sort((left, right) => left.rect.top - right.rect.top || left.text.length - right.text.length);
+
+    return candidates[0]?.text || "";
+  }
+
+  function getContextDataFromNode(node, allowRemembered = true) {
     let current = node;
     let appId = 0;
     let title = "";
@@ -1564,13 +1727,10 @@
 
       const appObject = findInObject(
         fiber,
-        (value) =>
-          (Number.isFinite(Number(value?.appid)) ||
-            Number.isFinite(Number(value?.appId)) ||
-            Number.isFinite(Number(value?.unAppID))) &&
-          isUsableGameTitle(getBestTitleFromValue(value)),
+        hasFiniteAppId,
+        9,
       );
-      const rawAppId = appObject?.appid ?? appObject?.appId ?? appObject?.unAppID;
+      const rawAppId = getRawAppIdFromValue(appObject);
       if (Number.isFinite(Number(rawAppId))) {
         appId = normalizeSteamAppId(rawAppId);
         title = getBestTitleFromValue(appObject) || title;
@@ -1587,10 +1747,26 @@
     }
 
     if (!appId) {
+      appId = findAppIdNearElement(node);
+    }
+
+    if (!appId && allowRemembered) {
+      const remembered = getRememberedArtworkContext();
+      if (remembered?.appId) {
+        appId = remembered.appId;
+        title = remembered.title || title;
+      }
+    }
+
+    if (!appId) {
       const match = location.href.match(/\/appdetails\/(\d+)/i);
       if (match) {
         appId = normalizeSteamAppId(match[1]);
       }
+    }
+
+    if (!title) {
+      title = getContextMenuTitle(node);
     }
 
     if (!title) {
@@ -1600,7 +1776,9 @@
       title = textBlocks[0] || document.title.replace(/\s*-\s*Steam.*$/i, "").trim();
     }
 
-    return { appId, title: title || "Selected Game" };
+    const result = { appId, title: title || "Selected Game" };
+    rememberArtworkContext(result);
+    return result;
   }
 
   function textOf(node) {
@@ -1608,12 +1786,46 @@
   }
 
   function isPropertiesRow(node) {
-    const text = textOf(node).toLowerCase();
-    return text === "properties" || text === "eigenschaften";
+    return isPropertiesText(textOf(node));
+  }
+
+  function getMenuRows(menu) {
+    const rows = [];
+    const seen = new Set();
+
+    for (const node of [...menu.querySelectorAll("div, button, [role='menuitem']")]) {
+      if (!(node instanceof HTMLElement)) {
+        continue;
+      }
+
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 120 || rect.height < 24 || rect.height > 180) {
+        continue;
+      }
+
+      const row = resolveMenuItemRow(node, menu);
+      if (!row || seen.has(row) || row.classList.contains("steamtools-artwork-context-row")) {
+        continue;
+      }
+
+      const rowText = textOf(row);
+      if (!rowText || rowText.length > 180) {
+        continue;
+      }
+
+      seen.add(row);
+      rows.push(row);
+    }
+
+    return rows.sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
+    });
   }
 
   function isGameContextMenu(menu) {
-    const text = textOf(menu).toLowerCase();
+    const text = normalizeMenuText(textOf(menu));
     return (
       (text.includes("properties") || text.includes("eigenschaften")) &&
       (text.includes("play") || text.includes("spielen") || text.includes("manage") || text.includes("verwalten"))
@@ -1680,9 +1892,9 @@
     let node = walker.nextNode();
 
     while (node) {
-      const value = (node.nodeValue || "").trim().toLowerCase();
-      if (value === "properties" || value === "eigenschaften") {
-        node.nodeValue = (node.nodeValue || "").replace(/properties|eigenschaften/i, text);
+      const value = node.nodeValue || "";
+      if (isPropertiesText(value)) {
+        node.nodeValue = text;
         replaced = true;
       }
 
@@ -1713,12 +1925,21 @@
     }
   }
 
-  function bindContextRowAction(row, menu) {
+  function getArtworkContextFromRow(row, menu) {
+    return (
+      readArtworkContextFromElement(row) ||
+      getContextDataFromNode(menu) ||
+      getRememberedArtworkContext()
+    );
+  }
+
+  function bindContextRowAction(row, menu, context) {
+    writeArtworkContextToElement(row, context);
     const open = (event) => {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation?.();
-      requestArtworkPanel(getContextDataFromNode(menu));
+      requestArtworkPanel(getArtworkContextFromRow(row, menu));
     };
 
     const handleKeys = (event) => {
@@ -1741,7 +1962,7 @@
     row.addEventListener("keydown", handleKeys, true);
   }
 
-  function createArtworkContextRow(propertiesRow, menu) {
+  function createArtworkContextRow(propertiesRow, menu, context) {
     const row = propertiesRow.cloneNode(true);
     sanitizeClonedRow(row);
     row.classList.add("steamtools-artwork-context-row");
@@ -1749,8 +1970,119 @@
     row.setAttribute("tabindex", propertiesRow.getAttribute("tabindex") || "0");
     row.setAttribute("data-steamtools-artwork-row", "true");
     replaceRowText(row, "Change Artwork...");
-    bindContextRowAction(row, menu);
+    bindContextRowAction(row, menu, context);
     return row;
+  }
+
+  function findArtworkContextRow(target) {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+
+    const markedRow = target.closest(".steamtools-artwork-context-row, [data-steamtools-artwork-row='true']");
+    if (markedRow) {
+      return markedRow;
+    }
+
+    let current = target;
+    for (let depth = 0; current instanceof HTMLElement && depth < 6; depth += 1, current = current.parentElement) {
+      const text = normalizeMenuText(textOf(current));
+      if (text === "change artwork") {
+        return current;
+      }
+    }
+
+    return null;
+  }
+
+  function findContextMenuForRow(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    return row.closest("[role='menu'], [class*='contextmenu'], [class*='ContextMenu']") || row.parentElement;
+  }
+
+  function installContextActivationCapture() {
+    if (state.contextActivationCaptureInstalled) {
+      return;
+    }
+
+    state.contextActivationHandler = (event) => {
+      const row = findArtworkContextRow(event.target);
+      if (!row) {
+        return;
+      }
+
+      if (event.type === "keydown") {
+        const keyboardEvent = event;
+        if (
+          keyboardEvent.key !== "Enter" &&
+          keyboardEvent.key !== " " &&
+          keyboardEvent.code !== "Enter" &&
+          keyboardEvent.code !== "Space"
+        ) {
+          return;
+        }
+      }
+
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      requestArtworkPanel(getArtworkContextFromRow(row, findContextMenuForRow(row)));
+    };
+
+    document.addEventListener("click", state.contextActivationHandler, true);
+    document.addEventListener("mouseup", state.contextActivationHandler, true);
+    document.addEventListener("keydown", state.contextActivationHandler, true);
+    state.contextActivationCaptureInstalled = true;
+  }
+
+  function uninstallContextActivationCapture() {
+    if (!state.contextActivationCaptureInstalled || !state.contextActivationHandler) {
+      return;
+    }
+
+    document.removeEventListener("click", state.contextActivationHandler, true);
+    document.removeEventListener("mouseup", state.contextActivationHandler, true);
+    document.removeEventListener("keydown", state.contextActivationHandler, true);
+    state.contextActivationHandler = null;
+    state.contextActivationCaptureInstalled = false;
+  }
+
+  function installContextTracking() {
+    if (state.contextTrackingInstalled) {
+      return;
+    }
+
+    state.contextTrackingHandler = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      const context = getContextDataFromNode(target, false);
+      if (context?.appId) {
+        rememberArtworkContext(context);
+      }
+    };
+
+    document.addEventListener("pointerdown", state.contextTrackingHandler, true);
+    document.addEventListener("contextmenu", state.contextTrackingHandler, true);
+    document.addEventListener("focusin", state.contextTrackingHandler, true);
+    state.contextTrackingInstalled = true;
+  }
+
+  function uninstallContextTracking() {
+    if (!state.contextTrackingInstalled || !state.contextTrackingHandler) {
+      return;
+    }
+
+    document.removeEventListener("pointerdown", state.contextTrackingHandler, true);
+    document.removeEventListener("contextmenu", state.contextTrackingHandler, true);
+    document.removeEventListener("focusin", state.contextTrackingHandler, true);
+    state.contextTrackingHandler = null;
+    state.contextTrackingInstalled = false;
   }
 
   function patchMenus() {
@@ -1760,17 +2092,23 @@
     }
 
     for (const menu of findMenuCandidates()) {
+      if (!isGameContextMenu(menu)) {
+        removeArtworkContextRows(menu);
+        continue;
+      }
+
       if (menu.querySelector(".steamtools-artwork-context-row") || textOf(menu).toLowerCase().includes("change artwork")) {
         continue;
       }
 
+      const menuContext = getContextDataFromNode(menu);
       const propertiesRow = findPropertiesRow(menu);
       const parent = propertiesRow?.parentElement;
       if (!propertiesRow || !parent) {
         continue;
       }
 
-      const row = createArtworkContextRow(propertiesRow, menu);
+      const row = createArtworkContextRow(propertiesRow, menu, menuContext);
       parent.insertBefore(row, propertiesRow);
     }
   }
@@ -1789,6 +2127,63 @@
 
   function getOpenRequestKey(appId, title) {
     return `${normalizeSteamAppId(appId)}:${String(title || "").trim().toLowerCase()}`;
+  }
+
+  function normalizeArtworkContext(context) {
+    const appId = normalizeSteamAppId(context?.appId);
+    if (!appId) {
+      return null;
+    }
+
+    return {
+      appId,
+      title: context?.title || "Selected Game",
+    };
+  }
+
+  function rememberArtworkContext(context) {
+    const normalized = normalizeArtworkContext(context);
+    if (!normalized) {
+      return null;
+    }
+
+    state.lastContextMenuContext = normalized;
+    state.lastContextMenuContextAt = Date.now();
+    return normalized;
+  }
+
+  function getRememberedArtworkContext() {
+    if (!state.lastContextMenuContext || Date.now() - state.lastContextMenuContextAt > 15000) {
+      return null;
+    }
+
+    return state.lastContextMenuContext;
+  }
+
+  function writeArtworkContextToElement(element, context) {
+    const normalized = normalizeArtworkContext(context);
+    if (!(element instanceof HTMLElement) || !normalized) {
+      return;
+    }
+
+    element.dataset.steamtoolsArtworkAppId = String(normalized.appId);
+    element.dataset.steamtoolsArtworkTitle = normalized.title;
+  }
+
+  function readArtworkContextFromElement(element) {
+    if (!(element instanceof HTMLElement)) {
+      return null;
+    }
+
+    const appId = normalizeSteamAppId(element.dataset.steamtoolsArtworkAppId);
+    if (!appId) {
+      return null;
+    }
+
+    return {
+      appId,
+      title: element.dataset.steamtoolsArtworkTitle || "Selected Game",
+    };
   }
 
   function shouldIgnoreDuplicateOpen(appId, title) {
@@ -2834,6 +3229,7 @@
 
   function destroy() {
     closeOverlay();
+    removeArtworkContextRows();
     uninstallArtworkCatchAllInput();
 
     if (state.catchAllReleaseTimer) {
@@ -2882,6 +3278,8 @@
     if (state.artworkChannel && state.artworkChannelHandler) {
       state.artworkChannel.removeEventListener("message", state.artworkChannelHandler);
     }
+    uninstallContextActivationCapture();
+    uninstallContextTracking();
     try {
       state.artworkChannel?.close();
     } catch {
@@ -2893,6 +3291,8 @@
   function refresh() {
     setupArtworkInputBridge();
     injectStyles();
+    installContextActivationCapture();
+    installContextTracking();
     installReactContextMenuPatch();
     void loadArtworkSettings();
   }
@@ -2900,6 +3300,8 @@
   function start() {
     setupArtworkInputBridge();
     injectStyles();
+    installContextActivationCapture();
+    installContextTracking();
     installReactContextMenuPatch();
     startArtworkSettingsPolling();
     startOpenRequestPolling();

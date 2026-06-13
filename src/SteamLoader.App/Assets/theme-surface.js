@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 7;
+  const stateVersion = 14;
   const themeScanEventName = "steamtools:theme-scan-complete";
   const detailViewMarkers = [
     "SPIELZEIT",
@@ -16,6 +16,31 @@
     "MANAGE",
     "FREUNDE, DIE SPIELEN",
     "FRIENDS WHO PLAY",
+  ];
+  const appIdPatterns = [
+    /\/apps\/(\d+)\//i,
+    /\/images\/apps\/(\d+)\//i,
+    /\/libraryassets\/(\d+)\//i,
+    /[?&]appid=(\d+)/i,
+    /\/appdetails\/(\d+)/i,
+  ];
+  const detailClassFragments = [
+    "sharedappdetailsheader_",
+    "basicappdetailssectionstyler_",
+    "appdetailsplaysection_",
+  ];
+  const semanticDetailMappings = [
+    ["sharedappdetailsheader_topcapsule_", "steamloader-theme-game-detail-topcapsule"],
+    ["sharedappdetailsheader_headerbackgroundimage_", "steamloader-theme-game-detail-hero"],
+    ["sharedappdetailsheader_imgsrc_", "steamloader-theme-game-detail-hero-image"],
+    ["sharedappdetailsheader_titlesection_", "steamloader-theme-game-detail-title-section"],
+    ["sharedappdetailsheader_svgtitle_", "steamloader-theme-game-detail-logo"],
+    ["sharedappdetailsheader_boxsizer_", "steamloader-theme-game-detail-logo-box"],
+    ["basicappdetailssectionstyler_playsection_", "steamloader-theme-game-detail-playbar"],
+    ["appdetailsplaysection_cloudstatusrow_", "steamloader-theme-game-detail-cloud-status"],
+    ["appdetailsplaysection_cloudstatuslabel_", "steamloader-theme-game-detail-cloud-label"],
+    ["appdetailsplaysection_cloudstatusicon_", "steamloader-theme-game-detail-cloud-icon"],
+    ["appdetailsplaysection_cloudsyncproblem_", "steamloader-theme-game-detail-cloud-problem"],
   ];
   const themeMarkerClasses = [
     "steamloader-theme-artwork",
@@ -61,6 +86,14 @@
       window.clearTimeout(previousState.scanHandle);
     }
 
+    if (previousState?.quickScanHandle) {
+      window.cancelAnimationFrame(previousState.quickScanHandle);
+    }
+
+    if (previousState?.cleanupHandle) {
+      window.clearTimeout(previousState.cleanupHandle);
+    }
+
     if (previousState?.observer) {
       previousState.observer.disconnect();
     }
@@ -74,14 +107,27 @@
           installed: false,
           timerHandle: null,
           scanHandle: null,
+          quickScanHandle: null,
+          quickScanRoots: new Set(),
+          cleanupHandle: null,
+          activeScanNodes: null,
           observer: null,
           markedNodes: new Set(),
+          didInitialFullScan: false,
           lastResolveKey: "",
           lastResolvedAt: 0,
+          lastCssText: "",
+          lastScanAt: 0,
+          lastSurfaceProbeAt: 0,
+          lastSurfaceProbeIsLibraryGrid: false,
         });
 
   if (!(state.markedNodes instanceof Set)) {
     state.markedNodes = new Set();
+  }
+
+  if (!(state.quickScanRoots instanceof Set)) {
+    state.quickScanRoots = new Set();
   }
 
   function ensureStyleElement() {
@@ -105,6 +151,51 @@
     state.markedNodes.clear();
   }
 
+  function beginFullScan() {
+    state.activeScanNodes = new Set();
+  }
+
+  function finishFullScan() {
+    const activeScanNodes = state.activeScanNodes;
+    state.activeScanNodes = null;
+
+    if (!(activeScanNodes instanceof Set)) {
+      return;
+    }
+
+    for (const node of [...state.markedNodes]) {
+      if (!(node instanceof Element) || !node.isConnected || !activeScanNodes.has(node)) {
+        if (node instanceof Element) {
+          node.classList.remove(...themeMarkerClasses);
+        }
+
+        state.markedNodes.delete(node);
+      }
+    }
+  }
+
+  function pruneDisconnectedMarkers() {
+    state.cleanupHandle = null;
+
+    for (const node of [...state.markedNodes]) {
+      if (!(node instanceof Element) || !node.isConnected) {
+        if (node instanceof Element) {
+          node.classList.remove(...themeMarkerClasses);
+        }
+
+        state.markedNodes.delete(node);
+      }
+    }
+  }
+
+  function queueCleanup(delay = 1800) {
+    if (state.cleanupHandle) {
+      return;
+    }
+
+    state.cleanupHandle = window.setTimeout(pruneDisconnectedMarkers, delay);
+  }
+
   function markNode(node, ...classes) {
     if (!(node instanceof Element)) {
       return;
@@ -112,10 +203,256 @@
 
     node.classList.add(...classes);
     state.markedNodes.add(node);
+
+    if (state.activeScanNodes instanceof Set) {
+      state.activeScanNodes.add(node);
+    }
   }
 
   function normalizeText(value) {
-    return (value || "").replace(/\s+/g, " ").trim().toUpperCase();
+    return (value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toUpperCase();
+  }
+
+  function classText(node) {
+    return String(node?.className || "").toLowerCase();
+  }
+
+  function hasClassFragment(node, fragment) {
+    return classText(node).includes(fragment.toLowerCase());
+  }
+
+  function extractAppIdFromUrlish(value) {
+    if (!value) {
+      return null;
+    }
+
+    for (const pattern of appIdPatterns) {
+      const match = String(value).match(pattern);
+      if (match) {
+        const parsed = Number(match[1]);
+        if (Number.isInteger(parsed) && parsed > 0) {
+          return parsed;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getElementUrlishValues(node) {
+    const values = [
+      node?.getAttribute?.("href"),
+      node?.getAttribute?.("src"),
+      node?.getAttribute?.("style"),
+      node instanceof HTMLImageElement ? node.currentSrc : "",
+      node instanceof HTMLImageElement ? node.src : "",
+      node instanceof HTMLImageElement ? node.alt : "",
+      node instanceof HTMLElement ? node.style.backgroundImage : "",
+    ];
+
+    return values.filter(Boolean);
+  }
+
+  function findAppIdInElement(node) {
+    if (!(node instanceof Element)) {
+      return null;
+    }
+
+    for (const value of getElementUrlishValues(node)) {
+      const appId = extractAppIdFromUrlish(value);
+      if (appId) {
+        return appId;
+      }
+    }
+
+    for (const candidate of node.querySelectorAll("img, a, [style], [href], [src]")) {
+      for (const value of getElementUrlishValues(candidate)) {
+        const appId = extractAppIdFromUrlish(value);
+        if (appId) {
+          return appId;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function hasDetailClassMarker(node) {
+    return detailClassFragments.some((fragment) => hasClassFragment(node, fragment));
+  }
+
+  function getSemanticDetailScore(container) {
+    if (!(container instanceof Element)) {
+      return 0;
+    }
+
+    const matches = new Set();
+    if (hasDetailClassMarker(container)) {
+      matches.add("self");
+    }
+
+    for (const node of container.querySelectorAll("[class]")) {
+      for (const fragment of detailClassFragments) {
+        if (hasClassFragment(node, fragment)) {
+          matches.add(fragment);
+        }
+      }
+    }
+
+    return matches.size;
+  }
+
+  function getDetailTextSignalCount(container) {
+    const text = normalizeText(container?.innerText || "");
+    if (!text) {
+      return 0;
+    }
+
+    const signals = [
+      "PLAY TIME",
+      "PLAYTIME",
+      "SPIELZEIT",
+      "LAST PLAYED",
+      "ZULETZT GESPIELT",
+      "STEAM CLOUD",
+      "CONTROLLER",
+      "ACTIVITY",
+      "AKTIVITAT",
+      "YOUR STUFF",
+      "IHRE DINGE",
+      "COMMUNITY",
+      "GAME INFO",
+      "SPIELINFO",
+      "ACHIEVEMENTS",
+      "ERFOLGE",
+      "SPACE REQUIRED",
+      "SPEICHERPLATZ",
+    ];
+
+    return signals.reduce((count, signal) => count + (text.includes(signal) ? 1 : 0), 0);
+  }
+
+  function isHomeOrLibraryHub(container) {
+    const text = normalizeText(container?.innerText || "");
+    if (!text) {
+      return false;
+    }
+
+    const hubSignals = [
+      "RECENT GAMES",
+      "VOR KURZEM GESPIELT",
+      "VIEW MORE IN YOUR LIBRARY",
+      "MEHR IN IHRER BIBLIOTHEK",
+      "WHAT'S NEW",
+      "WAS IST NEU",
+      "RECOMMENDED",
+      "EMPFOHLEN",
+    ];
+
+    const detailSignals = getDetailTextSignalCount(container);
+    const hasCloudOrTabs =
+      text.includes("STEAM CLOUD") ||
+      text.includes("YOUR STUFF") ||
+      text.includes("IHRE DINGE") ||
+      text.includes("GAME INFO") ||
+      text.includes("SPIELINFO");
+
+    return hubSignals.some((signal) => text.includes(signal)) && (!hasCloudOrTabs || detailSignals < 3);
+  }
+
+  function isLibraryGridSurface() {
+    const now = Date.now();
+    if (now - (state.lastSurfaceProbeAt || 0) < 600) {
+      return Boolean(state.lastSurfaceProbeIsLibraryGrid);
+    }
+
+    state.lastSurfaceProbeAt = now;
+
+    const portraitCards = document.querySelectorAll(
+      "img._24_AuLm54JVe1Zc0AApCDR, img._3d_bT685lnWotXxgzKW6am, img[src^='/customimages/'][src*='p.'], img[src*='library_600x900']",
+    ).length;
+
+    if (portraitCards < 4) {
+      state.lastSurfaceProbeIsLibraryGrid = false;
+      return false;
+    }
+
+    const text = normalizeText(document.body?.innerText || "");
+    const detailSignals = getDetailTextSignalCount(document.body);
+    const hasLibraryTabs =
+      text.includes("ALL GAMES") ||
+      text.includes("ALLE SPIELE") ||
+      text.includes("INSTALLED") ||
+      text.includes("INSTALLIERT") ||
+      text.includes("NON-STEAM") ||
+      text.includes("SOUNDTRACKS") ||
+      text.includes("CONTROLLER FRIENDLY");
+    const hasDetailChrome =
+      text.includes("STEAM CLOUD") ||
+      text.includes("YOUR STUFF") ||
+      text.includes("IHRE DINGE") ||
+      text.includes("GAME INFO") ||
+      text.includes("SPIELINFO");
+
+    state.lastSurfaceProbeIsLibraryGrid = hasLibraryTabs && (!hasDetailChrome || detailSignals < 3);
+    return Boolean(state.lastSurfaceProbeIsLibraryGrid);
+  }
+
+  function hasLargeDetailHero(container, containerRect) {
+    for (const candidate of container.querySelectorAll("img, canvas, video, [style*='background']")) {
+      if (!(candidate instanceof HTMLElement)) {
+        continue;
+      }
+
+      const rect = candidate.getBoundingClientRect();
+      if (
+        rect.width >= Math.min(520, containerRect.width * 0.5) &&
+        rect.height >= 180 &&
+        rect.top <= containerRect.top + Math.max(180, containerRect.height * 0.35)
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isLikelyDetailViewContainer(container) {
+    if (!(container instanceof HTMLElement)) {
+      return false;
+    }
+
+    if (container === document.body || container === document.documentElement) {
+      return false;
+    }
+
+    const rect = container.getBoundingClientRect();
+    if (rect.width < 480 || rect.height < 260) {
+      return false;
+    }
+
+    if (isHomeOrLibraryHub(container)) {
+      return false;
+    }
+
+    const semanticScore = getSemanticDetailScore(container);
+    const detailSignalCount = getDetailTextSignalCount(container);
+    if (semanticScore >= 2 && detailSignalCount >= 2) {
+      return true;
+    }
+
+    const routeAppId = extractAppIdFromUrlish(location.href);
+    const containedAppId = findAppIdInElement(container);
+    if (!routeAppId && !containedAppId) {
+      return false;
+    }
+
+    return detailSignalCount >= 1 && hasLargeDetailHero(container, rect);
   }
 
   function classifyArtworkRect(rect) {
@@ -178,17 +515,13 @@
 
   function getDetailViewContainer(node) {
     let current = node;
-    for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+    for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
       const rect = current.getBoundingClientRect();
       if (rect.width < 320 || rect.height < 160) {
         continue;
       }
 
       const text = normalizeText(current.innerText || "");
-      if (!text) {
-        continue;
-      }
-
       let markerHits = 0;
       for (const marker of detailViewMarkers) {
         if (text.includes(marker)) {
@@ -196,7 +529,7 @@
         }
       }
 
-      if (markerHits >= 2) {
+      if (!isHomeOrLibraryHub(current) && (markerHits >= 2 || isLikelyDetailViewContainer(current))) {
         return current;
       }
     }
@@ -246,16 +579,25 @@
   function markDetailViewStructure(container) {
     const containerRect = container.getBoundingClientRect();
 
+    for (const node of container.querySelectorAll("[class]")) {
+      for (const [fragment, markerClass] of semanticDetailMappings) {
+        if (hasClassFragment(node, fragment)) {
+          markNode(node, markerClass);
+        }
+      }
+    }
+
     const topCapsule = findBestDetailNode(container, (candidate) => {
       const rect = candidate.getBoundingClientRect();
       const text = normalizeText(candidate.innerText || "");
       return (
-        rect.width >= containerRect.width * 0.92 &&
+        hasClassFragment(candidate, "sharedappdetailsheader_topcapsule_") ||
+        (rect.width >= containerRect.width * 0.92 &&
         rect.height >= 220 &&
         rect.height <= 520 &&
         rect.top <= containerRect.top + 80 &&
         rect.bottom <= containerRect.top + containerRect.height * 0.55 &&
-        text.length < 16
+        text.length < 16)
       );
     });
 
@@ -270,9 +612,11 @@
 
       const rect = candidate.getBoundingClientRect();
       return (
-        rect.width >= containerRect.width * 0.65 &&
+        hasClassFragment(candidate, "sharedappdetailsheader_imgsrc_") ||
+        hasClassFragment(candidate, "sharedappdetailsheader_headerbackgroundimage_") ||
+        (rect.width >= containerRect.width * 0.65 &&
         rect.height >= 220 &&
-        rect.top <= containerRect.top + containerRect.height * 0.35
+        rect.top <= containerRect.top + containerRect.height * 0.35)
       );
     });
 
@@ -296,13 +640,14 @@
       const rect = candidate.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
       return (
-        rect.width >= 180 &&
+        hasClassFragment(candidate, "sharedappdetailsheader_svgtitle_") ||
+        (rect.width >= 180 &&
         rect.width <= 720 &&
         rect.height >= 50 &&
         rect.height <= 240 &&
         rect.top <= containerRect.top + containerRect.height * 0.4 &&
         centerX >= containerRect.left + containerRect.width * 0.25 &&
-        centerX <= containerRect.right - containerRect.width * 0.25
+        centerX <= containerRect.right - containerRect.width * 0.25)
       );
     });
 
@@ -316,8 +661,12 @@
     const playBar = findBestDetailNode(container, (candidate) => {
       const rect = candidate.getBoundingClientRect();
       const text = normalizeText(candidate.innerText || "");
+      const steamClassMatch =
+        hasClassFragment(candidate, "basicappdetailssectionstyler_playsection_") ||
+        hasClassFragment(candidate, "sharedappdetailsheader_titlesection_");
       return (
-        rect.width >= containerRect.width * 0.7 &&
+        steamClassMatch ||
+        (rect.width >= containerRect.width * 0.7 &&
         rect.height >= 40 &&
         rect.height <= 140 &&
         rect.top >= containerRect.top + 180 &&
@@ -328,7 +677,7 @@
           text.includes("ZULETZT GESPIELT") ||
           text.includes("CONTROLLER") ||
           text.startsWith("PLAY ") ||
-          text.startsWith("SPIELEN "))
+          text.startsWith("SPIELEN ")))
       );
     });
 
@@ -344,11 +693,12 @@
       const rect = candidate.getBoundingClientRect();
       const text = normalizeText(candidate.innerText || "");
       return (
-        rect.width >= 120 &&
+        hasClassFragment(candidate, "appdetailsplaysection_cloudstatusrow_") ||
+        (rect.width >= 120 &&
         rect.width <= containerRect.width &&
         rect.height >= 18 &&
         rect.height <= 60 &&
-        text.includes("STEAM CLOUD")
+        text.includes("STEAM CLOUD"))
       );
     });
 
@@ -357,7 +707,7 @@
 
       for (const candidate of cloudStatus.querySelectorAll("div, span")) {
         const text = normalizeText(candidate.innerText || "");
-        if (text.includes("STEAM CLOUD")) {
+        if (text.includes("STEAM CLOUD") || hasClassFragment(candidate, "appdetailsplaysection_cloudstatuslabel_")) {
           markNode(candidate, "steamloader-theme-game-detail-cloud-label");
         }
       }
@@ -370,14 +720,15 @@
     }
   }
 
-  function markDetailView(node) {
-    const container = getDetailViewContainer(node);
-    if (!container) {
+  function markDetailContainer(container, sourceNode = null) {
+    if (!container || isHomeOrLibraryHub(container)) {
       return;
     }
 
     markNode(container, "steamloader-theme-game-detail");
-    markNode(node, "steamloader-theme-game-detail-art");
+    if (sourceNode) {
+      markNode(sourceNode, "steamloader-theme-game-detail-art");
+    }
 
     const copyCandidates = [...container.querySelectorAll("div, section, span, h1, h2, h3")]
       .filter((candidate) => candidate instanceof HTMLElement && isLikelyDetailCopy(candidate))
@@ -388,6 +739,30 @@
     }
 
     markDetailViewStructure(container);
+  }
+
+  function markDetailView(node) {
+    markDetailContainer(getDetailViewContainer(node), node);
+  }
+
+  function scanSemanticDetailContainers() {
+    const containers = new Set();
+    const semanticNodes = [...document.querySelectorAll("[class]")]
+      .filter((node) => node instanceof HTMLElement)
+      .filter((node) => detailClassFragments.some((fragment) => hasClassFragment(node, fragment)));
+
+    for (const node of semanticNodes) {
+      let current = node;
+      for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+        if (isLikelyDetailViewContainer(current)) {
+          containers.add(current);
+        }
+      }
+    }
+
+    for (const container of containers) {
+      markDetailContainer(container);
+    }
   }
 
   function getArtworkHost(node) {
@@ -548,15 +923,33 @@
     }
   }
 
-  function scanThemeTargets() {
-    state.scanHandle = null;
-    clearThemeMarkers();
+  function scanThemeSubtree(root) {
+    const scope =
+      root instanceof Document
+        ? root
+        : root instanceof Element
+          ? root
+          : null;
 
-    for (const image of document.images) {
+    if (!scope) {
+      return;
+    }
+
+    if (scope instanceof HTMLImageElement) {
+      markArtworkImage(scope);
+    }
+
+    if (scope instanceof HTMLElement) {
+      markArtworkBackground(scope);
+      markToggleNode(scope);
+    }
+
+    const images = scope instanceof Document ? scope.images : scope.querySelectorAll("img");
+    for (const image of images) {
       markArtworkImage(image);
     }
 
-    const backgroundCandidates = document.querySelectorAll(
+    const backgroundCandidates = scope.querySelectorAll(
       ".Panel, .Focusable, [role='link'], a, [style*='background'], [role='switch'], [aria-checked], [aria-pressed], [class*='Toggle'], [class*='toggle'], [class*='Switch'], [class*='switch']",
     );
 
@@ -568,16 +961,61 @@
       markArtworkBackground(node);
       markToggleNode(node);
     }
+  }
 
+  function scanThemeTargets() {
+    state.scanHandle = null;
+    state.lastScanAt = Date.now();
+
+    if (isLibraryGridSurface()) {
+      state.didInitialFullScan = true;
+      queueCleanup();
+      window.dispatchEvent(new CustomEvent(themeScanEventName));
+      return;
+    }
+
+    beginFullScan();
+    try {
+      scanThemeSubtree(document);
+      scanSemanticDetailContainers();
+    } finally {
+      finishFullScan();
+    }
+
+    state.didInitialFullScan = true;
     window.dispatchEvent(new CustomEvent(themeScanEventName));
   }
 
-  function queueScan(delay = 160) {
+  function queueQuickScan(root) {
+    if (root instanceof Document || root instanceof Element) {
+      state.quickScanRoots.add(root);
+    }
+
+    if (state.quickScanHandle) {
+      return;
+    }
+
+    state.quickScanHandle = window.requestAnimationFrame(() => {
+      state.quickScanHandle = null;
+      const roots = [...state.quickScanRoots];
+      state.quickScanRoots.clear();
+
+      for (const queuedRoot of roots) {
+        scanThemeSubtree(queuedRoot);
+      }
+
+      queueCleanup();
+    });
+  }
+
+  function queueScan(delay = 420) {
     if (state.scanHandle) {
       return;
     }
 
-    state.scanHandle = window.setTimeout(scanThemeTargets, delay);
+    const elapsed = Date.now() - (state.lastScanAt || 0);
+    const quietWindow = Math.max(0, 900 - elapsed);
+    state.scanHandle = window.setTimeout(scanThemeTargets, Math.max(delay, quietWindow));
   }
 
   async function refreshThemeCss(force = false) {
@@ -598,12 +1036,18 @@
       }
 
       const payload = await response.json();
-      ensureStyleElement().textContent =
-        payload && typeof payload.css === "string" ? payload.css : "";
+      const cssText = payload && typeof payload.css === "string" ? payload.css : "";
+      const styleElement = ensureStyleElement();
+      const cssChanged = styleElement.textContent !== cssText;
+      styleElement.textContent = cssText;
+      state.lastCssText = cssText;
 
       state.lastResolveKey = resolveKey;
       state.lastResolvedAt = now;
-      queueScan();
+
+      if (!state.didInitialFullScan || cssChanged) {
+        queueScan(0);
+      }
     } catch {
     }
   }
@@ -614,15 +1058,21 @@
 
     if (!state.observer) {
       state.observer = new MutationObserver((mutations) => {
-        let shouldRefresh = false;
-        let shouldScan = false;
+        let shouldCleanup = false;
+        const cssOnlyLibraryGrid = isLibraryGridSurface();
 
         for (const mutation of mutations) {
           if (mutation.type === "childList") {
             if (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0) {
-              shouldScan = true;
-              shouldRefresh = true;
-              break;
+              if (!cssOnlyLibraryGrid) {
+                for (const node of mutation.addedNodes) {
+                  queueQuickScan(node);
+                }
+              }
+
+              if (mutation.removedNodes.length > 0) {
+                shouldCleanup = true;
+              }
             }
           }
 
@@ -630,16 +1080,14 @@
             mutation.type === "attributes" &&
             (mutation.target instanceof HTMLImageElement || mutation.attributeName === "href")
           ) {
-            shouldScan = true;
+            if (!cssOnlyLibraryGrid) {
+              queueQuickScan(mutation.target);
+            }
           }
         }
 
-        if (shouldRefresh) {
-          void refreshThemeCss();
-        }
-
-        if (shouldScan) {
-          queueScan();
+        if (shouldCleanup) {
+          queueCleanup();
         }
       });
 
@@ -657,7 +1105,7 @@
 
     state.timerHandle = window.setInterval(() => {
       if (!document.hidden) {
-        queueScan();
+        queueCleanup();
         void refreshThemeCss();
       }
     }, 8000);

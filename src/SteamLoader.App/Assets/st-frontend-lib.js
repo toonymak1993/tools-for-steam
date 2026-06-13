@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 12) {
+  if (existing?.version >= 13) {
     return;
   }
 
@@ -26,6 +26,7 @@
     volumePanel: null,
     cards: Object.freeze([]),
     editor: null,
+    editors: Object.freeze([]),
     slots: Object.freeze([]),
   });
 
@@ -974,6 +975,8 @@
   }
 
   function createEditorCard(createElement, withChildren, editor) {
+    const editorKey = editor.cardKey || editor.inputKey || "steamloader-editor";
+
     return createElement(
       "div",
       withChildren(
@@ -1009,7 +1012,7 @@
           },
         }),
       ),
-      "steamloader-editor",
+      editorKey,
     );
   }
 
@@ -1139,7 +1142,7 @@
       withChildren(
         {
           className: "steamloader-panel",
-          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 12),
+          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 13),
           "data-st-renderer": "st-frontend-lib",
         },
         createElement(
@@ -1192,6 +1195,14 @@
           ? model.cards.map((card, index) => createInfoCard(createElement, withChildren, card, index))
           : []),
         model.editor ? createEditorCard(createElement, withChildren, model.editor) : null,
+        ...(Array.isArray(model.editors)
+          ? model.editors.map((editor, index) =>
+              createEditorCard(createElement, withChildren, {
+                ...editor,
+                cardKey: editor.cardKey || editor.inputKey || `steamloader-editor-${index}`,
+              }),
+            )
+          : []),
         createElement(
           "div",
           withChildren(
@@ -1211,7 +1222,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 12,
+      version: 13,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -1225,7 +1236,7 @@
   }
 
   window.STFrontendLib = {
-    version: 12,
+    version: 13,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

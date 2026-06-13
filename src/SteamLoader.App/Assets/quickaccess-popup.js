@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 44;
+  const stateVersion = 48;
   const soundtrackTabKey = 7;
 
   if (window.__steamLoaderPopupTimer) {
@@ -101,6 +101,10 @@
             saving: false,
             error: "",
             snapshot: null,
+            splashWallpaperDraft: "",
+            splashIconDraft: "",
+            splashWallpaperInputVersion: 0,
+            splashIconInputVersion: 0,
           },
           autoSisir: {
             loading: false,
@@ -140,6 +144,11 @@
           id: "general",
           title: "General",
           description: "Startup behavior and global loader options",
+        },
+        {
+          id: "splashscreen-themes",
+          title: "Splashscreen Themes",
+          description: "Wallpaper, icon, text, and splash timing",
         },
       ],
     },
@@ -2074,7 +2083,7 @@
           },
         }),
       ),
-      "steamloader-editor",
+      editor.inputKey || editor.cardKey || "steamloader-editor",
     );
   }
 
@@ -2520,6 +2529,9 @@
           ? model.cards.map((card, index) => createInfoCard(card, index))
           : []),
         model.editor ? createEditorCard(model.editor) : null,
+        ...(Array.isArray(model.editors)
+          ? model.editors.map((editor, index) => createEditorCard({ ...editor, inputKey: editor.inputKey || `editor-${index}` }))
+          : []),
         createElement(
           "div",
           withChildren(
@@ -2632,6 +2644,27 @@
 
   function getGeneralSettingsSnapshot() {
     return state.generalSettings.snapshot;
+  }
+
+  function getSplashScreenSettings() {
+    return getGeneralSettingsSnapshot()?.splashScreen || null;
+  }
+
+  function syncSplashDraftsFromSnapshot(force = false) {
+    const splash = getSplashScreenSettings();
+    if (!splash) {
+      return;
+    }
+
+    if (force || !state.generalSettings.splashWallpaperDraft) {
+      state.generalSettings.splashWallpaperDraft = splash.wallpaperPath || "";
+      state.generalSettings.splashWallpaperInputVersion += 1;
+    }
+
+    if (force || !state.generalSettings.splashIconDraft) {
+      state.generalSettings.splashIconDraft = splash.iconPath || "";
+      state.generalSettings.splashIconInputVersion += 1;
+    }
   }
 
   function getAutoSisirSnapshot() {
@@ -3131,6 +3164,7 @@
       }
 
       state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncSplashDraftsFromSnapshot(true);
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
       state.generalSettings.snapshot = null;
@@ -3379,6 +3413,7 @@
       }
 
       state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncSplashDraftsFromSnapshot(true);
       succeeded = true;
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
@@ -3597,11 +3632,27 @@
       state.generalSettings.snapshot = {
         ...snapshot,
         runOnWindowsSignIn: enabled,
+        startupMode: enabled ? "shell" : "manual",
       };
       rerenderGeneralSettingsPanel();
     }
 
     await sendGeneralSettingsRequest("api/settings/autostart", { value: enabled });
+  }
+
+  async function setStartupMode(mode) {
+    const normalizedMode = ["shell", "tray", "manual"].includes(mode) ? mode : "manual";
+    const snapshot = getGeneralSettingsSnapshot();
+    if (snapshot) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        startupMode: normalizedMode,
+        runOnWindowsSignIn: normalizedMode !== "manual",
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/startup-mode", { mode: normalizedMode });
   }
 
   async function toggleHideWindowsShellInConsoleMode() {
@@ -3616,6 +3667,97 @@
     }
 
     await sendGeneralSettingsRequest("api/settings/hide-windows-shell", { value: enabled });
+  }
+
+  async function toggleSplashScreenSetting(key) {
+    const snapshot = getGeneralSettingsSnapshot();
+    const splash = snapshot?.splashScreen;
+    const propertyMap = {
+      enabled: "enabled",
+      "show-text": "showText",
+    };
+    const propertyName = propertyMap[key];
+    if (!propertyName) {
+      return;
+    }
+
+    const enabled = !Boolean(splash?.[propertyName]);
+    if (snapshot && splash) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        splashScreen: {
+          ...splash,
+          [propertyName]: enabled,
+        },
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    const path = key === "enabled" ? "api/settings/splash/enabled" : "api/settings/splash/show-text";
+    await sendGeneralSettingsRequest(path, { value: enabled });
+  }
+
+  async function saveSplashWallpaperPath() {
+    await sendGeneralSettingsRequest("api/settings/splash/wallpaper", {
+      value: state.generalSettings.splashWallpaperDraft || "",
+    });
+  }
+
+  async function showSplashPreview() {
+    await sendGeneralSettingsRequest("api/settings/splash/preview");
+  }
+
+  async function clearSplashWallpaperPath() {
+    state.generalSettings.splashWallpaperDraft = "";
+    state.generalSettings.splashWallpaperInputVersion += 1;
+    await sendGeneralSettingsRequest("api/settings/splash/wallpaper", { value: "" });
+  }
+
+  async function saveSplashIconPath() {
+    await sendGeneralSettingsRequest("api/settings/splash/icon", {
+      value: state.generalSettings.splashIconDraft || "",
+    });
+  }
+
+  async function clearSplashIconPath() {
+    state.generalSettings.splashIconDraft = "";
+    state.generalSettings.splashIconInputVersion += 1;
+    await sendGeneralSettingsRequest("api/settings/splash/icon", { value: "" });
+  }
+
+  async function adjustSplashExtraDelay(delta) {
+    const snapshot = getGeneralSettingsSnapshot();
+    const splash = snapshot?.splashScreen;
+    const nextValue = Math.max(0, Math.min(30, Number(splash?.extraCloseDelaySeconds || 0) + delta));
+    if (snapshot && splash) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        splashScreen: {
+          ...splash,
+          extraCloseDelaySeconds: nextValue,
+        },
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/splash/extra-delay", { value: nextValue });
+  }
+
+  async function resetSplashExtraDelay() {
+    const snapshot = getGeneralSettingsSnapshot();
+    const splash = snapshot?.splashScreen;
+    if (snapshot && splash) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        splashScreen: {
+          ...splash,
+          extraCloseDelaySeconds: 0,
+        },
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/splash/extra-delay", { value: 0 });
   }
 
   async function togglePluginEnabled(pluginId, enabled) {
@@ -5299,6 +5441,7 @@
     ) {
       const settings = getGeneralSettingsSnapshot();
       const pluginSettings = getGeneralPluginSettings();
+      const startupMode = settings?.startupMode || (settings?.runOnWindowsSignIn ? "shell" : "manual");
 
       return {
         ...defaultModel,
@@ -5306,25 +5449,47 @@
         subtitle: "General",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Global Tools for Steam options live here so plugin settings can stay focused on their own job.",
-        dividerAfterIndex: 2,
+        note: "Choose how Tools for Steam starts with Windows, then manage the global behavior and plugin list below.",
+        dividerAfterIndex: 4,
         slots: [
-          makeSettingToggleSlot(
-            "tfs",
-            "run-on-windows-sign-in",
-            "Run on Windows Sign-In",
-            "Start Tools for Steam before Explorer, sync your launchers, launch Steam in dev mode, and then bring Windows back in behind it.",
-            Boolean(settings?.runOnWindowsSignIn),
-            () => toggleRunOnWindowsSignIn(),
+          makeChoiceSlot(
+            "Shell Takeover",
+            "Tools for Steam starts before Explorer, syncs launchers, opens Steam Big Picture, then brings Windows back behind Steam.",
+            () => setStartupMode("shell"),
             {
-              disabled: isGeneralSettingsBusy(),
+              disabled: isGeneralSettingsBusy() || startupMode === "shell",
+              selected: startupMode === "shell",
+              badge: startupMode === "shell" ? "Current" : "",
+              trailing: startupMode === "shell" ? "none" : "chevron",
+            },
+          ),
+          makeChoiceSlot(
+            "Tray App",
+            "Windows starts normally. Tools for Steam runs from the tray, syncs launchers, and starts Steam without taking over the shell.",
+            () => setStartupMode("tray"),
+            {
+              disabled: isGeneralSettingsBusy() || startupMode === "tray",
+              selected: startupMode === "tray",
+              badge: startupMode === "tray" ? "Current" : "",
+              trailing: startupMode === "tray" ? "none" : "chevron",
+            },
+          ),
+          makeChoiceSlot(
+            "Manual",
+            "Do not start Tools for Steam automatically. Use this if you want to launch it yourself.",
+            () => setStartupMode("manual"),
+            {
+              disabled: isGeneralSettingsBusy() || startupMode === "manual",
+              selected: startupMode === "manual",
+              badge: startupMode === "manual" ? "Current" : "",
+              trailing: startupMode === "manual" ? "none" : "chevron",
             },
           ),
           makeSettingToggleSlot(
             "tfs",
             "hide-windows-shell",
             "Hide Windows Shell in Console Mode",
-            "Hide the taskbar and desktop icons while Steam Big Picture is active. They return when Big Picture closes.",
+            "Hide the taskbar and desktop icons while Steam Big Picture is active. This is most useful for a SteamOS-like shell setup.",
             settings?.hideWindowsShellInConsoleMode !== false,
             () => toggleHideWindowsShellInConsoleMode(),
             {
@@ -5351,6 +5516,163 @@
                 disabled: isGeneralSettingsBusy() || plugin.canDisable === false,
               },
             ),
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "splashscreen-themes"
+    ) {
+      const settings = getGeneralSettingsSnapshot();
+      const splash = getSplashScreenSettings();
+      const wallpaperPath = splash?.wallpaperPath || "";
+      const iconPath = splash?.iconPath || "";
+      const extraDelay = Number(splash?.extraCloseDelaySeconds || 0);
+
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "Splashscreen Themes",
+        status: resolveGeneralSettingsStatusText(),
+        error: state.generalSettings.error,
+        note: "Use full local image paths. Missing files are kept in settings, but the splash falls back safely until the path exists.",
+        cards: [
+          {
+            title: "Current Splash",
+            lines: [
+              `Splashscreen: ${splash?.enabled === false ? "Hidden" : "Shown"}`,
+              `Text: ${splash?.showText === false ? "Hidden" : "Shown"}`,
+              wallpaperPath
+                ? `Wallpaper: ${splash?.wallpaperExists ? wallpaperPath : `Missing - ${wallpaperPath}`}`
+                : "Wallpaper: default background",
+              iconPath
+                ? `Icon: ${splash?.iconExists ? iconPath : `Missing - ${iconPath}`}`
+                : "Icon: default Tools for Steam icon",
+              `Extra close delay: ${extraDelay}s`,
+            ],
+          },
+        ],
+        editors: [
+          {
+            label: "Wallpaper Path",
+            help: "PNG, JPG, JPEG, or WebP image shown behind the startup splash.",
+            value: state.generalSettings.splashWallpaperDraft,
+            placeholder: "C:\\Path\\To\\splash-wallpaper.png",
+            rows: 2,
+            inputKey: `splash-wallpaper-${state.generalSettings.splashWallpaperInputVersion}`,
+            onInput: (value) => {
+              state.generalSettings.splashWallpaperDraft = value;
+            },
+          },
+          {
+            label: "Icon Path",
+            help: "PNG, JPG, JPEG, or WebP image used instead of the default splash icon.",
+            value: state.generalSettings.splashIconDraft,
+            placeholder: "C:\\Path\\To\\splash-icon.png",
+            rows: 2,
+            inputKey: `splash-icon-${state.generalSettings.splashIconInputVersion}`,
+            onInput: (value) => {
+              state.generalSettings.splashIconDraft = value;
+            },
+          },
+        ],
+        slots: [
+          makeSettingToggleSlot(
+            "tfs-splash",
+            "enabled",
+            "Show Splashscreen",
+            "Show the full-screen Tools for Steam startup splash before Steam takes over.",
+            splash?.enabled !== false,
+            () => toggleSplashScreenSetting("enabled"),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeSettingToggleSlot(
+            "tfs-splash",
+            "show-text",
+            "Show Splash Text",
+            "Show startup status text on top of the splash artwork.",
+            splash?.showText !== false,
+            () => toggleSplashScreenSetting("show-text"),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Show Splashscreen for 5 Seconds",
+            "Open a preview-only splash window without starting Steam or running setup actions.",
+            () => showSplashPreview(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Save Wallpaper",
+            "Use the wallpaper path above for future startup splashes.",
+            () => saveSplashWallpaperPath(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Clear Wallpaper",
+            "Return to the default splash background.",
+            () => clearSplashWallpaperPath(),
+            {
+              disabled: isGeneralSettingsBusy() || !wallpaperPath,
+            },
+          ),
+          makeCommandSlot(
+            "Save Icon",
+            "Use the icon path above for future startup splashes.",
+            () => saveSplashIconPath(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Clear Icon",
+            "Return to the default Tools for Steam splash icon.",
+            () => clearSplashIconPath(),
+            {
+              disabled: isGeneralSettingsBusy() || !iconPath,
+            },
+          ),
+          makeCommandSlot(
+            "Shorter Delay",
+            "Close the splash one second sooner after Steam is ready.",
+            () => adjustSplashExtraDelay(-1),
+            {
+              disabled: isGeneralSettingsBusy() || extraDelay <= 0,
+            },
+          ),
+          makeCommandSlot(
+            "Longer Delay",
+            "Keep the splash visible one extra second after Steam is ready.",
+            () => adjustSplashExtraDelay(1),
+            {
+              disabled: isGeneralSettingsBusy() || extraDelay >= 30,
+            },
+          ),
+          makeCommandSlot(
+            "Reset Delay",
+            "Close the splash as soon as the normal handoff is complete.",
+            () => resetSplashExtraDelay(),
+            {
+              disabled: isGeneralSettingsBusy() || extraDelay <= 0,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Settings",
+            "Reload the current splashscreen settings from Tools for Steam.",
+            () => loadGeneralSettingsState(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
           ),
         ],
       };
@@ -6071,10 +6393,8 @@
         makeNavigationSlot(plugin.title, plugin.description, () => {
           rememberCurrentRouteIndex(pluginIndex);
           setRoute(
-            plugin.id === "settings"
-              ? { screen: "page", pluginId: "settings", pageId: "general" }
-              : plugin.id === "artwork"
-                ? { screen: "page", pluginId: "artwork", pageId: "settings" }
+            plugin.id === "artwork"
+              ? { screen: "page", pluginId: "artwork", pageId: "settings" }
               : plugin.id === "hltb"
                 ? { screen: "page", pluginId: "hltb", pageId: "settings" }
               : { screen: "plugin", pluginId: plugin.id, pageId: null },
@@ -6115,14 +6435,13 @@
       route = parseRoute("root");
     }
 
-    const enteringGeneralSettingsPage =
+    const enteringSettingsPage =
       route.screen === "page" &&
       route.pluginId === "settings" &&
-      route.pageId === "general" &&
       !(
         previousRoute?.screen === "page" &&
         previousRoute?.pluginId === "settings" &&
-        previousRoute?.pageId === "general"
+        previousRoute?.pageId === route.pageId
       );
 
     state.audio.pendingVolumeActionAutoFocus =
@@ -6250,7 +6569,7 @@
       (route.pluginId === "settings" || route.screen === "root") &&
       !state.generalSettings.loading &&
       !state.generalSettings.snapshot &&
-      (route.screen === "root" || enteringGeneralSettingsPage || !state.generalSettings.error)
+      (route.screen === "root" || enteringSettingsPage || !state.generalSettings.error)
     ) {
       void loadGeneralSettingsState();
     }

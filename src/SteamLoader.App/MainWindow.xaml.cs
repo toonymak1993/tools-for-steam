@@ -11,8 +11,13 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _refreshTimer;
     private bool _allowClose;
     private bool _shellBootstrapMode;
+    private bool _runtimeInitialized;
 
     public bool StartHiddenInTray { get; set; }
+
+    public bool PreviewSplashMode { get; set; }
+
+    public TimeSpan PreviewSplashDuration { get; set; } = TimeSpan.FromSeconds(5);
 
     public bool ShellBootstrapMode
     {
@@ -46,13 +51,13 @@ public partial class MainWindow : Window
 
         Loaded += async (_, _) =>
         {
-            if (DataContext is MainWindowViewModel viewModel)
+            if (PreviewSplashMode)
             {
-                viewModel.PropertyChanged += OnViewModelPropertyChanged;
-                await viewModel.InitializeAsync();
+                _ = CloseSplashPreviewAsync();
+                return;
             }
 
-            _refreshTimer.Start();
+            await InitializeRuntimeAsync();
 
             if (StartHiddenInTray && !ShellBootstrapMode)
             {
@@ -100,13 +105,43 @@ public partial class MainWindow : Window
     public void CloseFromTray()
     {
         _allowClose = true;
-        Close();
+        System.Windows.Application.Current?.Shutdown();
+    }
+
+    public async Task InitializeHiddenAsync()
+    {
+        await InitializeRuntimeAsync();
     }
 
     private void HideToTray()
     {
         ShowInTaskbar = false;
         Hide();
+    }
+
+    private async Task InitializeRuntimeAsync()
+    {
+        if (_runtimeInitialized)
+        {
+            return;
+        }
+
+        _runtimeInitialized = true;
+
+        if (DataContext is MainWindowViewModel viewModel)
+        {
+            viewModel.PropertyChanged += OnViewModelPropertyChanged;
+            await viewModel.InitializeAsync();
+        }
+
+        _refreshTimer.Start();
+    }
+
+    private async Task CloseSplashPreviewAsync()
+    {
+        await Task.Delay(PreviewSplashDuration);
+        _allowClose = true;
+        System.Windows.Application.Current?.Shutdown();
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)

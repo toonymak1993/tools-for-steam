@@ -11,9 +11,15 @@ internal static class SteamLoaderRuntime
     public const string BackgroundArgument = "--background";
     public const string TrayArgument = "--tray";
     public const string ManagerArgument = "--manager";
+    public const string PreviewSplashArgument = "--preview-splash";
+    public const string PreviewSplashDurationArgument = "--preview-duration";
+    public const string SetStartupModeArgumentPrefix = "--set-startup-mode=";
     public const string StartupSyncArgument = "--startup-sync";
     public const string ShellBootstrapArgument = "--shell-bootstrap";
     public const string AutostartValueName = "TFS";
+    public const string StartupModeShell = "shell";
+    public const string StartupModeTray = "tray";
+    public const string StartupModeManual = "manual";
 
     public static string AutostartArguments => $"{TrayArgument} {StartupSyncArgument}";
 

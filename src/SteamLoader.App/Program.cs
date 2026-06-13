@@ -20,6 +20,18 @@ public static class Program
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
         }
 
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PreviewSplashArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunSplashPreview(args);
+        }
+
+        var startupModeArgument = args.FirstOrDefault(argument =>
+            argument.StartsWith(SteamLoaderRuntime.SetStartupModeArgumentPrefix, StringComparison.OrdinalIgnoreCase));
+        if (startupModeArgument is not null)
+        {
+            return ConfigureStartupMode(startupModeArgument[SteamLoaderRuntime.SetStartupModeArgumentPrefix.Length..]);
+        }
+
         var shellBootstrapMode = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.ShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
         if (shellBootstrapMode)
@@ -79,7 +91,7 @@ public static class Program
 
         var application = new System.Windows.Application
         {
-            ShutdownMode = ShutdownMode.OnMainWindowClose
+            ShutdownMode = ShutdownMode.OnExplicitShutdown
         };
 
         var window = new MainWindow
@@ -89,16 +101,121 @@ public static class Program
             ShellBootstrapMode = shellBootstrapMode
         };
 
-        if (startHiddenInTray && !shellBootstrapMode)
-        {
-            window.ShowInTaskbar = false;
-            window.WindowState = WindowState.Minimized;
-        }
-
         using var trayIconController = new TrayIconController(application, window, viewModel);
         trayIconController.Initialize();
 
-        return application.Run(window);
+        application.Startup += async (_, _) =>
+        {
+            if (showManager || viewModel.ShowStartupSplash)
+            {
+                window.Show();
+                return;
+            }
+
+            await window.InitializeHiddenAsync();
+        };
+
+        application.MainWindow = window;
+        return application.Run();
+    }
+
+    private static int RunSplashPreview(string[] args)
+    {
+        var durationSeconds = ParsePreviewDurationSeconds(args);
+        var executablePath =
+            Environment.ProcessPath
+            ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+        var processManager = new SteamLoaderProcessManager(
+            new Uri("http://127.0.0.1:47652/"),
+            SteamLoaderRuntime.BackgroundArgument);
+        var autostartService = new WindowsAutostartService(
+            SteamLoaderRuntime.AutostartValueName,
+            "SteamLoader",
+            "SteamTools");
+        var shellService = new WindowsShellService();
+        var settingsService = new SteamLoaderSettingsService(
+            autostartService,
+            shellService,
+            executablePath,
+            SteamLoaderRuntime.ShellLaunchArguments,
+            Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
+        var releaseUpdateService = new ReleaseUpdateService();
+        var supportBundleService = new SupportBundleService(shellService);
+        var viewModel = new MainWindowViewModel(
+            processManager,
+            autostartService,
+            shellService,
+            settingsService,
+            releaseUpdateService,
+            supportBundleService,
+            SteamLoaderRuntime.ShellLaunchArguments,
+            false,
+            false);
+
+        var duration = TimeSpan.FromSeconds(durationSeconds);
+        viewModel.StartSplashPreview(duration);
+
+        var application = new System.Windows.Application
+        {
+            ShutdownMode = ShutdownMode.OnMainWindowClose
+        };
+
+        var window = new MainWindow
+        {
+            DataContext = viewModel,
+            PreviewSplashMode = true,
+            PreviewSplashDuration = duration,
+            StartHiddenInTray = false,
+            ShellBootstrapMode = true
+        };
+
+        application.MainWindow = window;
+        application.Startup += (_, _) => window.Show();
+        return application.Run();
+    }
+
+    private static int ParsePreviewDurationSeconds(string[] args)
+    {
+        var prefix = $"{SteamLoaderRuntime.PreviewSplashDurationArgument}=";
+        var durationArgument = args.FirstOrDefault(argument =>
+            argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+
+        if (durationArgument is not null &&
+            int.TryParse(durationArgument[prefix.Length..], out var parsed))
+        {
+            return Math.Clamp(parsed, 1, 30);
+        }
+
+        return 5;
+    }
+
+    private static int ConfigureStartupMode(string mode)
+    {
+        try
+        {
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var autostartService = new WindowsAutostartService(
+                SteamLoaderRuntime.AutostartValueName,
+                "SteamLoader",
+                "SteamTools");
+            var shellService = new WindowsShellService();
+            var settingsService = new SteamLoaderSettingsService(
+                autostartService,
+                shellService,
+                executablePath,
+                SteamLoaderRuntime.ShellLaunchArguments,
+                Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
+
+            settingsService.SetStartupMode(mode);
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
     }
 
     private static async Task<int> RunBackgroundHostAsync()
