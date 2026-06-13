@@ -1,6 +1,6 @@
 #define MyAppName "Tools for Steam"
 #define MyAppShortName "TFS"
-#define MyAppVersion "0.3.1"
+#define MyAppVersion "0.3.2"
 #define MyAppPublisher "GCM - Gaming Console Mode"
 #define MyAppExeName "ToolsForSteam.exe"
 #define MyAppId "{{9A9F0B7E-4C79-4C7D-8E4B-0E0D766E0B72}"
@@ -62,9 +62,9 @@ Name: "{autodesktop}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parame
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-startup-mode=shell"; Flags: runhidden waituntilterminated runasoriginaluser skipifdoesntexist; Check: IsShellMode
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-startup-mode=tray"; Flags: runhidden waituntilterminated runasoriginaluser skipifdoesntexist; Check: IsTrayMode
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync --shell-bootstrap"; Description: "Start Tools for Steam"; Flags: nowait runasoriginaluser postinstall skipifsilent skipifdoesntexist; Check: IsShellMode
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync"; Description: "Start Tools for Steam"; Flags: nowait runasoriginaluser postinstall skipifsilent skipifdoesntexist; Check: IsShellMode
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync"; Description: "Start Tools for Steam"; Flags: nowait runasoriginaluser postinstall skipifsilent skipifdoesntexist; Check: IsTrayMode
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync --shell-bootstrap"; Flags: nowait runasoriginaluser skipifnotsilent skipifdoesntexist; Check: IsShellMode
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync"; Flags: nowait runasoriginaluser skipifnotsilent skipifdoesntexist; Check: IsShellMode
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray --startup-sync"; Flags: nowait runasoriginaluser skipifnotsilent skipifdoesntexist; Check: IsTrayMode
 
 [UninstallRun]
@@ -82,6 +82,32 @@ var
   ResultCode: Integer;
 begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM "' + ImageName + '" /T /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure RequestToolsForSteamShutdown;
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "try { Invoke-WebRequest -UseBasicParsing -Method Post -Uri ''http://127.0.0.1:47652/api/control/shutdown'' -TimeoutSec 2 | Out-Null } catch {}"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode);
+end;
+
+procedure RestoreWindowsShellChrome;
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$code = ''using System; using System.Runtime.InteropServices; public static class W { [DllImport(\"\"user32.dll\"\", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string n); [DllImport(\"\"user32.dll\"\", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string n); [DllImport(\"\"user32.dll\"\")] public static extern bool ShowWindow(IntPtr h, int c); }''; try { Add-Type $code -ErrorAction SilentlyContinue } catch {}; $show = 5; $handles = New-Object System.Collections.Generic.List[IntPtr]; $h = [W]::FindWindow(''Shell_TrayWnd'', $null); if ($h -ne [IntPtr]::Zero) { $handles.Add($h) }; $h = [IntPtr]::Zero; while (($h = [W]::FindWindowEx([IntPtr]::Zero, $h, ''Shell_SecondaryTrayWnd'', $null)) -ne [IntPtr]::Zero) { $handles.Add($h) }; foreach ($parent in @([W]::FindWindow(''Progman'', $null))) { if ($parent -ne [IntPtr]::Zero) { $view = [W]::FindWindowEx($parent, [IntPtr]::Zero, ''SHELLDLL_DefView'', $null); if ($view -ne [IntPtr]::Zero) { $handles.Add($view); $list = [W]::FindWindowEx($view, [IntPtr]::Zero, ''SysListView32'', ''FolderView''); if ($list -ne [IntPtr]::Zero) { $handles.Add($list) } } } }; $worker = [IntPtr]::Zero; while (($worker = [W]::FindWindowEx([IntPtr]::Zero, $worker, ''WorkerW'', $null)) -ne [IntPtr]::Zero) { $view = [W]::FindWindowEx($worker, [IntPtr]::Zero, ''SHELLDLL_DefView'', $null); if ($view -ne [IntPtr]::Zero) { $handles.Add($view); $list = [W]::FindWindowEx($view, [IntPtr]::Zero, ''SysListView32'', ''FolderView''); if ($list -ne [IntPtr]::Zero) { $handles.Add($list) } } }; foreach ($handle in $handles) { [W]::ShowWindow($handle, $show) | Out-Null }"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode);
 end;
 
 function ContainsText(Value: string; Needle: string): Boolean;
@@ -231,9 +257,13 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  RequestToolsForSteamShutdown;
+  Sleep(2000);
+  RestoreWindowsShellChrome;
   CloseProcess('ToolsForSteam.exe');
   CloseProcess('SteamLoader.exe');
   CloseProcess('steam.exe');
   CloseProcess('steamwebhelper.exe');
+  RestoreWindowsShellChrome;
   Result := '';
 end;
