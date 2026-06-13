@@ -89,13 +89,13 @@ begin
   Result := Pos(LowerCase(Needle), LowerCase(Value)) > 0;
 end;
 
-function ReadStartupModeFromSettings: string;
+function ReadStartupModeFromSettingsPath(SettingsPath: string): string;
 var
   SettingsJson: AnsiString;
   SettingsJsonLower: string;
 begin
   Result := '';
-  if LoadStringFromFile(ExpandConstant('{app}\data\tfs.json'), SettingsJson) then
+  if LoadStringFromFile(SettingsPath, SettingsJson) then
   begin
     SettingsJsonLower := LowerCase(string(SettingsJson));
     if Pos('"startupmode"', SettingsJsonLower) > 0 then
@@ -114,6 +114,33 @@ begin
       end;
     end;
   end;
+end;
+
+function ReadStartupModeFromSettings: string;
+var
+  InstallLocation: string;
+begin
+  Result := '';
+
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1', 'InstallLocation', InstallLocation) then
+  begin
+    Result := ReadStartupModeFromSettingsPath(AddBackslash(InstallLocation) + 'data\tfs.json');
+    if Result <> '' then
+    begin
+      Exit;
+    end;
+  end;
+
+  if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1', 'InstallLocation', InstallLocation) then
+  begin
+    Result := ReadStartupModeFromSettingsPath(AddBackslash(InstallLocation) + 'data\tfs.json');
+    if Result <> '' then
+    begin
+      Exit;
+    end;
+  end;
+
+  Result := ReadStartupModeFromSettingsPath(ExpandConstant('{localappdata}\Programs\ToolsForSteam\data\tfs.json'));
 end;
 
 function ExistingStartupMode: string;
