@@ -1,18 +1,17 @@
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\ToolsForSteam"),
-    [string]$ReleaseZip = "",
+    [string]$ReleaseInstaller = "",
     [switch]$NoLaunch
 )
 
 $ErrorActionPreference = "Stop"
 
 $repository = "toonymak1993/tools-for-steam"
-$assetName = "ToolsForSteam-portable-win-x64.zip"
+$assetName = "ToolsForSteamSetup.exe"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$localZip = Join-Path $projectRoot "dist\$assetName"
+$localInstaller = Join-Path $projectRoot "dist\installer\$assetName"
 $workDir = Join-Path $env:TEMP ("ToolsForSteam-Install-" + [guid]::NewGuid().ToString("N"))
-$zipPath = Join-Path $workDir $assetName
-$extractDir = Join-Path $workDir "package"
+$installerPath = Join-Path $workDir $assetName
 
 function Write-Uninstaller {
     param([string]$DestinationPath)
@@ -81,58 +80,34 @@ function Get-LatestReleaseAssetUrl {
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
 try {
-    if ($ReleaseZip) {
-        Copy-Item -LiteralPath $ReleaseZip -Destination $zipPath -Force
-    } elseif (Test-Path $localZip) {
-        Copy-Item -LiteralPath $localZip -Destination $zipPath -Force
+    if ($ReleaseInstaller) {
+        Copy-Item -LiteralPath $ReleaseInstaller -Destination $installerPath -Force
+    } elseif (Test-Path $localInstaller) {
+        Copy-Item -LiteralPath $localInstaller -Destination $installerPath -Force
     } else {
         $downloadUrl = Get-LatestReleaseAssetUrl
         Invoke-WebRequest `
             -Uri $downloadUrl `
-            -OutFile $zipPath `
+            -OutFile $installerPath `
             -Headers @{ "User-Agent" = "ToolsForSteam-Installer" }
     }
 
     Get-Process ToolsForSteam -ErrorAction SilentlyContinue | Stop-Process -Force
 
-    if (Test-Path $extractDir) {
-        Remove-Item -LiteralPath $extractDir -Recurse -Force
+    $arguments = @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/DIR=`"$InstallDir`""
+    )
+
+    $installer = Start-Process -FilePath $installerPath -ArgumentList $arguments -PassThru -Wait
+    if ($installer.ExitCode -ne 0) {
+        throw "The installer exited with code $($installer.ExitCode)."
     }
 
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $extractDir "*") -Destination $InstallDir -Recurse -Force
-
-    $exePath = Join-Path $InstallDir "ToolsForSteam.exe"
-    if (-not (Test-Path $exePath)) {
-        throw "ToolsForSteam.exe was not found after installation."
-    }
-
-    $startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Tools for Steam"
-    New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
-
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut((Join-Path $startMenuDir "Tools for Steam.lnk"))
-    $shortcut.TargetPath = $exePath
-    $shortcut.Arguments = "--manager"
-    $shortcut.WorkingDirectory = $InstallDir
-    $shortcut.IconLocation = $exePath
-    $shortcut.Save()
-
-    $uninstallShortcut = $shell.CreateShortcut((Join-Path $startMenuDir "Uninstall Tools for Steam.lnk"))
-    $uninstallShortcut.TargetPath = "powershell.exe"
-    $uninstallShortcut.Arguments = "-ExecutionPolicy Bypass -File `"$InstallDir\uninstall-toolsforsteam.ps1`""
-    $uninstallShortcut.WorkingDirectory = $InstallDir
-    $uninstallShortcut.Save()
-
-    Write-Uninstaller -DestinationPath (Join-Path $InstallDir "uninstall-toolsforsteam.ps1")
-
-    Write-Host "Tools for Steam installed to:"
+    Write-Host "Tools for Steam installer finished for:"
     Write-Host "  $InstallDir"
-
-    if (-not $NoLaunch) {
-        Start-Process -FilePath $exePath -ArgumentList "--manager"
-    }
 } finally {
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
 }

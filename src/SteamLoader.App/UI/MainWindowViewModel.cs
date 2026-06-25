@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using SteamLoader.App;
 using SteamLoader.App.Hosting;
 using SteamLoader.App.Infrastructure.Settings;
@@ -9,6 +10,9 @@ namespace SteamLoader.App.UI;
 
 public sealed class MainWindowViewModel : BindableBase
 {
+    private const int BigPictureReadySplashHoldSeconds = 3;
+    private const int ShowWindowRestore = 9;
+
     private readonly SteamLoaderProcessManager _processManager;
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
@@ -17,11 +21,12 @@ public sealed class MainWindowViewModel : BindableBase
     private readonly SupportBundleService _supportBundleService;
     private readonly string _shellLaunchArguments;
     private readonly bool _shellBootstrapMode;
+    private readonly bool _consoleStartupMode;
     private readonly bool _runStartupSyncOnInitialize;
     private bool _isBusy;
     private bool _isRunning;
     private bool _autostartEnabled;
-    private string _startupMode = SteamLoaderRuntime.StartupModeManual;
+    private string _startupMode = SteamLoaderRuntime.StartupModeShell;
     private bool _initialized;
     private bool _startupSyncTriggered;
     private bool _showStartupSplash;
@@ -55,6 +60,7 @@ public sealed class MainWindowViewModel : BindableBase
         SupportBundleService supportBundleService,
         string shellLaunchArguments,
         bool shellBootstrapMode,
+        bool consoleStartupMode,
         bool runStartupSyncOnInitialize)
     {
         _processManager = processManager;
@@ -65,14 +71,15 @@ public sealed class MainWindowViewModel : BindableBase
         _supportBundleService = supportBundleService;
         _shellLaunchArguments = shellLaunchArguments;
         _shellBootstrapMode = shellBootstrapMode;
+        _consoleStartupMode = consoleStartupMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
         ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
-        _showStartupSplash = shellBootstrapMode && _splashScreenEnabled;
-        if (shellBootstrapMode)
+        _showStartupSplash = consoleStartupMode && _splashScreenEnabled;
+        if (consoleStartupMode)
         {
             _serviceStateText = "Preparing Tools for Steam";
-            _serviceDetailText = "Starting the background service.";
-            _steamStateText = "Waiting to begin the Steam startup flow.";
+            _serviceDetailText = "Starting the background service and preparing the fast Steam hand-off.";
+            _steamStateText = "Startup sync runs first, then Steam opens as soon as shortcuts are ready.";
         }
 
         StartCommand = new AsyncRelayCommand(StartAsync, () => !IsBusy && !IsRunning);
@@ -267,13 +274,15 @@ public sealed class MainWindowViewModel : BindableBase
 
     public string StatusPillText => IsRunning ? "Running" : "Stopped";
 
-    public string AutostartButtonText => AutostartEnabled ? "Disable Startup" : "Enable Shell Startup";
+    public string AutostartButtonText => StartupMode == SteamLoaderRuntime.StartupModeShell
+        ? "Switch to Tray Startup"
+        : "Switch to Shell Startup";
 
     public string AutostartMenuText => StartupMode switch
     {
         SteamLoaderRuntime.StartupModeShell => "Startup Mode: Shell takeover",
         SteamLoaderRuntime.StartupModeTray => "Startup Mode: Tray app",
-        _ => "Startup Mode: Manual"
+        _ => "Startup Mode: Shell takeover"
     };
 
     public AsyncRelayCommand StartCommand { get; }
@@ -320,7 +329,7 @@ public sealed class MainWindowViewModel : BindableBase
             await TriggerStartupSyncAsync();
         }
 
-        if (_shellBootstrapMode)
+        if (_consoleStartupMode)
         {
             EnsureShellBootstrapMonitor();
         }
@@ -358,7 +367,7 @@ public sealed class MainWindowViewModel : BindableBase
             IsRunning = status is not null;
             ShowFirstRunSetup = false;
 
-            if (_shellBootstrapMode && !_windowsShellStarted)
+            if (_consoleStartupMode && !_windowsShellStarted)
             {
                 ApplyShellBootstrapStatus(status);
             }
@@ -382,12 +391,12 @@ public sealed class MainWindowViewModel : BindableBase
             RecoveryHintText = BuildRecoveryHintText(status);
 
             StartupMode = settings.StartupMode;
-            AutostartEnabled = settings.RunOnWindowsSignIn;
+            AutostartEnabled = string.Equals(settings.StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase);
             AutostartStateText = BuildAutostartStateText(settings.StartupMode);
         }
         catch (Exception exception)
         {
-            if (_shellBootstrapMode && !_windowsShellStarted)
+            if (_consoleStartupMode && !_windowsShellStarted)
             {
                 ApplyShellBootstrapStatus(null);
             }
@@ -448,11 +457,12 @@ public sealed class MainWindowViewModel : BindableBase
     {
         try
         {
-            var settings = AutostartEnabled
-                ? _settingsService.SetStartupMode(SteamLoaderRuntime.StartupModeManual)
-                : _settingsService.SetRunOnWindowsSignIn(true);
+            var nextMode = string.Equals(StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase)
+                ? SteamLoaderRuntime.StartupModeTray
+                : SteamLoaderRuntime.StartupModeShell;
+            var settings = _settingsService.SetStartupMode(nextMode);
             StartupMode = settings.StartupMode;
-            AutostartEnabled = settings.RunOnWindowsSignIn;
+            AutostartEnabled = string.Equals(settings.StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase);
             AutostartStateText = BuildAutostartStateText(settings.StartupMode);
             ErrorText = string.Empty;
         }
@@ -614,13 +624,13 @@ public sealed class MainWindowViewModel : BindableBase
     {
         IsBusy = true;
         ErrorText = string.Empty;
-        ServiceDetailText = "Running startup sync before launching Steam...";
+        ServiceDetailText = "Syncing launchers and writing Steam shortcuts...";
 
         try
         {
             await _processManager.RequestStartupSyncAsync();
-            ServiceDetailText = "Startup sync requested. Tools for Steam will finish the sync and launch Steam.";
-            if (_shellBootstrapMode)
+            ServiceDetailText = "Startup sync requested. Steam will open as soon as shortcuts are ready.";
+            if (_consoleStartupMode)
             {
                 EnsureShellBootstrapMonitor();
             }
@@ -728,7 +738,7 @@ public sealed class MainWindowViewModel : BindableBase
 
     private void EnsureShellBootstrapMonitor()
     {
-        if (!_shellBootstrapMode || _shellBootstrapMonitorTask is not null)
+        if (!_consoleStartupMode || _shellBootstrapMonitorTask is not null)
         {
             return;
         }
@@ -738,7 +748,7 @@ public sealed class MainWindowViewModel : BindableBase
 
     private async Task MonitorShellBootstrapAsync()
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(90);
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(180);
 
         while (DateTimeOffset.UtcNow < deadline)
         {
@@ -754,7 +764,9 @@ public sealed class MainWindowViewModel : BindableBase
         if (!SteamReadyForShellHandOff())
         {
             ServiceStateText = "Steam needs more time";
-            ServiceDetailText = "Starting Windows Desktop recovery while Tools for Steam keeps trying in the tray.";
+            ServiceDetailText = _shellBootstrapMode
+                ? "Starting Windows Desktop recovery while Tools for Steam keeps trying in the tray."
+                : "Keeping Tools for Steam alive while Steam continues to start.";
             SteamStateText = "Steam was not ready before the console-mode timeout.";
         }
 
@@ -764,8 +776,107 @@ public sealed class MainWindowViewModel : BindableBase
 
     private bool SteamReadyForShellHandOff()
     {
-        return _lastKnownStatus?.QuickAccessAttached == true
-            || _lastKnownStatus?.SharedContextAttached == true;
+        return IsSteamBigPictureWindowVisible();
+    }
+
+    private static bool IsSteamBigPictureWindowVisible()
+    {
+        var processes = Process.GetProcessesByName("steamwebhelper");
+        try
+        {
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (!process.HasExited &&
+                        process.MainWindowHandle != IntPtr.Zero &&
+                        process.MainWindowTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private static void TryFocusSteamWindow()
+    {
+        var handle = FindSteamWindowHandle();
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        ShowWindow(handle, ShowWindowRestore);
+        SetForegroundWindow(handle);
+    }
+
+    private static IntPtr FindSteamWindowHandle()
+    {
+        var preferredHandle = FindSteamWindowHandle("steamwebhelper", preferSteamTitle: true);
+        if (preferredHandle != IntPtr.Zero)
+        {
+            return preferredHandle;
+        }
+
+        var steamHandle = FindSteamWindowHandle("steam", preferSteamTitle: false);
+        if (steamHandle != IntPtr.Zero)
+        {
+            return steamHandle;
+        }
+
+        return FindSteamWindowHandle("steamwebhelper", preferSteamTitle: false);
+    }
+
+    private static IntPtr FindSteamWindowHandle(string processName, bool preferSteamTitle)
+    {
+        var processes = Process.GetProcessesByName(processName);
+        try
+        {
+            var fallbackHandle = IntPtr.Zero;
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (process.HasExited || process.MainWindowHandle == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    fallbackHandle = process.MainWindowHandle;
+                    if (!preferSteamTitle ||
+                        process.MainWindowTitle.Contains("Steam", StringComparison.OrdinalIgnoreCase) ||
+                        process.MainWindowTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return process.MainWindowHandle;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return fallbackHandle;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
     }
 
     private void CompleteShellBootstrap()
@@ -776,7 +887,11 @@ public sealed class MainWindowViewModel : BindableBase
         }
 
         _windowsShellStarted = true;
-        _shellService.StartWindowsShellIfNeeded();
+        if (_shellBootstrapMode)
+        {
+            _shellService.StartWindowsShellIfNeeded();
+        }
+
         ShowStartupSplash = false;
         ShowFirstRunSetup = false;
     }
@@ -784,14 +899,18 @@ public sealed class MainWindowViewModel : BindableBase
     private async Task HoldSplashBeforeShellHandoffAsync()
     {
         ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
-        if (!ShowStartupSplash || SplashExtraCloseDelaySeconds <= 0)
+        var holdSeconds = _consoleStartupMode
+            ? Math.Max(BigPictureReadySplashHoldSeconds, SplashExtraCloseDelaySeconds)
+            : SplashExtraCloseDelaySeconds;
+
+        if (!ShowStartupSplash || holdSeconds <= 0)
         {
             return;
         }
 
         ServiceStateText = "Steam is ready";
-        ServiceDetailText = $"Keeping the splash screen visible for {SplashExtraCloseDelaySeconds}s.";
-        await Task.Delay(TimeSpan.FromSeconds(SplashExtraCloseDelaySeconds));
+        ServiceDetailText = $"Big Picture is visible. Closing the splash screen in {holdSeconds}s.";
+        await Task.Delay(TimeSpan.FromSeconds(holdSeconds));
     }
 
     private void ApplyShellBootstrapStatus(SteamLoaderHostStatus? status)
@@ -802,8 +921,8 @@ public sealed class MainWindowViewModel : BindableBase
         if (status is null)
         {
             ServiceStateText = "Preparing Tools for Steam";
-            ServiceDetailText = "Starting the background service.";
-            SteamStateText = "Waiting to begin the Steam startup flow.";
+            ServiceDetailText = "Starting the background service and preparing the fast Steam hand-off.";
+            SteamStateText = "Startup sync runs first, then Steam opens as soon as shortcuts are ready.";
             return;
         }
 
@@ -811,8 +930,12 @@ public sealed class MainWindowViewModel : BindableBase
 
         if (status.QuickAccessAttached)
         {
-            ServiceStateText = "Steam is ready";
-            ServiceDetailText = "Gamepad UI is live. Finishing the Windows hand-off.";
+            ServiceStateText = IsSteamBigPictureWindowVisible()
+                ? "Steam is ready"
+                : "Steam is opening";
+            ServiceDetailText = IsSteamBigPictureWindowVisible()
+                ? "Gamepad UI is live. Finishing the startup hand-off."
+                : "Quick Access is attached. Waiting for the Big Picture window to appear.";
             SteamStateText = "Quick Access is attached.";
             return;
         }
@@ -826,7 +949,7 @@ public sealed class MainWindowViewModel : BindableBase
         }
 
         ServiceStateText = "Launching Steam";
-        ServiceDetailText = "Syncing launchers and starting Steam in Gamepad UI.";
+        ServiceDetailText = "Writing shortcuts first, then handing off to Steam Gamepad UI.";
         SteamStateText = "Waiting for Steam to finish booting.";
     }
 
@@ -838,7 +961,7 @@ public sealed class MainWindowViewModel : BindableBase
                 "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer.",
             SteamLoaderRuntime.StartupModeTray =>
                 "Tray app mode is active. Windows starts normally, then Tools for Steam runs from the tray, syncs launchers, and starts Steam in dev mode.",
-            _ => "Tools for Steam only starts when you launch it manually."
+            _ => "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
         };
     }
 
@@ -850,4 +973,10 @@ public sealed class MainWindowViewModel : BindableBase
         SplashIconPath = settings.IconExists ? settings.IconPath : string.Empty;
         SplashExtraCloseDelaySeconds = settings.ExtraCloseDelaySeconds;
     }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }

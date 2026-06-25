@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using Microsoft.Win32;
+using SteamLoader.App.Infrastructure.Steam;
 
 namespace SteamLoader.App.Services;
 
@@ -11,17 +11,45 @@ public sealed class SteamClientLaunchService
 
     private readonly HttpClient _httpClient;
     private readonly Uri _debugEndpoint;
-    private readonly string _fallbackSteamRootPath;
+    private readonly SteamInstallationService _steamInstallationService;
 
     private DateTimeOffset? _firstUnavailableAt;
     private DateTimeOffset _lastActionAt = DateTimeOffset.MinValue;
     private bool _restartedExistingSteam;
 
-    public SteamClientLaunchService(HttpClient httpClient, Uri debugEndpoint, string fallbackSteamRootPath)
+    public SteamClientLaunchService(
+        HttpClient httpClient,
+        Uri debugEndpoint,
+        SteamInstallationService steamInstallationService)
     {
         _httpClient = httpClient;
         _debugEndpoint = debugEndpoint;
-        _fallbackSteamRootPath = fallbackSteamRootPath;
+        _steamInstallationService = steamInstallationService;
+    }
+
+    public static SteamClientLaunchState RequestSteamStartForTools(SteamInstallationService steamInstallationService)
+    {
+        var steamExePath = steamInstallationService.ResolveSteamExecutablePath();
+        if (steamExePath is null)
+        {
+            return new SteamClientLaunchState(
+                false,
+                "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
+        }
+
+        try
+        {
+            LaunchSteam(steamExePath);
+            return new SteamClientLaunchState(
+                false,
+                "Starting Steam in Gamepad UI with DevTools enabled.");
+        }
+        catch (Exception exception)
+        {
+            return new SteamClientLaunchState(
+                false,
+                $"Steam could not be started: {exception.Message}");
+        }
     }
 
     public async Task<SteamClientLaunchState> EnsureDevToolsReadyAsync(CancellationToken cancellationToken)
@@ -63,12 +91,19 @@ public sealed class SteamClientLaunchService
 
         if (!_restartedExistingSteam && now - _firstUnavailableAt.Value >= RestartGracePeriod)
         {
-            RestartSteamForDevTools(steamExePath);
+            if (RestartSteamForDevTools(steamExePath))
+            {
+                _lastActionAt = now;
+                _restartedExistingSteam = true;
+                return new SteamClientLaunchState(
+                    false,
+                    "Restarting Steam once so Tools for Steam can attach to the DevTools endpoint.");
+            }
+
             _lastActionAt = now;
-            _restartedExistingSteam = true;
             return new SteamClientLaunchState(
                 false,
-                "Restarting Steam once so Tools for Steam can attach to the DevTools endpoint.");
+                "Waiting for Steam to finish its official shutdown before restarting.");
         }
 
         return new SteamClientLaunchState(
@@ -93,14 +128,16 @@ public sealed class SteamClientLaunchService
                 "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
         }
 
-        RestartSteamForDevTools(steamExePath);
+        var restartRequested = RestartSteamForDevTools(steamExePath);
         _lastActionAt = DateTimeOffset.UtcNow;
         _firstUnavailableAt = _lastActionAt;
-        _restartedExistingSteam = true;
+        _restartedExistingSteam = restartRequested;
 
         return new SteamClientLaunchState(
             false,
-            "Steam is restarting in Gamepad UI with DevTools enabled.");
+            restartRequested
+                ? "Steam is restarting in Gamepad UI with DevTools enabled."
+                : "Waiting for Steam to finish its official shutdown before restarting.");
     }
 
     private async Task<bool> IsDebugEndpointAvailableAsync(CancellationToken cancellationToken)
@@ -117,10 +154,15 @@ public sealed class SteamClientLaunchService
         }
     }
 
-    private void RestartSteamForDevTools(string steamExePath)
+    private bool RestartSteamForDevTools(string steamExePath)
     {
-        CloseSteam();
+        if (!CloseSteam())
+        {
+            return false;
+        }
+
         LaunchSteam(steamExePath);
+        return true;
     }
 
     private static void LaunchSteam(string steamExePath)
@@ -135,12 +177,12 @@ public sealed class SteamClientLaunchService
         })?.Dispose();
     }
 
-    private void CloseSteam()
+    private bool CloseSteam()
     {
         var steamProcesses = GetSteamProcesses().ToList();
         if (steamProcesses.Count == 0)
         {
-            return;
+            return true;
         }
 
         foreach (var process in steamProcesses)
@@ -181,63 +223,18 @@ public sealed class SteamClientLaunchService
         {
             if (!IsSteamRunning())
             {
-                return;
+                return true;
             }
 
             Thread.Sleep(300);
         }
 
-        foreach (var process in GetSteamProcesses())
-        {
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        Thread.Sleep(800);
+        return !IsSteamRunning();
     }
 
     private string? ResolveSteamExecutablePath()
     {
-        var candidates = new[]
-        {
-            GetRegistryString(Registry.CurrentUser, @"Software\Valve\Steam", "SteamExe"),
-            CombineRegistryPath(GetRegistryString(Registry.CurrentUser, @"Software\Valve\Steam", "SteamPath")),
-            CombineRegistryPath(GetRegistryString(Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath")),
-            CombineRegistryPath(GetRegistryString(Registry.LocalMachine, @"SOFTWARE\Valve\Steam", "InstallPath")),
-            Path.Combine(_fallbackSteamRootPath, "steam.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam", "steam.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Steam", "steam.exe"),
-        };
-
-        return candidates.FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path));
-    }
-
-    private static string? CombineRegistryPath(string? steamPath)
-    {
-        return string.IsNullOrWhiteSpace(steamPath)
-            ? null
-            : Path.Combine(steamPath, "steam.exe");
-    }
-
-    private static string? GetRegistryString(RegistryKey root, string keyPath, string valueName)
-    {
-        try
-        {
-            using var key = root.OpenSubKey(keyPath, writable: false);
-            return key?.GetValue(valueName) as string;
-        }
-        catch
-        {
-            return null;
-        }
+        return _steamInstallationService.ResolveSteamExecutablePath();
     }
 
     private static bool IsSteamRunning()

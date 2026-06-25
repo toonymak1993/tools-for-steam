@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/SteamLoader.App/SteamLoader.App.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SteamLoader.App.Tests/SteamLoader.App.Tests.csproj" />
+  </Folder>
 </Solution>

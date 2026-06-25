@@ -39,7 +39,8 @@ public sealed record ArtworkSettingsState(
     bool SteamGridDbApiKeyConfigured,
     string SteamGridDbApiKeyPreview,
     bool PreferVerifiedMatches,
-    int ResultLimit);
+    int ResultLimit,
+    SteamPathState SteamPath);
 
 public sealed record ArtworkSnapshot(
     ArtworkSettingsState Settings,

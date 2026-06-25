@@ -9,6 +9,7 @@ public sealed record SteamLoaderGeneralSettingsSnapshot(
     SteamLoaderSplashScreenSettingsSnapshot SplashScreen,
     string ProductVersion,
     string InstallPath,
+    bool DeveloperDebugEnabled,
     IReadOnlyList<SteamLoaderPluginSettingsState> Plugins);
 
 public sealed record SteamLoaderPluginSettingsState(

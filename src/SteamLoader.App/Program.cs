@@ -1,6 +1,8 @@
 using System.Windows;
 using SteamLoader.App.Hosting;
+using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Settings;
+using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Services;
 using SteamLoader.App.UI;
 
@@ -18,6 +20,21 @@ public static class Program
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.BackgroundArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.FpsHelperArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunFpsHelper();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RegisterFpsHelperTask();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return CheckFpsHelperTask();
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PreviewSplashArgument, StringComparison.OrdinalIgnoreCase)))
@@ -47,11 +64,7 @@ public static class Program
             string.Equals(argument, SteamLoaderRuntime.ManagerArgument, StringComparison.OrdinalIgnoreCase));
         var runStartupSync = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        if (shellBootstrapMode && !runStartupSync)
-        {
-            var bootstrapShellService = new WindowsShellService();
-            bootstrapShellService.StartWindowsShellIfNeeded();
-        }
+        var consoleStartupMode = shellBootstrapMode && runStartupSync;
 
         var startHiddenInTray = !showManager;
 
@@ -71,10 +84,25 @@ public static class Program
             SteamLoaderRuntime.ShellLaunchArguments,
             Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
         var settingsSnapshot = settingsService.EnsureDefaultConsoleModeEnabled();
+
         if (shellBootstrapMode && !settingsSnapshot.FirstRunCompleted)
         {
             settingsService.CompleteFirstRunSetup();
         }
+
+        if (startHiddenInTray && !runStartupSync)
+        {
+            var steamInstallationService = new SteamInstallationService(
+                new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            SteamClientLaunchService.RequestSteamStartForTools(steamInstallationService);
+        }
+
+        if (shellBootstrapMode && !runStartupSync)
+        {
+            shellService.StartWindowsShellIfNeeded();
+        }
+
         var releaseUpdateService = new ReleaseUpdateService();
         var supportBundleService = new SupportBundleService(shellService);
 
@@ -87,6 +115,7 @@ public static class Program
             supportBundleService,
             SteamLoaderRuntime.ShellLaunchArguments,
             shellBootstrapMode,
+            consoleStartupMode,
             runStartupSync);
 
         var application = new System.Windows.Application
@@ -98,7 +127,7 @@ public static class Program
         {
             DataContext = viewModel,
             StartHiddenInTray = startHiddenInTray,
-            ShellBootstrapMode = shellBootstrapMode
+            ShellBootstrapMode = consoleStartupMode
         };
 
         using var trayIconController = new TrayIconController(application, window, viewModel);
@@ -149,6 +178,7 @@ public static class Program
             releaseUpdateService,
             supportBundleService,
             SteamLoaderRuntime.ShellLaunchArguments,
+            false,
             false,
             false);
 
@@ -214,6 +244,86 @@ public static class Program
         catch (Exception exception)
         {
             Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
+    }
+
+    private static int RunFpsHelper()
+    {
+        try
+        {
+            var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
+            var settingsStore = new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json"));
+            var statusStore = new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json"));
+            var helperHost = new TfsFpsHelperHost(settingsStore, statusStore);
+            return helperHost.Run();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception);
+            return 1;
+        }
+    }
+
+    private static int RegisterFpsHelperTask()
+    {
+        var logPath = Path.Combine(AppContext.BaseDirectory, "data", "fps-helper-task.log");
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+            if (File.Exists(logPath))
+            {
+                File.Delete(logPath);
+            }
+
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var taskService = new FpsHelperScheduledTaskService(
+                executablePath,
+                SteamLoaderRuntime.FpsHelperArgument,
+                AppContext.BaseDirectory);
+            taskService.EnsureRegistered();
+
+            if (File.Exists(logPath))
+            {
+                File.Delete(logPath);
+            }
+
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+                File.WriteAllText(logPath, exception.Message);
+            }
+            catch
+            {
+            }
+
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
+    }
+
+    private static int CheckFpsHelperTask()
+    {
+        try
+        {
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var taskService = new FpsHelperScheduledTaskService(
+                executablePath,
+                SteamLoaderRuntime.FpsHelperArgument,
+                AppContext.BaseDirectory);
+            return taskService.IsRegistered() ? 0 : 1;
+        }
+        catch
+        {
             return 1;
         }
     }

@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using SteamLoader.App.Infrastructure.Steam;
 using System.Text.Json;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Models;
@@ -49,15 +50,15 @@ public sealed class SteamGridDbManualArtworkService
                 DefaultMime: "image/png"),
         };
 
-    private readonly string _steamRootPath;
+    private readonly SteamInstallationService _steamInstallationService;
     private readonly ArtworkSettingsStore _settingsStore;
     private readonly object _gate = new();
 
     public SteamGridDbManualArtworkService(
-        string steamRootPath,
+        SteamInstallationService steamInstallationService,
         ArtworkSettingsStore settingsStore)
     {
-        _steamRootPath = steamRootPath;
+        _steamInstallationService = steamInstallationService;
         _settingsStore = settingsStore;
     }
 
@@ -121,6 +122,24 @@ public sealed class SteamGridDbManualArtworkService
             configuration.ResultLimit = Math.Clamp(value, 12, 72);
             _settingsStore.Save(configuration);
             return BuildSnapshot(configuration);
+        }
+    }
+
+    public ArtworkSnapshot SetSteamPath(string value)
+    {
+        lock (_gate)
+        {
+            _steamInstallationService.SetManualOverridePath(value);
+            return BuildSnapshot(_settingsStore.Load());
+        }
+    }
+
+    public ArtworkSnapshot ClearSteamPath()
+    {
+        lock (_gate)
+        {
+            _steamInstallationService.ClearManualOverridePath();
+            return BuildSnapshot(_settingsStore.Load());
         }
     }
 
@@ -261,13 +280,16 @@ public sealed class SteamGridDbManualArtworkService
 
         var extension = ResolveExtension(assetUri, downloadedArtwork.Mime, slot.DefaultExtension);
         var mime = downloadedArtwork.Mime ?? ResolveMime(extension, slot.DefaultMime);
+        var steamPathState = _steamInstallationService.GetState();
         var writtenPath = TryWriteSteamGridFile(appId, slot, extension, bytes);
 
         return new ArtworkApplyResult(
             true,
-            writtenPath is null
-                ? "Artwork downloaded. Steam will apply it through the active Big Picture session."
-                : "Artwork applied and written to Steam's grid folder.",
+            writtenPath is not null
+                ? "Artwork applied and written to Steam's grid folder."
+                : string.IsNullOrWhiteSpace(steamPathState.EffectivePath)
+                    ? "Artwork downloaded, but Steam's install path could not be detected. Set it in Artwork settings and try again."
+                    : "Artwork downloaded, but Tools for Steam could not write to Steam's grid folder.",
             appId,
             slot.Id,
             slot.SteamAssetType,
@@ -354,18 +376,22 @@ public sealed class SteamGridDbManualArtworkService
         return null;
     }
 
-    private static ArtworkSnapshot BuildSnapshot(ArtworkConfiguration configuration)
+    private ArtworkSnapshot BuildSnapshot(ArtworkConfiguration configuration)
     {
         var apiKey = GetEffectiveApiKey(configuration);
+        var steamPathState = _steamInstallationService.GetState();
         var settings = new ArtworkSettingsState(
             ContextMenuEnabled: configuration.ContextMenuEnabled,
             SteamGridDbApiKeyConfigured: !string.IsNullOrWhiteSpace(apiKey),
             SteamGridDbApiKeyPreview: GetApiKeyPreview(configuration.SteamGridDbApiKey),
             PreferVerifiedMatches: configuration.PreferVerifiedMatches,
-            ResultLimit: configuration.ResultLimit);
+            ResultLimit: configuration.ResultLimit,
+            SteamPath: steamPathState);
 
         var status = configuration.ContextMenuEnabled
-            ? "Context menu entry is enabled."
+            ? string.IsNullOrWhiteSpace(steamPathState.EffectivePath)
+                ? "Context menu entry is enabled, but Steam's install path has not been detected yet."
+                : "Context menu entry is enabled."
             : "Context menu entry is hidden.";
 
         return new ArtworkSnapshot(settings, status);
@@ -417,13 +443,19 @@ public sealed class SteamGridDbManualArtworkService
 
     private string? ResolveGridDirectory()
     {
-        var userdataPath = Path.Combine(_steamRootPath, "userdata");
+        var steamRootPath = _steamInstallationService.ResolveSteamRootPath();
+        if (string.IsNullOrWhiteSpace(steamRootPath))
+        {
+            return null;
+        }
+
+        var userdataPath = Path.Combine(steamRootPath, "userdata");
         if (!Directory.Exists(userdataPath))
         {
             return null;
         }
 
-        var accountId = ResolveLastUsedAccountId(userdataPath);
+        var accountId = ResolveLastUsedAccountId(steamRootPath, userdataPath);
         if (string.IsNullOrWhiteSpace(accountId))
         {
             accountId = Directory.GetDirectories(userdataPath)
@@ -448,9 +480,9 @@ public sealed class SteamGridDbManualArtworkService
             : Path.Combine(userdataPath, accountId, "config", "grid");
     }
 
-    private string? ResolveLastUsedAccountId(string userdataPath)
+    private string? ResolveLastUsedAccountId(string steamRootPath, string userdataPath)
     {
-        var loginUsersPath = Path.Combine(_steamRootPath, "config", "loginusers.vdf");
+        var loginUsersPath = Path.Combine(steamRootPath, "config", "loginusers.vdf");
         if (!File.Exists(loginUsersPath))
         {
             return null;

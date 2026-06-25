@@ -101,7 +101,8 @@ Outputs:
 
 - `dist\installer\ToolsForSteamSetup.exe`
 - `dist\portable\ToolsForSteam.exe`
-- `dist\ToolsForSteam-portable-win-x64.zip`
+
+`dist\portable\ToolsForSteam.exe` is an internal staging payload used to assemble the installer. Public releases now ship the installer only.
 
 ## Repository Layout
 

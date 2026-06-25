@@ -30,13 +30,23 @@ public sealed class ConsoleModeShellGuardService
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var shouldHideShell = _settingsService.ShouldHideWindowsShellInConsoleMode()
+                var settings = _settingsService.GetSnapshot();
+                var shellModeActive = string.Equals(
+                    settings.StartupMode,
+                    SteamLoaderRuntime.StartupModeShell,
+                    StringComparison.OrdinalIgnoreCase);
+                var shouldHideShell = shellModeActive
+                    && settings.HideWindowsShellInConsoleMode
                     && await IsBigPictureActiveAsync(cancellationToken);
 
                 if (shouldHideShell)
                 {
                     lastBigPictureSeenAt = DateTimeOffset.UtcNow;
                     _shellVisibilityService.HideShellChrome();
+                }
+                else if (_shellVisibilityService.IsHidden && !shellModeActive)
+                {
+                    _shellVisibilityService.RestoreShellChrome();
                 }
                 else if (
                     _shellVisibilityService.IsHidden &&

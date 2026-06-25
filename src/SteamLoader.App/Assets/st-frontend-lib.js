@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 13) {
+  if (existing?.version >= 21) {
     return;
   }
 
@@ -21,8 +21,12 @@
     error: "",
     note: "",
     headerIcon: null,
+    headerActions: Object.freeze([]),
+    footerLegend: Object.freeze([]),
     autoFocusIndex: null,
+    panelClassName: "",
     dividerAfterIndex: null,
+    dividerAfterIndices: null,
     volumePanel: null,
     cards: Object.freeze([]),
     editor: null,
@@ -635,14 +639,14 @@
       return createElement(DialogButton, {
         ...commonProps,
         focusable: true,
-      });
+      }, options.slotKey || options.key || null);
     }
 
     return createElement("button", {
       type: "button",
       ...commonProps,
       className: "steamloader-fallback-button",
-    });
+    }, options.slotKey || options.key || null);
   }
 
   function renderSwitchAccessory(createElement, withChildren, slot) {
@@ -748,7 +752,10 @@
       switchLabel: options.switchLabel || "",
       leadingIcon: options.leadingIcon || null,
       buttonClassName: options.buttonClassName || "",
+      buttonStyle: options.buttonStyle || null,
+      buttonProps: options.buttonProps || null,
       rowClassName: options.rowClassName || "",
+      slotKey: options.slotKey || options.key || "",
       selected: Boolean(options.selected),
       value: options.value,
       nativeComponentId:
@@ -931,6 +938,7 @@
       () => invokeSlotAction(state, slot, index, helpers),
       {
         disabled: slot.disabled,
+        slotKey: slot.slotKey || null,
         className: slot.buttonClassName || "steamloader-dialog-button",
         extraProps: {
           ...roleProps,
@@ -939,12 +947,14 @@
           "data-native-component-ready": nativeAvailable ? "true" : "false",
           "data-setting-scope": slot.settingScope || undefined,
           "data-setting-key": slot.settingKey || undefined,
+          style: slot.buttonStyle || undefined,
           autoFocus: Number.isInteger(autoFocusIndex) && index === autoFocusIndex,
           onCancelButton: backNavigation
             ? () => {
                 helpers.navigateBackFromRoute();
               }
             : undefined,
+          ...(slot.buttonProps || {}),
         },
       },
     );
@@ -962,6 +972,16 @@
           className: "steamloader-card-title",
           children: card.title,
         }),
+        card.imageSrc
+          ? createElement("div", {
+              className: "steamloader-card-image-shell",
+              children: createElement("img", {
+                className: "steamloader-card-image",
+                src: card.imageSrc,
+                alt: card.imageAlt || card.title || "",
+              }),
+            })
+          : null,
         ...(Array.isArray(card.lines) ? card.lines : []).map((line, lineIndex) =>
           createElement("div", {
             className: "steamloader-card-line",
@@ -971,6 +991,73 @@
         ),
       ),
       `steamloader-card-${index}`,
+    );
+  }
+
+  function createHeaderActionButton(state, createElement, withChildren, action) {
+    if (!action || typeof action.onClick !== "function") {
+      return null;
+    }
+
+    const HeaderActionIcon = action.icon;
+    return createDialogButton(
+      state,
+      createElement,
+      createElement(
+        "div",
+        withChildren(
+          { className: "steamloader-header-action-shell" },
+          HeaderActionIcon ? createElement(HeaderActionIcon, {}) : null,
+        ),
+      ),
+      action.onClick,
+      {
+        disabled: action.disabled,
+        className: action.buttonClassName || "steamloader-dialog-button steamloader-header-action-button",
+        extraProps: {
+          "aria-label": action.title || "Action",
+          title: action.title || "Action",
+          style: action.buttonStyle || undefined,
+        },
+      },
+    );
+  }
+
+  function createFooterLegend(createElement, withChildren, items) {
+    if (!Array.isArray(items) || !items.length) {
+      return null;
+    }
+
+    return createElement(
+      "div",
+      withChildren(
+        { className: "steamloader-footer-legend" },
+        ...items
+          .map((item, index) => {
+            if (!item?.button || !item?.label) {
+              return null;
+            }
+
+            return createElement(
+              "div",
+              withChildren(
+                {
+                  className: `steamloader-footer-legend-item${item.active ? " is-active" : ""}`,
+                  key: item.key || `footer-legend-${index}`,
+                },
+                createElement("span", {
+                  className: "steamloader-footer-legend-button",
+                  children: item.button,
+                }),
+                createElement("span", {
+                  className: "steamloader-footer-legend-label",
+                  children: item.label,
+                }),
+              ),
+            );
+          })
+          .filter(Boolean),
+      ),
     );
   }
 
@@ -1024,6 +1111,14 @@
     });
   }
 
+  function hasDividerAfter(model, index) {
+    if (Number.isInteger(model?.dividerAfterIndex) && index === model.dividerAfterIndex) {
+      return true;
+    }
+
+    return Array.isArray(model?.dividerAfterIndices) && model.dividerAfterIndices.includes(index);
+  }
+
   function createVolumeActionButton(state, createElement, withChildren, action, index, helpers = {}) {
     return createDialogButton(
       state,
@@ -1060,8 +1155,121 @@
     );
   }
 
+  function createFallbackVolumeSlider(state, createElement, withChildren, slider, shouldAutoFocusAction, helpers = {}) {
+    const min = Number.isFinite(slider.min) ? slider.min : 0;
+    const max = Number.isFinite(slider.max) ? slider.max : 100;
+    const range = Math.max(1, max - min);
+    const notchCount = Number.isInteger(slider.notchCount) && slider.notchCount > 1 ? slider.notchCount : 11;
+    const value = Math.max(min, Math.min(max, Math.round(Number(slider.value) || 0)));
+    const percent = ((value - min) / range) * 100;
+
+    return createDialogButton(
+      state,
+      createElement,
+      createElement(
+        "div",
+        withChildren(
+          { className: "steamloader-volume-slider-fallback-shell" },
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-volume-slider-fallback-head" },
+              createElement("div", {
+                className: "steamloader-volume-slider-label",
+                children: slider.title,
+              }),
+              createElement("div", {
+                className: "steamloader-volume-slider-value",
+                children: `${value}${slider.valueSuffix || ""}`,
+              }),
+            ),
+          ),
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-volume-slider-track-shell", "aria-hidden": "true" },
+              createElement("div", {
+                className: "steamloader-volume-slider-track",
+              }),
+              ...Array.from({ length: notchCount }, (_, index) =>
+                createElement("span", {
+                  key: `volume-slider-notch-${index}`,
+                  className: "steamloader-volume-slider-notch",
+                  style: {
+                    left: `${(index / Math.max(1, notchCount - 1)) * 100}%`,
+                  },
+                }),
+              ),
+              createElement("div", {
+                className: "steamloader-volume-slider-fill",
+                style: {
+                  width: `${percent}%`,
+                },
+              }),
+              createElement("div", {
+                className: "steamloader-volume-slider-thumb",
+                style: {
+                  left: `${percent}%`,
+                },
+              }),
+            ),
+          ),
+        ),
+      ),
+      () => {
+        helpers.rememberVolumeActionFocus?.(0);
+        slider.onActivate?.();
+      },
+      {
+        disabled: slider.disabled,
+        className: `steamloader-dialog-button steamloader-volume-slider-fallback-button${slider.isEditing ? " is-editing" : ""}`,
+        extraProps: {
+          "data-volume-slider": "true",
+          autoFocus: shouldAutoFocusAction && helpers.getActiveVolumeActionIndex?.() === 0,
+          onGamepadFocus: () => {
+            helpers.rememberVolumeActionFocus?.(0);
+          },
+          onCancelButton: () => {
+            if (slider.isEditing) {
+              slider.onDeactivate?.();
+              return;
+            }
+
+            slider.onCancel?.();
+          },
+          onMoveLeft: (event) => {
+            helpers.rememberVolumeActionFocus?.(0);
+            slider.onMoveLeft?.(event);
+          },
+          onMoveRight: (event) => {
+            helpers.rememberVolumeActionFocus?.(0);
+            slider.onMoveRight?.(event);
+          },
+          style: {
+            width: "100%",
+            minWidth: 0,
+            padding: "10px 12px",
+          },
+        },
+      },
+    );
+  }
+
+  function createVolumeSliderControl(state, createElement, withChildren, slider, shouldAutoFocusAction, helpers = {}) {
+    return createFallbackVolumeSlider(
+      state,
+      createElement,
+      withChildren,
+      slider,
+      shouldAutoFocusAction,
+      helpers,
+    );
+  }
+
   function createVolumePanel(state, createElement, withChildren, panel, helpers = {}) {
     const shouldAutoFocusAction = Boolean(helpers.consumeVolumeActionAutoFocus?.());
+    const hasSlider = Boolean(panel.slider);
+    const hasActions = Array.isArray(panel.actions) && panel.actions.length > 0;
 
     return createElement(
       "div",
@@ -1087,12 +1295,29 @@
             ),
           ),
         ),
+        hasSlider
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-volume-slider-wrap" },
+                createVolumeSliderControl(
+                  state,
+                  createElement,
+                  withChildren,
+                  panel.slider,
+                  shouldAutoFocusAction,
+                  helpers,
+                ),
+              ),
+            )
+          : null,
         createElement("div", {
           className: panel.error
             ? "steamloader-volume-hint steamloader-volume-hint-error"
             : "steamloader-volume-hint",
           children: panel.error || panel.hint,
         }),
+        hasActions ? createDivider(createElement, "volume-panel-actions-divider") : null,
         createElement(
           "div",
           withChildren(
@@ -1106,7 +1331,7 @@
                   ...action,
                   autoFocus: shouldAutoFocusAction,
                 },
-                index,
+                hasSlider ? index + 1 : index,
                 helpers,
               ),
             ),
@@ -1120,7 +1345,8 @@
     state.nativeUi ??= {};
     state.nativeUi.renderError = "";
 
-    const HeaderIcon = model.headerIcon || helpers.DefaultIcon;
+    const HeaderIcon = model.headerIcon === null ? null : model.headerIcon || helpers.DefaultIcon;
+    const headerActions = Array.isArray(model.headerActions) ? model.headerActions : [];
     const slots = Array.isArray(model.slots) ? model.slots : [];
     state.slotActions = slots.map((slot) => slot.onClick);
     helpers.consumeResolvedFocus?.(state.route, model.autoFocusIndex);
@@ -1130,7 +1356,7 @@
         createButtonSlot(state, createElement, withChildren, slot, index, model.autoFocusIndex, helpers),
       ];
 
-      if (Number.isInteger(model.dividerAfterIndex) && index === model.dividerAfterIndex) {
+      if (hasDividerAfter(model, index)) {
         children.push(createDivider(createElement, `divider-${index}`));
       }
 
@@ -1141,36 +1367,55 @@
       "div",
       withChildren(
         {
-          className: "steamloader-panel",
-          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 13),
+          className: model.panelClassName
+            ? `steamloader-panel ${model.panelClassName}`
+            : "steamloader-panel",
+          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 21),
           "data-st-renderer": "st-frontend-lib",
         },
         createElement(
           "div",
           withChildren(
             { className: "steamloader-header" },
-            HeaderIcon
-              ? createElement(
-                  "div",
-                  withChildren({ className: "steamloader-header-mark" }, createElement(HeaderIcon, {})),
-                )
-              : null,
             createElement(
               "div",
               withChildren(
-                { className: "steamloader-title-wrap" },
-                createElement("h1", {
-                  className: "steamloader-title",
-                  children: model.title,
-                }),
-                model.subtitle
-                  ? createElement("div", {
-                      className: "steamloader-subtitle",
-                      children: model.subtitle,
-                    })
+                { className: "steamloader-header-main" },
+                HeaderIcon
+                  ? createElement(
+                      "div",
+                      withChildren({ className: "steamloader-header-mark" }, createElement(HeaderIcon, {})),
+                    )
                   : null,
+                createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-title-wrap" },
+                    createElement("h1", {
+                      className: "steamloader-title",
+                      children: model.title,
+                    }),
+                    model.subtitle
+                      ? createElement("div", {
+                          className: "steamloader-subtitle",
+                          children: model.subtitle,
+                        })
+                      : null,
+                  ),
+                ),
               ),
             ),
+            headerActions.length
+              ? createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-header-actions" },
+                    ...headerActions
+                      .map((action) => createHeaderActionButton(state, createElement, withChildren, action))
+                      .filter(Boolean),
+                  ),
+                )
+              : null,
           ),
         ),
         model.status
@@ -1213,6 +1458,7 @@
         model.volumePanel
           ? createVolumePanel(state, createElement, withChildren, model.volumePanel, helpers)
           : null,
+        createFooterLegend(createElement, withChildren, model.footerLegend),
       ),
     );
   }
@@ -1222,7 +1468,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 13,
+      version: 21,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -1236,7 +1482,7 @@
   }
 
   window.STFrontendLib = {
-    version: 13,
+    version: 21,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

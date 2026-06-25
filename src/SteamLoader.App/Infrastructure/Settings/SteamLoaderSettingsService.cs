@@ -17,6 +17,7 @@ public sealed class SteamLoaderSettingsService
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),
         new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),
+        new("performance", "Performance", "Built-in TFS FPS meter and Steam-style overlay controls.", true),
         new("hltb", "HLTB", "HowLongToBeat game page estimates.", true),
         new("themes", "Themes", "Theme engine, theme store, and profiles.", true),
         new("power", "Power", "Recovery and power actions. This stays available for safety.", false)
@@ -54,7 +55,7 @@ public sealed class SteamLoaderSettingsService
         var settings = LoadSettings();
         var startupMode = ResolveStartupMode(settings);
         return new SteamLoaderGeneralSettingsSnapshot(
-            RunOnWindowsSignIn: !string.Equals(startupMode, SteamLoaderRuntime.StartupModeManual, StringComparison.OrdinalIgnoreCase),
+            RunOnWindowsSignIn: true,
             StartupMode: startupMode,
             HideWindowsShellInConsoleMode: settings.HideWindowsShellInConsoleMode ?? true,
             FirstRunCompleted: settings.FirstRunCompleted == true,
@@ -62,6 +63,7 @@ public sealed class SteamLoaderSettingsService
             SplashScreen: BuildSplashScreenSettings(settings),
             ProductVersion: GetProductVersion(),
             InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
+            DeveloperDebugEnabled: settings.DeveloperDebugEnabled == true,
             Plugins: BuildPluginStates(settings));
     }
 
@@ -86,7 +88,7 @@ public sealed class SteamLoaderSettingsService
 
     public SteamLoaderGeneralSettingsSnapshot SetRunOnWindowsSignIn(bool enabled)
     {
-        var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeManual;
+        var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeTray;
         ApplyStartupMode(mode);
 
         var settings = LoadSettings();
@@ -118,10 +120,7 @@ public sealed class SteamLoaderSettingsService
 
     private void ApplyStartupMode(string mode)
     {
-        if (!string.Equals(mode, SteamLoaderRuntime.StartupModeManual, StringComparison.OrdinalIgnoreCase))
-        {
-            _autostartService.DisableSteamAutostartEntries();
-        }
+        _autostartService.DisableSteamAutostartEntries();
 
         switch (NormalizeStartupMode(mode))
         {
@@ -135,7 +134,7 @@ public sealed class SteamLoaderSettingsService
                 break;
             default:
                 _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
-                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, false);
+                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
                 break;
         }
     }
@@ -149,6 +148,34 @@ public sealed class SteamLoaderSettingsService
 
         SaveSettings(settings);
         return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetDeveloperDebugEnabled(bool enabled)
+    {
+        var settings = LoadSettings() with
+        {
+            DeveloperDebugEnabled = enabled
+        };
+
+        SaveSettings(settings);
+        return GetSnapshot();
+    }
+
+    public string GetUpdateChannel()
+    {
+        return NormalizeUpdateChannel(LoadSettings().UpdateChannel);
+    }
+
+    public string SetUpdateChannel(string channel)
+    {
+        var normalizedChannel = NormalizeUpdateChannel(channel);
+        var settings = LoadSettings() with
+        {
+            UpdateChannel = normalizedChannel
+        };
+
+        SaveSettings(settings);
+        return normalizedChannel;
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetSplashScreenEnabled(bool enabled)
@@ -239,6 +266,18 @@ public sealed class SteamLoaderSettingsService
             PluginEnabled = pluginStates
         });
 
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetPluginOrder(IReadOnlyList<string>? pluginIds)
+    {
+        var normalizedOrder = NormalizePluginOrder(pluginIds);
+        var settings = LoadSettings() with
+        {
+            PluginOrder = normalizedOrder.ToArray()
+        };
+
+        SaveSettings(settings);
         return GetSnapshot();
     }
 
@@ -336,8 +375,11 @@ public sealed class SteamLoaderSettingsService
     private static IReadOnlyList<SteamLoaderPluginSettingsState> BuildPluginStates(SteamLoaderSettingsData settings)
     {
         var pluginStates = NormalizePluginStates(settings.PluginEnabled);
+        var orderedPluginIds = NormalizePluginOrder(settings.PluginOrder);
+        var orderedDefinitions = orderedPluginIds
+            .Select(id => PluginDefinitions.First(plugin => string.Equals(plugin.Id, id, StringComparison.OrdinalIgnoreCase)));
 
-        return PluginDefinitions
+        return orderedDefinitions
             .Select(plugin => new SteamLoaderPluginSettingsState(
                 plugin.Id,
                 plugin.Title,
@@ -402,14 +444,22 @@ public sealed class SteamLoaderSettingsService
         {
             SteamLoaderRuntime.StartupModeShell => SteamLoaderRuntime.StartupModeShell,
             SteamLoaderRuntime.StartupModeTray => SteamLoaderRuntime.StartupModeTray,
-            SteamLoaderRuntime.StartupModeManual => SteamLoaderRuntime.StartupModeManual,
-            _ => SteamLoaderRuntime.StartupModeManual
+            _ => SteamLoaderRuntime.StartupModeShell
         };
     }
 
     private static int ClampSplashCloseDelay(int seconds)
     {
         return Math.Clamp(seconds, 0, MaximumSplashCloseDelaySeconds);
+    }
+
+    private static string NormalizeUpdateChannel(string? channel)
+    {
+        return channel?.Trim().ToLowerInvariant() switch
+        {
+            SteamLoaderRuntime.UpdateChannelBeta => SteamLoaderRuntime.UpdateChannelBeta,
+            _ => SteamLoaderRuntime.UpdateChannelStable
+        };
     }
 
     private static Dictionary<string, bool> NormalizePluginStates(Dictionary<string, bool>? savedStates)
@@ -441,6 +491,46 @@ public sealed class SteamLoaderSettingsService
         return normalized;
     }
 
+    private static IReadOnlyList<string> NormalizePluginOrder(IReadOnlyList<string>? savedOrder)
+    {
+        var knownPluginIds = PluginDefinitions
+            .Select(plugin => plugin.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var canonicalPluginIds = PluginDefinitions.ToDictionary(
+            plugin => plugin.Id,
+            plugin => plugin.Id,
+            StringComparer.OrdinalIgnoreCase);
+        var normalized = new List<string>(PluginDefinitions.Length);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (savedOrder is not null)
+        {
+            foreach (var candidate in savedOrder)
+            {
+                if (string.IsNullOrWhiteSpace(candidate) || !knownPluginIds.Contains(candidate))
+                {
+                    continue;
+                }
+
+                var canonicalId = canonicalPluginIds[candidate];
+                if (seen.Add(canonicalId))
+                {
+                    normalized.Add(canonicalId);
+                }
+            }
+        }
+
+        foreach (var plugin in PluginDefinitions)
+        {
+            if (seen.Add(plugin.Id))
+            {
+                normalized.Add(plugin.Id);
+            }
+        }
+
+        return normalized;
+    }
+
     private sealed record SteamLoaderPluginDefinition(
         string Id,
         string Title,
@@ -458,11 +548,17 @@ public sealed class SteamLoaderSettingsService
 
         public bool? HideWindowsShellInConsoleMode { get; init; }
 
+        public bool? DeveloperDebugEnabled { get; init; }
+
+        public string? UpdateChannel { get; init; }
+
         public bool? FirstRunCompleted { get; init; }
 
         public DateTimeOffset? FirstRunCompletedAtUtc { get; init; }
 
         public Dictionary<string, bool>? PluginEnabled { get; init; }
+
+        public string[]? PluginOrder { get; init; }
 
         public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
     }

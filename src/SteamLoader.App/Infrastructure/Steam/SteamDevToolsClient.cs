@@ -2,6 +2,7 @@ using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace SteamLoader.App.Infrastructure.Steam;
 
@@ -11,6 +12,7 @@ public sealed class SteamDevToolsClient
 
     private readonly HttpClient _httpClient;
     private readonly Uri _debugEndpoint;
+    private int _nextCommandId = 1;
 
     public SteamDevToolsClient(HttpClient httpClient, Uri debugEndpoint)
     {
@@ -110,9 +112,11 @@ public sealed class SteamDevToolsClient
         using var webSocket = new ClientWebSocket();
         await webSocket.ConnectAsync(new Uri(webSocketDebuggerUrl), cancellationToken);
 
+        var commandId = Interlocked.Increment(ref _nextCommandId);
+
         var payload = JsonSerializer.Serialize(
             new DevToolsCommand(
-                1,
+                commandId,
                 "Runtime.evaluate",
                 new DevToolsCommandParameters(expression, true, true)),
             JsonOptions);
@@ -124,8 +128,21 @@ public sealed class SteamDevToolsClient
             true,
             cancellationToken);
 
-        var responseText = await ReceiveMessageAsync(webSocket, cancellationToken);
-        var response = JsonSerializer.Deserialize<DevToolsResponse>(responseText, JsonOptions);
+        DevToolsResponse? response = null;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var responseText = await ReceiveMessageAsync(webSocket, cancellationToken);
+            response = TryDeserializeMatchingResponse(responseText, commandId);
+            if (response is not null)
+            {
+                break;
+            }
+        }
+
+        if (response is null)
+        {
+            return new SteamDevToolsEvaluationResult(false, null, "Steam DevTools did not return a matching evaluation response.");
+        }
 
         if (response?.Error is not null)
         {
@@ -169,6 +186,33 @@ public sealed class SteamDevToolsClient
         }
 
         return Encoding.UTF8.GetString(memory.ToArray());
+    }
+
+    private static DevToolsResponse? TryDeserializeMatchingResponse(string responseText, int expectedCommandId)
+    {
+        if (string.IsNullOrWhiteSpace(responseText))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(responseText);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("id", out var idElement) ||
+                !idElement.TryGetInt32(out var actualCommandId) ||
+                actualCommandId != expectedCommandId)
+            {
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<DevToolsResponse>(root.GetRawText(), JsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private sealed record DevToolsCommand(int Id, string Method, DevToolsCommandParameters Params);

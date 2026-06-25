@@ -7,4 +7,6 @@ public sealed record StoreSyncSettingsState(
     bool PreferAnimatedArtwork,
     bool CloseSteamBeforeSync,
     bool BackupShortcuts,
-    bool LaunchBigPictureAfterSync);
+    bool LaunchBigPictureAfterSync,
+    bool TakeOverExistingShortcuts,
+    bool CleanupMissingTitles);

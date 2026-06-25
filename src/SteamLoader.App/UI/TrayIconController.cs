@@ -58,7 +58,7 @@ public sealed class TrayIconController : IDisposable
         _startHostItem = new Forms.ToolStripMenuItem("Start Background Host", null, (_, _) => _viewModel.StartCommand.Execute(null));
         _restartHostItem = new Forms.ToolStripMenuItem("Restart Background Host", null, (_, _) => _viewModel.RestartCommand.Execute(null));
         _stopHostItem = new Forms.ToolStripMenuItem("Stop Background Host", null, (_, _) => _viewModel.StopCommand.Execute(null));
-        _autostartItem = new Forms.ToolStripMenuItem("Startup Mode: Manual", null, (_, _) => _viewModel.ToggleAutostartSetting())
+        _autostartItem = new Forms.ToolStripMenuItem("Startup Mode: Shell takeover", null, (_, _) => _viewModel.ToggleAutostartSetting())
         {
             CheckOnClick = false
         };

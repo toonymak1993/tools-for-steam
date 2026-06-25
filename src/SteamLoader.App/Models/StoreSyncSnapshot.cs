@@ -4,4 +4,7 @@ public sealed record StoreSyncSnapshot(
     SteamProfileInfo? SteamProfile,
     StoreSyncSettingsState Settings,
     IReadOnlyList<StoreSyncStoreState> Stores,
-    StoreSyncLastSyncState? LastSync);
+    StoreSyncPreviewState Preview,
+    StoreSyncLastSyncState? LastSync,
+    StoreSyncHealthState Health,
+    IReadOnlyList<StoreSyncJournalEntryState> Journal);

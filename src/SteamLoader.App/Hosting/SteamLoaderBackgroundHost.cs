@@ -5,6 +5,7 @@ using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
@@ -46,22 +47,33 @@ public sealed class SteamLoaderBackgroundHost
             "SteamLoader",
             "SteamTools");
         var shellService = new WindowsShellService();
+        var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
+        var steamInstallationService = new SteamInstallationService(
+            new SteamInstallPathSettingsStore(Path.Combine(dataDirectory, "steam-install-path.json")),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         var storeSyncSettingsStore = new StoreSyncSettingsStore(
             Path.Combine(dataDirectory, "store-sync.json"));
+        var storeSyncJournal = new StoreSyncJournal(
+            Path.Combine(dataDirectory, "store-sync-journal.jsonl"));
         var storeSyncService = new StoreSyncService(
             storeSyncSettingsStore,
             new SteamShortcutFile(),
             new SteamGridDbArtworkDownloader(),
             shellService,
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            steamInstallationService,
+            devToolsClient,
+            storeSyncJournal);
         var artworkService = new SteamGridDbManualArtworkService(
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"),
+            steamInstallationService,
             new ArtworkSettingsStore(Path.Combine(dataDirectory, "artwork.json")));
         var themesService = new ThemesService(
             new ThemesSettingsStore(Path.Combine(dataDirectory, "themes.json")),
             "Assets/themes-catalog.json",
             "Assets/themes-profiles-catalog.json",
             Path.Combine(dataDirectory, "themes"));
+        var performanceService = new TfsPerformanceService(
+            new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json")),
+            new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json")));
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
@@ -70,7 +82,9 @@ public sealed class SteamLoaderBackgroundHost
             SteamLoaderRuntime.ShellLaunchArguments,
             Path.Combine(dataDirectory, "tfs.json"));
         steamLoaderSettingsService.EnsureDefaultConsoleModeEnabled();
-        var devToolsClient = new SteamDevToolsClient(httpClient, DebugEndpoint);
+        var storeSyncAutomationService = new StoreSyncAutomationService(
+            storeSyncService,
+            () => steamLoaderSettingsService.IsPluginEnabled("store-sync"));
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
         var shellVisibilityService = new WindowsShellVisibilityService();
         var shellGuardService = new ConsoleModeShellGuardService(
@@ -83,12 +97,13 @@ public sealed class SteamLoaderBackgroundHost
         var steamClientLaunchService = new SteamClientLaunchService(
             httpClient,
             DebugEndpoint,
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            steamInstallationService);
         var powerActionService = new PowerActionService(
             steamClientLaunchService,
             shellService,
             executablePath,
             SteamLoaderRuntime.BackgroundArgument);
+        var releaseUpdateService = new ReleaseUpdateService();
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
         var popupScript = string.Join(
             Environment.NewLine,
@@ -117,8 +132,10 @@ public sealed class SteamLoaderBackgroundHost
             hltbService,
             storeSyncService,
             themesService,
+            performanceService,
             steamLoaderSettingsService,
             powerActionService,
+            releaseUpdateService,
             frontendComponentService,
             ApiBaseUri,
             _hostState,
@@ -138,6 +155,8 @@ public sealed class SteamLoaderBackgroundHost
         var shellGuardTask = shellGuardService.RunAsync(shellGuardCts.Token);
         using var autoSisirCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var autoSisirTask = autoSisirService.RunAsync(autoSisirCts.Token);
+        using var storeSyncAutomationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var storeSyncAutomationTask = storeSyncAutomationService.RunAsync(storeSyncAutomationCts.Token);
 
         try
         {
@@ -145,6 +164,15 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await storeSyncAutomationCts.CancelAsync();
+            try
+            {
+                await storeSyncAutomationTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             await autoSisirCts.CancelAsync();
             try
             {

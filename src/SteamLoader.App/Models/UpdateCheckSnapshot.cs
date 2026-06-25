@@ -8,4 +8,11 @@ public sealed record UpdateCheckSnapshot(
     string Message,
     string? ReleaseUrl,
     string? AssetName,
-    DateTimeOffset? PublishedAtUtc);
+    DateTimeOffset? PublishedAtUtc,
+    string Channel,
+    bool IsPrerelease,
+    string? ReleaseName,
+    DateTimeOffset CheckedAtUtc,
+    bool InstallInProgress = false,
+    string? InstallState = null,
+    int? InstallProgressPercent = null);

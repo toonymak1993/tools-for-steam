@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -7,6 +8,7 @@ using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
@@ -20,6 +22,7 @@ namespace SteamLoader.App.Hosting;
 public sealed class SteamLoaderApiServer : IAsyncDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan UpdateSnapshotCacheDuration = TimeSpan.FromMinutes(15);
 
     private readonly IAudioOutputDeviceService _audioOutputDeviceService;
     private readonly DisplaySwitchService _displaySwitchService;
@@ -30,8 +33,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly HltbService _hltbService;
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
+    private readonly TfsPerformanceService _performanceService;
     private readonly SteamLoaderSettingsService _steamLoaderSettingsService;
     private readonly PowerActionService _powerActionService;
+    private readonly ReleaseUpdateService _releaseUpdateService;
     private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamLoaderHostState _hostState;
     private readonly HttpListener _listener;
@@ -41,6 +46,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private DateTimeOffset _latestArtworkOpenRequestAt = DateTimeOffset.MinValue;
     private string _latestArtworkOpenRequestKey = string.Empty;
     private long _artworkOpenRequestNonce;
+    private readonly SemaphoreSlim _updateSnapshotGate = new(1, 1);
+    private readonly object _updateInstallGate = new();
+    private UpdateCheckSnapshot? _cachedUpdateSnapshot;
+    private Task? _activeUpdateInstallTask;
     private Task? _acceptLoopTask;
 
     public SteamLoaderApiServer(
@@ -53,8 +62,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         HltbService hltbService,
         StoreSyncService storeSyncService,
         ThemesService themesService,
+        TfsPerformanceService performanceService,
         SteamLoaderSettingsService steamLoaderSettingsService,
         PowerActionService powerActionService,
+        ReleaseUpdateService releaseUpdateService,
         SteamFrontendComponentService frontendComponentService,
         Uri baseUri,
         SteamLoaderHostState hostState,
@@ -69,8 +80,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _hltbService = hltbService;
         _storeSyncService = storeSyncService;
         _themesService = themesService;
+        _performanceService = performanceService;
         _steamLoaderSettingsService = steamLoaderSettingsService;
         _powerActionService = powerActionService;
+        _releaseUpdateService = releaseUpdateService;
         _frontendComponentService = frontendComponentService;
         _hostState = hostState;
         _requestShutdown = requestShutdown;
@@ -273,6 +286,43 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/steam-path")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Steam path value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.SetSteamPath(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/artwork/settings/steam-path/clear")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _artworkService.ClearSteamPath(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/artwork/settings/result-limit")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
@@ -446,6 +496,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/state")
+            {
+                var snapshot = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.GetDashboardSnapshot(),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/audio/devices")
             {
                 var devices = await StaThread.RunAsync(
@@ -490,11 +551,56 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/default-capture")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetDefaultDeviceRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.DeviceId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Device ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await StaThread.RunAsync(
+                    () =>
+                    {
+                        _audioOutputDeviceService.SetDefaultCaptureDevice(payload.DeviceId);
+                        return true;
+                    },
+                    cancellationToken);
+
+                var devices = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.GetCaptureDevices(),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, devices, cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/audio/volume")
             {
                 var volumeInfo = await StaThread.RunAsync(
                     () => _audioOutputDeviceService.GetDefaultPlaybackVolume(),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/capture/volume")
+            {
+                var volumeInfo = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.GetDefaultCaptureVolume(),
                     cancellationToken);
 
                 await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
@@ -528,6 +634,32 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/capture/volume")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetVolumeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || double.IsNaN(payload.Volume) || double.IsInfinity(payload.Volume))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid volume value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var volumeInfo = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.SetDefaultCaptureVolume(payload.Volume),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/audio/volume/adjust")
             {
                 var payload = await JsonSerializer.DeserializeAsync<AdjustVolumeRequest>(
@@ -554,6 +686,32 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/capture/volume/adjust")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<AdjustVolumeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || double.IsNaN(payload.Delta) || double.IsInfinity(payload.Delta))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid volume delta is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var volumeInfo = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.AdjustDefaultCaptureVolume(payload.Delta),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/audio/volume/toggle-mute")
             {
                 var volumeInfo = await StaThread.RunAsync(
@@ -561,6 +719,83 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     cancellationToken);
 
                 await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/capture/volume/toggle-mute")
+            {
+                var volumeInfo = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.ToggleDefaultCaptureMute(),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, volumeInfo, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/mixer")
+            {
+                var sessions = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.GetActiveMixerSessions(),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, sessions, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/mixer/session/volume")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetAudioMixerSessionVolumeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.SessionId) ||
+                    double.IsNaN(payload.Volume) ||
+                    double.IsInfinity(payload.Volume))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid session ID and volume value are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var session = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.SetMixerSessionVolume(payload.SessionId, payload.Volume),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, session, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/audio/mixer/session/toggle-mute")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<ToggleAudioMixerSessionRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.SessionId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid session ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var session = await StaThread.RunAsync(
+                    () => _audioOutputDeviceService.ToggleMixerSessionMute(payload.SessionId),
+                    cancellationToken);
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, session, cancellationToken);
                 return;
             }
 
@@ -649,6 +884,32 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _steamLoaderSettingsService.SetHideWindowsShellInConsoleMode(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/developer-debug")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetDeveloperDebugEnabled(payload.Value),
                     cancellationToken);
                 return;
             }
@@ -810,6 +1071,32 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/plugins/order")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetPluginOrderRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload?.PluginIds is null || payload.PluginIds.Count == 0)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "At least one plugin ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _steamLoaderSettingsService.SetPluginOrder(payload.PluginIds),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/open-manager")
             {
                 var executablePath = Environment.ProcessPath;
@@ -830,6 +1117,79 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     HttpStatusCode.OK,
                     _steamLoaderSettingsService.GetSnapshot(),
                     cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/updates/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await GetUpdateSnapshotAsync(forceRefresh: false, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/updates/check")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/updates/channel")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetUpdateChannelRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Channel))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An update channel is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var normalizedChannel = _steamLoaderSettingsService.SetUpdateChannel(payload.Channel);
+                InvalidateUpdateSnapshotCache();
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken, normalizedChannel),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/updates/install")
+            {
+                var executablePath = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(executablePath))
+                {
+                    throw new InvalidOperationException("Tools for Steam path could not be resolved for the update.");
+                }
+
+                var updateSnapshot = await BeginBackgroundUpdateInstallAsync(
+                    executablePath,
+                    cancellationToken);
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    updateSnapshot,
+                    cancellationToken);
+
                 return;
             }
 
@@ -1220,6 +1580,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/themes/state")
             {
                 await WriteJsonAsync(
@@ -1254,6 +1625,102 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _themesService.RefreshCatalog(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/overlay/start")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.StartOverlay(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/elevated-helper/prepare")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.PrepareElevatedHelper(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/overlay/stop")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.StopOverlay(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/settings/overlay-level")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetPerformanceOverlayLevelRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid TFS Overlay preset is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.SetOverlayLevel(payload.Level),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/settings/auto-target")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.ToggleAutoTarget(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/performance/settings/value")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetPerformanceIntegerSettingRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Key))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A valid TFS Overlay setting key and value are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _performanceService.SetSettingValue(payload.Key, payload.Value),
                     cancellationToken);
                 return;
             }
@@ -1769,6 +2236,84 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/stores/path")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePathRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.SetStoreScanPath(payload.StoreId, payload.Value ?? string.Empty),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/stores/path/clear")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.ClearStoreScanPath(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/stores/additional-paths")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePathsRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.SetStoreAdditionalScanPaths(payload.StoreId, payload.Values),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/store-sync/stores/custom-path")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
@@ -1791,6 +2336,84 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _storeSyncService.ClearCustomScanPath(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/titles/artwork-preview")
+            {
+                var titleId = request.QueryString["titleId"] ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(titleId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A title ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _storeSyncService.GetArtworkPreviewAsync(titleId, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/titles/override")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStoreSyncTitleOverrideRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.TitleId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A title ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.SetTitleOverride(
+                        payload.TitleId,
+                        payload.TitleOverride ?? string.Empty,
+                        payload.ArtworkTitleOverride ?? string.Empty,
+                        payload.Excluded),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/titles/override/clear")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A title ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.ClearTitleOverride(payload.Value),
                     cancellationToken);
                 return;
             }
@@ -1934,6 +2557,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/app-start"] = "app-start",
             ["/api/auto-sisr"] = "auto-sisr",
             ["/api/display"] = "display",
+            ["/api/performance"] = "performance",
             ["/api/processes"] = "processes",
             ["/api/artwork"] = "artwork",
             ["/api/hltb"] = "hltb",
@@ -1955,27 +2579,261 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         return false;
     }
 
+    private async Task<UpdateCheckSnapshot> GetUpdateSnapshotAsync(
+        bool forceRefresh,
+        CancellationToken cancellationToken,
+        string? overrideChannel = null)
+    {
+        var channel = NormalizeUpdateChannel(overrideChannel ?? _steamLoaderSettingsService.GetUpdateChannel());
+
+        await _updateSnapshotGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_cachedUpdateSnapshot?.InstallInProgress == true)
+            {
+                return _cachedUpdateSnapshot;
+            }
+
+            if (!forceRefresh &&
+                _cachedUpdateSnapshot is not null &&
+                string.Equals(_cachedUpdateSnapshot.Channel, channel, StringComparison.OrdinalIgnoreCase) &&
+                DateTimeOffset.UtcNow - _cachedUpdateSnapshot.CheckedAtUtc <= UpdateSnapshotCacheDuration)
+            {
+                return _cachedUpdateSnapshot;
+            }
+        }
+        finally
+        {
+            _updateSnapshotGate.Release();
+        }
+
+        var snapshot = await _releaseUpdateService.CheckAsync(channel, cancellationToken);
+        await CacheUpdateSnapshotAsync(snapshot, cancellationToken);
+        return snapshot;
+    }
+
+    private async Task CacheUpdateSnapshotAsync(UpdateCheckSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        await _updateSnapshotGate.WaitAsync(cancellationToken);
+        try
+        {
+            _cachedUpdateSnapshot = snapshot;
+        }
+        finally
+        {
+            _updateSnapshotGate.Release();
+        }
+    }
+
+    private void InvalidateUpdateSnapshotCache()
+    {
+        _cachedUpdateSnapshot = null;
+    }
+
+    private async Task<UpdateCheckSnapshot> BeginBackgroundUpdateInstallAsync(
+        string executablePath,
+        CancellationToken cancellationToken)
+    {
+        Task? activeTask;
+        lock (_updateInstallGate)
+        {
+            activeTask = _activeUpdateInstallTask is { IsCompleted: false }
+                ? _activeUpdateInstallTask
+                : null;
+        }
+
+        if (activeTask is not null)
+        {
+            return await GetUpdateSnapshotAsync(forceRefresh: false, cancellationToken);
+        }
+
+        var channel = _steamLoaderSettingsService.GetUpdateChannel();
+        var basisSnapshot = await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken, channel);
+        if (!basisSnapshot.UpdateAvailable || !basisSnapshot.CanInstall)
+        {
+            return basisSnapshot;
+        }
+
+        var pendingSnapshot = basisSnapshot with
+        {
+            Message = $"Please wait. Downloading {basisSnapshot.LatestVersion ?? "the update"} in the background...",
+            CheckedAtUtc = DateTimeOffset.UtcNow,
+            InstallInProgress = true,
+            InstallState = "starting",
+            InstallProgressPercent = 0
+        };
+        await CacheUpdateSnapshotAsync(pendingSnapshot, cancellationToken);
+
+        Task installTask;
+        lock (_updateInstallGate)
+        {
+            if (_activeUpdateInstallTask is { IsCompleted: false })
+            {
+                return _cachedUpdateSnapshot ?? pendingSnapshot;
+            }
+
+            installTask = Task.Run(async () =>
+            {
+                try
+                {
+                    var finalSnapshot = await _releaseUpdateService.BeginInstallLatestAsync(
+                        channel,
+                        AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
+                        executablePath,
+                        GetUpdateProcessIdsToWaitFor(executablePath),
+                        async snapshot => await CacheUpdateSnapshotAsync(snapshot, CancellationToken.None),
+                        CancellationToken.None);
+
+                    await CacheUpdateSnapshotAsync(finalSnapshot, CancellationToken.None);
+                    await Task.Delay(500);
+                    _requestShutdown();
+                }
+                catch (Exception exception)
+                {
+                    var failedSnapshot = basisSnapshot with
+                    {
+                        Message = $"Update install failed: {exception.Message}",
+                        CheckedAtUtc = DateTimeOffset.UtcNow,
+                        InstallInProgress = false,
+                        InstallState = "failed",
+                        InstallProgressPercent = null
+                    };
+
+                    await CacheUpdateSnapshotAsync(failedSnapshot, CancellationToken.None);
+                }
+                finally
+                {
+                    lock (_updateInstallGate)
+                    {
+                        _activeUpdateInstallTask = null;
+                    }
+                }
+            });
+
+            _activeUpdateInstallTask = installTask;
+        }
+
+        return pendingSnapshot;
+    }
+
+    private static string NormalizeUpdateChannel(string? channel)
+    {
+        return channel?.Trim().ToLowerInvariant() switch
+        {
+            SteamLoaderRuntime.UpdateChannelBeta => SteamLoaderRuntime.UpdateChannelBeta,
+            _ => SteamLoaderRuntime.UpdateChannelStable
+        };
+    }
+
+    private static IReadOnlyList<int> GetUpdateProcessIdsToWaitFor(string executablePath)
+    {
+        var normalizedExecutablePath = NormalizeExecutablePath(executablePath);
+        var processName = Path.GetFileNameWithoutExtension(executablePath);
+        var processIds = new HashSet<int> { Environment.ProcessId };
+
+        try
+        {
+            foreach (var process in Process.GetProcessesByName(processName))
+            {
+                using (process)
+                {
+                    if (process.Id == Environment.ProcessId)
+                    {
+                        processIds.Add(process.Id);
+                        continue;
+                    }
+
+                    string? processPath = null;
+                    try
+                    {
+                        processPath = process.MainModule?.FileName;
+                    }
+                    catch
+                    {
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(processPath) &&
+                        string.Equals(NormalizeExecutablePath(processPath), normalizedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        processIds.Add(process.Id);
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return processIds
+            .Where(id => id > 0)
+            .OrderBy(id => id)
+            .ToArray();
+    }
+
+    private static string NormalizeExecutablePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return Path.GetFullPath(path)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            return path.Trim()
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+    }
+
     private sealed record SetDefaultDeviceRequest(string DeviceId);
 
     private sealed record SetVolumeRequest(double Volume);
 
     private sealed record AdjustVolumeRequest(double Delta);
 
+    private sealed record SetAudioMixerSessionVolumeRequest(string SessionId, double Volume);
+
+    private sealed record ToggleAudioMixerSessionRequest(string SessionId);
+
     private sealed record ToggleSettingRequest(string Key);
 
     private sealed record SetTextValueRequest(string Value);
+
+    private sealed record SetPerformanceOverlayLevelRequest(int Level);
+
+    private sealed record SetPerformanceVendorOverlayRequest(string VendorId);
+
+    private sealed record SetPerformanceIntegerSettingRequest(string Key, int Value);
 
     private sealed record SetBooleanValueRequest(bool Value);
 
     private sealed record SetIntegerValueRequest(int Value);
 
-    private sealed record SetStartupModeRequest(string Mode);
+    private sealed record SetUpdateChannelRequest(string Channel);
 
     private sealed record ApplyArtworkRequest(long AppId, string AssetType, string Url);
 
+    private sealed record SetStartupModeRequest(string Mode);
+
     private sealed record SetPluginEnabledRequest(string PluginId, bool Enabled);
 
+    private sealed record SetPluginOrderRequest(IReadOnlyList<string> PluginIds);
+
     private sealed record SetStoreEnabledRequest(string StoreId, bool Enabled);
+
+    private sealed record SetStorePathRequest(string StoreId, string? Value);
+
+    private sealed record SetStorePathsRequest(string StoreId, IReadOnlyList<string>? Values);
+
+    private sealed record SetStoreSyncTitleOverrideRequest(
+        string TitleId,
+        string? TitleOverride,
+        string? ArtworkTitleOverride,
+        bool Excluded);
 
     private sealed record SetThemeInstalledRequest(string ThemeId, bool Installed);
 

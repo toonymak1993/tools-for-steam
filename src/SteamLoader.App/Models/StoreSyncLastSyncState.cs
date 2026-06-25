@@ -7,4 +7,7 @@ public sealed record StoreSyncLastSyncState(
     string Message,
     int ImportedCount,
     int RemovedCount,
-    int SkippedCount);
+    int SkippedCount,
+    int AdoptedCount,
+    int CleanedUpCount,
+    int ArtworkUpdatedTitleCount);
