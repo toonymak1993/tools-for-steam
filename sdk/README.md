@@ -8,7 +8,7 @@ Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins shoul
 
 ## Store Contract
 
-- The store refreshes the default GitHub catalog from `https://raw.githubusercontent.com/toonymak1993/tools-for-steam/main/sdk/catalog.online.json`.
+- The store refreshes the default GitHub catalog from `https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json`.
 - The downloaded catalog is cached as `data/plugin-store/catalog.json`.
 - Advanced users can override the feed by creating `data/plugin-store/catalog-source.json` with `{ "catalogUrl": "https://example.com/catalog.json" }`.
 - Each catalog entry points to a zip package through `packagePath` or `packageUrl`.
@@ -161,8 +161,8 @@ Home Assistant's REST API is documented at https://developers.home-assistant.io/
 See these files for the store-side registry format:
 
 - `catalog.example.json`: human-readable example.
-- `catalog.online.json`: the live official catalog consumed by the default Store Refresh action.
-- `catalog.local.json`: local development catalog written by the build script.
+- `catalog.local.json`: local development catalog written by the build script and ignored by git.
+- `tfs-plugin-database/catalog.json`: the live official catalog consumed by the default Store Refresh action.
 - `tfs-catalog.schema.json`: JSON schema for catalog validation.
 
 The catalog is display and delivery metadata. The manifest inside the package is the runtime contract.
@@ -177,11 +177,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plug
 
 This builds `sdk/packages/home-assistant.zip`, writes `sdk/catalog.local.json`, copies the package to the active runtime `data/plugin-store/packages/` folder, and writes the active runtime `data/plugin-store/catalog.json`.
 
-For the online catalog, the same script also writes:
+For the online catalog, clone `tfs-plugin-database` and pass its path:
 
-- `sdk/catalog.online.json`
-- `sdk/images/<plugin-id>.<extension>`
-- `sdk/packages/<plugin-id>.zip`
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plugin-store.ps1 `
+  -ImagePath "$env:USERPROFILE\Downloads\hassio.png" `
+  -PluginDatabaseRoot "C:\path\to\tfs-plugin-database"
+```
+
+That writes these files into the database repository:
+
+- `catalog.json`
+- `images/<plugin-id>.<extension>`
+- `packages/<plugin-id>.zip`
 
 The online catalog uses GitHub Raw URLs and SHA-256 package validation.
 
@@ -194,12 +202,12 @@ The online catalog uses GitHub Raw URLs and SHA-256 package validation.
 
 Recommended flow:
 
-1. Fork this repository or copy `sdk/plugin-template/` into your own plugin repository.
+1. Fork `tfs-plugin-template` or copy `sdk/plugin-template/` into your own plugin repository.
 2. Build a zip with `tfs-plugin.json` at the package root.
 3. Add a required preview image.
-4. Publish the zip somewhere stable, or add it to `sdk/packages/` for official catalog inclusion.
-5. Add a catalog entry with `packageUrl`, `packageSha256`, and at least one image URL.
-6. Open a pull request that updates the catalog and documents what permissions the plugin needs.
+4. Publish the zip somewhere stable, or add it to `tfs-plugin-database/packages/` for official catalog inclusion.
+5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, and at least one image URL.
+6. Open a pull request against `tfs-plugin-database` and document what permissions the plugin needs.
 
 Use the smallest permission set possible. If your plugin only renders UI, use `frontend`. Add `storage`, `secrets`, or `network` only when the plugin truly needs them.
 

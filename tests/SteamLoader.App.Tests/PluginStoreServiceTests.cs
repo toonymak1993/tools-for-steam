@@ -82,7 +82,7 @@ public sealed class PluginStoreServiceTests
             var plugin = Assert.Single(snapshot.CommunityPlugins);
             Assert.Equal("sample-plugin", plugin.Id);
             Assert.True(plugin.CanInstall);
-            Assert.Contains("catalog.online.json", handler.RequestUri?.ToString());
+            Assert.Contains("tfs-plugin-database/main/catalog.json", handler.RequestUri?.ToString());
             Assert.True(File.Exists(Path.Combine(root, "plugin-store", "catalog.json")));
         }
         finally

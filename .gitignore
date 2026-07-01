@@ -3,3 +3,7 @@ obj/
 .vs/
 dist/
 .codex_probe/
+sdk/catalog.local.json
+sdk/catalog.online.json
+sdk/images/
+sdk/packages/

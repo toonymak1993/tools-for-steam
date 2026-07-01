@@ -3,7 +3,8 @@ param(
     [string]$RepositoryRoot = "",
     [string]$RuntimeDataDirectory = "",
     [string]$ImagePath = "",
-    [string]$RepositoryRawBaseUrl = "https://raw.githubusercontent.com/toonymak1993/tools-for-steam/main/sdk"
+    [string]$PluginDatabaseRoot = "",
+    [string]$PluginDatabaseRawBaseUrl = "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main"
 )
 
 $ErrorActionPreference = "Stop"
@@ -132,7 +133,6 @@ $storeImageFileName = "$PluginId$imageExtension"
 $storeImagePath = Join-Path $storeImagesRoot $storeImageFileName
 $catalogPath = Join-Path $storeRoot "catalog.json"
 $sdkCatalogPath = Join-Path $RepositoryRoot "sdk\catalog.local.json"
-$onlineCatalogPath = Join-Path $RepositoryRoot "sdk\catalog.online.json"
 
 New-Item -ItemType Directory -Force -Path $packageRoot, $sdkImagesRoot, $tmpRoot, $storePackagesRoot, $storeImagesRoot | Out-Null
 Remove-DirectoryIfSafe -Path $stagingRoot -ExpectedRoot $tmpRoot
@@ -195,33 +195,45 @@ $catalog = [ordered]@{
     )
 }
 
-$repositoryRawBaseUrl = $RepositoryRawBaseUrl.TrimEnd("/")
-$onlineCatalog = [ordered]@{
-    title = "TFS Community"
-    description = "Official Tools for Steam community plugin catalog."
-    plugins = @(
-        [ordered]@{
-            id = $manifest.id
-            title = $manifest.name
-            description = $manifest.description
-            author = "Tools for Steam"
-            category = "Smart Home"
-            version = $manifest.version
-            packageUrl = "$repositoryRawBaseUrl/packages/$PluginId.zip"
-            packageSha256 = $sha256
-            images = @("$repositoryRawBaseUrl/images/$sdkImageFileName")
-            tags = @("smart-home", "lights", "sdk-v1")
-            homepageUrl = "https://www.home-assistant.io/"
-            repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
-        }
-    )
-}
-
 $catalogJson = $catalog | ConvertTo-Json -Depth 10
-$onlineCatalogJson = $onlineCatalog | ConvertTo-Json -Depth 10
 Write-Utf8NoBom -Path $catalogPath -Value $catalogJson
 Write-Utf8NoBom -Path $sdkCatalogPath -Value $catalogJson
-Write-Utf8NoBom -Path $onlineCatalogPath -Value $onlineCatalogJson
+
+$pluginDatabaseCatalogPath = ""
+if (-not [string]::IsNullOrWhiteSpace($PluginDatabaseRoot)) {
+    $pluginDatabaseRootPath = [System.IO.Path]::GetFullPath($PluginDatabaseRoot)
+    $pluginDatabasePackagesRoot = Join-Path $pluginDatabaseRootPath "packages"
+    $pluginDatabaseImagesRoot = Join-Path $pluginDatabaseRootPath "images"
+    New-Item -ItemType Directory -Force -Path $pluginDatabasePackagesRoot, $pluginDatabaseImagesRoot | Out-Null
+
+    Copy-Item -LiteralPath $packagePath -Destination (Join-Path $pluginDatabasePackagesRoot "$PluginId.zip") -Force
+    Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $pluginDatabaseImagesRoot $sdkImageFileName) -Force
+
+    $pluginDatabaseRawBaseUrl = $PluginDatabaseRawBaseUrl.TrimEnd("/")
+    $onlineCatalog = [ordered]@{
+        title = "TFS Community"
+        description = "Official Tools for Steam community plugin catalog."
+        plugins = @(
+            [ordered]@{
+                id = $manifest.id
+                title = $manifest.name
+                description = $manifest.description
+                author = "Tools for Steam"
+                category = "Smart Home"
+                version = $manifest.version
+                packageUrl = "$pluginDatabaseRawBaseUrl/packages/$PluginId.zip"
+                packageSha256 = $sha256
+                images = @("$pluginDatabaseRawBaseUrl/images/$sdkImageFileName")
+                tags = @("smart-home", "lights", "sdk-v1")
+                homepageUrl = "https://www.home-assistant.io/"
+                repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
+            }
+        )
+    }
+
+    $pluginDatabaseCatalogPath = Join-Path $pluginDatabaseRootPath "catalog.json"
+    Write-Utf8NoBom -Path $pluginDatabaseCatalogPath -Value ($onlineCatalog | ConvertTo-Json -Depth 10)
+}
 
 [pscustomobject]@{
     PluginId = $PluginId
@@ -233,6 +245,6 @@ Write-Utf8NoBom -Path $onlineCatalogPath -Value $onlineCatalogJson
     StoreImagePath = $storeImagePath
     CatalogPath = $catalogPath
     SdkCatalogPath = $sdkCatalogPath
-    OnlineCatalogPath = $onlineCatalogPath
+    PluginDatabaseCatalogPath = $pluginDatabaseCatalogPath
     RuntimeDataDirectory = $RuntimeDataDirectory
 }

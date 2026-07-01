@@ -21,7 +21,7 @@ public sealed class PluginStoreService
     private const int MaxPluginNetworkResponseBytes = 1024 * 1024;
     private const int MaxCommunityCatalogBytes = 1024 * 1024;
     private const string DefaultCommunityCatalogUrl =
-        "https://raw.githubusercontent.com/toonymak1993/tools-for-steam/main/sdk/catalog.online.json";
+        "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json";
 
     private static readonly string ShopPictureDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),

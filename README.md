@@ -42,7 +42,7 @@ Plugins can be disabled from `Settings`. Disabled plugins are hidden from the TF
 
 The first community plugin contract lives in `sdk/`. It defines the store catalog format, the required `tfs-plugin.json` manifest, SDK permissions, and templates that use the shared TFS frontend library.
 
-Community plugin packages are discovered through the TFS Store. The default Store Refresh action downloads `sdk/catalog.online.json` from this GitHub repository, caches it as `data/plugin-store/catalog.json`, and installs selected packages into `data/plugin-store/community/<plugin-id>`. The installer validates the package manifest and SHA-256 checksum before replacing an installed plugin.
+Community plugin packages are discovered through the TFS Store. The default Store Refresh action downloads `catalog.json` from the separate `tfs-plugin-database` repository, caches it as `data/plugin-store/catalog.json`, and installs selected packages into `data/plugin-store/community/<plugin-id>`. The installer validates the package manifest and SHA-256 checksum before replacing an installed plugin.
 
 The SDK currently exposes controller-friendly UI helpers plus core-owned storage, write-only secrets, a permission-gated HTTP/HTTPS network proxy, and a dynamic Quick Access loader for installed community entry points. `sdk/official-plugins/home-assistant/` is the first official community plugin and shows the intended pattern without giving the plugin special core access.
 

@@ -4,15 +4,15 @@ Tools for Steam community plugins are normal zip packages plus a catalog entry. 
 
 ## Recommended Developer Flow
 
-1. Fork `https://github.com/toonymak1993/tools-for-steam`.
-2. Copy `sdk/plugin-template/` into your own plugin folder or build in your own repository.
+1. Fork `https://github.com/toonymak1993/tfs-plugin-template`.
+2. Build your plugin in that fork or in your own repository.
 3. Create `tfs-plugin.json` at the package root.
 4. Build your frontend entry point, normally `dist/index.js`.
 5. Add a required store image, normally `assets/preview.png`.
 6. Zip the package with `tfs-plugin.json` at the zip root.
 7. Compute the SHA-256 hash of the zip.
-8. Add or update a catalog entry in `sdk/catalog.online.json`.
-9. Open a pull request and explain what the plugin does and why each permission is needed.
+8. Add or update a catalog entry in `https://github.com/toonymak1993/tfs-plugin-database/blob/main/catalog.json`.
+9. Open a pull request against `tfs-plugin-database` and explain what the plugin does and why each permission is needed.
 
 ## Minimal Package
 
@@ -108,3 +108,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plug
 ```
 
 Then open the TFS Store, refresh the catalog, install the plugin, and verify that the plugin appears on the Home screen without restarting Tools for Steam.
+
+To update the live official catalog, clone `tfs-plugin-database` and pass its path:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plugin-store.ps1 `
+  -ImagePath "$env:USERPROFILE\Downloads\hassio.png" `
+  -PluginDatabaseRoot "C:\path\to\tfs-plugin-database"
+```

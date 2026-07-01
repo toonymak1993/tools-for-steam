@@ -42,7 +42,15 @@ From the repository root:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plugin-store.ps1 -ImagePath "$env:USERPROFILE\Downloads\hassio.png"
 ```
 
-This writes the installable package to `sdk/packages/home-assistant.zip`, updates the local catalog, updates the online catalog, and copies the preview image to `sdk/images/home-assistant.png`.
+This writes the installable package to `sdk/packages/home-assistant.zip`, updates the local development catalog, and copies the preview image to `sdk/images/home-assistant.png`.
+
+To publish the official store entry, pass a local checkout of `tfs-plugin-database`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plugin-store.ps1 `
+  -ImagePath "$env:USERPROFILE\Downloads\hassio.png" `
+  -PluginDatabaseRoot "C:\path\to\tfs-plugin-database"
+```
 
 ## Manual Setup During Development
 
