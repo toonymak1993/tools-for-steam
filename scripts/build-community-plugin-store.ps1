@@ -48,6 +48,16 @@ function Get-FileSha256 {
     }
 }
 
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Value
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Value, $encoding)
+}
+
 function Remove-DirectoryIfSafe {
     param(
         [string]$Path,
@@ -209,9 +219,9 @@ $onlineCatalog = [ordered]@{
 
 $catalogJson = $catalog | ConvertTo-Json -Depth 10
 $onlineCatalogJson = $onlineCatalog | ConvertTo-Json -Depth 10
-Set-Content -LiteralPath $catalogPath -Value $catalogJson -Encoding UTF8
-Set-Content -LiteralPath $sdkCatalogPath -Value $catalogJson -Encoding UTF8
-Set-Content -LiteralPath $onlineCatalogPath -Value $onlineCatalogJson -Encoding UTF8
+Write-Utf8NoBom -Path $catalogPath -Value $catalogJson
+Write-Utf8NoBom -Path $sdkCatalogPath -Value $catalogJson
+Write-Utf8NoBom -Path $onlineCatalogPath -Value $onlineCatalogJson
 
 [pscustomobject]@{
     PluginId = $PluginId

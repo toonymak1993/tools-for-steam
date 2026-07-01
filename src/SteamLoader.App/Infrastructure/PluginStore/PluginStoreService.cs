@@ -1163,7 +1163,7 @@ public sealed class PluginStoreService
             throw new InvalidOperationException("The community catalog is too large.");
         }
 
-        var catalogBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        var catalogBytes = StripUtf8Bom(await response.Content.ReadAsByteArrayAsync(cancellationToken));
         if (catalogBytes.Length > MaxCommunityCatalogBytes)
         {
             throw new InvalidOperationException("The community catalog is too large.");
@@ -1174,6 +1174,16 @@ public sealed class PluginStoreService
 
         Directory.CreateDirectory(_rootPath);
         await File.WriteAllBytesAsync(_catalogPath, catalogBytes, cancellationToken);
+    }
+
+    private static byte[] StripUtf8Bom(byte[] bytes)
+    {
+        return bytes.Length >= 3 &&
+            bytes[0] == 0xEF &&
+            bytes[1] == 0xBB &&
+            bytes[2] == 0xBF
+            ? bytes[3..]
+            : bytes;
     }
 
     private string GetCommunityCatalogUrl()
