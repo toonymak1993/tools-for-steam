@@ -33,9 +33,14 @@ public sealed class PluginStoreService
         {
             ["app-start"] = "appstart.png",
             ["artwork"] = "steamgriddb.png",
+            ["audio"] = "audio.png",
+            ["auto-sisr"] = "autosisr.png",
+            ["display"] = "display.png",
             ["hltb"] = "how long to beat .png",
             ["performance"] = "performance.png",
             ["power"] = "power.png",
+            ["processes"] = "prozesse.png",
+            ["smart-home"] = "homey.png",
             ["store-sync"] = "storesync.png",
             ["themes"] = "cssloader.png"
         };
