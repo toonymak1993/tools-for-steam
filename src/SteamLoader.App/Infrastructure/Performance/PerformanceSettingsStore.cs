@@ -89,7 +89,7 @@ internal sealed class PerformanceSettingsConfiguration
 
     public int OverlayScale { get; set; } = 100;
 
-    public int GraphMode { get; set; } = 1;
+    public int GraphMode { get; set; } = 2;
 
     public int BackgroundTheme { get; set; } = 0;
 

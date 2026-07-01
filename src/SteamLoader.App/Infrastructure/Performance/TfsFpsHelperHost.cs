@@ -24,7 +24,7 @@ public sealed class TfsFpsHelperHost
     private PerformanceSettingsConfiguration _configuration = new();
     private ForegroundTargetCandidate? _currentTarget;
     private PerformanceRuntimeStatus _lastStatus = new();
-    private TfsPerformanceOverlayWindow? _window;
+    private SteamOsPerformanceOverlayWindow? _window;
     private System.Windows.Application? _application;
     private DateTimeOffset _lastTelemetrySampleAt = DateTimeOffset.MinValue;
     private TimeSpan _lastProcessCpuTime = TimeSpan.Zero;
@@ -73,7 +73,7 @@ public sealed class TfsFpsHelperHost
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown
         };
-        _window = new TfsPerformanceOverlayWindow();
+        _window = new SteamOsPerformanceOverlayWindow();
         _application.Exit += (_, _) => FlushStoppedStatus("TFS FPS Overlay stopped.");
         _application.Startup += (_, _) =>
         {

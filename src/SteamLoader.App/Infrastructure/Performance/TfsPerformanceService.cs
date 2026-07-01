@@ -8,9 +8,9 @@ public sealed class TfsPerformanceService
 {
     private static readonly PerformanceOverlayLevelState[] OverlayLevels =
     [
-        new(0, "FPS Only", "Large FPS readout with frametime.", false),
-        new(1, "Balanced", "FPS, frametime, 1% low, and target app stats.", false),
-        new(2, "Detailed", "Expanded Steam-style layout with extra live app telemetry.", false)
+        new(0, "SteamOS Strip", "Slim MangoHud-style strip for FPS, frametime, CPU, RAM, and quick status.", false),
+        new(1, "SteamOS Full", "Detailed left-side MangoHud-style panel with a stat column and live graph.", false),
+        new(2, "SteamOS Compact", "Compact SteamOS-inspired block with large values and a bottom graph.", false)
     ];
 
     private static readonly string HelperExecutablePath =
@@ -104,7 +104,7 @@ public sealed class TfsPerformanceService
 
             try
             {
-                EnsureHelperRunning();
+                EnsureHelperRunning(allowRegistrationPrompt: true);
                 return BuildSnapshot(configuration, $"Starting TFS FPS Overlay with {OverlayLevels[configuration.OverlayLevel].Title}.");
             }
             catch
@@ -117,6 +117,20 @@ public sealed class TfsPerformanceService
 
                 throw;
             }
+        }
+    }
+
+    public void RestoreOverlayOnStartup()
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            if (!configuration.OverlayEnabled)
+            {
+                return;
+            }
+
+            _ = TryEnsureHelperRunning(allowRegistrationPrompt: false, out _, out _);
         }
     }
 
@@ -151,12 +165,25 @@ public sealed class TfsPerformanceService
         }
     }
 
-    private void EnsureHelperRunning()
+    private void EnsureHelperRunning(bool allowRegistrationPrompt)
     {
+        if (TryEnsureHelperRunning(allowRegistrationPrompt, out var errorText, out _))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(errorText);
+    }
+
+    private bool TryEnsureHelperRunning(bool allowRegistrationPrompt, out string errorText, out bool registrationMissing)
+    {
+        errorText = string.Empty;
+        registrationMissing = false;
+
         var status = _statusStore.Load();
         if (IsHelperRunning(status) && status.Elevated)
         {
-            return;
+            return true;
         }
 
         if (IsHelperRunning(status) && !status.Elevated)
@@ -166,11 +193,21 @@ public sealed class TfsPerformanceService
             _statusStore.Save(status);
         }
 
-        if (!_taskService.TryEnsureRegistered(out var registrationError, out var cancelledByUser))
+        if (allowRegistrationPrompt)
         {
-            throw new InvalidOperationException(cancelledByUser
-                ? registrationError
-                : $"The elevated TFS FPS helper could not be prepared. {registrationError}".Trim());
+            if (!_taskService.TryEnsureRegistered(out var registrationError, out var cancelledByUser))
+            {
+                errorText = cancelledByUser
+                    ? registrationError
+                    : $"The elevated TFS FPS helper could not be prepared. {registrationError}".Trim();
+                SaveHelperStartupFailure(errorText);
+                return false;
+            }
+        }
+        else if (!_taskService.IsRegistered())
+        {
+            registrationMissing = true;
+            return false;
         }
 
         _statusStore.Save(new PerformanceRuntimeStatus
@@ -181,16 +218,21 @@ public sealed class TfsPerformanceService
 
         if (!_taskService.TryRun(out var startError))
         {
-            throw new InvalidOperationException($"The elevated TFS FPS helper could not be started. {startError}".Trim());
+            errorText = $"The elevated TFS FPS helper could not be started. {startError}".Trim();
+            SaveHelperStartupFailure(errorText);
+            return false;
         }
 
         if (!WaitForElevatedHelperStartup(TimeSpan.FromSeconds(6), out var startedStatus))
         {
-            var detail = string.IsNullOrWhiteSpace(startedStatus.ErrorText)
+            errorText = string.IsNullOrWhiteSpace(startedStatus.ErrorText)
                 ? "The elevated TFS FPS helper did not report ready in time."
                 : startedStatus.ErrorText;
-            throw new InvalidOperationException(detail);
+            SaveHelperStartupFailure(errorText);
+            return false;
         }
+
+        return true;
     }
 
     private PerformanceSnapshot BuildSnapshot(PerformanceSettingsConfiguration configuration, string? statusOverride = null)
@@ -314,7 +356,7 @@ public sealed class TfsPerformanceService
         {
             return elevatedHelperReady
                 ? "TFS FPS Overlay is ready. Press Start TFS FPS Overlay when you want it on screen."
-                : "Prepare the elevated TFS FPS helper once, then the overlay can start silently.";
+                : "Prepare the elevated TFS FPS helper once, then the overlay can start silently and restore after restarts.";
         }
 
         if (!elevatedHelperReady)
@@ -418,5 +460,15 @@ public sealed class TfsPerformanceService
         catch
         {
         }
+    }
+
+    private void SaveHelperStartupFailure(string detail)
+    {
+        _statusStore.Save(new PerformanceRuntimeStatus
+        {
+            DetailText = detail,
+            ErrorText = detail,
+            UpdatedAtUtc = DateTimeOffset.UtcNow
+        });
     }
 }

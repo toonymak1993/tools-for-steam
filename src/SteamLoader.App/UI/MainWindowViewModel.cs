@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using SteamLoader.App;
 using SteamLoader.App.Hosting;
 using SteamLoader.App.Infrastructure.Settings;
+using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 
@@ -10,7 +13,9 @@ namespace SteamLoader.App.UI;
 
 public sealed class MainWindowViewModel : BindableBase
 {
-    private const int BigPictureReadySplashHoldSeconds = 3;
+    private const int BigPictureVisibleWindowsShellHandOffDelaySeconds = 3;
+    private const int RequiredStableShellHandOffPollsWithSteamSignal = 2;
+    private const int RequiredStableShellHandOffPollsWithoutSteamSignal = 4;
     private const int ShowWindowRestore = 9;
 
     private readonly SteamLoaderProcessManager _processManager;
@@ -19,6 +24,7 @@ public sealed class MainWindowViewModel : BindableBase
     private readonly SteamLoaderSettingsService _settingsService;
     private readonly ReleaseUpdateService _releaseUpdateService;
     private readonly SupportBundleService _supportBundleService;
+    private readonly SteamInstallationService _steamInstallationService;
     private readonly string _shellLaunchArguments;
     private readonly bool _shellBootstrapMode;
     private readonly bool _consoleStartupMode;
@@ -34,6 +40,8 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _windowsShellStarted;
     private Task? _shellBootstrapMonitorTask;
     private SteamLoaderHostStatus? _lastKnownStatus;
+    private int _stableBigPictureVisiblePollCount;
+    private int _stableSteamSignalPollCount;
     private string _serviceStateText = "Checking background host...";
     private string _serviceDetailText = "The manager is reading the current runtime status.";
     private string _steamStateText = "Waiting for status...";
@@ -44,11 +52,15 @@ public sealed class MainWindowViewModel : BindableBase
     private string _updateStateText = "Updates have not been checked yet.";
     private string _supportBundleText = "No support bundle has been exported yet.";
     private string _errorText = string.Empty;
-    private bool _splashScreenEnabled = true;
     private bool _showStartupSplashText = true;
+    private double _splashOverlayOpacity = 1.0;
     private string _splashWallpaperPath = string.Empty;
     private string _splashIconPath = string.Empty;
-    private int _splashExtraCloseDelaySeconds;
+    private IReadOnlyList<BitmapSource> _splashGameCovers = [];
+    private string _splashDebugText = string.Empty;
+    private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
+    private Task _splashCoversTask = Task.CompletedTask;
+    private int _windowsShellStartDelaySeconds;
     private UpdateCheckSnapshot? _updateSnapshot;
 
     public MainWindowViewModel(
@@ -58,6 +70,7 @@ public sealed class MainWindowViewModel : BindableBase
         SteamLoaderSettingsService settingsService,
         ReleaseUpdateService releaseUpdateService,
         SupportBundleService supportBundleService,
+        SteamInstallationService steamInstallationService,
         string shellLaunchArguments,
         bool shellBootstrapMode,
         bool consoleStartupMode,
@@ -69,14 +82,16 @@ public sealed class MainWindowViewModel : BindableBase
         _settingsService = settingsService;
         _releaseUpdateService = releaseUpdateService;
         _supportBundleService = supportBundleService;
+        _steamInstallationService = steamInstallationService;
         _shellLaunchArguments = shellLaunchArguments;
         _shellBootstrapMode = shellBootstrapMode;
         _consoleStartupMode = consoleStartupMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
-        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
-        _showStartupSplash = consoleStartupMode && _splashScreenEnabled;
+        ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
+        _showStartupSplash = consoleStartupMode;
         if (consoleStartupMode)
         {
+            _splashCoversTask = LoadSplashGameCoversAsync();
             _serviceStateText = "Preparing Tools for Steam";
             _serviceDetailText = "Starting the background service and preparing the fast Steam hand-off.";
             _steamStateText = "Startup sync runs first, then Steam opens as soon as shortcuts are ready.";
@@ -232,6 +247,12 @@ public sealed class MainWindowViewModel : BindableBase
         private set => SetProperty(ref _showStartupSplashText, value);
     }
 
+    public double SplashOverlayOpacity
+    {
+        get => _splashOverlayOpacity;
+        private set => SetProperty(ref _splashOverlayOpacity, value);
+    }
+
     public string SplashWallpaperPath
     {
         get => _splashWallpaperPath;
@@ -260,10 +281,29 @@ public sealed class MainWindowViewModel : BindableBase
 
     public bool HasCustomSplashIcon => !string.IsNullOrWhiteSpace(SplashIconPath);
 
-    public int SplashExtraCloseDelaySeconds
+    public IReadOnlyList<BitmapSource> SplashGameCovers
     {
-        get => _splashExtraCloseDelaySeconds;
-        private set => SetProperty(ref _splashExtraCloseDelaySeconds, value);
+        get => _splashGameCovers;
+        private set => SetProperty(ref _splashGameCovers, value);
+    }
+
+    /// <summary>
+    /// Awaits cover loading with a timeout. Returns when covers are ready OR when
+    /// the timeout expires — whichever comes first. Never throws.
+    /// </summary>
+    public Task AwaitSplashCoversAsync(int timeoutMs = 2500) =>
+        Task.WhenAny(_splashCoversTask, Task.Delay(timeoutMs));
+
+    public string SplashDebugText
+    {
+        get => _splashDebugText;
+        private set => SetProperty(ref _splashDebugText, value);
+    }
+
+    public int WindowsShellStartDelaySeconds
+    {
+        get => _windowsShellStartDelaySeconds;
+        private set => SetProperty(ref _windowsShellStartDelaySeconds, value);
     }
 
     public bool ShowFirstRunSetup
@@ -337,7 +377,8 @@ public sealed class MainWindowViewModel : BindableBase
 
     public void StartSplashPreview(TimeSpan duration)
     {
-        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
+        ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
+        _splashCoversTask = LoadSplashGameCoversAsync();
         ShowStartupSplash = true;
         ShowFirstRunSetup = false;
         ServiceStateText = "Splash preview";
@@ -362,7 +403,7 @@ public sealed class MainWindowViewModel : BindableBase
 
             var status = await _processManager.GetStatusAsync();
             var settings = _settingsService.GetSnapshot();
-            ApplySplashScreenSettings(settings.SplashScreen);
+            ApplyGeneralSettingsSnapshot(settings);
             _lastKnownStatus = status;
             IsRunning = status is not null;
             ShowFirstRunSetup = false;
@@ -629,21 +670,22 @@ public sealed class MainWindowViewModel : BindableBase
         try
         {
             await _processManager.RequestStartupSyncAsync();
-            ServiceDetailText = "Startup sync requested. Steam will open as soon as shortcuts are ready.";
-            if (_consoleStartupMode)
-            {
-                EnsureShellBootstrapMonitor();
-            }
+            ServiceDetailText = "Startup sync triggered. Steam will open as soon as shortcuts are ready.";
         }
         catch (Exception exception)
         {
-            CompleteShellBootstrap();
+            ServiceDetailText = "Startup sync could not be confirmed. Steam launch will continue.";
             ErrorText = exception.Message;
         }
         finally
         {
             IsBusy = false;
             await RefreshAsync();
+        }
+
+        if (_consoleStartupMode)
+        {
+            EnsureShellBootstrapMonitor();
         }
     }
 
@@ -749,10 +791,13 @@ public sealed class MainWindowViewModel : BindableBase
     private async Task MonitorShellBootstrapAsync()
     {
         var deadline = DateTimeOffset.UtcNow.AddSeconds(180);
+        ShellHandOffReadiness? readiness = null;
 
         while (DateTimeOffset.UtcNow < deadline)
         {
-            if (SteamReadyForShellHandOff())
+            readiness = CaptureShellHandOffReadiness();
+
+            if (readiness.WindowsShellHandOffReady)
             {
                 break;
             }
@@ -761,22 +806,61 @@ public sealed class MainWindowViewModel : BindableBase
             await RefreshAsync();
         }
 
-        if (!SteamReadyForShellHandOff())
+        readiness ??= CaptureShellHandOffReadiness();
+
+        if (!readiness.BigPictureVisible)
         {
             ServiceStateText = "Steam needs more time";
             ServiceDetailText = _shellBootstrapMode
                 ? "Starting Windows Desktop recovery while Tools for Steam keeps trying in the tray."
                 : "Keeping Tools for Steam alive while Steam continues to start.";
             SteamStateText = "Steam was not ready before the console-mode timeout.";
+
+            await DismissStartupSplashAsync();
+            CompleteShellBootstrap();
+            return;
         }
 
-        await HoldSplashBeforeShellHandoffAsync();
+        if (ShowStartupSplash)
+        {
+            await DismissStartupSplashAsync();
+            TryFocusSteamWindow();
+        }
+
+        await WaitBeforeWindowsShellHandoffAsync();
         CompleteShellBootstrap();
     }
 
-    private bool SteamReadyForShellHandOff()
+    private ShellHandOffReadiness CaptureShellHandOffReadiness()
     {
-        return IsSteamBigPictureWindowVisible();
+        var bigPictureVisible = IsSteamBigPictureWindowVisible();
+        var quickAccessAttached = _lastKnownStatus?.QuickAccessAttached == true;
+        var sharedContextAttached = _lastKnownStatus?.SharedContextAttached == true;
+        var steamSignalReady = quickAccessAttached || sharedContextAttached;
+
+        if (!bigPictureVisible)
+        {
+            _stableBigPictureVisiblePollCount = 0;
+            _stableSteamSignalPollCount = 0;
+            return new ShellHandOffReadiness(
+                BigPictureVisible: false,
+                SteamSignalReady: false,
+                WindowsShellHandOffReady: false);
+        }
+
+        _stableBigPictureVisiblePollCount += 1;
+        _stableSteamSignalPollCount = steamSignalReady
+            ? _stableSteamSignalPollCount + 1
+            : 0;
+
+        var windowsShellHandOffReady =
+            _stableSteamSignalPollCount >= RequiredStableShellHandOffPollsWithSteamSignal ||
+            _stableBigPictureVisiblePollCount >= RequiredStableShellHandOffPollsWithoutSteamSignal;
+
+        return new ShellHandOffReadiness(
+            BigPictureVisible: true,
+            SteamSignalReady: steamSignalReady,
+            WindowsShellHandOffReady: windowsShellHandOffReady);
     }
 
     private static bool IsSteamBigPictureWindowVisible()
@@ -891,25 +975,35 @@ public sealed class MainWindowViewModel : BindableBase
         {
             _shellService.StartWindowsShellIfNeeded();
         }
+    }
+
+    private async Task DismissStartupSplashAsync()
+    {
+        const int steps = 20;
+        const int stepDelayMs = 15; // 20 × 15ms = 300ms fade
+        for (int i = steps - 1; i >= 0; i--)
+        {
+            SplashOverlayOpacity = (double)i / steps;
+            await Task.Delay(stepDelayMs);
+        }
 
         ShowStartupSplash = false;
         ShowFirstRunSetup = false;
+        SplashOverlayOpacity = 1.0;
     }
 
-    private async Task HoldSplashBeforeShellHandoffAsync()
+    private async Task WaitBeforeWindowsShellHandoffAsync()
     {
-        ApplySplashScreenSettings(_settingsService.GetSplashScreenSettings());
-        var holdSeconds = _consoleStartupMode
-            ? Math.Max(BigPictureReadySplashHoldSeconds, SplashExtraCloseDelaySeconds)
-            : SplashExtraCloseDelaySeconds;
+        ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
+        var holdSeconds = BigPictureVisibleWindowsShellHandOffDelaySeconds + WindowsShellStartDelaySeconds;
 
-        if (!ShowStartupSplash || holdSeconds <= 0)
+        if (holdSeconds <= 0)
         {
             return;
         }
 
         ServiceStateText = "Steam is ready";
-        ServiceDetailText = $"Big Picture is visible. Closing the splash screen in {holdSeconds}s.";
+        ServiceDetailText = $"Big Picture is visible. Starting the Windows desktop in {holdSeconds}s.";
         await Task.Delay(TimeSpan.FromSeconds(holdSeconds));
     }
 
@@ -927,15 +1021,24 @@ public sealed class MainWindowViewModel : BindableBase
         }
 
         ApiStateText = $"{_processManager.ApiBaseUri} ({FormatElapsed(status.StartedAtUtc)})";
+        var bigPictureVisible = IsSteamBigPictureWindowVisible();
+
+        if (bigPictureVisible)
+        {
+            ServiceStateText = "Steam is ready";
+            ServiceDetailText = status.QuickAccessAttached || status.SharedContextAttached
+                ? "Gamepad UI is live. Finishing the startup hand-off."
+                : "Big Picture is visible. Confirming the startup hand-off before Windows starts.";
+            SteamStateText = status.QuickAccessAttached
+                ? "Quick Access is attached."
+                : "Big Picture is visible.";
+            return;
+        }
 
         if (status.QuickAccessAttached)
         {
-            ServiceStateText = IsSteamBigPictureWindowVisible()
-                ? "Steam is ready"
-                : "Steam is opening";
-            ServiceDetailText = IsSteamBigPictureWindowVisible()
-                ? "Gamepad UI is live. Finishing the startup hand-off."
-                : "Quick Access is attached. Waiting for the Big Picture window to appear.";
+            ServiceStateText = "Steam is opening";
+            ServiceDetailText = "Quick Access is attached. Waiting for the Big Picture window to appear.";
             SteamStateText = "Quick Access is attached.";
             return;
         }
@@ -965,14 +1068,178 @@ public sealed class MainWindowViewModel : BindableBase
         };
     }
 
-    private void ApplySplashScreenSettings(SteamLoaderSplashScreenSettingsSnapshot settings)
+    private async Task LoadSplashGameCoversAsync()
     {
-        _splashScreenEnabled = settings.Enabled;
-        ShowStartupSplashText = settings.ShowText;
-        SplashWallpaperPath = settings.WallpaperExists ? settings.WallpaperPath : string.Empty;
-        SplashIconPath = settings.IconExists ? settings.IconPath : string.Empty;
-        SplashExtraCloseDelaySeconds = settings.ExtraCloseDelaySeconds;
+        var steamRoot = _steamInstallationService.ResolveSteamRootPath();
+
+        // Step 1: collect paths (fast I/O scan)
+        var (paths, debugText) = await Task.Run(() => CollectSteamGameCoverPaths(steamRoot)).ConfigureAwait(false);
+
+        // Step 2: decode thumbnails at 160 px width on the background thread.
+        // BitmapImage with OnLoad + Freeze() is safe to create outside the UI thread.
+        var thumbnails = await Task.Run(() => CreateThumbnails(paths)).ConfigureAwait(false);
+
+        await _dispatcher.InvokeAsync(() =>
+        {
+            SplashGameCovers = thumbnails;
+            SplashDebugText = $"{debugText} | loaded: {thumbnails.Count}";
+        });
     }
+
+    // Decode each image once at the exact cell size (1920/12 = 160 px) so WPF
+    // receives frozen BitmapSources instead of loading full-res JPEGs on the UI thread.
+    private static IReadOnlyList<BitmapSource> CreateThumbnails(IReadOnlyList<string> paths)
+    {
+        const int cellWidth = 160; // 1920 px ÷ 12 columns
+        var results = new List<BitmapSource>(paths.Count);
+        foreach (var path in paths)
+        {
+            try
+            {
+                var bmp = new BitmapImage();
+                bmp.BeginInit();
+                bmp.UriSource = new Uri(path, UriKind.Absolute);
+                bmp.DecodePixelWidth = cellWidth;
+                bmp.CacheOption = BitmapCacheOption.OnLoad;   // load fully before EndInit returns
+                bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                bmp.EndInit();
+                bmp.Freeze(); // makes it cross-thread safe for WPF binding
+                results.Add(bmp);
+            }
+            catch
+            {
+                // skip unreadable files silently
+            }
+        }
+        return results;
+    }
+
+    private static (IReadOnlyList<string> Paths, string Debug) CollectSteamGameCoverPaths(string? steamRoot)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(steamRoot))
+                return ([], "No Steam path found");
+
+            // Primary source: userdata/<steamid>/config/grid
+            // Portrait covers end with 'p' before the extension: e.g. 730p.jpg
+            var gridDir = FindSteamGridDir(steamRoot);
+            List<string> covers = [];
+            string debugInfo;
+
+            if (gridDir != null)
+            {
+                var portraitCovers = Directory.EnumerateFiles(gridDir, "*p.jpg")
+                    .Concat(Directory.EnumerateFiles(gridDir, "*p.png"))
+                    .Where(f =>
+                    {
+                        var name = Path.GetFileNameWithoutExtension(f);
+                        // Must end with 'p' and have only digits before it: e.g. "730p"
+                        return name.Length >= 2 && name[^1] == 'p' &&
+                               name[..^1].All(char.IsDigit);
+                    })
+                    .ToList();
+
+                if (portraitCovers.Count >= 5)
+                {
+                    covers = portraitCovers;
+                    debugInfo = $"grid: {gridDir} | portrait: {portraitCovers.Count}";
+                }
+                else
+                {
+                    // Not enough portrait covers — use all non-logo, non-hero images from grid
+                    var allGrid = Directory.EnumerateFiles(gridDir, "*.jpg")
+                        .Concat(Directory.EnumerateFiles(gridDir, "*.png"))
+                        .Where(f =>
+                        {
+                            var name = Path.GetFileNameWithoutExtension(f);
+                            return !name.EndsWith("_hero", StringComparison.OrdinalIgnoreCase) &&
+                                   !name.EndsWith("_logo", StringComparison.OrdinalIgnoreCase) &&
+                                   !name.EndsWith("_icon", StringComparison.OrdinalIgnoreCase);
+                        })
+                        .ToList();
+                    covers = allGrid;
+                    debugInfo = $"grid: {gridDir} | portrait: {portraitCovers.Count} | all: {allGrid.Count}";
+                }
+            }
+            else
+            {
+                // Fallback: appcache/librarycache (old Steam client behaviour)
+                var cacheDir = Path.Combine(steamRoot, "appcache", "librarycache");
+                if (Directory.Exists(cacheDir))
+                {
+                    covers = Directory.EnumerateFiles(cacheDir, "*_library_600x900.jpg")
+                        .Concat(Directory.EnumerateFiles(cacheDir, "*_library_600x900.png"))
+                        .ToList();
+
+                    if (covers.Count < 5)
+                    {
+                        covers = Directory.EnumerateFiles(cacheDir, "*.jpg")
+                            .Concat(Directory.EnumerateFiles(cacheDir, "*.png"))
+                            .Where(f => !f.EndsWith("_logo.png", StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+                    }
+                }
+
+                debugInfo = $"librarycache: {covers.Count} files (no grid dir found)";
+            }
+
+            if (covers.Count == 0)
+                return ([], debugInfo);
+
+            // Shuffle so each launch shows a different arrangement.
+            var rng = new Random();
+            covers = [.. covers.OrderBy(_ => rng.Next())];
+
+            // Fill a 12×7 UniformGrid — tile if fewer than 84 images.
+            const int targetCount = 84;
+            if (covers.Count < targetCount)
+            {
+                var repeated = new List<string>(targetCount);
+                while (repeated.Count < targetCount)
+                    repeated.AddRange(covers);
+                covers = repeated;
+            }
+
+            return (covers.Take(targetCount).ToList(), debugInfo);
+        }
+        catch (Exception ex)
+        {
+            return ([], $"Error: {ex.Message}");
+        }
+    }
+
+    private static string? FindSteamGridDir(string steamRoot)
+    {
+        var userdataDir = Path.Combine(steamRoot, "userdata");
+        if (!Directory.Exists(userdataDir))
+            return null;
+
+        // Find grid folder across all Steam user IDs; prefer the one with most files
+        return Directory.EnumerateDirectories(userdataDir)
+            .Select(d => Path.Combine(d, "config", "grid"))
+            .Where(Directory.Exists)
+            .OrderByDescending(d =>
+            {
+                try { return Directory.EnumerateFiles(d).Count(); }
+                catch { return 0; }
+            })
+            .FirstOrDefault();
+    }
+
+    private void ApplyGeneralSettingsSnapshot(SteamLoaderGeneralSettingsSnapshot settings)
+    {
+        var splashScreen = settings.SplashScreen;
+        ShowStartupSplashText = splashScreen.ShowText;
+        SplashWallpaperPath = splashScreen.WallpaperExists ? splashScreen.WallpaperPath : string.Empty;
+        SplashIconPath = splashScreen.IconExists ? splashScreen.IconPath : string.Empty;
+        WindowsShellStartDelaySeconds = settings.WindowsShellStartDelaySeconds;
+    }
+
+    private sealed record ShellHandOffReadiness(
+        bool BigPictureVisible,
+        bool SteamSignalReady,
+        bool WindowsShellHandOffReady);
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);

@@ -62,9 +62,9 @@ public static class Program
 
         var showManager = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.ManagerArgument, StringComparison.OrdinalIgnoreCase));
-        var runStartupSync = args.Any(argument =>
+        var runStartupSync = shellBootstrapMode || args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleStartupMode = shellBootstrapMode && runStartupSync;
+        var consoleStartupMode = shellBootstrapMode;
 
         var startHiddenInTray = !showManager;
 
@@ -90,11 +90,12 @@ public static class Program
             settingsService.CompleteFirstRunSetup();
         }
 
+        var steamInstallationService = new SteamInstallationService(
+            new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+
         if (startHiddenInTray && !runStartupSync)
         {
-            var steamInstallationService = new SteamInstallationService(
-                new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
             SteamClientLaunchService.RequestSteamStartForTools(steamInstallationService);
         }
 
@@ -113,6 +114,7 @@ public static class Program
             settingsService,
             releaseUpdateService,
             supportBundleService,
+            steamInstallationService,
             SteamLoaderRuntime.ShellLaunchArguments,
             shellBootstrapMode,
             consoleStartupMode,
@@ -137,6 +139,12 @@ public static class Program
         {
             if (showManager || viewModel.ShowStartupSplash)
             {
+                // Wait for game covers to be ready before showing the window so
+                // the mosaic appears immediately without a pop-in effect.
+                // Falls back gracefully after 2.5 s if covers are unavailable.
+                if (viewModel.ShowStartupSplash)
+                    await viewModel.AwaitSplashCoversAsync();
+
                 window.Show();
                 return;
             }
@@ -170,6 +178,9 @@ public static class Program
             Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
         var releaseUpdateService = new ReleaseUpdateService();
         var supportBundleService = new SupportBundleService(shellService);
+        var previewSteamInstallationService = new SteamInstallationService(
+            new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         var viewModel = new MainWindowViewModel(
             processManager,
             autostartService,
@@ -177,6 +188,7 @@ public static class Program
             settingsService,
             releaseUpdateService,
             supportBundleService,
+            previewSteamInstallationService,
             SteamLoaderRuntime.ShellLaunchArguments,
             false,
             false,
@@ -200,7 +212,11 @@ public static class Program
         };
 
         application.MainWindow = window;
-        application.Startup += (_, _) => window.Show();
+        application.Startup += async (_, _) =>
+        {
+            await viewModel.AwaitSplashCoversAsync();
+            window.Show();
+        };
         return application.Run();
     }
 

@@ -1,0 +1,10 @@
+{
+  "id": "example-plugin",
+  "name": "Example Plugin",
+  "version": "1.0.0",
+  "sdkVersion": "1.0.0",
+  "entryPoint": "dist/index.js",
+  "permissions": [
+    "frontend"
+  ]
+}

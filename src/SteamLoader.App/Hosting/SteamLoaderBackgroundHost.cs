@@ -6,8 +6,10 @@ using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
 using SteamLoader.App.Infrastructure.Performance;
+using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
+using SteamLoader.App.Infrastructure.SmartHome;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Infrastructure.Themes;
@@ -19,6 +21,7 @@ public sealed class SteamLoaderBackgroundHost
 {
     private static readonly Uri DebugEndpoint = new("http://127.0.0.1:8080");
     private static readonly Uri ApiBaseUri = new("http://127.0.0.1:47652/");
+    private static readonly Uri CssLoaderApiUri = new("http://127.0.0.1:35821/req");
 
     private readonly SteamLoaderHostState _hostState;
 
@@ -66,14 +69,11 @@ public sealed class SteamLoaderBackgroundHost
         var artworkService = new SteamGridDbManualArtworkService(
             steamInstallationService,
             new ArtworkSettingsStore(Path.Combine(dataDirectory, "artwork.json")));
-        var themesService = new ThemesService(
-            new ThemesSettingsStore(Path.Combine(dataDirectory, "themes.json")),
-            "Assets/themes-catalog.json",
-            "Assets/themes-profiles-catalog.json",
-            Path.Combine(dataDirectory, "themes"));
+        var themesService = new ThemesService(httpClient, CssLoaderApiUri);
         var performanceService = new TfsPerformanceService(
             new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json")),
             new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json")));
+        performanceService.RestoreOverlayOnStartup();
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
@@ -82,6 +82,10 @@ public sealed class SteamLoaderBackgroundHost
             SteamLoaderRuntime.ShellLaunchArguments,
             Path.Combine(dataDirectory, "tfs.json"));
         steamLoaderSettingsService.EnsureDefaultConsoleModeEnabled();
+        var pluginStoreService = new PluginStoreService(
+            httpClient,
+            steamLoaderSettingsService,
+            Path.Combine(dataDirectory, "plugin-store"));
         var storeSyncAutomationService = new StoreSyncAutomationService(
             storeSyncService,
             () => steamLoaderSettingsService.IsPluginEnabled("store-sync"));
@@ -104,16 +108,19 @@ public sealed class SteamLoaderBackgroundHost
             executablePath,
             SteamLoaderRuntime.BackgroundArgument);
         var releaseUpdateService = new ReleaseUpdateService();
+        var liveUpdateHub = new QuickAccessLiveUpdateHub();
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
         var popupScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
-            EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"));
+            EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"),
+            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"));
+            EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
 
         var appStartService = new AppStartService(Path.Combine(dataDirectory, "app-start.json"));
         var autoSisirService = new AutoSisirService(
@@ -121,6 +128,16 @@ public sealed class SteamLoaderBackgroundHost
             storeSyncService,
             Path.Combine(dataDirectory, "auto-sisr.log"),
             () => steamLoaderSettingsService.IsPluginEnabled("auto-sisr"));
+        var smartHomeService = new SmartHomeService(
+            httpClient,
+            new SmartHomeSettingsStore(Path.Combine(dataDirectory, "smart-home.json")));
+        var liveStatePublisher = new QuickAccessLiveStatePublisher(
+            liveUpdateHub,
+            audioOutputDeviceService,
+            processWindowService,
+            storeSyncService,
+            smartHomeService,
+            () => steamLoaderSettingsService.IsPluginEnabled("smart-home"));
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
@@ -134,11 +151,15 @@ public sealed class SteamLoaderBackgroundHost
             themesService,
             performanceService,
             steamLoaderSettingsService,
+            pluginStoreService,
             powerActionService,
             releaseUpdateService,
             frontendComponentService,
+            devToolsClient,
+            smartHomeService,
             ApiBaseUri,
             _hostState,
+            liveUpdateHub,
             requestShutdown);
 
         var injector = new QuickAccessShellInjector(
@@ -151,12 +172,15 @@ public sealed class SteamLoaderBackgroundHost
             _hostState);
 
         await apiServer.StartAsync(cancellationToken);
+        _ = themesService.StartBackendOnStartupAsync();
         using var shellGuardCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var shellGuardTask = shellGuardService.RunAsync(shellGuardCts.Token);
         using var autoSisirCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var autoSisirTask = autoSisirService.RunAsync(autoSisirCts.Token);
         using var storeSyncAutomationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var storeSyncAutomationTask = storeSyncAutomationService.RunAsync(storeSyncAutomationCts.Token);
+        using var liveStatePublisherCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var liveStatePublisherTask = liveStatePublisher.RunAsync(liveStatePublisherCts.Token);
 
         try
         {
@@ -164,6 +188,15 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await liveStatePublisherCts.CancelAsync();
+            try
+            {
+                await liveStatePublisherTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             await storeSyncAutomationCts.CancelAsync();
             try
             {

@@ -1,0 +1,45 @@
+{
+  "title": "TFS Community",
+  "description": "Community plugins published for Tools for Steam.",
+  "plugins": [
+    {
+      "id": "example-plugin",
+      "title": "Example Plugin",
+      "description": "A minimal controller-friendly Tools for Steam community plugin.",
+      "author": "Community",
+      "category": "Utility",
+      "version": "1.0.0",
+      "packagePath": "./packages/example-plugin.zip",
+      "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "images": [
+        "./images/example-plugin.png"
+      ],
+      "tags": [
+        "sample",
+        "sdk-v1"
+      ],
+      "homepageUrl": "https://example.com",
+      "repositoryUrl": "https://example.com/example-plugin"
+    },
+    {
+      "id": "home-assistant",
+      "title": "Home Assistant",
+      "description": "Control Home Assistant light entities from Tools for Steam.",
+      "author": "Tools for Steam",
+      "category": "Smart Home",
+      "version": "0.1.0",
+      "packagePath": "./packages/home-assistant.zip",
+      "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "images": [
+        "./images/home-assistant.png"
+      ],
+      "tags": [
+        "smart-home",
+        "lights",
+        "sdk-v1"
+      ],
+      "homepageUrl": "https://www.home-assistant.io/",
+      "repositoryUrl": "https://developers.home-assistant.io/docs/api/rest/"
+    }
+  ]
+}

@@ -74,7 +74,7 @@ public sealed class StoreSyncSettingsStore
             configuration.SyncBehaviorVersion = 3;
         }
 
-        foreach (var storeId in new[] { "epic-games", "gog-galaxy", "xbox-game-pass", "ubisoft-connect", "ea-app", "custom-locations" })
+        foreach (var storeId in new[] { "epic-games", "gog-galaxy", "xbox-game-pass", "ubisoft-connect", "ea-app", "battle-net", "amazon-games", "itch-io", "custom-locations" })
         {
             if (!configuration.Stores.TryGetValue(storeId, out var storeConfiguration) || storeConfiguration is null)
             {

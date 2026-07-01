@@ -7,6 +7,7 @@ public sealed record SteamLoaderGeneralSettingsSnapshot(
     bool FirstRunCompleted,
     bool ConsoleModeDefaultApplied,
     SteamLoaderSplashScreenSettingsSnapshot SplashScreen,
+    int WindowsShellStartDelaySeconds,
     string ProductVersion,
     string InstallPath,
     bool DeveloperDebugEnabled,
@@ -25,5 +26,4 @@ public sealed record SteamLoaderSplashScreenSettingsSnapshot(
     string WallpaperPath,
     bool WallpaperExists,
     string IconPath,
-    bool IconExists,
-    int ExtraCloseDelaySeconds);
+    bool IconExists);

@@ -78,22 +78,30 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
 
     public AudioDashboardSnapshot GetDashboardSnapshot()
     {
-        var playbackDevice = GetDefaultPlaybackDevice();
-        var captureDevice = GetDefaultCaptureDevice();
+        var playbackDevice = TryGetDefaultPlaybackDevice();
+        var captureDevice = TryGetDefaultCaptureDevice();
 
         return new AudioDashboardSnapshot(
-            CreateVolumeInfo(playbackDevice),
-            CreateVolumeInfo(captureDevice),
+            playbackDevice is null ? null : CreateVolumeInfo(playbackDevice),
+            captureDevice is null ? null : CreateVolumeInfo(captureDevice),
             GetPlaybackDevices(),
             GetCaptureDevices(),
-            GetMixerSessionGroups(playbackDevice)
-                .Select(group => group.Info)
-                .ToArray());
+            playbackDevice is null
+                ? Array.Empty<AudioMixerSessionInfo>()
+                : GetMixerSessionGroups(playbackDevice)
+                    .Select(group => group.Info)
+                    .ToArray());
     }
 
     public IReadOnlyList<AudioMixerSessionInfo> GetActiveMixerSessions()
     {
-        return GetMixerSessionGroups(GetDefaultPlaybackDevice())
+        var playbackDevice = TryGetDefaultPlaybackDevice();
+        if (playbackDevice is null)
+        {
+            return Array.Empty<AudioMixerSessionInfo>();
+        }
+
+        return GetMixerSessionGroups(playbackDevice)
             .Select(group => group.Info)
             .ToArray();
     }
@@ -191,7 +199,7 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
 
     private CoreAudioDevice GetDefaultPlaybackDevice()
     {
-        var device = _controller.DefaultPlaybackDevice;
+        var device = TryGetDefaultPlaybackDevice();
         if (device is null)
         {
             throw new InvalidOperationException("No default playback device is available.");
@@ -202,13 +210,23 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
 
     private CoreAudioDevice GetDefaultCaptureDevice()
     {
-        var device = _controller.DefaultCaptureDevice;
+        var device = TryGetDefaultCaptureDevice();
         if (device is null)
         {
             throw new InvalidOperationException("No default capture device is available.");
         }
 
         return device;
+    }
+
+    private CoreAudioDevice? TryGetDefaultPlaybackDevice()
+    {
+        return _controller.DefaultPlaybackDevice;
+    }
+
+    private CoreAudioDevice? TryGetDefaultCaptureDevice()
+    {
+        return _controller.DefaultCaptureDevice;
     }
 
     private static MixerSessionGroup GetMixerSessionGroup(CoreAudioDevice device, string sessionId)

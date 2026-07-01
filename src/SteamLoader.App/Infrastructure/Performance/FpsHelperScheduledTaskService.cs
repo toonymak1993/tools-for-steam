@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Xml.Linq;
@@ -15,6 +16,7 @@ internal sealed class FpsHelperScheduledTaskService
     private const int TaskRunLevelHighest = 1;
     private const int TaskInstancesIgnoreNew = 2;
     private const int TaskActionExecute = 0;
+    private const int TaskTriggerLogon = 9;
 
     private readonly string _executablePath;
     private readonly string _arguments;
@@ -47,12 +49,10 @@ internal sealed class FpsHelperScheduledTaskService
     {
         try
         {
-            dynamic service = CreateSchedulerService();
-            dynamic? task = TryGetTask(service);
             string compatibilityIssue;
-            if (!IsCompatibleTask(task, out compatibilityIssue))
+            if (!TryGetRegisteredTaskCompatibilityIssue(out compatibilityIssue))
             {
-                errorText = task is null
+                errorText = string.IsNullOrWhiteSpace(compatibilityIssue)
                     ? "The elevated TFS FPS helper task is not installed yet."
                     : $"The elevated TFS FPS helper needs repair. {compatibilityIssue}".Trim();
                 return false;
@@ -118,9 +118,8 @@ internal sealed class FpsHelperScheduledTaskService
     {
         try
         {
-            dynamic service = CreateSchedulerService();
             string compatibilityIssue;
-            return IsCompatibleTask(TryGetTask(service), out compatibilityIssue);
+            return TryGetRegisteredTaskCompatibilityIssue(out compatibilityIssue);
         }
         catch
         {
@@ -252,6 +251,11 @@ internal sealed class FpsHelperScheduledTaskService
         action.Arguments = _arguments;
         action.WorkingDirectory = _workingDirectory;
 
+        dynamic trigger = definition.Triggers.Create(TaskTriggerLogon);
+        trigger.Enabled = true;
+        trigger.UserId = ResolveInteractiveUserId();
+        trigger.StartBoundary = DateTime.Now.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
+
         folder.RegisterTaskDefinition(
             TaskName,
             definition,
@@ -303,23 +307,22 @@ internal sealed class FpsHelperScheduledTaskService
         }
     }
 
-    private bool IsCompatibleTask(dynamic? task, out string issue)
+    private bool TryGetRegisteredTaskCompatibilityIssue(out string issue)
     {
-        if (task is null)
+        var xml = TryReadTaskXmlFromSchtasks();
+        if (string.IsNullOrWhiteSpace(xml))
         {
-            issue = "The task is missing.";
+            issue = string.Empty;
             return false;
         }
 
+        return IsCompatibleTaskXml(xml, out issue);
+    }
+
+    private bool IsCompatibleTaskXml(string xml, out string issue)
+    {
         try
         {
-            var xml = GetTaskXml(task);
-            if (string.IsNullOrWhiteSpace(xml))
-            {
-                issue = "The registered task could not be inspected.";
-                return false;
-            }
-
             var document = XDocument.Parse(xml);
             var taskNamespace = document.Root?.Name.Namespace ?? XNamespace.None;
             var command = GetTaskValue(document, taskNamespace, "Command");
@@ -329,8 +332,7 @@ internal sealed class FpsHelperScheduledTaskService
             var logonType = GetTaskValue(document, taskNamespace, "LogonType");
             var hidden = GetTaskValue(document, taskNamespace, "Hidden");
             var multipleInstancesPolicy = GetTaskValue(document, taskNamespace, "MultipleInstancesPolicy");
-            var userId = GetTaskValue(document, taskNamespace, "UserId");
-            var expectedUserId = ResolveInteractiveUserId();
+            var logonTrigger = document.Descendants(taskNamespace + "LogonTrigger").FirstOrDefault();
 
             if (!PathsEqual(command, _executablePath))
             {
@@ -374,9 +376,9 @@ internal sealed class FpsHelperScheduledTaskService
                 return false;
             }
 
-            if (!string.IsNullOrWhiteSpace(expectedUserId) && !IdentitiesMatch(userId, expectedUserId))
+            if (logonTrigger is null)
             {
-                issue = "The helper task is registered for another Windows user.";
+                issue = "The helper task does not start automatically when Windows signs in.";
                 return false;
             }
 
@@ -390,33 +392,53 @@ internal sealed class FpsHelperScheduledTaskService
         }
     }
 
-    private static string GetTaskXml(dynamic task)
+    private static string TryReadTaskXmlFromSchtasks()
     {
         try
         {
-            var xml = task.Xml as string;
-            if (!string.IsNullOrWhiteSpace(xml))
+            using var process = new Process
             {
-                return xml;
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Environment.SystemDirectory, "schtasks.exe"),
+                    Arguments = $"/Query /TN \"{FolderPath}\\{TaskName}\" /XML",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+
+            if (!process.Start())
+            {
+                return string.Empty;
             }
+
+            if (!process.WaitForExit(5000))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                }
+
+                return string.Empty;
+            }
+
+            if (process.ExitCode != 0)
+            {
+                return string.Empty;
+            }
+
+            return process.StandardOutput.ReadToEnd();
         }
         catch
         {
+            return string.Empty;
         }
-
-        try
-        {
-            var xml = task.Definition.XmlText as string;
-            if (!string.IsNullOrWhiteSpace(xml))
-            {
-                return xml;
-            }
-        }
-        catch
-        {
-        }
-
-        return string.Empty;
     }
 
     private static string GetTaskValue(XContainer document, XNamespace taskNamespace, string elementName)

@@ -16,7 +16,8 @@ public sealed record ThemeOptionState(
     int? Step,
     string? Unit,
     string? SelectedChoiceId,
-    IReadOnlyList<ThemeChoiceState> Choices);
+    IReadOnlyList<ThemeChoiceState> Choices,
+    int AdvancedControlCount);
 
 public sealed record ThemeState(
     string Id,
@@ -31,7 +32,9 @@ public sealed record ThemeState(
     string SourceLabel,
     int DownloadCount,
     IReadOnlyList<string> Targets,
-    IReadOnlyList<ThemeOptionState> Options);
+    IReadOnlyList<ThemeOptionState> Options,
+    int DependencyCount,
+    int AdvancedControlCount);
 
 public sealed record ThemeProfileThemeState(
     string ThemeId,
@@ -66,6 +69,49 @@ public sealed record ThemesSettingsState(
     bool SingleThemeMode,
     bool AutoEnableOnInstall);
 
+public sealed record ThemeLoadErrorState(
+    string Title,
+    string Message);
+
+public sealed record ThemeStoreThemeState(
+    string StoreId,
+    string ThemeId,
+    string Title,
+    string Author,
+    string Version,
+    string Description,
+    string Source,
+    string Target,
+    IReadOnlyList<string> Targets,
+    int DownloadCount,
+    int StarCount,
+    int DependencyCount,
+    bool Installed,
+    bool InstalledVersionMatches,
+    string StatusText,
+    string PreviewImageUrl,
+    string PreviewThumbnailUrl);
+
+public sealed record ThemeStoreCatalogState(
+    string Search,
+    string Filter,
+    string Order,
+    int Page,
+    int PerPage,
+    int Total,
+    IReadOnlyList<string> AvailableFilters,
+    IReadOnlyList<string> AvailableOrders,
+    IReadOnlyList<ThemeStoreThemeState> Items);
+
+public sealed record ThemeIntegrationState(
+    bool BackendReachable,
+    bool BackendInstalled,
+    string ThemePath,
+    string BackendPath,
+    int? BackendVersion,
+    bool WatchEnabled,
+    IReadOnlyList<ThemeLoadErrorState> LoadErrors);
+
 public sealed record ThemesSnapshot(
     ThemesSettingsState Settings,
     IReadOnlyList<ThemeState> InstalledThemes,
@@ -73,4 +119,5 @@ public sealed record ThemesSnapshot(
     ThemesProfilesState Profiles,
     string ActiveCss,
     string StatusText,
-    string LocalThemesFolder);
+    string LocalThemesFolder,
+    ThemeIntegrationState Integration);

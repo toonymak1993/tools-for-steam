@@ -28,5 +28,5 @@ internal static class SteamLoaderRuntime
 
     public static string AutostartArguments => TrayArgument;
 
-    public static string ShellLaunchArguments => $"{TrayArgument} {ShellBootstrapArgument}";
+    public static string ShellLaunchArguments => $"{TrayArgument} {ShellBootstrapArgument} {StartupSyncArgument}";
 }

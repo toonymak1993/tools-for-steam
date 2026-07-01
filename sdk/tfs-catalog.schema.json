@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toolsforsteam.dev/schemas/tfs-catalog.schema.json",
+  "title": "Tools for Steam Community Catalog",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "title",
+    "description",
+    "plugins"
+  ],
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "id",
+          "title",
+          "description",
+          "version",
+          "packageSha256",
+          "images"
+        ],
+        "oneOf": [
+          {
+            "required": [
+              "packageUrl"
+            ]
+          },
+          {
+            "required": [
+              "packagePath"
+            ]
+          }
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "author": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "packagePath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "packageUrl": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https?://"
+          },
+          "packageSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$"
+          },
+          "images": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "homepageUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "repositoryUrl": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "uniqueItems": true
+    }
+  }
+}

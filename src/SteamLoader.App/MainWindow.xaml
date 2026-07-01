@@ -384,23 +384,42 @@
         <Border Grid.ColumnSpan="2"
                 Background="#081019"
                 Panel.ZIndex="100"
+                ClipToBounds="True"
+                Opacity="{Binding SplashOverlayOpacity}"
                 Visibility="{Binding ShowStartupSplash, Converter={StaticResource BooleanToVisibilityConverter}}">
             <Grid>
-                <Image Source="{Binding SplashWallpaperPath}"
-                       Stretch="UniformToFill"
-                       Opacity="0.52"
-                       Visibility="{Binding HasSplashWallpaper, Converter={StaticResource BooleanToVisibilityConverter}}" />
-                <Rectangle Fill="#B0081019" />
+                <!-- Game cover grid: fixed 1920×1080 canvas scaled by Viewbox to any screen.
+                     UniformGrid with explicit Columns/Rows is the only reliable WPF approach
+                     — no ScrollViewer, no WrapPanel infinity-width bug, no rotation tricks. -->
+                <Viewbox Stretch="Fill" IsHitTestVisible="False">
+                    <ItemsControl Width="1920" Height="1080"
+                                  ItemsSource="{Binding SplashGameCovers}"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                  ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <UniformGrid Columns="12" Rows="7"/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Image Source="{Binding}" Stretch="UniformToFill"/>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Viewbox>
+
+                <!-- Flat overlay -->
+                <Rectangle Fill="#55081019" />
+                <!-- Vignette: darker in centre so logo/text stays readable -->
                 <Rectangle>
                     <Rectangle.Fill>
-                        <RadialGradientBrush Center="0.5,0.48"
-                                             GradientOrigin="0.5,0.48"
-                                             RadiusX="0.72"
-                                             RadiusY="0.72">
-                            <GradientStop Color="#401C2C3A"
-                                          Offset="0" />
-                            <GradientStop Color="#DA081019"
-                                          Offset="1" />
+                        <RadialGradientBrush Center="0.5,0.5"
+                                             GradientOrigin="0.5,0.5"
+                                             RadiusX="0.52"
+                                             RadiusY="0.52">
+                            <GradientStop Color="#D0081019" Offset="0" />
+                            <GradientStop Color="#20081019" Offset="1" />
                         </RadialGradientBrush>
                     </Rectangle.Fill>
                 </Rectangle>
@@ -409,60 +428,43 @@
                 <StackPanel HorizontalAlignment="Center"
                             VerticalAlignment="Center"
                             MaxWidth="720">
-                    <Viewbox Width="150"
-                             Height="150"
-                             HorizontalAlignment="Center">
-                        <Viewbox.Style>
-                            <Style TargetType="Viewbox">
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding HasCustomSplashIcon}"
-                                                 Value="True">
-                                        <Setter Property="Visibility"
-                                                Value="Collapsed" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </Viewbox.Style>
-                        <Canvas Width="160" Height="160">
-                            <Ellipse Width="160"
-                                     Height="160"
-                                     Fill="#0F1823"
-                                     Stroke="#243244"
-                                     StrokeThickness="4" />
-                            <Ellipse Width="64"
-                                     Height="64"
-                                     Canvas.Left="28"
-                                     Canvas.Top="26"
-                                     Fill="#E7EEF6" />
-                            <Ellipse Width="26"
-                                     Height="26"
-                                     Canvas.Left="96"
-                                     Canvas.Top="60"
-                                     Fill="#E7EEF6" />
-                            <Path Stroke="#E7EEF6"
-                                  StrokeThickness="16"
-                                  StrokeStartLineCap="Round"
-                                  StrokeEndLineCap="Round"
-                                  Data="M 57 82 C 73 103, 93 108, 109 102" />
-                            <Ellipse Width="20"
-                                     Height="20"
-                                     Canvas.Left="104"
-                                     Canvas.Top="95"
-                                     Fill="#7CD06B" />
-                        </Canvas>
-                    </Viewbox>
 
-                    <Border Width="150"
-                            Height="150"
+                    <!-- Custom icon from settings (overrides Steam icon when set) -->
+                    <Border Width="180"
+                            Height="180"
                             HorizontalAlignment="Center"
                             Background="#0F1823"
                             BorderBrush="#243244"
                             BorderThickness="4"
-                            CornerRadius="36"
+                            CornerRadius="90"
                             ClipToBounds="True"
                             Visibility="{Binding HasCustomSplashIcon, Converter={StaticResource BooleanToVisibilityConverter}}">
                         <Image Source="{Binding SplashIconPath}"
-                               Stretch="UniformToFill" />
+                               Stretch="Uniform"
+                               Margin="18"/>
+                    </Border>
+
+                    <!-- Steam icon — default when no custom icon is configured -->
+                    <Border Width="180"
+                            Height="180"
+                            HorizontalAlignment="Center"
+                            Background="#0F1823"
+                            BorderBrush="#243244"
+                            BorderThickness="4"
+                            CornerRadius="90"
+                            ClipToBounds="True">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasCustomSplashIcon}" Value="True">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <Image Source="pack://application:,,,/Assets/splash-steam-icon.png"
+                               Stretch="Uniform"
+                               Margin="18"/>
                     </Border>
 
                     <TextBlock Text="Tools for Steam"
@@ -498,8 +500,47 @@
                                TextAlignment="Center"
                                TextWrapping="Wrap"
                                Visibility="{Binding ShowStartupSplashText, Converter={StaticResource BooleanToVisibilityConverter}}" />
+
+                    <StackPanel Orientation="Horizontal"
+                                HorizontalAlignment="Center"
+                                Margin="0,32,0,0">
+                        <StackPanel.Triggers>
+                            <EventTrigger RoutedEvent="StackPanel.Loaded">
+                                <BeginStoryboard>
+                                    <Storyboard RepeatBehavior="Forever">
+                                        <DoubleAnimation Storyboard.TargetName="Dot1"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         From="0.2" To="1.0"
+                                                         Duration="0:0:0.45"
+                                                         AutoReverse="True"
+                                                         BeginTime="0:0:0" />
+                                        <DoubleAnimation Storyboard.TargetName="Dot2"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         From="0.2" To="1.0"
+                                                         Duration="0:0:0.45"
+                                                         AutoReverse="True"
+                                                         BeginTime="0:0:0.18" />
+                                        <DoubleAnimation Storyboard.TargetName="Dot3"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         From="0.2" To="1.0"
+                                                         Duration="0:0:0.45"
+                                                         AutoReverse="True"
+                                                         BeginTime="0:0:0.36" />
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </EventTrigger>
+                        </StackPanel.Triggers>
+                        <Ellipse x:Name="Dot1" Width="9" Height="9" Fill="#6A93B5" Margin="7,0" Opacity="0.2" />
+                        <Ellipse x:Name="Dot2" Width="9" Height="9" Fill="#6A93B5" Margin="7,0" Opacity="0.2" />
+                        <Ellipse x:Name="Dot3" Width="9" Height="9" Fill="#6A93B5" Margin="7,0" Opacity="0.2" />
+                    </StackPanel>
                 </StackPanel>
                 </Grid>
+                <!-- DEBUG: remove after diagnosing cover loading -->
+                <TextBlock Text="{Binding SplashDebugText}"
+                           Foreground="White" FontSize="10" Opacity="0.85"
+                           VerticalAlignment="Bottom" HorizontalAlignment="Left"
+                           Margin="10,0,0,10" TextWrapping="Wrap"/>
             </Grid>
         </Border>
     </Grid>

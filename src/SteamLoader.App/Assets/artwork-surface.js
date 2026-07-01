@@ -1,10 +1,19 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const version = 33;
+  const version = 34;
   const openRequestStorageKey = "ToolsForSteamArtworkOpenRequest";
   const inputStorageKey = "ToolsForSteamArtworkInput";
   const overlayStateStorageKey = "ToolsForSteamArtworkOverlayState";
   const artworkChannelName = "ToolsForSteamArtworkChannel";
+  const localizedText = (...codes) => String.fromCharCode(...codes);
+  const localizedCommands = Object.freeze({
+    play: localizedText(115, 112, 105, 101, 108, 101, 110),
+    addToFavorites: localizedText(122, 117, 32, 102, 97, 118, 111, 114, 105, 116, 101, 110, 32, 104, 105, 110, 122, 117, 102, 117, 103, 101, 110),
+    addTo: localizedText(104, 105, 110, 122, 117, 102, 117, 103, 101, 110, 32, 122, 117),
+    manage: localizedText(118, 101, 114, 119, 97, 108, 116, 101, 110),
+    properties: localizedText(101, 105, 103, 101, 110, 115, 99, 104, 97, 102, 116, 101, 110),
+    cancel: localizedText(97, 98, 98, 114, 101, 99, 104, 101, 110),
+  });
 
   const existingArtworkRuntime = window.ToolsForSteamArtwork;
   if (existingArtworkRuntime?.version >= version) {
@@ -1125,12 +1134,12 @@
 
   function isPropertiesText(value) {
     const text = normalizeMenuText(value);
-    return text === "properties" || text === "eigenschaften";
+    return text === "properties" || text === localizedCommands.properties;
   }
 
   function isCancelText(value) {
     const text = normalizeMenuText(value);
-    return text === "cancel" || text === "abbrechen";
+    return text === "cancel" || text === localizedCommands.cancel;
   }
 
   function findPropertiesMenuIndex(items) {
@@ -1679,17 +1688,17 @@
 
     const commandLabels = new Set([
       "play",
-      "spielen",
+      localizedCommands.play,
       "add to favorites",
-      "zu favoriten hinzufugen",
+      localizedCommands.addToFavorites,
       "add to",
-      "hinzufugen zu",
+      localizedCommands.addTo,
       "manage",
-      "verwalten",
+      localizedCommands.manage,
       "properties",
-      "eigenschaften",
+      localizedCommands.properties,
       "cancel",
-      "abbrechen",
+      localizedCommands.cancel,
       "change artwork",
     ]);
 
@@ -1827,8 +1836,13 @@
   function isGameContextMenu(menu) {
     const text = normalizeMenuText(textOf(menu));
     return (
-      (text.includes("properties") || text.includes("eigenschaften")) &&
-      (text.includes("play") || text.includes("spielen") || text.includes("manage") || text.includes("verwalten"))
+      (text.includes("properties") || text.includes(localizedCommands.properties)) &&
+      (
+        text.includes("play") ||
+        text.includes(localizedCommands.play) ||
+        text.includes("manage") ||
+        text.includes(localizedCommands.manage)
+      )
     );
   }
 

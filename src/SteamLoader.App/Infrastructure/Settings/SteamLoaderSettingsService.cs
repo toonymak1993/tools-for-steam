@@ -8,26 +8,11 @@ namespace SteamLoader.App.Infrastructure.Settings;
 
 public sealed class SteamLoaderSettingsService
 {
-    private static readonly SteamLoaderPluginDefinition[] PluginDefinitions =
-    [
-        new("processes", "Processes", "Window switcher for visible app windows.", true),
-        new("app-start", "App Start", "Controller launcher for selected Windows apps.", true),
-        new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, and artwork updates.", true),
-        new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
-        new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
-        new("audio", "Audio", "Output device switching and system volume controls.", true),
-        new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),
-        new("performance", "Performance", "Built-in TFS FPS meter and Steam-style overlay controls.", true),
-        new("hltb", "HLTB", "HowLongToBeat game page estimates.", true),
-        new("themes", "Themes", "Theme engine, theme store, and profiles.", true),
-        new("power", "Power", "Recovery and power actions. This stays available for safety.", false)
-    ];
-
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
     };
-    private const int MaximumSplashCloseDelaySeconds = 30;
+    private const int MaximumWindowsShellStartDelaySeconds = 30;
 
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
@@ -61,6 +46,7 @@ public sealed class SteamLoaderSettingsService
             FirstRunCompleted: settings.FirstRunCompleted == true,
             ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
             SplashScreen: BuildSplashScreenSettings(settings),
+            WindowsShellStartDelaySeconds: GetWindowsShellStartDelaySeconds(settings),
             ProductVersion: GetProductVersion(),
             InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
             DeveloperDebugEnabled: settings.DeveloperDebugEnabled == true,
@@ -226,15 +212,14 @@ public sealed class SteamLoaderSettingsService
         return GetSnapshot();
     }
 
-    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenExtraCloseDelaySeconds(int seconds)
+    public SteamLoaderGeneralSettingsSnapshot SetWindowsShellStartDelaySeconds(int seconds)
     {
-        var settings = LoadSettings();
-        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        var settings = LoadSettings() with
         {
-            ExtraCloseDelaySeconds = ClampSplashCloseDelay(seconds)
+            WindowsShellStartDelaySeconds = ClampWindowsShellStartDelay(seconds)
         };
 
-        SaveSettings(settings with { SplashScreen = splashScreen });
+        SaveSettings(settings);
         return GetSnapshot();
     }
 
@@ -245,8 +230,7 @@ public sealed class SteamLoaderSettingsService
 
     public SteamLoaderGeneralSettingsSnapshot SetPluginEnabled(string pluginId, bool enabled)
     {
-        var definition = PluginDefinitions.FirstOrDefault(plugin =>
-            string.Equals(plugin.Id, pluginId, StringComparison.OrdinalIgnoreCase));
+        var definition = SteamLoaderPluginCatalog.Find(pluginId);
         if (definition is null)
         {
             throw new InvalidOperationException("Unknown plugin.");
@@ -288,8 +272,7 @@ public sealed class SteamLoaderSettingsService
             return true;
         }
 
-        var definition = PluginDefinitions.FirstOrDefault(plugin =>
-            string.Equals(plugin.Id, pluginId, StringComparison.OrdinalIgnoreCase));
+        var definition = SteamLoaderPluginCatalog.Find(pluginId);
         if (definition is null)
         {
             return true;
@@ -377,7 +360,7 @@ public sealed class SteamLoaderSettingsService
         var pluginStates = NormalizePluginStates(settings.PluginEnabled);
         var orderedPluginIds = NormalizePluginOrder(settings.PluginOrder);
         var orderedDefinitions = orderedPluginIds
-            .Select(id => PluginDefinitions.First(plugin => string.Equals(plugin.Id, id, StringComparison.OrdinalIgnoreCase)));
+            .Select(id => SteamLoaderPluginCatalog.Definitions.First(plugin => string.Equals(plugin.Id, id, StringComparison.OrdinalIgnoreCase)));
 
         return orderedDefinitions
             .Select(plugin => new SteamLoaderPluginSettingsState(
@@ -401,8 +384,7 @@ public sealed class SteamLoaderSettingsService
             wallpaperPath,
             !string.IsNullOrWhiteSpace(wallpaperPath) && File.Exists(wallpaperPath),
             iconPath,
-            !string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath),
-            ClampSplashCloseDelay(splashScreen.ExtraCloseDelaySeconds ?? 0));
+            !string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath));
     }
 
     private static SteamLoaderSplashScreenSettingsData NormalizeSplashScreenSettings(
@@ -413,9 +395,16 @@ public sealed class SteamLoaderSettingsService
             Enabled = settings?.Enabled ?? true,
             ShowText = settings?.ShowText ?? true,
             WallpaperPath = NormalizeOptionalPath(settings?.WallpaperPath ?? string.Empty),
-            IconPath = NormalizeOptionalPath(settings?.IconPath ?? string.Empty),
-            ExtraCloseDelaySeconds = ClampSplashCloseDelay(settings?.ExtraCloseDelaySeconds ?? 0)
+            IconPath = NormalizeOptionalPath(settings?.IconPath ?? string.Empty)
         };
+    }
+
+    private static int GetWindowsShellStartDelaySeconds(SteamLoaderSettingsData settings)
+    {
+        return ClampWindowsShellStartDelay(
+            settings.WindowsShellStartDelaySeconds
+            ?? settings.SplashScreen?.ExtraCloseDelaySeconds
+            ?? 0);
     }
 
     private static string NormalizeOptionalPath(string? path)
@@ -448,9 +437,9 @@ public sealed class SteamLoaderSettingsService
         };
     }
 
-    private static int ClampSplashCloseDelay(int seconds)
+    private static int ClampWindowsShellStartDelay(int seconds)
     {
-        return Math.Clamp(seconds, 0, MaximumSplashCloseDelaySeconds);
+        return Math.Clamp(seconds, 0, MaximumWindowsShellStartDelaySeconds);
     }
 
     private static string NormalizeUpdateChannel(string? channel)
@@ -464,7 +453,7 @@ public sealed class SteamLoaderSettingsService
 
     private static Dictionary<string, bool> NormalizePluginStates(Dictionary<string, bool>? savedStates)
     {
-        var normalized = PluginDefinitions.ToDictionary(
+        var normalized = SteamLoaderPluginCatalog.Definitions.ToDictionary(
             plugin => plugin.Id,
             plugin => plugin.DefaultEnabled,
             StringComparer.OrdinalIgnoreCase);
@@ -474,7 +463,7 @@ public sealed class SteamLoaderSettingsService
             return normalized;
         }
 
-        foreach (var plugin in PluginDefinitions)
+        foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
         {
             if (!plugin.CanDisable)
             {
@@ -493,14 +482,14 @@ public sealed class SteamLoaderSettingsService
 
     private static IReadOnlyList<string> NormalizePluginOrder(IReadOnlyList<string>? savedOrder)
     {
-        var knownPluginIds = PluginDefinitions
+        var knownPluginIds = SteamLoaderPluginCatalog.Definitions
             .Select(plugin => plugin.Id)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var canonicalPluginIds = PluginDefinitions.ToDictionary(
+        var canonicalPluginIds = SteamLoaderPluginCatalog.Definitions.ToDictionary(
             plugin => plugin.Id,
             plugin => plugin.Id,
             StringComparer.OrdinalIgnoreCase);
-        var normalized = new List<string>(PluginDefinitions.Length);
+        var normalized = new List<string>(SteamLoaderPluginCatalog.Definitions.Count);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (savedOrder is not null)
@@ -520,7 +509,7 @@ public sealed class SteamLoaderSettingsService
             }
         }
 
-        foreach (var plugin in PluginDefinitions)
+        foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
         {
             if (seen.Add(plugin.Id))
             {
@@ -530,14 +519,6 @@ public sealed class SteamLoaderSettingsService
 
         return normalized;
     }
-
-    private sealed record SteamLoaderPluginDefinition(
-        string Id,
-        string Title,
-        string Description,
-        bool CanDisable,
-        bool DefaultEnabled = true);
-
     private sealed record SteamLoaderSettingsData
     {
         public bool? ConsoleModeDefaultApplied { get; init; }
@@ -560,6 +541,8 @@ public sealed class SteamLoaderSettingsService
 
         public string[]? PluginOrder { get; init; }
 
+        public int? WindowsShellStartDelaySeconds { get; init; }
+
         public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
     }
 
@@ -572,7 +555,6 @@ public sealed class SteamLoaderSettingsService
         public string? WallpaperPath { get; init; }
 
         public string? IconPath { get; init; }
-
         public int? ExtraCloseDelaySeconds { get; init; }
     }
 }

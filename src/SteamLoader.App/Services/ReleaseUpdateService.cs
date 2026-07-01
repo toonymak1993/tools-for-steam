@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
 using System.Net.Http;
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using SteamLoader.App.Models;
@@ -11,6 +12,8 @@ namespace SteamLoader.App.Services;
 public sealed class ReleaseUpdateService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly Uri LatestStableReleaseUri = new(
+        $"https://api.github.com/repos/{SteamLoaderRuntime.ReleaseRepository}/releases/latest");
     private static readonly Uri ReleasesUri = new(
         $"https://api.github.com/repos/{SteamLoaderRuntime.ReleaseRepository}/releases?per_page=20");
 
@@ -213,17 +216,72 @@ public sealed class ReleaseUpdateService
 
     private async Task<GithubRelease> GetPreferredReleaseAsync(string channel, CancellationToken cancellationToken)
     {
+        if (string.Equals(channel, SteamLoaderRuntime.UpdateChannelStable, StringComparison.OrdinalIgnoreCase))
+        {
+            return await RetryUpdateNetworkOperationAsync(
+                () => GetReleaseAsync(LatestStableReleaseUri, cancellationToken),
+                cancellationToken);
+        }
+
         var releases = await RetryUpdateNetworkOperationAsync(
             () => GetReleasesAsync(cancellationToken),
             cancellationToken);
         return SelectRelease(releases, channel);
     }
 
+    private async Task<GithubRelease> GetReleaseAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        await EnsureGithubResponseSuccessAsync(response, cancellationToken);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        return await JsonSerializer.DeserializeAsync<GithubRelease>(stream, JsonOptions, cancellationToken)
+            ?? throw new InvalidOperationException("GitHub returned an empty release response.");
+    }
+
     private async Task<IReadOnlyList<GithubRelease>> GetReleasesAsync(CancellationToken cancellationToken)
     {
-        await using var stream = await _httpClient.GetStreamAsync(ReleasesUri, cancellationToken);
+        using var response = await _httpClient.GetAsync(ReleasesUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        await EnsureGithubResponseSuccessAsync(response, cancellationToken);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         return await JsonSerializer.DeserializeAsync<IReadOnlyList<GithubRelease>>(stream, JsonOptions, cancellationToken)
             ?? throw new InvalidOperationException("GitHub returned an empty releases response.");
+    }
+
+    private static async Task EnsureGithubResponseSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
+        if (response.StatusCode == HttpStatusCode.Forbidden &&
+            response.Headers.TryGetValues("X-RateLimit-Remaining", out var remainingValues) &&
+            string.Equals(remainingValues.FirstOrDefault(), "0", StringComparison.Ordinal))
+        {
+            string? resetText = null;
+            if (response.Headers.TryGetValues("X-RateLimit-Reset", out var resetValues) &&
+                long.TryParse(resetValues.FirstOrDefault(), out var resetUnixSeconds))
+            {
+                resetText = DateTimeOffset
+                    .FromUnixTimeSeconds(resetUnixSeconds)
+                    .ToLocalTime()
+                    .ToString("yyyy-MM-dd HH:mm");
+            }
+
+            var retryMessage = resetText is null
+                ? "GitHub API rate limit reached. Try again a little later."
+                : $"GitHub API rate limit reached. Try again after {resetText}.";
+            throw new InvalidOperationException(retryMessage);
+        }
+
+        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!string.IsNullOrWhiteSpace(responseBody))
+        {
+            throw new InvalidOperationException(
+                $"GitHub release query failed ({(int)response.StatusCode} {response.ReasonPhrase}): {responseBody}");
+        }
+
+        response.EnsureSuccessStatusCode();
     }
 
     private static GithubRelease SelectRelease(IReadOnlyList<GithubRelease> releases, string channel)

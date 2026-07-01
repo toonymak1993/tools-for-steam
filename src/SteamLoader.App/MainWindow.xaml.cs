@@ -158,7 +158,9 @@ public partial class MainWindow : Window
 
         if (StartHiddenInTray && !viewModel.ShowStartupSplash)
         {
-            _ = Dispatcher.BeginInvoke(HideToTray, DispatcherPriority.ApplicationIdle);
+            // Call directly (no dispatcher delay) so the window hides before
+            // WPF renders the now-uncovered manager UI — eliminates the flicker.
+            HideToTray();
         }
     }
 

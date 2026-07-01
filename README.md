@@ -34,9 +34,19 @@ This shell behavior is intentional and can be disabled again from `Tools for Ste
 - `Display`: Switch internal/external display output and choose supported resolution or refresh-rate presets.
 - `Power`: Restart Steam, recover the Windows desktop, sleep, reboot, or shut down the PC.
 - `HLTB`: Show HowLongToBeat estimates on supported Big Picture game pages.
-- `Themes`: Apply and manage bundled Steam UI themes and profiles.
+- `CSSLoader`: Control local CSSLoader themes and presets from Quick Access.
 
 Plugins can be disabled from `Settings`. Disabled plugins are hidden from the TFS home screen and their background routes are blocked.
+
+## Community Plugin SDK
+
+The first community plugin contract lives in `sdk/`. It defines the store catalog format, the required `tfs-plugin.json` manifest, SDK permissions, and templates that use the shared TFS frontend library.
+
+Community plugin packages are discovered through the TFS Store. The default Store Refresh action downloads `sdk/catalog.online.json` from this GitHub repository, caches it as `data/plugin-store/catalog.json`, and installs selected packages into `data/plugin-store/community/<plugin-id>`. The installer validates the package manifest and SHA-256 checksum before replacing an installed plugin.
+
+The SDK currently exposes controller-friendly UI helpers plus core-owned storage, write-only secrets, a permission-gated HTTP/HTTPS network proxy, and a dynamic Quick Access loader for installed community entry points. `sdk/official-plugins/home-assistant/` is the first official community plugin and shows the intended pattern without giving the plugin special core access.
+
+SDK v1 is designed to grow additively. Future SDK v1 helpers should not break existing community plugins; incompatible runtime changes should become a future SDK v2.
 
 ## Requirements
 
@@ -111,7 +121,7 @@ Outputs:
 - `src/SteamLoader.App/Infrastructure/Audio`: Core Audio integration
 - `src/SteamLoader.App/Infrastructure/Display`: Windows display switching and mode selection
 - `src/SteamLoader.App/Infrastructure/StoreSync`: launcher scanning, shortcut sync, and artwork download
-- `src/SteamLoader.App/Infrastructure/Themes`: theme state, CSS resolution, and profiles
+- `src/SteamLoader.App/Infrastructure/Themes`: CSSLoader bridge, theme state mapping, and preset control
 - `src/SteamLoader.App/Infrastructure/Hltb`: HowLongToBeat integration
 - `src/SteamLoader.App/Assets`: injected Quick Access UI and Big Picture surface scripts
 

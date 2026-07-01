@@ -1,23 +1,39 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 6;
+  const stateVersion = 9;
   const themeScanEventName = "steamtools:theme-scan-complete";
+  const localizedText = (...codes) => String.fromCharCode(...codes);
+  const localizedSignals = Object.freeze({
+    play: localizedText(83, 80, 73, 69, 76, 69, 78),
+    playtime: localizedText(83, 80, 73, 69, 76, 90, 69, 73, 84),
+    lastPlayed: localizedText(90, 85, 76, 69, 84, 90, 84, 32, 71, 69, 83, 80, 73, 69, 76, 84),
+    activityAscii: localizedText(65, 75, 84, 73, 86, 73, 84, 65, 84),
+    activityNative: localizedText(65, 75, 84, 73, 86, 73, 84, 196, 84),
+    yourStuff: localizedText(73, 72, 82, 69, 32, 68, 73, 78, 71, 69),
+    gameInfo: localizedText(83, 80, 73, 69, 76, 73, 78, 70, 79),
+    achievements: localizedText(69, 82, 70, 79, 76, 71, 69),
+    spaceRequired: localizedText(83, 80, 69, 73, 67, 72, 69, 82, 80, 76, 65, 84, 90),
+    recentGames: localizedText(86, 79, 82, 32, 75, 85, 82, 90, 69, 77, 32, 71, 69, 83, 80, 73, 69, 76, 84),
+    libraryMore: localizedText(77, 69, 72, 82, 32, 73, 78, 32, 73, 72, 82, 69, 82, 32, 66, 73, 66, 76, 73, 79, 84, 72, 69, 75),
+    whatsNew: localizedText(87, 65, 83, 32, 73, 83, 84, 32, 78, 69, 85),
+    recommended: localizedText(69, 77, 80, 70, 79, 72, 76, 69, 78),
+  });
   const titleNoiseMarkers = [
     "PLAY",
-    "SPIELEN",
+    localizedSignals.play,
     "PLAYTIME",
-    "SPIELZEIT",
+    localizedSignals.playtime,
     "LAST PLAYED",
-    "ZULETZT GESPIELT",
+    localizedSignals.lastPlayed,
     "ACTIVITY",
-    "AKTIVITAT",
-    "AKTIVITÄT",
+    localizedSignals.activityAscii,
+    localizedSignals.activityNative,
     "COMMUNITY",
-    "SPIELINFO",
+    localizedSignals.gameInfo,
     "GAME INFO",
     "STEAM CLOUD",
     "ACHIEVEMENTS",
-    "ERFOLGE",
+    localizedSignals.achievements,
     "CONTROLLER",
     "MAIN STORY",
     "MAIN + EXTRAS",
@@ -44,7 +60,23 @@
     "appdetailsplaysection_",
   ];
   const detailTextPattern =
-    /PLAY TIME|PLAYTIME|SPIELZEIT|LAST PLAYED|ZULETZT GESPIELT|STEAM CLOUD|CONTROLLER|ACTIVITY|AKTIVITAT|AKTIVITÄT|YOUR STUFF|IHRE DINGE|COMMUNITY|GAME INFO|SPIELINFO/i;
+    new RegExp([
+      "PLAY TIME",
+      "PLAYTIME",
+      localizedSignals.playtime,
+      "LAST PLAYED",
+      localizedSignals.lastPlayed,
+      "STEAM CLOUD",
+      "CONTROLLER",
+      "ACTIVITY",
+      localizedSignals.activityAscii,
+      localizedSignals.activityNative,
+      "YOUR STUFF",
+      localizedSignals.yourStuff,
+      "COMMUNITY",
+      "GAME INFO",
+      localizedSignals.gameInfo,
+    ].join("|"), "i");
 
   const previousState = window.__steamToolsHltbSurfaceState;
   if (previousState?.version !== stateVersion) {
@@ -91,90 +123,211 @@
     }
 
     style.textContent = `
+      .steamtools-hltb-host {
+        position: relative;
+      }
+
       .steamtools-hltb-panel {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 18px;
-        align-items: stretch;
-        width: 100%;
+        position: absolute;
+        top: clamp(72px, 8vh, 104px);
+        right: clamp(22px, 2.2vw, 34px);
+        z-index: 7;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        width: min(620px, calc(100% - 44px));
         box-sizing: border-box;
-        padding: 14px 24px;
+        min-height: 136px;
+        padding: 16px 18px;
         margin: 0;
-        background: linear-gradient(90deg, rgba(12, 17, 24, 0.9), rgba(18, 26, 34, 0.86));
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-        backdrop-filter: blur(14px);
+        overflow: hidden;
+        border-radius: 30px 34px 30px 34px;
+        background:
+          radial-gradient(circle at 86% 22%, rgba(255, 225, 155, 0.2), transparent 28%),
+          radial-gradient(circle at 100% 0%, rgba(104, 181, 255, 0.14), transparent 24%),
+          linear-gradient(135deg, rgba(9, 14, 20, 0.78), rgba(19, 28, 40, 0.48));
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        box-shadow:
+          0 20px 70px rgba(0, 0, 0, 0.3),
+          inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(22px) saturate(145%);
+      }
+
+      .steamtools-hltb-panel::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, rgba(255, 255, 255, 0.04), transparent 28%, transparent 72%, rgba(255, 224, 156, 0.08));
+        pointer-events: none;
+      }
+
+      .steamtools-hltb-panel > * {
+        position: relative;
+        z-index: 1;
+      }
+
+      .steamtools-hltb-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+      }
+
+      .steamtools-hltb-header-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .steamtools-hltb-kicker {
+        color: rgba(228, 237, 245, 0.72);
+        font-size: 11px;
+        line-height: 1;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-hltb-brand {
+        color: #f5f9fc;
+        font-size: clamp(20px, 2vw, 28px);
+        line-height: 1;
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .steamtools-hltb-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .steamtools-hltb-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 26px;
+        padding: 0 10px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        color: rgba(236, 242, 248, 0.9);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        white-space: nowrap;
       }
 
       .steamtools-hltb-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-        gap: 12px 18px;
+        grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+        gap: 10px;
         min-width: 0;
       }
 
       .steamtools-hltb-stat {
         display: flex;
         flex-direction: column;
-        gap: 3px;
+        gap: 4px;
         min-width: 0;
+        padding: 11px 12px 10px;
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.04));
+        border: 1px solid rgba(255, 255, 255, 0.09);
       }
 
       .steamtools-hltb-value {
-        color: #edf3f8;
-        font-size: clamp(18px, 1.7vw, 26px);
-        line-height: 1.05;
-        font-weight: 700;
-        letter-spacing: -0.03em;
+        color: #f3f8fd;
+        font-size: clamp(18px, 1.65vw, 24px);
+        line-height: 1;
+        font-weight: 800;
+        letter-spacing: -0.04em;
         white-space: nowrap;
       }
 
       .steamtools-hltb-label {
-        color: rgba(200, 212, 224, 0.78);
-        font-size: clamp(11px, 1vw, 14px);
-        line-height: 1.15;
-        font-weight: 600;
-        letter-spacing: 0.08em;
+        color: rgba(204, 216, 228, 0.74);
+        font-size: clamp(9px, 0.78vw, 11px);
+        line-height: 1.2;
+        font-weight: 700;
+        letter-spacing: 0.12em;
         text-transform: uppercase;
       }
 
       .steamtools-hltb-actions {
         display: flex;
         align-items: center;
-        justify-content: flex-end;
+        justify-content: flex-start;
       }
 
       .steamtools-hltb-button {
         appearance: none;
-        border: 0;
+        border: 1px solid rgba(255, 255, 255, 0.14);
         border-radius: 999px;
-        padding: 0 18px;
-        min-height: 44px;
-        background: rgba(42, 135, 219, 0.18);
-        color: #49a3ff;
-        font-size: 13px;
+        padding: 0 14px;
+        min-height: 34px;
+        background: rgba(255, 255, 255, 0.08);
+        color: #f2f7fb;
+        font-size: 11px;
         font-weight: 700;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.08em;
         text-transform: uppercase;
         cursor: pointer;
+        transition:
+          background 160ms ease,
+          border-color 160ms ease,
+          transform 160ms ease;
       }
 
       .steamtools-hltb-button:hover {
-        background: rgba(42, 135, 219, 0.28);
+        background: rgba(255, 255, 255, 0.14);
+        border-color: rgba(255, 255, 255, 0.2);
+        transform: translateY(-1px);
       }
 
-      @media (max-width: 1280px) {
+      @media (max-width: 1360px) {
         .steamtools-hltb-panel {
-          grid-template-columns: 1fr;
-          padding: 12px 18px;
+          top: clamp(60px, 7vh, 86px);
+          width: min(520px, calc(100% - 34px));
+          min-height: 0;
+          padding: 15px 16px;
+          border-radius: 28px;
+        }
+      }
+
+      @media (max-width: 1080px) {
+        .steamtools-hltb-panel {
+          width: min(360px, calc(100% - 24px));
+          top: 58px;
+          right: 16px;
+          gap: 10px;
         }
 
-        .steamtools-hltb-actions {
+        .steamtools-hltb-header {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .steamtools-hltb-toolbar {
           justify-content: flex-start;
         }
 
-        .steamtools-hltb-grid {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
+        .steamtools-hltb-stat {
+          padding: 10px 11px 9px;
+        }
+      }
+
+      @media (max-width: 860px) {
+        .steamtools-hltb-panel {
+          position: static;
+          width: 100%;
+          margin-top: 16px;
         }
       }
     `;
@@ -308,23 +461,23 @@
     const signals = [
       "PLAY TIME",
       "PLAYTIME",
-      "SPIELZEIT",
+      localizedSignals.playtime,
       "LAST PLAYED",
-      "ZULETZT GESPIELT",
+      localizedSignals.lastPlayed,
       "STEAM CLOUD",
       "CONTROLLER",
       "ACTIVITY",
-      "AKTIVITAT",
-      "AKTIVITÄT",
+      localizedSignals.activityAscii,
+      localizedSignals.activityNative,
       "YOUR STUFF",
-      "IHRE DINGE",
+      localizedSignals.yourStuff,
       "COMMUNITY",
       "GAME INFO",
-      "SPIELINFO",
+      localizedSignals.gameInfo,
       "ACHIEVEMENTS",
-      "ERFOLGE",
+      localizedSignals.achievements,
       "SPACE REQUIRED",
-      "SPEICHERPLATZ",
+      localizedSignals.spaceRequired,
     ];
 
     return signals.reduce((count, signal) => count + (text.includes(signal) ? 1 : 0), 0);
@@ -338,22 +491,22 @@
 
     const hubSignals = [
       "RECENT GAMES",
-      "VOR KURZEM GESPIELT",
+      localizedSignals.recentGames,
       "VIEW MORE IN YOUR LIBRARY",
-      "MEHR IN IHRER BIBLIOTHEK",
+      localizedSignals.libraryMore,
       "WHAT'S NEW",
-      "WAS IST NEU",
+      localizedSignals.whatsNew,
       "RECOMMENDED",
-      "EMPFOHLEN",
+      localizedSignals.recommended,
     ];
 
     const detailSignals = getDetailTextSignalCount(container);
     const hasCloudOrTabs =
       text.includes("STEAM CLOUD") ||
       text.includes("YOUR STUFF") ||
-      text.includes("IHRE DINGE") ||
+      text.includes(localizedSignals.yourStuff) ||
       text.includes("GAME INFO") ||
-      text.includes("SPIELINFO");
+      text.includes(localizedSignals.gameInfo);
 
     return hubSignals.some((signal) => text.includes(signal)) && (!hasCloudOrTabs || detailSignals < 3);
   }
@@ -778,13 +931,55 @@
 
     const fallback = [...container.querySelectorAll("div, section")]
       .filter((node) => node instanceof HTMLElement)
-      .find((node) => /PLAYTIME|SPIELZEIT|LAST PLAYED|ZULETZT GESPIELT|CONTROLLER/i.test(node.innerText || ""));
+      .find((node) => new RegExp([
+        "PLAYTIME",
+        localizedSignals.playtime,
+        "LAST PLAYED",
+        localizedSignals.lastPlayed,
+        "CONTROLLER",
+      ].join("|"), "i").test(node.innerText || ""));
 
     return fallback instanceof HTMLElement ? fallback : null;
   }
 
+  function findOverlayHost(container) {
+    const preferredSelectors = [
+      ".steamloader-theme-game-detail-topcapsule",
+      ".steamloader-theme-game-detail-hero",
+      ".steamloader-theme-game-detail-title-section",
+    ];
+
+    for (const selector of preferredSelectors) {
+      const node = container.querySelector(selector);
+      if (node instanceof HTMLElement) {
+        return node;
+      }
+    }
+
+    for (const candidate of container.querySelectorAll("[class]")) {
+      if (!(candidate instanceof HTMLElement)) {
+        continue;
+      }
+
+      if (hasClassFragment(candidate, "sharedappdetailsheader_topcapsule_")) {
+        return candidate;
+      }
+
+      if (hasClassFragment(candidate, "sharedappdetailsheader_titlesection_")) {
+        return candidate;
+      }
+
+      if (hasClassFragment(candidate, "sharedappdetailsheader_headerbackgroundimage_")) {
+        return candidate.parentElement instanceof HTMLElement ? candidate.parentElement : candidate;
+      }
+    }
+
+    const anchor = findInsertionAnchor(container);
+    return anchor?.parentElement instanceof HTMLElement ? anchor.parentElement : container;
+  }
+
   function formatHours(value) {
-    return value && value !== "--" ? `${value} hours` : "--";
+    return value && value !== "--" ? `${value}h` : "--";
   }
 
   function buildVisibleStats(snapshot) {
@@ -810,15 +1005,20 @@
     return stats.filter((entry) => entry.value && entry.value !== "--");
   }
 
-  function ensurePanel(container, anchor) {
+  function ensurePanel(container) {
+    const host = findOverlayHost(container);
+    if (host instanceof HTMLElement) {
+      host.classList.add("steamtools-hltb-host");
+    }
+
     let panel = container.querySelector(".steamtools-hltb-panel");
     if (!(panel instanceof HTMLElement)) {
-      panel = document.createElement("div");
+      panel = document.createElement("section");
       panel.className = "steamtools-hltb-panel";
     }
 
-    if (anchor?.parentElement && panel !== anchor.previousElementSibling) {
-      anchor.parentElement.insertBefore(panel, anchor);
+    if (host instanceof HTMLElement && panel.parentElement !== host) {
+      host.append(panel);
     } else if (!panel.isConnected) {
       container.append(panel);
     }
@@ -849,14 +1049,61 @@
       return;
     }
 
-    const anchor = findInsertionAnchor(container);
-    if (!anchor) {
+    const host = findOverlayHost(container);
+    if (!(host instanceof HTMLElement)) {
       clearPanel(container);
       return;
     }
 
-    const panel = ensurePanel(container, anchor);
+    const panel = ensurePanel(container);
     panel.replaceChildren();
+
+    const header = document.createElement("div");
+    header.className = "steamtools-hltb-header";
+
+    const headerCopy = document.createElement("div");
+    headerCopy.className = "steamtools-hltb-header-copy";
+
+    const kicker = document.createElement("div");
+    kicker.className = "steamtools-hltb-kicker";
+    kicker.textContent = "HowLongToBeat";
+
+    const brand = document.createElement("div");
+    brand.className = "steamtools-hltb-brand";
+    brand.textContent = snapshot.matchedTitle || snapshot.requestedTitle || "Playtime";
+
+    headerCopy.append(kicker, brand);
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "steamtools-hltb-toolbar";
+
+    const badge = document.createElement("div");
+    badge.className = "steamtools-hltb-badge";
+    badge.textContent = snapshot.cached ? "Cached" : "Live";
+
+    toolbar.append(badge);
+
+    if (snapshot.settings.showViewDetails && snapshot.detailUrl) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "steamtools-hltb-button";
+      button.textContent = "Details";
+      button.setAttribute("aria-label", "Open HowLongToBeat details");
+      button.addEventListener("click", () => {
+        void fetch(`${apiBase}api/hltb/open-details`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ value: snapshot.detailUrl }),
+        });
+      });
+
+      toolbar.append(button);
+    }
+
+    header.append(headerCopy, toolbar);
+    panel.append(header);
 
     const grid = document.createElement("div");
     grid.className = "steamtools-hltb-grid";
@@ -878,28 +1125,6 @@
     }
 
     panel.append(grid);
-
-    if (snapshot.settings.showViewDetails && snapshot.detailUrl) {
-      const actions = document.createElement("div");
-      actions.className = "steamtools-hltb-actions";
-
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "steamtools-hltb-button";
-      button.textContent = "View Details";
-      button.addEventListener("click", () => {
-        void fetch(`${apiBase}api/hltb/open-details`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ value: snapshot.detailUrl }),
-        });
-      });
-
-      actions.append(button);
-      panel.append(actions);
-    }
   }
 
   async function fetchSnapshot(context) {

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using SteamLoader.App.Infrastructure.StoreSync;
@@ -9,6 +10,526 @@ namespace SteamLoader.App.Tests;
 
 public sealed class StoreSyncLiveSyncHardeningTests
 {
+    [Fact]
+    public void TryBuildLiveShortcutMirrorEntries_AppendsCreatedShortcutWithLiveAppId()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryBuildLiveShortcutMirrorEntries", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(method);
+
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "xbox-game-pass",
+            "Xbox / Game Pass",
+            "Test store",
+            true,
+            false);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "xbox-game-pass",
+            @"xbox|d:\xboxgames\quake\content\microsoftgame.config|d:\xboxgames\quake",
+            "QUAKE",
+            @"D:\XboxGames\QUAKE\Content\bastet_WinStore.exe",
+            @"D:\XboxGames\QUAKE\Content",
+            string.Empty);
+        var actionKind = Enum.Parse(actionKindType!, "Create");
+        var item = CreateNonPublicInstance(
+            analysisItemType!,
+            "xbox-game-pass-02ed64b6991a",
+            "xbox-game-pass-02ed64b6991a",
+            definition,
+            game,
+            new StoreSyncTitleOverride(),
+            "QUAKE",
+            "QUAKE",
+            1111u,
+            actionKind,
+            "Create",
+            string.Empty,
+            null,
+            null,
+            null,
+            Array.Empty<string>());
+        var analysisItems = Array.CreateInstance(analysisItemType!, 1);
+        analysisItems.SetValue(item, 0);
+        var emptyCleanupCandidates = Array.CreateInstance(
+            serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic)!,
+            0);
+        var preview = new StoreSyncPreviewState(1, 0, 0, 0, 0, 0, 0, []);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            emptyCleanupCandidates,
+            0,
+            preview);
+
+        var arguments = new object?[]
+        {
+            new List<Dictionary<string, object?>>(),
+            analysis,
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["xbox-game-pass-02ed64b6991a"] = 3155387848u,
+            },
+            null,
+        };
+
+        var changed = (bool?)method!.Invoke(null, arguments);
+
+        Assert.True(changed);
+
+        var mirroredEntries = Assert.IsType<List<Dictionary<string, object?>>>(arguments[3]);
+        var shortcutEntry = Assert.Single(mirroredEntries);
+
+        Assert.Equal("QUAKE", shortcutEntry["appname"]);
+        Assert.Equal("steamloader://managed", shortcutEntry["ShortcutPath"]);
+        Assert.Equal("xbox-game-pass", ((Dictionary<string, object?>)shortcutEntry["tags"]!)["2"]);
+        Assert.Equal("xbox-game-pass-02ed64b6991a", ((Dictionary<string, object?>)shortcutEntry["tags"]!)["3"]);
+
+        var rawAppId = Assert.IsType<int>(shortcutEntry["appid"]);
+        Assert.Equal(3155387848u, unchecked((uint)rawAppId));
+    }
+
+    [Fact]
+    public void TryBuildLiveShortcutMirrorEntries_DoesNotAppendDuplicateCreatedShortcut()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryBuildLiveShortcutMirrorEntries", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(method);
+
+        var existingEntry = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["appid"] = unchecked((int)3155387848u),
+            ["appname"] = "QUAKE",
+            ["Exe"] = "\"D:\\XboxGames\\QUAKE\\Content\\bastet_WinStore.exe\"",
+            ["StartDir"] = "\"D:\\XboxGames\\QUAKE\\Content\"",
+            ["icon"] = @"D:\XboxGames\QUAKE\Content\bastet_WinStore.exe",
+            ["ShortcutPath"] = "steamloader://managed",
+            ["LaunchOptions"] = string.Empty,
+            ["IsHidden"] = 0,
+            ["AllowDesktopConfig"] = 1,
+            ["AllowOverlay"] = 1,
+            ["OpenVR"] = 0,
+            ["Devkit"] = 0,
+            ["DevkitGameID"] = string.Empty,
+            ["DevkitOverrideAppID"] = 0,
+            ["LastPlayTime"] = 0,
+            ["FlatpakAppID"] = string.Empty,
+            ["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["0"] = "Tools for Steam",
+                ["1"] = "Store Sync",
+                ["2"] = "xbox-game-pass",
+                ["3"] = "xbox-game-pass-02ed64b6991a",
+            },
+        };
+
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "xbox-game-pass",
+            "Xbox / Game Pass",
+            "Test store",
+            true,
+            false);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "xbox-game-pass",
+            @"xbox|d:\xboxgames\quake\content\microsoftgame.config|d:\xboxgames\quake",
+            "QUAKE",
+            @"D:\XboxGames\QUAKE\Content\bastet_WinStore.exe",
+            @"D:\XboxGames\QUAKE\Content",
+            string.Empty);
+        var actionKind = Enum.Parse(actionKindType!, "Create");
+        var item = CreateNonPublicInstance(
+            analysisItemType!,
+            "xbox-game-pass-02ed64b6991a",
+            "xbox-game-pass-02ed64b6991a",
+            definition,
+            game,
+            new StoreSyncTitleOverride(),
+            "QUAKE",
+            "QUAKE",
+            3155387848u,
+            actionKind,
+            "Create",
+            string.Empty,
+            null,
+            null,
+            null,
+            Array.Empty<string>());
+        var analysisItems = Array.CreateInstance(analysisItemType!, 1);
+        analysisItems.SetValue(item, 0);
+        var emptyCleanupCandidates = Array.CreateInstance(
+            serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic)!,
+            0);
+        var preview = new StoreSyncPreviewState(1, 0, 0, 0, 0, 0, 0, []);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            emptyCleanupCandidates,
+            0,
+            preview);
+
+        var arguments = new object?[]
+        {
+            new List<Dictionary<string, object?>> { existingEntry },
+            analysis,
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["xbox-game-pass-02ed64b6991a"] = 3155387848u,
+            },
+            null,
+        };
+
+        var changed = (bool?)method!.Invoke(null, arguments);
+
+        Assert.False(changed);
+
+        var mirroredEntries = Assert.IsType<List<Dictionary<string, object?>>>(arguments[3]);
+        var shortcutEntry = Assert.Single(mirroredEntries);
+        Assert.Equal("QUAKE", shortcutEntry["appname"]);
+    }
+
+    [Fact]
+    public void TryBuildLiveShortcutMirrorEntries_RefreshesManagedShortcutWithoutDroppingPlaytime()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryBuildLiveShortcutMirrorEntries", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var existingEntry = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["appid"] = unchecked((int)1002u),
+            ["appname"] = "Anno 117 Old",
+            ["Exe"] = "\"C:\\Games\\Ubisoft\\UbisoftConnect.exe\"",
+            ["StartDir"] = "\"C:\\Games\\Ubisoft\"",
+            ["icon"] = @"C:\Games\Ubisoft\UbisoftConnect.exe",
+            ["ShortcutPath"] = "steamloader://managed",
+            ["LaunchOptions"] = "uplay://launch/9999/0",
+            ["IsHidden"] = 0,
+            ["AllowDesktopConfig"] = 1,
+            ["AllowOverlay"] = 1,
+            ["OpenVR"] = 0,
+            ["Devkit"] = 0,
+            ["DevkitGameID"] = string.Empty,
+            ["DevkitOverrideAppID"] = 0,
+            ["LastPlayTime"] = 77,
+            ["FlatpakAppID"] = string.Empty,
+            ["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["0"] = "Tools for Steam",
+                ["1"] = "Store Sync",
+                ["2"] = "ubisoft-connect",
+                ["3"] = "ubisoft-connect-anno",
+            },
+        };
+
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "ubisoft-connect",
+            "Ubisoft Connect",
+            "Test store",
+            true,
+            false);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "ubisoft-connect",
+            "ubisoft|anno",
+            "Anno 117 Pax Romana",
+            @"C:\Games\Ubisoft\UbisoftConnect.exe",
+            @"C:\Games\Ubisoft",
+            "uplay://launch/1234/0");
+        var existingShortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            0,
+            1002u,
+            "Anno 117 Old",
+            @"C:\Games\Ubisoft\UbisoftConnect.exe",
+            @"C:\Games\Ubisoft",
+            "uplay://launch/9999/0",
+            true,
+            "ubisoft-connect",
+            "ubisoft-connect-anno",
+            existingEntry);
+        var actionKind = Enum.Parse(actionKindType!, "RefreshManaged");
+        var item = CreateNonPublicInstance(
+            analysisItemType!,
+            "ubisoft-connect-anno",
+            "ubisoft-connect-anno",
+            definition,
+            game,
+            new StoreSyncTitleOverride(),
+            "Anno 117 Pax Romana",
+            "Anno 117 Pax Romana",
+            1002u,
+            actionKind,
+            "Refresh Managed",
+            string.Empty,
+            existingShortcut,
+            null,
+            null,
+            Array.Empty<string>());
+        var analysisItems = Array.CreateInstance(analysisItemType!, 1);
+        analysisItems.SetValue(item, 0);
+        var emptyCleanupCandidates = Array.CreateInstance(
+            serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic)!,
+            0);
+        var preview = new StoreSyncPreviewState(0, 1, 0, 0, 0, 0, 0, []);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            emptyCleanupCandidates,
+            0,
+            preview);
+
+        var arguments = new object?[]
+        {
+            new List<Dictionary<string, object?>> { existingEntry },
+            analysis,
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase),
+            null,
+        };
+
+        var changed = (bool?)method!.Invoke(null, arguments);
+
+        Assert.True(changed);
+
+        var mirroredEntries = Assert.IsType<List<Dictionary<string, object?>>>(arguments[3]);
+        var refreshedEntry = Assert.Single(mirroredEntries);
+
+        Assert.Equal("Anno 117 Pax Romana", refreshedEntry["appname"]);
+        Assert.Equal("uplay://launch/1234/0", refreshedEntry["LaunchOptions"]);
+        Assert.Equal(77, refreshedEntry["LastPlayTime"]);
+        Assert.Equal("ubisoft-connect-anno", ((Dictionary<string, object?>)refreshedEntry["tags"]!)["3"]);
+    }
+
+    [Fact]
+    public void ResolveActionKind_KeepsManagedManifestOnRefresh_WhenShortcutIsTemporarilyMissing()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("ResolveActionKind", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(method);
+
+        var configuration = new StoreSyncConfiguration();
+        var manifestEntry = new StoreSyncManifestEntry
+        {
+            TitleId = "xbox-game-pass-doom3",
+            StoreId = "xbox-game-pass",
+            StoreItemId = @"xbox|c:\xboxgames\doom 3\content\microsoftgame.config|c:\xboxgames\doom 3",
+            Title = "DOOM 3",
+            EffectiveTitle = "DOOM 3",
+            ExecutablePath = @"C:\XboxGames\DOOM 3\Content\Doom3.exe",
+            AppId = 3304478195u,
+            ManagedShortcut = true,
+        };
+
+        var result = method!.Invoke(null, [configuration, new StoreSyncTitleOverride(), manifestEntry, null]);
+
+        Assert.Equal(Enum.Parse(actionKindType!, "RefreshManaged"), result);
+    }
+
+    [Fact]
+    public void BuildLiveShortcutSyncPlan_RefreshesManagedShortcutByManifestAppId_WhenLoadedShortcutIsMissing()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("BuildLiveShortcutSyncPlan", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(method);
+
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "xbox-game-pass",
+            "Xbox / Game Pass",
+            "Test store",
+            true,
+            false);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "xbox-game-pass",
+            @"xbox|c:\xboxgames\doom 3\content\microsoftgame.config|c:\xboxgames\doom 3",
+            "DOOM 3",
+            @"C:\XboxGames\DOOM 3\Content\Doom3.exe",
+            @"C:\XboxGames\DOOM 3\Content",
+            string.Empty);
+        var manifestEntry = new StoreSyncManifestEntry
+        {
+            TitleId = "xbox-game-pass-doom3",
+            StoreId = "xbox-game-pass",
+            StoreItemId = @"xbox|c:\xboxgames\doom 3\content\microsoftgame.config|c:\xboxgames\doom 3",
+            Title = "DOOM 3",
+            EffectiveTitle = "DOOM 3",
+            ExecutablePath = @"C:\XboxGames\DOOM 3\Content\Doom3.exe",
+            AppId = 3304478195u,
+            ManagedShortcut = true,
+        };
+        var actionKind = Enum.Parse(actionKindType!, "RefreshManaged");
+        var item = CreateNonPublicInstance(
+            analysisItemType!,
+            "xbox-game-pass-doom3",
+            "xbox-game-pass-doom3",
+            definition,
+            game,
+            new StoreSyncTitleOverride(),
+            "DOOM 3",
+            "DOOM 3",
+            3304478195u,
+            actionKind,
+            "Refresh Managed",
+            string.Empty,
+            null,
+            manifestEntry,
+            null,
+            Array.Empty<string>());
+        var analysisItems = Array.CreateInstance(analysisItemType!, 1);
+        analysisItems.SetValue(item, 0);
+        var emptyCleanupCandidates = Array.CreateInstance(
+            serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic)!,
+            0);
+        var preview = new StoreSyncPreviewState(0, 1, 0, 0, 0, 0, 0, []);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            emptyCleanupCandidates,
+            0,
+            preview);
+
+        var plan = method!.Invoke(
+            null,
+            [
+                new StoreSyncConfiguration(),
+                new SteamProfileInfo("User", "user", "1", "1", @"C:\Steam\shortcuts.vdf"),
+                analysis
+            ]);
+
+        Assert.NotNull(plan);
+
+        var updateOperations = plan!.GetType().GetProperty("UpdateOperations")?.GetValue(plan) as System.Collections.IEnumerable;
+        Assert.NotNull(updateOperations);
+
+        var update = Assert.Single(updateOperations!.Cast<object>());
+        var appId = (uint?)update.GetType().GetProperty("AppId")?.GetValue(update);
+        Assert.Equal(3304478195u, appId);
+        var forceCreate = (bool?)update.GetType().GetProperty("ForceCreate")?.GetValue(update);
+        Assert.True(forceCreate);
+    }
+
+    [Fact]
+    public void TryCreateXboxGameFromConfig_UsesAppxManifestDisplayName_WhenConfigOnlyHasMsResourcePlaceholder()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var method = serviceType.GetMethod("TryCreateXboxGameFromConfig", BindingFlags.NonPublic | BindingFlags.Static);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+
+        Assert.NotNull(method);
+        Assert.NotNull(storeGameEntryType);
+
+        var rootDirectory = Path.Combine(Path.GetTempPath(), $"tfs-xbox-title-{Guid.NewGuid():N}");
+        var contentDirectory = Path.Combine(rootDirectory, "Content");
+        Directory.CreateDirectory(contentDirectory);
+
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(contentDirectory, "MicrosoftGame.config"),
+                """
+                <?xml version="1.0" encoding="utf-8"?>
+                <Game>
+                  <ShellVisuals DefaultDisplayName="ms-resource:AppDisplayName" Description="ms-resource:AppDescription" />
+                  <Executables>
+                    <Executable Name="Kani.exe" TargetDeviceFamily="PC" />
+                  </Executables>
+                </Game>
+                """);
+            File.WriteAllText(
+                Path.Combine(contentDirectory, "appxmanifest.xml"),
+                """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Package xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+                  <Identity Name="tinyBuildGames.KillItWithFire2" Publisher="CN=Test" Version="1.0.0.0" ProcessorArchitecture="x64" />
+                  <Properties>
+                    <DisplayName>Kill It With Fire 2</DisplayName>
+                  </Properties>
+                  <Applications>
+                    <Application Id="App" Executable="Kani.exe" EntryPoint="Windows.FullTrustApplication">
+                      <uap:VisualElements DisplayName="ms-resource:AppDisplayName" />
+                    </Application>
+                  </Applications>
+                </Package>
+                """);
+            File.WriteAllBytes(Path.Combine(contentDirectory, "Kani.exe"), [0x4D, 0x5A]);
+
+            var arguments = new object?[]
+            {
+                rootDirectory,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                null,
+            };
+
+            var created = (bool?)method!.Invoke(null, arguments);
+
+            Assert.True(created);
+            Assert.NotNull(arguments[2]);
+
+            var title = (string?)storeGameEntryType!.GetProperty("Title")?.GetValue(arguments[2]);
+            Assert.Equal("Kill It With Fire 2", title);
+        }
+        finally
+        {
+            if (Directory.Exists(rootDirectory))
+            {
+                Directory.Delete(rootDirectory, recursive: true);
+            }
+        }
+    }
+
     [Fact]
     public void TryFindExistingShortcut_PrefersMatchingLaunchOptions_ForSharedExecutables()
     {
@@ -157,6 +678,57 @@ public sealed class StoreSyncLiveSyncHardeningTests
         Assert.Null(ignored);
         Assert.Null(mismatched);
         Assert.NotNull(matched);
+    }
+
+    [Fact]
+    public void BuildLiveShortcutSyncExpression_AlwaysCreatesNewShortcutsThroughAddShortcut()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var createOperationType = serviceType.GetNestedType("LiveShortcutSyncCreateOperation", BindingFlags.NonPublic);
+        var updateOperationType = serviceType.GetNestedType("LiveShortcutSyncUpdateOperation", BindingFlags.NonPublic);
+        var removeOperationType = serviceType.GetNestedType("LiveShortcutSyncRemoveOperation", BindingFlags.NonPublic);
+        var planType = serviceType.GetNestedType("LiveShortcutSyncPlan", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("BuildLiveShortcutSyncExpression", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(createOperationType);
+        Assert.NotNull(updateOperationType);
+        Assert.NotNull(removeOperationType);
+        Assert.NotNull(planType);
+        Assert.NotNull(method);
+
+        var createOperation = CreateNonPublicInstance(
+            createOperationType!,
+            "xbox-game-pass-quake",
+            3155387848u,
+            "QUAKE",
+            @"D:\XboxGames\QUAKE\Content\bastet_WinStore.exe",
+            @"D:\XboxGames\QUAKE\Content",
+            string.Empty,
+            @"D:\XboxGames\QUAKE\Content\bastet_WinStore.exe");
+        var createOperations = Array.CreateInstance(createOperationType!, 1);
+        createOperations.SetValue(createOperation, 0);
+        var updateOperations = Array.CreateInstance(updateOperationType!, 0);
+        var removeOperations = Array.CreateInstance(removeOperationType!, 0);
+        var plan = CreateNonPublicInstance(
+            planType!,
+            "226501611",
+            true,
+            createOperations,
+            updateOperations,
+            removeOperations);
+
+        var expression = Assert.IsType<string>(method!.Invoke(null, [plan]));
+        var createMarker = "for (const operation of plan.createOperations ?? [])";
+        var updateMarker = "for (const operation of plan.updateOperations ?? [])";
+        var createStart = expression.IndexOf(createMarker, StringComparison.Ordinal);
+        var updateStart = expression.IndexOf(updateMarker, StringComparison.Ordinal);
+
+        Assert.True(createStart >= 0, "The live sync JavaScript should include a create loop.");
+        Assert.True(updateStart > createStart, "The update loop should appear after the create loop.");
+
+        var createBlock = expression.Substring(createStart, updateStart - createStart);
+        Assert.Contains("\"AddShortcut\"", createBlock, StringComparison.Ordinal);
+        Assert.DoesNotContain("tryApplyToShortcut", createBlock, StringComparison.Ordinal);
     }
 
     [Fact]

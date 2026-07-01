@@ -22,7 +22,8 @@ internal sealed class SteamGridDbArtworkDownloader
             ],
             FileStemBuilder: gridId => gridId,
             PreferredWidth: 920,
-            PreferredHeight: 430),
+            PreferredHeight: 430,
+            SupportsBadge: true),
         new(
             SlotName: "portrait",
             RequestPaths:
@@ -32,7 +33,8 @@ internal sealed class SteamGridDbArtworkDownloader
             ],
             FileStemBuilder: gridId => $"{gridId}p",
             PreferredWidth: 600,
-            PreferredHeight: 900),
+            PreferredHeight: 900,
+            SupportsBadge: true),
         new(
             SlotName: "hero",
             RequestPaths:
@@ -42,7 +44,8 @@ internal sealed class SteamGridDbArtworkDownloader
             ],
             FileStemBuilder: gridId => $"{gridId}_hero",
             PreferredWidth: 1920,
-            PreferredHeight: 620),
+            PreferredHeight: 620,
+            SupportsBadge: true),
         new(
             SlotName: "logo",
             RequestPaths:
@@ -51,7 +54,8 @@ internal sealed class SteamGridDbArtworkDownloader
             ],
             FileStemBuilder: gridId => $"{gridId}_logo",
             PreferredWidth: null,
-            PreferredHeight: null),
+            PreferredHeight: null,
+            SupportsBadge: false),
         new(
             SlotName: "icon",
             RequestPaths:
@@ -61,7 +65,8 @@ internal sealed class SteamGridDbArtworkDownloader
             ],
             FileStemBuilder: gridId => $"{gridId}-icon",
             PreferredWidth: 256,
-            PreferredHeight: 256),
+            PreferredHeight: 256,
+            SupportsBadge: false),
     ];
 
     private static readonly IReadOnlyDictionary<string, string[]> KnownTitleAliases =
@@ -150,6 +155,7 @@ internal sealed class SteamGridDbArtworkDownloader
                     gridDirectory,
                     SteamShortcutIds.BuildGridId(target.AppId),
                     match.GameId,
+                    target.StoreId,
                     cancellationToken);
 
                 if (updatedFilesForTitle > 0)
@@ -323,6 +329,7 @@ internal sealed class SteamGridDbArtworkDownloader
         string gridDirectory,
         string gridId,
         int gameId,
+        string? storeId,
         CancellationToken cancellationToken)
     {
         var updatedFileCount = 0;
@@ -334,6 +341,7 @@ internal sealed class SteamGridDbArtworkDownloader
                 if (await DownloadArtworkSlotAsync(httpClient, gridDirectory, gridId, slot, gameId, cancellationToken))
                 {
                     updatedFileCount++;
+                    await TryApplyStoreBadgeAsync(gridDirectory, gridId, slot, storeId, cancellationToken);
                 }
             }
             catch
@@ -348,6 +356,7 @@ internal sealed class SteamGridDbArtworkDownloader
                 gridDirectory,
                 gridId,
                 gameId,
+                storeId,
                 cancellationToken);
         }
 
@@ -359,6 +368,7 @@ internal sealed class SteamGridDbArtworkDownloader
         string gridDirectory,
         string gridId,
         int gameId,
+        string? storeId,
         CancellationToken cancellationToken)
     {
         var updatedFileCount = 0;
@@ -375,6 +385,7 @@ internal sealed class SteamGridDbArtworkDownloader
                 if (await DownloadArtworkSlotAsync(httpClient, gridDirectory, gridId, slot, gameId, cancellationToken))
                 {
                     updatedFileCount++;
+                    await TryApplyStoreBadgeAsync(gridDirectory, gridId, slot, storeId, cancellationToken);
                 }
             }
             catch
@@ -383,6 +394,40 @@ internal sealed class SteamGridDbArtworkDownloader
         }
 
         return updatedFileCount;
+    }
+
+    private static async Task TryApplyStoreBadgeAsync(
+        string gridDirectory,
+        string gridId,
+        ArtworkSlot slot,
+        string? storeId,
+        CancellationToken cancellationToken)
+    {
+        if (!slot.SupportsBadge || string.IsNullOrWhiteSpace(storeId))
+        {
+            return;
+        }
+
+        var fileStem = slot.FileStemBuilder(gridId);
+        var imagePath = FindArtworkFile(gridDirectory, fileStem);
+        if (!string.IsNullOrWhiteSpace(imagePath))
+        {
+            await StoreBadgeCompositor.ApplyBadgeAsync(imagePath, storeId, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static string? FindArtworkFile(string gridDirectory, string fileStem)
+    {
+        foreach (var extension in new[] { ".png", ".jpg", ".jpeg" })
+        {
+            var path = Path.Combine(gridDirectory, fileStem + extension);
+            if (File.Exists(path))
+            {
+                return path;
+            }
+        }
+
+        return null;
     }
 
     private static async Task<bool> DownloadArtworkSlotAsync(
@@ -923,7 +968,8 @@ internal sealed class SteamGridDbArtworkDownloader
         IReadOnlyList<string> RequestPaths,
         Func<string, string> FileStemBuilder,
         int? PreferredWidth,
-        int? PreferredHeight);
+        int? PreferredHeight,
+        bool SupportsBadge = false);
 
     private sealed record SteamGridDbListResponse<T>(
         bool Success,
@@ -953,7 +999,8 @@ internal sealed record StoreSyncArtworkTarget(
     uint AppId,
     IReadOnlyList<string> SearchHints,
     int? CachedGameId,
-    string CachedMatchName);
+    string CachedMatchName,
+    string StoreId = "");
 
 internal sealed record StoreSyncArtworkSummary(
     int UpdatedTitleCount,

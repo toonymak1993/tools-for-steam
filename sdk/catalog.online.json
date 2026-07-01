@@ -1,0 +1,26 @@
+﻿{
+    "title":  "TFS Community",
+    "description":  "Official Tools for Steam community plugin catalog.",
+    "plugins":  [
+                    {
+                        "id":  "home-assistant",
+                        "title":  "Home Assistant",
+                        "description":  "Control Home Assistant light entities from Tools for Steam.",
+                        "author":  "Tools for Steam",
+                        "category":  "Smart Home",
+                        "version":  "0.1.0",
+                        "packageUrl":  "https://raw.githubusercontent.com/toonymak1993/tools-for-steam/main/sdk/packages/home-assistant.zip",
+                        "packageSha256":  "50D1881054EB1B97BC093B0E98C3D24E1D428936AFB3D6C3D5535C1455C2F805",
+                        "images":  [
+                                       "https://raw.githubusercontent.com/toonymak1993/tools-for-steam/main/sdk/images/home-assistant.png"
+                                   ],
+                        "tags":  [
+                                     "smart-home",
+                                     "lights",
+                                     "sdk-v1"
+                                 ],
+                        "homepageUrl":  "https://www.home-assistant.io/",
+                        "repositoryUrl":  "https://developers.home-assistant.io/docs/api/rest/"
+                    }
+                ]
+}

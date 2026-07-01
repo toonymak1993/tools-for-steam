@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 21) {
+  if (existing?.version >= 39) {
     return;
   }
 
@@ -25,8 +25,10 @@
     footerLegend: Object.freeze([]),
     autoFocusIndex: null,
     panelClassName: "",
+    sectionHeaders: Object.freeze([]),
     dividerAfterIndex: null,
     dividerAfterIndices: null,
+    topSlots: Object.freeze([]),
     volumePanel: null,
     cards: Object.freeze([]),
     editor: null,
@@ -718,7 +720,7 @@
       return renderSwitchAccessory(createElement, withChildren, slot);
     }
 
-    if (slot.badge) {
+    if (slot.badge && slot.layout !== "feature") {
       return createElement("span", {
         className: "steamloader-badge",
         children: slot.badge,
@@ -758,6 +760,15 @@
       slotKey: options.slotKey || options.key || "",
       selected: Boolean(options.selected),
       value: options.value,
+      layout: options.layout || "",
+      expanded: Boolean(options.expanded),
+      eyebrow: options.eyebrow || "",
+      meta: Array.isArray(options.meta) ? options.meta.filter(Boolean) : [],
+      mediaImageSrc: options.mediaImageSrc || "",
+      mediaImageAlt: options.mediaImageAlt || "",
+      footerLabel: options.footerLabel || "",
+      stepperLeftDisabled: Boolean(options.stepperLeftDisabled),
+      stepperRightDisabled: Boolean(options.stepperRightDisabled),
       nativeComponentId:
         options.nativeComponentId || nativeComponentByRole[options.role || "action"] || "dialogButton",
     };
@@ -817,30 +828,300 @@
     });
   }
 
+  function createAccordionSlot(title, copy, expanded, onClick, options = {}) {
+    return createCommandSlot(title, copy, onClick, {
+      ...options,
+      layout: "accordion",
+      expanded,
+      buttonClassName:
+        options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-accordion",
+    });
+  }
+
+  function createFeatureNavigationSlot(title, copy, onClick, options = {}) {
+    return createNavigationSlot(title, copy, onClick, {
+      ...options,
+      layout: "feature",
+      eyebrow: options.eyebrow || "",
+      meta: Array.isArray(options.meta) ? options.meta : [],
+      mediaImageSrc: options.mediaImageSrc || "",
+      mediaImageAlt: options.mediaImageAlt || title || "",
+      footerLabel: options.footerLabel || "Open",
+      buttonClassName:
+        options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-feature",
+    });
+  }
+
+  function createInlineStepperSlot(title, copy, onMoveLeft, onMoveRight, options = {}) {
+    const leftDisabled = Boolean(options.leftDisabled);
+    const rightDisabled = Boolean(options.rightDisabled);
+    const externalButtonProps = options.buttonProps || {};
+
+    return createCommandSlot(
+      title,
+      copy,
+      options.onClick || onMoveRight || onMoveLeft || (() => {}),
+      {
+        ...options,
+        layout: "stepper",
+        trailing: "none",
+        stepperLeftDisabled: leftDisabled,
+        stepperRightDisabled: rightDisabled,
+        buttonClassName:
+          options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-inline-stepper",
+        buttonProps: {
+          ...externalButtonProps,
+          onMoveLeft: (event) => {
+            externalButtonProps.onMoveLeft?.(event);
+            if (!leftDisabled) {
+              onMoveLeft?.(event);
+            }
+            return true;
+          },
+          onMoveRight: (event) => {
+            externalButtonProps.onMoveRight?.(event);
+            if (!rightDisabled) {
+              onMoveRight?.(event);
+            }
+            return true;
+          },
+        },
+      },
+    );
+  }
+
   function createScreenModel(overrides = {}) {
     return {
       ...defaultModel,
       ...overrides,
       cards: Array.isArray(overrides.cards) ? overrides.cards : [],
+      sectionHeaders: Array.isArray(overrides.sectionHeaders) ? overrides.sectionHeaders : [],
+      topSlots: Array.isArray(overrides.topSlots) ? overrides.topSlots : [],
       slots: Array.isArray(overrides.slots) ? overrides.slots : [],
     };
   }
 
+  function getRenderableSlots(model) {
+    return [
+      ...(Array.isArray(model?.topSlots) ? model.topSlots : []),
+      ...(Array.isArray(model?.slots) ? model.slots : []),
+    ];
+  }
+
   function buildRowClassName(slot) {
     const roleClassName = slot.role ? ` steamtools-row-${slot.role}` : "";
+    const layoutClassName = slot.layout ? ` steamtools-row-layout-${slot.layout}` : "";
 
     if (slot.leadingIcon) {
       return slot.rowClassName
-        ? `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName} ${slot.rowClassName}`
-        : `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName}`;
+        ? `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName}${layoutClassName} ${slot.rowClassName}`
+        : `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName}${layoutClassName}`;
     }
 
     return slot.rowClassName
-      ? `steamloader-row-shell${roleClassName} ${slot.rowClassName}`
-      : `steamloader-row-shell${roleClassName}`;
+      ? `steamloader-row-shell${roleClassName}${layoutClassName} ${slot.rowClassName}`
+      : `steamloader-row-shell${roleClassName}${layoutClassName}`;
   }
 
-  function createRowContent(createElement, withChildren, slot, trailingNode) {
+  function createAccordionRowContent(createElement, withChildren, slot) {
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: `steamloader-accordion-toggle${slot.expanded ? " is-expanded" : ""}`,
+        },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-accordion-toggle-copy-wrap" },
+            createElement("div", {
+              className: "steamloader-accordion-toggle-title",
+              children: slot.title,
+            }),
+            slot.copy
+              ? createElement("div", {
+                  className: "steamloader-accordion-toggle-copy",
+                  children: slot.copy,
+                })
+              : null,
+          ),
+        ),
+        createElement("span", {
+          className: "steamloader-accordion-toggle-arrow",
+          children: "v",
+        }),
+      ),
+    );
+  }
+
+  function createFeatureRowContent(createElement, withChildren, slot, trailingNode) {
+    const metaItems = Array.isArray(slot.meta) ? slot.meta.filter(Boolean) : [];
+    const FeatureIcon = slot.leadingIcon;
+
+    return createElement(
+      "div",
+      withChildren(
+        { className: "steamloader-feature-card" },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-feature-media-shell" },
+            slot.mediaImageSrc
+              ? createElement("img", {
+                  className: "steamloader-feature-media",
+                  src: slot.mediaImageSrc,
+                  alt: slot.mediaImageAlt || slot.title || "",
+                })
+              : createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-feature-media-placeholder" },
+                    FeatureIcon ? createElement(FeatureIcon, {}) : null,
+                  ),
+                ),
+            slot.eyebrow
+              ? createElement("span", {
+                  className: "steamloader-feature-eyebrow",
+                  children: slot.eyebrow,
+                })
+              : null,
+            slot.badge
+              ? createElement("span", {
+                  className: "steamloader-badge steamloader-feature-status",
+                  children: slot.badge,
+                })
+              : null,
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-feature-body" },
+            createElement("div", {
+              className: "steamloader-feature-title",
+              children: slot.title,
+            }),
+            slot.copy
+              ? createElement("div", {
+                  className: "steamloader-feature-copy",
+                  children: slot.copy,
+                })
+              : null,
+            metaItems.length
+              ? createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-feature-meta" },
+                    ...metaItems.map((item, metaIndex) =>
+                      createElement("span", {
+                        className: "steamloader-feature-meta-item",
+                        key: `feature-meta-${metaIndex}`,
+                        children: item,
+                      }),
+                    ),
+                  ),
+                )
+              : null,
+            createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-feature-footer" },
+                createElement("span", {
+                  className: "steamloader-feature-footer-copy",
+                  children: slot.footerLabel || "Open",
+                }),
+                trailingNode
+                  ? createElement(
+                      "span",
+                      withChildren(
+                        { className: "steamloader-feature-footer-chevron" },
+                        trailingNode,
+                      ),
+                    )
+                  : null,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  function createInlineStepperRowContent(createElement, withChildren, slot, helpers = {}) {
+    const StepperBackIcon = helpers.BackIcon;
+    const StepperNextIcon = helpers.ChevronIcon;
+    const primaryText = slot.title || slot.copy || "";
+    const secondaryText = slot.title && slot.copy ? slot.copy : "";
+
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: `steamloader-inline-stepper${secondaryText ? "" : " is-compact"}`,
+        },
+        createElement(
+          "span",
+          withChildren(
+            {
+              className: `steamloader-inline-stepper-arrow${slot.stepperLeftDisabled ? " is-disabled" : ""}`,
+              "aria-hidden": "true",
+            },
+            StepperBackIcon
+              ? createElement(StepperBackIcon, {})
+              : createElement("span", {
+                  children: "<",
+                }),
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-inline-stepper-main" },
+            primaryText
+              ? createElement("div", {
+                  className: "steamloader-inline-stepper-title",
+                  children: primaryText,
+                })
+              : null,
+            secondaryText
+              ? createElement("div", {
+                  className: "steamloader-inline-stepper-copy",
+                  children: secondaryText,
+                })
+              : null,
+          ),
+        ),
+        createElement(
+          "span",
+          withChildren(
+            {
+              className: `steamloader-inline-stepper-arrow${slot.stepperRightDisabled ? " is-disabled" : ""}`,
+              "aria-hidden": "true",
+            },
+            StepperNextIcon
+              ? createElement(StepperNextIcon, {})
+              : createElement("span", {
+                  children: ">",
+                }),
+          ),
+        ),
+      ),
+    );
+  }
+
+  function createRowContent(createElement, withChildren, slot, trailingNode, helpers = {}) {
+    if (slot.layout === "accordion") {
+      return createAccordionRowContent(createElement, withChildren, slot);
+    }
+
+    if (slot.layout === "feature") {
+      return createFeatureRowContent(createElement, withChildren, slot, trailingNode);
+    }
+
+    if (slot.layout === "stepper") {
+      return createInlineStepperRowContent(createElement, withChildren, slot, helpers);
+    }
+
     return createElement(
       "div",
       withChildren(
@@ -867,6 +1148,24 @@
                   className: "steamloader-row-copy",
                   children: slot.copy,
                 })
+              : null,
+            slot.swatchHex
+              ? createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-row-swatch" },
+                    createElement("span", {
+                      className: "steamloader-row-swatch-dot",
+                      style: {
+                        background: slot.swatchHex,
+                      },
+                    }),
+                    createElement("span", {
+                      className: "steamloader-row-swatch-label",
+                      children: slot.swatchLabel || slot.swatchHex,
+                    }),
+                  ),
+                )
               : null,
           ),
         ),
@@ -915,6 +1214,10 @@
   }
 
   function createButtonSlot(state, createElement, withChildren, slot, index, autoFocusIndex, helpers) {
+    if (typeof slot?.customRenderer === "function") {
+      return slot.customRenderer(slot, index, autoFocusIndex);
+    }
+
     const backNavigation = typeof helpers.getBackNavigation === "function"
       ? helpers.getBackNavigation()
       : null;
@@ -934,6 +1237,7 @@
         typeof helpers.renderTrailingContent === "function"
           ? helpers.renderTrailingContent(slot)
           : renderTrailingContent(createElement, withChildren, slot, helpers),
+        helpers,
       ),
       () => invokeSlotAction(state, slot, index, helpers),
       {
@@ -942,19 +1246,25 @@
         className: slot.buttonClassName || "steamloader-dialog-button",
         extraProps: {
           ...roleProps,
+          ...(slot.buttonProps || {}),
           "data-slot-button": String(index),
+          "data-slot-key": helpers.resolveSlotFocusKey?.(slot, index) || slot.slotKey || undefined,
           "data-native-component": nativeComponentId,
           "data-native-component-ready": nativeAvailable ? "true" : "false",
           "data-setting-scope": slot.settingScope || undefined,
           "data-setting-key": slot.settingKey || undefined,
           style: slot.buttonStyle || undefined,
           autoFocus: Number.isInteger(autoFocusIndex) && index === autoFocusIndex,
+          onGamepadFocus: () => {
+            helpers.rememberCurrentRouteSlot?.(index, slot);
+            helpers.rememberCurrentRouteIndex?.(index);
+            slot.buttonProps?.onGamepadFocus?.();
+          },
           onCancelButton: backNavigation
             ? () => {
                 helpers.navigateBackFromRoute();
               }
             : undefined,
-          ...(slot.buttonProps || {}),
         },
       },
     );
@@ -989,6 +1299,24 @@
             children: line,
           }),
         ),
+        card.swatchHex
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-card-swatch" },
+                createElement("span", {
+                  className: "steamloader-card-swatch-dot",
+                  style: {
+                    background: card.swatchHex,
+                  },
+                }),
+                createElement("span", {
+                  className: "steamloader-card-swatch-label",
+                  children: card.swatchLabel || card.swatchHex,
+                }),
+              ),
+            )
+          : null,
       ),
       `steamloader-card-${index}`,
     );
@@ -1061,8 +1389,280 @@
     );
   }
 
-  function createEditorCard(createElement, withChildren, editor) {
+  function tryInvokeSteamKeyboardOpener(opener, argSets) {
+    for (const args of argSets) {
+      try {
+        opener(...args);
+        return true;
+      } catch {
+      }
+    }
+
+    return false;
+  }
+
+  function tryPostSteamVirtualKeyboardMessage(message) {
+    const payload = {
+      type: "VirtualKeyboardMessage",
+      message,
+    };
+    const payloadText = JSON.stringify(payload);
+    let posted = false;
+
+    try {
+      if (typeof window.SteamClient?.BrowserView?.PostMessageToParent === "function") {
+        window.SteamClient.BrowserView.PostMessageToParent(payload.type, payloadText);
+        posted = true;
+      }
+    } catch {
+    }
+
+    try {
+      if (window.parent && window.parent !== window && typeof window.parent.postMessage === "function") {
+        window.parent.postMessage(payload, "*");
+        posted = true;
+      }
+    } catch {
+    }
+
+    try {
+      if (window.opener && typeof window.opener.postMessage === "function") {
+        window.opener.postMessage(payload, "*");
+        posted = true;
+      }
+    } catch {
+    }
+
+    return posted;
+  }
+
+  let lastTfsSteamKeyboardRequestAt = 0;
+  let lastTfsSteamKeyboardRequestKey = "";
+
+  function requestTfsSteamKeyboard(element, description, apiEndpointBase) {
+    const base = apiEndpointBase || window.__steamLoaderApiBase || "";
+    if (!base || !(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const currentValue = element.value || "";
+    const payload = {
+      label: description || "Text",
+      value: currentValue,
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    const requestKey = JSON.stringify({
+      label: payload.label,
+      value: payload.value,
+      x: Math.round(payload.x),
+      y: Math.round(payload.y),
+      width: Math.round(payload.width),
+      height: Math.round(payload.height),
+    });
+    const now = Date.now();
+
+    if (requestKey === lastTfsSteamKeyboardRequestKey && now - lastTfsSteamKeyboardRequestAt < 650) {
+      return true;
+    }
+
+    lastTfsSteamKeyboardRequestKey = requestKey;
+    lastTfsSteamKeyboardRequestAt = now;
+
+    try {
+      void fetch(`${base}api/steam/keyboard/show`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function tryOpenSteamKeyboard(element, description, apiEndpointBase) {
+    if (requestTfsSteamKeyboard(element, description, apiEndpointBase)) {
+      return true;
+    }
+
+    const label = description || "Text";
+    const currentValue = element instanceof HTMLElement ? element.value || "" : "";
+    const rect = element instanceof HTMLElement ? element.getBoundingClientRect() : null;
+    let opened = false;
+
+    try {
+      if (typeof window.navigator?.virtualKeyboard?.show === "function") {
+        window.navigator.virtualKeyboard.show();
+        opened = true;
+      }
+    } catch {
+    }
+
+    opened = tryPostSteamVirtualKeyboardMessage("ShowVirtualKeyboard") || opened;
+
+    const steamInput = window.SteamClient?.Input;
+    if (typeof steamInput?.ShowFloatingGamepadTextInput === "function" && rect) {
+      opened =
+        tryInvokeSteamKeyboardOpener(steamInput.ShowFloatingGamepadTextInput.bind(steamInput), [
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.right), Math.round(rect.bottom)],
+        ]) || opened;
+    }
+
+    if (typeof steamInput?.ShowGamepadTextInput === "function") {
+      opened =
+        tryInvokeSteamKeyboardOpener(steamInput.ShowGamepadTextInput.bind(steamInput), [
+          [0, 0, label, 256, currentValue],
+          [0, 0, label, 1024, currentValue],
+        ]) || opened;
+    }
+
+    const openVrKeyboard = window.SteamClient?.OpenVR?.Keyboard;
+    if (typeof openVrKeyboard?.Show === "function") {
+      opened =
+        tryInvokeSteamKeyboardOpener(openVrKeyboard.Show.bind(openVrKeyboard), [
+          [],
+          [0, 0, 0, label, 256, currentValue, false, 0],
+          [0, 0, label, 256, currentValue],
+          [label, currentValue],
+        ]) || opened;
+    }
+
+    return opened;
+  }
+
+  function findEditorTextarea(editorDataKey) {
+    for (const element of document.querySelectorAll("#quickaccess_content_7 [data-editor-key]")) {
+      if (element.getAttribute("data-editor-key") === editorDataKey) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  function getEditorDataKey(element) {
+    const value = element?.getAttribute?.("data-editor-key");
+    return typeof value === "string" && value.trim() ? value.trim() : "";
+  }
+
+  function ensureEditorSelectionStore(state) {
+    if (!state.editorSelectionByKey || typeof state.editorSelectionByKey !== "object") {
+      state.editorSelectionByKey = {};
+    }
+
+    return state.editorSelectionByKey;
+  }
+
+  function rememberEditorSelection(state, element) {
+    if (
+      !state ||
+      !(element instanceof HTMLElement) ||
+      typeof element.selectionStart !== "number" ||
+      typeof element.selectionEnd !== "number"
+    ) {
+      return null;
+    }
+
+    const editorKey = getEditorDataKey(element);
+    if (!editorKey) {
+      return null;
+    }
+
+    const value = typeof element.value === "string" ? element.value : "";
+    const selection = {
+      start: Math.max(0, Math.min(value.length, element.selectionStart)),
+      end: Math.max(0, Math.min(value.length, element.selectionEnd)),
+      direction: typeof element.selectionDirection === "string" ? element.selectionDirection : "none",
+      value,
+    };
+
+    ensureEditorSelectionStore(state)[editorKey] = selection;
+    return selection;
+  }
+
+  function restoreEditorSelection(state, element, options = {}) {
+    if (
+      !state ||
+      !(element instanceof HTMLElement) ||
+      typeof element.setSelectionRange !== "function" ||
+      typeof element.value !== "string"
+    ) {
+      return false;
+    }
+
+    const editorKey = getEditorDataKey(element);
+    const saved = editorKey ? ensureEditorSelectionStore(state)[editorKey] : null;
+    const valueLength = element.value.length;
+    const fallback = options.preferEnd ? valueLength : null;
+    const startValue = Number.isFinite(saved?.start) ? saved.start : fallback;
+    const endValue = Number.isFinite(saved?.end) ? saved.end : startValue;
+    if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) {
+      return false;
+    }
+
+    const start = Math.max(0, Math.min(valueLength, startValue));
+    const end = Math.max(0, Math.min(valueLength, endValue));
+    const direction = typeof saved?.direction === "string" ? saved.direction : "none";
+
+    try {
+      element.setSelectionRange(start, end, direction);
+      rememberEditorSelection(state, element);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function markEditorFocused(state, editorKey, element = null, helpers = {}) {
+    if (!state || !editorKey) {
+      return;
+    }
+
+    state.editorFocusActive = true;
+    state.editorFocusCardKey = editorKey;
+    state.editorFocusRouteKey =
+      typeof helpers.getRouteKey === "function"
+        ? helpers.getRouteKey()
+        : state.editorFocusRouteKey || null;
+  }
+
+  function clearEditorFocus(state, editorKey = null) {
+    if (!state || (editorKey && state.editorFocusCardKey && state.editorFocusCardKey !== editorKey)) {
+      return;
+    }
+
+    state.editorFocusActive = false;
+    state.editorFocusCardKey = null;
+    state.editorFocusRouteKey = null;
+  }
+
+  function createEditorCard(state, createElement, withChildren, editor, helpers = {}) {
     const editorKey = editor.cardKey || editor.inputKey || "steamloader-editor";
+    const editorDataKey = `editor-${editorKey}`;
+    const isSecretEditor = editor.inputType === "password" || editor.secret === true;
+    const editorElementType = isSecretEditor ? "input" : "textarea";
+
+    const focusEditorTextarea = () => {
+      const textarea = findEditorTextarea(editorDataKey);
+      if (!(textarea instanceof HTMLElement)) {
+        return;
+      }
+
+      markEditorFocused(state, editorDataKey, null, helpers);
+      textarea.focus({ preventScroll: true });
+      restoreEditorSelection(state, textarea, { preferEnd: true });
+      tryOpenSteamKeyboard(textarea, editor.label, helpers.apiBase);
+      window.requestAnimationFrame(() => tryOpenSteamKeyboard(textarea, editor.label, helpers.apiBase));
+      window.setTimeout(() => tryOpenSteamKeyboard(textarea, editor.label, helpers.apiBase), 120);
+    };
 
     return createElement(
       "div",
@@ -1070,37 +1670,120 @@
         {
           className: "steamloader-editor-card",
         },
-        createElement("div", {
-          className: "steamloader-editor-label",
-          children: editor.label,
-        }),
-        editor.help
-          ? createElement("div", {
-              className: "steamloader-editor-help",
-              children: editor.help,
-            })
-          : null,
-        createElement("textarea", {
+        createDialogButton(
+          state,
+          createElement,
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-editor-trigger-content" },
+              createElement("div", {
+                className: "steamloader-editor-label",
+                children: editor.label,
+              }),
+              editor.help
+                ? createElement("div", {
+                    className: "steamloader-editor-help",
+                    children: editor.help,
+                  })
+                : null,
+            ),
+          ),
+          focusEditorTextarea,
+          {
+            slotKey: editorDataKey,
+            className: "steamloader-dialog-button steamloader-editor-trigger",
+            extraProps: {
+              "data-slot-button": editorDataKey,
+              "data-slot-key": editorDataKey,
+              onOKButton: focusEditorTextarea,
+              onActivate: focusEditorTextarea,
+              onGamepadFocus: () => {
+                if (typeof helpers.resolveSlotFocusKey === "function") {
+                  helpers.rememberCurrentRouteSlot?.(null, { slotKey: editorDataKey });
+                }
+              },
+              onCancelButton: () => {
+                helpers.navigateBackFromRoute?.();
+              },
+              style: {
+                width: "100%",
+                minWidth: 0,
+              },
+            },
+          },
+        ),
+        createElement(editorElementType, {
           key: editor.inputKey,
-          className: "steamloader-editor-textarea",
+          className: `steamloader-editor-textarea${isSecretEditor ? " steamloader-editor-input-secret" : ""}`,
+          "data-editor-key": editorDataKey,
           "data-custom-path-input": editor.isCustomPath ? "true" : undefined,
+          type: isSecretEditor ? "password" : undefined,
           defaultValue: editor.value || "",
           placeholder: editor.placeholder || "",
-          rows: editor.rows || 3,
+          rows: isSecretEditor ? undefined : editor.rows || 3,
           spellCheck: false,
           autoCapitalize: "off",
           autoCorrect: "off",
-          autoComplete: "off",
+          autoComplete: isSecretEditor ? "new-password" : "off",
           onClick: (event) => {
             event.stopPropagation();
+            markEditorFocused(state, editorDataKey, event.target, helpers);
+            rememberEditorSelection(state, event.target);
+            tryOpenSteamKeyboard(event.target, editor.label, helpers.apiBase);
+          },
+          onFocus: (event) => {
+            markEditorFocused(state, editorDataKey, event.target, helpers);
+          },
+          onBlur: (event) => {
+            rememberEditorSelection(state, event.target);
+            window.setTimeout(() => {
+              const panel = document.querySelector("#quickaccess_content_7 .steamloader-panel");
+              const activeElement = document.activeElement;
+              if (
+                state.editorFocusCardKey !== editorDataKey ||
+                activeElement === document.body ||
+                activeElement?.getAttribute?.("data-editor-key") === editorDataKey
+              ) {
+                return;
+              }
+
+              if (panel instanceof HTMLElement && activeElement instanceof HTMLElement && panel.contains(activeElement)) {
+                clearEditorFocus(state, editorDataKey);
+              }
+            }, 120);
           },
           onInput: (event) => {
             editor.onInput?.(event.target.value);
+            rememberEditorSelection(state, event.target);
+          },
+          onSelect: (event) => {
+            rememberEditorSelection(state, event.target);
+          },
+          onKeyUp: (event) => {
+            rememberEditorSelection(state, event.target);
           },
         }),
       ),
       editorKey,
     );
+  }
+
+  function createSecretEditor(options = {}) {
+    const configured = Boolean(options.configured);
+    return {
+      ...options,
+      inputType: "password",
+      secret: true,
+      value: "",
+      rows: 1,
+      placeholder:
+        options.placeholder ||
+        (configured ? "Enter a new value to replace the stored secret." : "Enter secret value."),
+      help:
+        options.help ||
+        (configured ? "A secret is configured. The saved value cannot be read back." : "No secret is configured yet."),
+    };
   }
 
   function createDivider(createElement, key) {
@@ -1119,7 +1802,57 @@
     return Array.isArray(model?.dividerAfterIndices) && model.dividerAfterIndices.includes(index);
   }
 
+  function shouldSeparateAfterSlot(slot) {
+    return slot?.role === "back" || slot?.trailing === "back";
+  }
+
+  function getInlineSectionHeaders(model, index) {
+    return (Array.isArray(model?.sectionHeaders) ? model.sectionHeaders : []).filter((section) =>
+      Number.isInteger(section?.index) && section.index === index,
+    );
+  }
+
+  function createInlineSectionHeader(createElement, withChildren, section, key) {
+    const SectionIcon = section?.icon;
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: "steamloader-inline-section",
+          key,
+        },
+        SectionIcon
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-inline-section-mark" },
+                createElement(SectionIcon, {}),
+              ),
+            )
+          : null,
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-inline-section-copy-wrap" },
+            createElement("div", {
+              className: "steamloader-inline-section-title",
+              children: section?.title || "",
+            }),
+            section?.copy
+              ? createElement("div", {
+                  className: "steamloader-inline-section-copy",
+                  children: section.copy,
+                })
+              : null,
+          ),
+        ),
+      ),
+    );
+  }
+
   function createVolumeActionButton(state, createElement, withChildren, action, index, helpers = {}) {
+    const ActionIcon = action.icon || null;
+
     return createDialogButton(
       state,
       createElement,
@@ -1127,6 +1860,15 @@
         "div",
         withChildren(
           { className: "steamloader-volume-action-shell" },
+          ActionIcon
+            ? createElement(
+                "div",
+                withChildren(
+                  { className: "steamloader-volume-action-icon" },
+                  createElement(ActionIcon, {}),
+                ),
+              )
+            : null,
           createElement("div", {
             className: "steamloader-volume-action-title",
             children: action.title,
@@ -1187,37 +1929,45 @@
           createElement(
             "div",
             withChildren(
-              { className: "steamloader-volume-slider-track-shell", "aria-hidden": "true" },
-              createElement("div", {
-                className: "steamloader-volume-slider-track",
-              }),
-              ...Array.from({ length: notchCount }, (_, index) =>
-                createElement("span", {
-                  key: `volume-slider-notch-${index}`,
-                  className: "steamloader-volume-slider-notch",
+            { className: "steamloader-volume-slider-track-shell", "aria-hidden": "true" },
+            createElement("div", {
+              className: "steamloader-volume-slider-track",
+              style: slider.trackStyle || undefined,
+            }),
+            ...Array.from({ length: notchCount }, (_, index) =>
+              createElement("span", {
+                key: `volume-slider-notch-${index}`,
+                className: "steamloader-volume-slider-notch",
                   style: {
                     left: `${(index / Math.max(1, notchCount - 1)) * 100}%`,
                   },
                 }),
               ),
-              createElement("div", {
-                className: "steamloader-volume-slider-fill",
-                style: {
-                  width: `${percent}%`,
-                },
-              }),
-              createElement("div", {
-                className: "steamloader-volume-slider-thumb",
-                style: {
-                  left: `${percent}%`,
-                },
-              }),
-            ),
+            createElement("div", {
+              className: "steamloader-volume-slider-fill",
+              style: {
+                width: `${percent}%`,
+                ...(slider.fillStyle || {}),
+              },
+            }),
+            createElement("div", {
+              className: "steamloader-volume-slider-thumb",
+              style: {
+                left: `${percent}%`,
+                ...(slider.thumbStyle || {}),
+              },
+            }),
           ),
+        ),
         ),
       ),
       () => {
         helpers.rememberVolumeActionFocus?.(0);
+        if (slider.isEditing) {
+          slider.onDeactivate?.();
+          return;
+        }
+
         slider.onActivate?.();
       },
       {
@@ -1347,17 +2097,40 @@
 
     const HeaderIcon = model.headerIcon === null ? null : model.headerIcon || helpers.DefaultIcon;
     const headerActions = Array.isArray(model.headerActions) ? model.headerActions : [];
+    const topSlots = Array.isArray(model.topSlots) ? model.topSlots : [];
     const slots = Array.isArray(model.slots) ? model.slots : [];
-    state.slotActions = slots.map((slot) => slot.onClick);
+    state.renderedSlots = getRenderableSlots(model);
+    state.slotActions = state.renderedSlots.map((slot) => slot.onClick);
     helpers.consumeResolvedFocus?.(state.route, model.autoFocusIndex);
 
-    const slotChildren = slots.flatMap((slot, index) => {
+    const topSlotChildren = topSlots.flatMap((slot, index) => {
       const children = [
         createButtonSlot(state, createElement, withChildren, slot, index, model.autoFocusIndex, helpers),
       ];
+      if (shouldSeparateAfterSlot(slot)) {
+        children.push(createDivider(createElement, `top-back-divider-${index}`));
+      }
 
-      if (hasDividerAfter(model, index)) {
-        children.push(createDivider(createElement, `divider-${index}`));
+      return children;
+    });
+    const slotIndexOffset = topSlots.length;
+    const slotChildren = slots.flatMap((slot, index) => {
+      const slotIndex = slotIndexOffset + index;
+      const sectionHeaders = getInlineSectionHeaders(model, index).map((section, sectionIndex) =>
+        createInlineSectionHeader(
+          createElement,
+          withChildren,
+          section,
+          `section-${index}-${section.sectionKey || sectionIndex}`,
+        ),
+      );
+      const children = [
+        ...sectionHeaders,
+        createButtonSlot(state, createElement, withChildren, slot, slotIndex, model.autoFocusIndex, helpers),
+      ];
+
+      if (hasDividerAfter(model, index) || shouldSeparateAfterSlot(slot)) {
+        children.push(createDivider(createElement, `divider-${slotIndex}`));
       }
 
       return children;
@@ -1370,7 +2143,8 @@
           className: model.panelClassName
             ? `steamloader-panel ${model.panelClassName}`
             : "steamloader-panel",
-          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 21),
+          "data-route-key": model.routeKey || "",
+          "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 37),
           "data-st-renderer": "st-frontend-lib",
         },
         createElement(
@@ -1418,11 +2192,14 @@
               : null,
           ),
         ),
-        model.status
-          ? createElement("div", {
-              className: "steamloader-status",
-              children: model.status,
-            })
+        topSlotChildren.length
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-stack steamloader-top-stack" },
+                ...topSlotChildren,
+              ),
+            )
           : null,
         model.error
           ? createElement("div", {
@@ -1430,22 +2207,16 @@
               children: model.error,
             })
           : null,
-        model.note
-          ? createElement("div", {
-              className: "steamloader-note",
-              children: model.note,
-            })
-          : null,
         ...(Array.isArray(model.cards)
           ? model.cards.map((card, index) => createInfoCard(createElement, withChildren, card, index))
           : []),
-        model.editor ? createEditorCard(createElement, withChildren, model.editor) : null,
+        model.editor ? createEditorCard(state, createElement, withChildren, model.editor, helpers) : null,
         ...(Array.isArray(model.editors)
           ? model.editors.map((editor, index) =>
-              createEditorCard(createElement, withChildren, {
+              createEditorCard(state, createElement, withChildren, {
                 ...editor,
                 cardKey: editor.cardKey || editor.inputKey || `steamloader-editor-${index}`,
-              }),
+              }, helpers),
             )
           : []),
         createElement(
@@ -1463,12 +2234,166 @@
     );
   }
 
+  function joinApiPath(apiBase, path) {
+    const base = String(apiBase || window.__steamLoaderApiBase || "");
+    const relativePath = String(path || "").replace(/^\/+/, "");
+    if (!base) {
+      return relativePath;
+    }
+
+    return `${base.replace(/\/+$/, "")}/${relativePath}`;
+  }
+
+  function createPluginSdk(manifest = {}, options = {}) {
+    const apiBase = options.apiBase || window.__steamLoaderApiBase || "";
+    const pluginId = String(options.pluginId || manifest.id || "").trim();
+    const pluginApiBase = pluginId
+      ? `api/plugin-sdk/plugins/${encodeURIComponent(pluginId)}`
+      : "";
+
+    async function request(path, requestOptions = {}) {
+      const headers = { ...(requestOptions.headers || {}) };
+      let body = requestOptions.body;
+      const hasJsonBody =
+        body &&
+        typeof body === "object" &&
+        !(typeof FormData !== "undefined" && body instanceof FormData) &&
+        !(typeof Blob !== "undefined" && body instanceof Blob);
+
+      if (hasJsonBody) {
+        headers["Content-Type"] = headers["Content-Type"] || "application/json";
+        body = JSON.stringify(body);
+      }
+
+      const response = await fetch(joinApiPath(apiBase, path), {
+        ...requestOptions,
+        headers,
+        body,
+      });
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json")
+        ? await response.json()
+        : await response.text();
+
+      if (!response.ok) {
+        const message = payload && typeof payload === "object" && payload.message
+          ? payload.message
+          : `TFS API request failed (${response.status}).`;
+        throw new Error(message);
+      }
+
+      return payload;
+    }
+
+    function ensurePluginId() {
+      if (!pluginApiBase) {
+        throw new Error("TFS plugin SDK requires a manifest id.");
+      }
+    }
+
+    function pluginRequest(path, requestOptions = {}) {
+      ensurePluginId();
+      return request(`${pluginApiBase}/${String(path || "").replace(/^\/+/, "")}`, requestOptions);
+    }
+
+    const storage = {
+      async get() {
+        const payload = await pluginRequest("settings", { method: "GET" });
+        return payload?.settings || {};
+      },
+      async set(settings = {}) {
+        const payload = await pluginRequest("settings", { method: "POST", body: settings });
+        return payload?.settings || {};
+      },
+      async patch(partialSettings = {}) {
+        const current = await storage.get();
+        return storage.set({ ...current, ...partialSettings });
+      },
+    };
+
+    const secrets = {
+      async status() {
+        const payload = await pluginRequest("secrets", { method: "GET" });
+        return payload?.secrets || {};
+      },
+      async set(key, value) {
+        const payload = await pluginRequest(`secrets/${encodeURIComponent(key)}`, {
+          method: "POST",
+          body: { value: String(value ?? "") },
+        });
+        return payload?.secrets || {};
+      },
+      async clear(key) {
+        const payload = await pluginRequest(`secrets/${encodeURIComponent(key)}/clear`, {
+          method: "POST",
+          body: {},
+        });
+        return payload?.secrets || {};
+      },
+    };
+
+    const network = {
+      request(networkRequest = {}) {
+        return pluginRequest("network/request", {
+          method: "POST",
+          body: {
+            method: networkRequest.method || "GET",
+            url: networkRequest.url || "",
+            headers: networkRequest.headers || {},
+            body: networkRequest.body,
+            authorizationSecretKey: networkRequest.authorizationSecretKey || "",
+            authorizationScheme: networkRequest.authorizationScheme || "Bearer",
+          },
+        });
+      },
+      get(url, requestOptions = {}) {
+        return network.request({ ...requestOptions, method: "GET", url });
+      },
+      post(url, body = {}, requestOptions = {}) {
+        return network.request({ ...requestOptions, method: "POST", url, body });
+      },
+    };
+
+    return {
+      version: 1,
+      pluginId,
+      manifest: { ...manifest, id: pluginId || manifest.id || "" },
+      apiBase,
+      request,
+      get: (path, requestOptions = {}) => request(path, { ...requestOptions, method: "GET" }),
+      post: (path, body = {}, requestOptions = {}) => request(path, { ...requestOptions, method: "POST", body }),
+      state: () => pluginRequest("state", { method: "GET" }),
+      storage,
+      secrets,
+      network,
+      ui: {
+        createSlot,
+        createNavigationSlot,
+        createBackSlot,
+        createToggleSlot,
+        createChoiceSlot,
+        createCommandSlot,
+        createAccordionSlot,
+        createFeatureNavigationSlot,
+        createInlineStepperSlot,
+        createSecretEditor,
+        createScreenModel,
+        createPanelShell,
+      },
+      diagnostics: () => ({
+        libraryVersion: window.STFrontendLib?.version || 39,
+        sdkVersion: 1,
+        pluginId,
+      }),
+    };
+  }
+
   function createDiagnostics(state) {
     const registry = getNativeRegistry(state);
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 21,
+      version: 39,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -1482,7 +2407,7 @@
   }
 
   window.STFrontendLib = {
-    version: 21,
+    version: 39,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,
@@ -1507,6 +2432,9 @@
     createSettingToggleSlot,
     createChoiceSlot,
     createCommandSlot,
+    createAccordionSlot,
+    createFeatureNavigationSlot,
+    createInlineStepperSlot,
     createScreenModel,
     buildRowClassName,
     createRowContent,
@@ -1514,10 +2442,17 @@
     createButtonSlot,
     createInfoCard,
     createEditorCard,
+    createSecretEditor,
     createDivider,
     createVolumeActionButton,
     createVolumePanel,
     createPanelShell,
+    createPluginSdk,
     createDiagnostics,
+  };
+
+  window.TfsPluginSdk = {
+    version: 1,
+    create: createPluginSdk,
   };
 })();

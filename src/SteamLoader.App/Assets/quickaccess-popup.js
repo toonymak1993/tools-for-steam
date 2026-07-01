@@ -1,8 +1,18 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 67;
+  const stateVersion = 100;
+  const globalBackSlotKey = "global-back";
+  const sliderCommitSettleDelayMs = 180;
+  const smartHomeSliderCommitSettleDelayMs = 1000;
+  const smartHomeSliderCommitRetryDelayMs = 140;
+  const audioVolumeCommitSettleDelayMs = 260;
   const soundtrackTabKey = 7;
   const storeSyncPinnedTitlesStorageKey = "steamloader.storeSyncPinnedTitles.v1";
+  const pluginStoreInputStorageKey = "ToolsForSteamPluginStoreInput";
+  const pluginStoreOverlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
+  const pluginStoreChannelName = "ToolsForSteamPluginStoreChannel";
+
+  window.__steamLoaderApiBase = apiBase;
 
   if (window.__steamLoaderPopupTimer) {
     window.clearInterval(window.__steamLoaderPopupTimer);
@@ -24,7 +34,84 @@
     window.__steamToolsStoreSyncPollTimer = null;
   }
 
+  if (window.__steamToolsUpdatesPollTimer) {
+    window.clearInterval(window.__steamToolsUpdatesPollTimer);
+    window.__steamToolsUpdatesPollTimer = null;
+  }
+
+  if (window.__steamToolsSmartHomePollTimer) {
+    window.clearInterval(window.__steamToolsSmartHomePollTimer);
+    window.__steamToolsSmartHomePollTimer = null;
+  }
+
+  if (window.__steamLoaderFocusRepairTimer) {
+    window.clearInterval(window.__steamLoaderFocusRepairTimer);
+    window.__steamLoaderFocusRepairTimer = null;
+  }
+
+  if (window.__steamLoaderFocusRepairHandler) {
+    document.removeEventListener("focusout", window.__steamLoaderFocusRepairHandler, true);
+    window.__steamLoaderFocusRepairHandler = null;
+  }
+
   const previousState = window.__steamLoaderPopupReactState;
+  if (previousState?.version !== stateVersion) {
+    try {
+      previousState?.liveUpdates?.source?.close?.();
+    } catch {
+    }
+
+    if (previousState?.liveUpdates?.retryTimer) {
+      window.clearTimeout(previousState.liveUpdates.retryTimer);
+    }
+
+    if (previousState?.pluginStoreBridge?.activationFallbackTimer) {
+      window.clearTimeout(previousState.pluginStoreBridge.activationFallbackTimer);
+    }
+
+    if (previousState?.pluginStoreBridge?.overlayStatePollTimer) {
+      window.clearInterval(previousState.pluginStoreBridge.overlayStatePollTimer);
+    }
+
+    if (typeof previousState?.pluginStoreBridge?.overlayStateStorageHandler === "function") {
+      window.removeEventListener("storage", previousState.pluginStoreBridge.overlayStateStorageHandler);
+    }
+
+    if (typeof previousState?.pluginStoreBridge?.keyHandler === "function") {
+      window.removeEventListener("keydown", previousState.pluginStoreBridge.keyHandler, true);
+      window.removeEventListener("keyup", previousState.pluginStoreBridge.keyHandler, true);
+      window.removeEventListener("keypress", previousState.pluginStoreBridge.keyHandler, true);
+    }
+
+    const focusNav = window.FocusNavController;
+    if (
+      focusNav?.SetCatchAllGamepadInput &&
+      previousState?.pluginStoreBridge?.catchAllInstalled &&
+      focusNav.m_fnCatchAllGamepadInput?.__steamLoaderPluginStoreQuickAccessCatchAll
+    ) {
+      focusNav.SetCatchAllGamepadInput(
+        previousState.pluginStoreBridge.previousCatchAllGamepadInput || undefined,
+      );
+    }
+
+    if (
+      previousState?.pluginStoreBridge?.channel &&
+      previousState?.pluginStoreBridge?.channelHandler
+    ) {
+      previousState.pluginStoreBridge.channel.removeEventListener(
+        "message",
+        previousState.pluginStoreBridge.channelHandler,
+      );
+    }
+
+    try {
+      previousState?.pluginStoreBridge?.channel?.close?.();
+    } catch {
+    }
+
+    document.getElementById("steamloader-plugin-store-quickaccess-bridge-style")?.remove();
+    document.body?.classList?.remove("steamloader-plugin-store-remote-active");
+  }
 
   const state =
     previousState?.version === stateVersion
@@ -82,6 +169,9 @@
             sliderHotkeysInstalled: false,
             sliderActivationTimer: 0,
             draftOverlayLevel: null,
+            pendingOverlayLevelCommit: null,
+            suppressNextLivePanelRerender: false,
+            settingCommitTimersByKey: {},
             pendingSliderAutoFocus: false,
           },
           power: {
@@ -144,10 +234,19 @@
             saving: false,
             error: "",
             snapshot: null,
-            detailOriginByThemeId: {},
-            detailOriginByProfileId: {},
             profileDraft: "",
             profileDraftInputVersion: 0,
+            storeLoading: false,
+            storeCatalog: null,
+            storeCatalogRequestSequence: 0,
+            storeSearchDraft: "",
+            storeSearchInputVersion: 0,
+            storeDetailById: {},
+            storeDetailLoadingId: "",
+            installedPreviewByThemeId: {},
+            installedPreviewLoadingByThemeId: {},
+            operationText: "",
+            sliderCommitTimersByKey: {},
           },
           generalSettings: {
             loading: false,
@@ -168,6 +267,14 @@
           developerDebug: {
             messages: {},
           },
+          communityPlugins: {
+            loading: false,
+            error: "",
+            snapshot: null,
+            scriptVersionsById: {},
+            scriptPromisesById: {},
+            scriptErrorsById: {},
+          },
           homeReorder: {
             active: false,
             movingPluginId: "",
@@ -186,6 +293,19 @@
             pathDraft: "",
             pathInputVersion: 0,
           },
+          smartHome: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            baseUrlDraft: "",
+            baseUrlInputVersion: 0,
+            homeyIdDraft: "",
+            homeyIdInputVersion: 0,
+            sessionTokenDraft: "",
+            sessionTokenInputVersion: 0,
+            sliderCommitTimersByKey: {},
+          },
           nativeUi: {
             dialogButtonType: null,
             componentCandidates: null,
@@ -196,19 +316,614 @@
             renderError: "",
           },
           slotActions: [],
+          renderedSlots: [],
           renderRevision: 1,
           panelObserver: null,
           panelObserverHost: null,
+          trackedPanel: null,
+          trackedPanelScrollHandler: null,
+          trackedPanelFocusHandler: null,
+          trackedPanelFocusOutHandler: null,
           panelVisible: false,
           pendingEntryAutoFocus: true,
           lastSelectedIndexByRoute: {},
+          lastSelectedSlotKeyByRoute: {},
           lastScrollTopByRoute: {},
+          expandedSectionsByRoute: {},
           pendingFocusRouteKey: null,
           pendingFocusIndex: null,
+          pendingFocusSlotKey: null,
+          pendingFocusRestoreAnimationFrame: 0,
+          pendingFocusRestoreRouteKey: null,
           pendingScrollRouteKey: null,
           pendingScrollTop: null,
           pendingScrollAnimationFrame: 0,
+          installedPanelKey: null,
+          installedPanelRevision: -1,
+          installedPanelElement: null,
+          editorFocusActive: false,
+          editorFocusCardKey: null,
+          editorFocusRouteKey: null,
+          editorSelectionByKey: {},
+          liveUpdates: {
+            source: null,
+            connected: false,
+            retryTimer: 0,
+            lastMessageAt: 0,
+          },
+          optimistic: {
+            desiredValuesByKey: {},
+          },
+          pluginStoreBridge: {
+            remoteActive: false,
+            remoteActiveExpiresAt: 0,
+            lastOverlayStateNonce: "",
+            lastOverlayStateAt: 0,
+            activationFallbackTimer: 0,
+            overlayStatePollTimer: 0,
+            overlayStateStorageHandler: null,
+            channel: null,
+            channelHandler: null,
+            catchAllInstalled: false,
+            previousCatchAllGamepadInput: null,
+            catchAllButtonState: {},
+            keyHandler: null,
+          },
+          steamKeyboardActiveUntil: 0,
         });
+
+  function playSoundFile(path) {
+    try {
+      const audio = new Audio(path);
+      audio.volume = 0.72;
+      const promise = audio.play();
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(() => {});
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function playSliderMoveSound(direction) {
+    if (!direction) {
+      return false;
+    }
+
+    return (
+      playSoundFile(
+        direction < 0
+          ? "/sounds/deck_ui_slider_down.wav"
+          : "/sounds/deck_ui_slider_up.wav",
+      ) ||
+      Boolean(window.STFrontendLib?.playUiSound?.())
+    );
+  }
+
+  function ensurePluginStoreBridgeStyle() {
+    if (document.getElementById("steamloader-plugin-store-quickaccess-bridge-style")) {
+      return;
+    }
+
+    const style = document.createElement("style");
+    style.id = "steamloader-plugin-store-quickaccess-bridge-style";
+    style.textContent = `
+      body.steamloader-plugin-store-remote-active {
+        background: transparent !important;
+      }
+
+      body.steamloader-plugin-store-remote-active #QuickAccess-NA {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `;
+    document.head.append(style);
+  }
+
+  function getPluginStoreBridgeChannel() {
+    const bridge = state.pluginStoreBridge;
+    if (bridge.channel || typeof BroadcastChannel !== "function") {
+      return bridge.channel;
+    }
+
+    try {
+      bridge.channel = new BroadcastChannel(pluginStoreChannelName);
+      bridge.channelHandler = (event) => {
+        handlePluginStoreBridgeMessage(event.data);
+      };
+      bridge.channel.addEventListener("message", bridge.channelHandler);
+    } catch {
+      bridge.channel = null;
+    }
+
+    return bridge.channel;
+  }
+
+  function postPluginStoreBridgeMessage(message) {
+    const payload = {
+      nonce: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      ...message,
+    };
+
+    try {
+      getPluginStoreBridgeChannel()?.postMessage(payload);
+    } catch {
+    }
+
+    try {
+      const key = payload.type === "input"
+        ? pluginStoreInputStorageKey
+        : pluginStoreOverlayStateStorageKey;
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch {
+    }
+  }
+
+  function getPluginStoreActionFromSteamButton(button) {
+    const namedButton = String(button || "").toUpperCase();
+    if (/(DPAD|GAMEPAD|ARROW).*UP|\bUP\b/.test(namedButton)) {
+      return "up";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*DOWN|\bDOWN\b/.test(namedButton)) {
+      return "down";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*LEFT|\bLEFT\b/.test(namedButton)) {
+      return "left";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*RIGHT|\bRIGHT\b/.test(namedButton)) {
+      return "right";
+    }
+    if (/\b(A|ACCEPT|SELECT)\b/.test(namedButton)) {
+      return "a";
+    }
+    if (/\b(B|BACK|CANCEL)\b/.test(namedButton)) {
+      return "b";
+    }
+    if (/(LEFT|L).*(BUMPER|SHOULDER|TRIGGER)|\b(LB|L1)\b/.test(namedButton)) {
+      return "previous-section";
+    }
+    if (/(RIGHT|R).*(BUMPER|SHOULDER|TRIGGER)|\b(RB|R1)\b/.test(namedButton)) {
+      return "next-section";
+    }
+
+    switch (Number(button)) {
+      case 1:
+        return "a";
+      case 2:
+        return "b";
+      case 5:
+      case 7:
+        return "previous-section";
+      case 6:
+      case 8:
+        return "next-section";
+      case 9:
+        return "up";
+      case 10:
+        return "down";
+      case 11:
+        return "left";
+      case 12:
+        return "right";
+      default:
+        return "";
+    }
+  }
+
+  function getPluginStoreActionFromKeyEvent(event) {
+    const key = event.key || event.code || "";
+    const lowerKey = key.toLowerCase?.() || "";
+    if (key === "ArrowUp" || key === "GamepadUp" || key === "GamepadDPadUp") {
+      return "up";
+    }
+    if (key === "ArrowDown" || key === "GamepadDown" || key === "GamepadDPadDown") {
+      return "down";
+    }
+    if (key === "ArrowLeft" || key === "GamepadLeft" || key === "GamepadDPadLeft") {
+      return "left";
+    }
+    if (key === "ArrowRight" || key === "GamepadRight" || key === "GamepadDPadRight") {
+      return "right";
+    }
+    if (key === "Enter" || key === " " || key === "Space" || key === "GamepadA") {
+      return "a";
+    }
+    if (key === "Escape" || key === "Backspace" || key === "GamepadB") {
+      return "b";
+    }
+    if (
+      key === "PageUp" ||
+      key === "GamepadLB" ||
+      key === "GamepadL1" ||
+      key === "GamepadLeftShoulder" ||
+      lowerKey === "["
+    ) {
+      return "previous-section";
+    }
+    if (
+      key === "PageDown" ||
+      key === "GamepadRB" ||
+      key === "GamepadR1" ||
+      key === "GamepadRightShoulder" ||
+      lowerKey === "]"
+    ) {
+      return "next-section";
+    }
+
+    return "";
+  }
+
+  function shouldForwardPluginStoreSteamButton(button, action) {
+    const bridge = state.pluginStoreBridge;
+    const now = Date.now();
+    const repeatMs = action === "up" || action === "down" || action === "left" || action === "right"
+      ? 230
+      : 340;
+    const lastMs = bridge.catchAllButtonState[button] || 0;
+    if (now - lastMs < repeatMs) {
+      return false;
+    }
+
+    bridge.catchAllButtonState[button] = now;
+    return true;
+  }
+
+  function sendPluginStoreInput(action, source) {
+    if (!action) {
+      return;
+    }
+
+    postPluginStoreBridgeMessage({
+      type: "input",
+      action,
+      source,
+    });
+
+    fetch(`${apiBase}api/plugin-store/overlay/input`, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action,
+        source,
+      }),
+    }).catch(() => {
+    });
+  }
+
+  function installPluginStoreCatchAllInput() {
+    const bridge = state.pluginStoreBridge;
+    const focusNav = window.FocusNavController;
+    if (!focusNav?.SetCatchAllGamepadInput || bridge.catchAllInstalled) {
+      return;
+    }
+
+    const previous = focusNav.m_fnCatchAllGamepadInput;
+    const callback = (button) => {
+      if (!bridge.remoteActive) {
+        return typeof previous === "function" ? previous(button) : false;
+      }
+
+      const action = getPluginStoreActionFromSteamButton(button);
+      if (!action) {
+        return true;
+      }
+
+      if (shouldForwardPluginStoreSteamButton(button, action)) {
+        sendPluginStoreInput(action, "quickaccess-catch-all");
+      }
+
+      return true;
+    };
+
+    callback.__steamLoaderPluginStoreQuickAccessCatchAll = true;
+    bridge.previousCatchAllGamepadInput =
+      previous?.__steamLoaderPluginStoreQuickAccessCatchAll ? null : previous;
+    focusNav.SetCatchAllGamepadInput(callback);
+    bridge.catchAllInstalled = true;
+  }
+
+  function uninstallPluginStoreCatchAllInput() {
+    const bridge = state.pluginStoreBridge;
+    const focusNav = window.FocusNavController;
+    if (!focusNav?.SetCatchAllGamepadInput || !bridge.catchAllInstalled) {
+      return;
+    }
+
+    if (focusNav.m_fnCatchAllGamepadInput?.__steamLoaderPluginStoreQuickAccessCatchAll) {
+      focusNav.SetCatchAllGamepadInput(bridge.previousCatchAllGamepadInput || undefined);
+    }
+
+    bridge.catchAllInstalled = false;
+    bridge.previousCatchAllGamepadInput = null;
+    bridge.catchAllButtonState = {};
+  }
+
+  function handlePluginStoreBridgeKeyEvent(event) {
+    const bridge = state.pluginStoreBridge;
+    if (!bridge.remoteActive) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+
+    if (event.type !== "keydown") {
+      return;
+    }
+
+    sendPluginStoreInput(getPluginStoreActionFromKeyEvent(event), "quickaccess-key");
+  }
+
+  function installPluginStoreKeyTrap() {
+    const bridge = state.pluginStoreBridge;
+    if (!bridge.keyHandler) {
+      bridge.keyHandler = handlePluginStoreBridgeKeyEvent;
+      window.addEventListener("keydown", bridge.keyHandler, true);
+      window.addEventListener("keyup", bridge.keyHandler, true);
+      window.addEventListener("keypress", bridge.keyHandler, true);
+    }
+  }
+
+  function uninstallPluginStoreKeyTrap() {
+    const bridge = state.pluginStoreBridge;
+    if (!bridge.keyHandler) {
+      return;
+    }
+
+    window.removeEventListener("keydown", bridge.keyHandler, true);
+    window.removeEventListener("keyup", bridge.keyHandler, true);
+    window.removeEventListener("keypress", bridge.keyHandler, true);
+    bridge.keyHandler = null;
+  }
+
+  function updatePluginStoreRemoteUi() {
+    ensurePluginStoreBridgeStyle();
+    document.body?.classList?.toggle(
+      "steamloader-plugin-store-remote-active",
+      Boolean(state.pluginStoreBridge.remoteActive),
+    );
+  }
+
+  function schedulePluginStoreBridgeFallbackRelease() {
+    const bridge = state.pluginStoreBridge;
+    if (bridge.activationFallbackTimer) {
+      window.clearTimeout(bridge.activationFallbackTimer);
+    }
+
+    bridge.activationFallbackTimer = window.setTimeout(() => {
+      bridge.activationFallbackTimer = 0;
+      if (bridge.remoteActive && Date.now() > bridge.remoteActiveExpiresAt) {
+        setPluginStoreRemoteActive(false);
+      }
+    }, 3800);
+  }
+
+  function setPluginStoreRemoteActive(active, options = {}) {
+    const bridge = state.pluginStoreBridge;
+    const nextActive = Boolean(active);
+    bridge.remoteActive = nextActive;
+    bridge.remoteActiveExpiresAt = nextActive
+      ? Date.now() + (options.fromOverlay ? 2200 : 3600)
+      : 0;
+
+    if (nextActive) {
+      installPluginStoreCatchAllInput();
+      installPluginStoreKeyTrap();
+      schedulePluginStoreBridgeFallbackRelease();
+    } else {
+      uninstallPluginStoreKeyTrap();
+      uninstallPluginStoreCatchAllInput();
+      if (bridge.activationFallbackTimer) {
+        window.clearTimeout(bridge.activationFallbackTimer);
+        bridge.activationFallbackTimer = 0;
+      }
+    }
+
+    updatePluginStoreRemoteUi();
+  }
+
+  function consumePluginStoreOverlayState(raw) {
+    if (!raw) {
+      return;
+    }
+
+    try {
+      const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (payload?.type !== "overlay-state" || payload.nonce === state.pluginStoreBridge.lastOverlayStateNonce) {
+        return;
+      }
+
+      state.pluginStoreBridge.lastOverlayStateNonce = payload.nonce;
+      state.pluginStoreBridge.lastOverlayStateAt = Date.now();
+      const stillFresh = !payload.expiresAt || Number(payload.expiresAt) > Date.now();
+      setPluginStoreRemoteActive(Boolean(payload.active) && stillFresh, { fromOverlay: true });
+    } catch {
+    }
+  }
+
+  function handlePluginStoreBridgeMessage(payload) {
+    if (payload?.type === "overlay-state") {
+      consumePluginStoreOverlayState(payload);
+    }
+  }
+
+  function setupPluginStoreBridge() {
+    getPluginStoreBridgeChannel();
+    ensurePluginStoreBridgeStyle();
+
+    const bridge = state.pluginStoreBridge;
+    if (!bridge.overlayStateStorageHandler) {
+      bridge.overlayStateStorageHandler = (event) => {
+        if (event.key === pluginStoreOverlayStateStorageKey) {
+          consumePluginStoreOverlayState(event.newValue);
+        }
+      };
+      window.addEventListener("storage", bridge.overlayStateStorageHandler);
+    }
+
+    if (!bridge.overlayStatePollTimer) {
+      bridge.overlayStatePollTimer = window.setInterval(() => {
+        try {
+          consumePluginStoreOverlayState(localStorage.getItem(pluginStoreOverlayStateStorageKey));
+        } catch {
+        }
+      }, 250);
+    }
+  }
+
+  function tryInvokePluginStoreCloseCandidate(target, methodNames, argsList = [[]]) {
+    if (!target) {
+      return false;
+    }
+
+    for (const methodName of methodNames) {
+      const method = target?.[methodName];
+      if (typeof method !== "function") {
+        continue;
+      }
+
+      for (const args of argsList) {
+        try {
+          method.apply(target, args);
+          return true;
+        } catch {
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function tryCloseQuickAccessMenuForPluginStore() {
+    const closeMethodNames = [
+      "CloseSideMenus",
+      "HideSideMenus",
+      "CloseQuickAccessMenu",
+      "HideQuickAccessMenu",
+    ];
+    const setVisibleMethodNames = [
+      "SetQuickAccessMenuVisible",
+      "SetQuickAccessVisible",
+      "SetSideMenuVisible",
+      "SetSideMenuOpen",
+    ];
+    const candidates = [
+      window.GamepadUI?.Router,
+      window.GamepadUI?.NavigationManager,
+      window.SteamUIStore?.MenuStore,
+      window.SteamUIStore?.SideMenuStore,
+      window.SteamClient?.UI,
+      window.SteamClient?.Overlay,
+      window.SteamClient,
+    ];
+
+    for (const candidate of candidates) {
+      if (
+        tryInvokePluginStoreCloseCandidate(candidate, closeMethodNames, [[]]) ||
+        tryInvokePluginStoreCloseCandidate(candidate, setVisibleMethodNames, [[false], ["quickaccess", false]])
+      ) {
+        return true;
+      }
+    }
+
+    const runtime = findRuntime();
+    const propsList = [
+      runtime?.qamNode?.memoizedProps,
+      runtime?.qamNode?.pendingProps,
+      runtime?.qamNode?.return?.memoizedProps,
+      runtime?.qamNode?.return?.pendingProps,
+    ].filter(Boolean);
+
+    for (const props of propsList) {
+      for (const [key, value] of Object.entries(props)) {
+        if (typeof value !== "function" || !/(close|dismiss|hide|cancel)/i.test(key)) {
+          continue;
+        }
+
+        try {
+          value(false);
+          return true;
+        } catch {
+          try {
+            value();
+            return true;
+          } catch {
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function normalizeOptimisticValueKey(key) {
+    if (typeof key !== "string") {
+      return "";
+    }
+
+    return key.trim();
+  }
+
+  function setOptimisticDesiredValue(key, value) {
+    const resolvedKey = normalizeOptimisticValueKey(key);
+    if (!resolvedKey) {
+      return "";
+    }
+
+    state.optimistic.desiredValuesByKey[resolvedKey] = value;
+    return resolvedKey;
+  }
+
+  function getOptimisticDesiredValue(key) {
+    const resolvedKey = normalizeOptimisticValueKey(key);
+    if (!resolvedKey) {
+      return undefined;
+    }
+
+    return state.optimistic.desiredValuesByKey[resolvedKey];
+  }
+
+  function hasOptimisticDesiredValue(key) {
+    const resolvedKey = normalizeOptimisticValueKey(key);
+    return Boolean(
+      resolvedKey &&
+      Object.prototype.hasOwnProperty.call(state.optimistic.desiredValuesByKey, resolvedKey)
+    );
+  }
+
+  function canApplyOptimisticResponse(key, value) {
+    if (!hasOptimisticDesiredValue(key)) {
+      return true;
+    }
+
+    return Object.is(getOptimisticDesiredValue(key), value);
+  }
+
+  function clearOptimisticDesiredValue(key, expectedValue) {
+    const resolvedKey = normalizeOptimisticValueKey(key);
+    if (!resolvedKey || !hasOptimisticDesiredValue(resolvedKey)) {
+      return false;
+    }
+
+    if (arguments.length > 1 && !Object.is(getOptimisticDesiredValue(resolvedKey), expectedValue)) {
+      return false;
+    }
+
+    delete state.optimistic.desiredValuesByKey[resolvedKey];
+    return true;
+  }
+
+  function getOptimisticDesiredEntries(prefix = "") {
+    const normalizedPrefix = normalizeOptimisticValueKey(prefix);
+    return Object.entries(state.optimistic.desiredValuesByKey).filter(([key]) =>
+      normalizedPrefix ? key.startsWith(normalizedPrefix) : true,
+    );
+  }
 
   const plugins = [
     {
@@ -389,28 +1104,56 @@
     },
     {
       id: "themes",
-      title: "Themes",
-      description: "Browse, install, and tune Tools for Steam themes",
+      title: "CSSLoader",
+      description: "Manage installed themes, store installs, presets, and backend tools",
       pages: [
+        {
+          id: "installed",
+          title: "Installed Themes",
+          description: "Enable installed CSSLoader themes and change controller-friendly options",
+        },
         {
           id: "store",
           title: "Store",
-          description: "Browse built-in and community themes",
-        },
-        {
-          id: "installed",
-          title: "Installed",
-          description: "Manage active themes and per-theme options",
+          description: "Browse Big Picture themes from DeckThemes and install them into CSSLoader",
         },
         {
           id: "profiles",
-          title: "Profiles",
-          description: "Save, apply, and download full theme setups",
+          title: "Presets",
+          description: "Save and reapply full CSSLoader theme stacks",
         },
         {
           id: "settings",
           title: "Settings",
-          description: "Engine behavior and install defaults",
+          description: "Backend status, theme files, and CSSLoader shortcuts",
+        },
+      ],
+    },
+    {
+      id: "smart-home",
+      title: "Homey",
+      description: "Rooms, lights, moods, colors, and Homey flows",
+      defaultEnabled: false,
+      pages: [
+        {
+          id: "rooms",
+          title: "Rooms",
+          description: "Browse zones and expand controllable devices room by room",
+        },
+        {
+          id: "moods",
+          title: "Moods",
+          description: "Apply Homey moods and room scenes directly from Quick Access",
+        },
+        {
+          id: "flows",
+          title: "Flows",
+          description: "Trigger Homey flows and scenes directly from Quick Access",
+        },
+        {
+          id: "settings",
+          title: "Settings",
+          description: "Save the Homey address, session token, and provider foundation",
         },
       ],
     },
@@ -425,8 +1168,65 @@
     return getPluginSettings().find((entry) => entry.id === pluginId) || null;
   }
 
+  function getCommunityRuntimePlugins() {
+    const pluginsSnapshot = state.communityPlugins.snapshot?.plugins;
+    return Array.isArray(pluginsSnapshot) ? pluginsSnapshot : [];
+  }
+
+  function getCommunityRegistry() {
+    return window.ToolsForSteamCommunityPlugins && typeof window.ToolsForSteamCommunityPlugins === "object"
+      ? window.ToolsForSteamCommunityPlugins
+      : {};
+  }
+
+  function normalizeCommunityPluginDefinition(runtimePlugin) {
+    const pluginId = String(runtimePlugin?.id || "").trim();
+    if (!pluginId) {
+      return null;
+    }
+
+    const registryEntry = getCommunityRegistry()[pluginId] || null;
+    const manifest = registryEntry?.manifest || {};
+    const title = String(manifest.name || runtimePlugin.title || pluginId).trim();
+    const description = String(
+      manifest.description ||
+      runtimePlugin.description ||
+      "Community plugin.",
+    ).trim();
+
+    return {
+      id: pluginId,
+      title,
+      description,
+      pages: Array.isArray(registryEntry?.pages) ? registryEntry.pages : [],
+      defaultEnabled: true,
+      isCommunity: true,
+      registry: registryEntry,
+      runtime: runtimePlugin,
+      loadError: state.communityPlugins.scriptErrorsById?.[pluginId] || "",
+    };
+  }
+
+  function getCommunityPluginDefinitions() {
+    return getCommunityRuntimePlugins()
+      .map((plugin) => normalizeCommunityPluginDefinition(plugin))
+      .filter(Boolean);
+  }
+
+  function getCommunityPluginDefinition(pluginId) {
+    return getCommunityPluginDefinitions().find((plugin) => plugin.id === pluginId) || null;
+  }
+
+  function getPluginDefinition(pluginId) {
+    return plugins.find((plugin) => plugin.id === pluginId) || getCommunityPluginDefinition(pluginId);
+  }
+
   function isPluginEnabled(pluginId) {
     if (!pluginId || pluginId === "settings") {
+      return true;
+    }
+
+    if (getCommunityPluginDefinition(pluginId)) {
       return true;
     }
 
@@ -435,7 +1235,7 @@
       return entry.enabled !== false || entry.canDisable === false;
     }
 
-    const definition = plugins.find((plugin) => plugin.id === pluginId);
+    const definition = getPluginDefinition(pluginId);
     return definition ? definition.defaultEnabled !== false : true;
   }
 
@@ -500,7 +1300,11 @@
   }
 
   function getVisiblePlugins() {
-    return sortPluginsBySavedOrder(plugins.filter((plugin) => isPluginEnabled(plugin.id)));
+    const builtInEntries = sortPluginsBySavedOrder(plugins.filter((plugin) => isPluginEnabled(plugin.id)));
+    const communityEntries = getCommunityPluginDefinitions()
+      .filter((plugin) => isPluginEnabled(plugin.id))
+      .sort((left, right) => left.title.localeCompare(right.title));
+    return [...builtInEntries, ...communityEntries];
   }
 
   function getHomePlugins() {
@@ -625,6 +1429,10 @@
         gap: 10px;
       }
 
+      .steamloader-top-stack {
+        margin-bottom: 8px;
+      }
+
       .steamloader-dialog-button {
         width: 100%;
       }
@@ -654,6 +1462,46 @@
       }
 
       .steamloader-section-slot-copy {
+        margin-top: 3px;
+        color: rgba(143, 155, 167, 0.82);
+        font-size: clamp(10px, 1.08vw, 12px);
+        line-height: 1.3;
+      }
+
+      .steamloader-inline-section {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        margin-top: 12px;
+        padding: 2px 4px 0;
+      }
+
+      .steamloader-inline-section-mark {
+        width: 28px;
+        height: 28px;
+        border-radius: 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(226, 233, 240, 0.92);
+      }
+
+      .steamloader-inline-section-copy-wrap {
+        min-width: 0;
+      }
+
+      .steamloader-inline-section-title {
+        color: rgba(226, 233, 240, 0.94);
+        font-size: clamp(12px, 1.36vw, 14px);
+        line-height: 1.2;
+        font-weight: 800;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .steamloader-inline-section-copy {
         margin-top: 3px;
         color: rgba(143, 155, 167, 0.82);
         font-size: clamp(10px, 1.08vw, 12px);
@@ -725,6 +1573,14 @@
         height: 18px;
       }
 
+      .steamloader-row-icon img {
+        width: 100%;
+        height: 100%;
+        display: block;
+        border-radius: inherit;
+        object-fit: cover;
+      }
+
       .steamloader-row-icon .steamloader-app-start-icon {
         width: 100%;
         height: 100%;
@@ -758,6 +1614,30 @@
         line-height: 1.35;
       }
 
+      .steamloader-row-swatch {
+        margin-top: 7px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: rgba(205, 214, 224, 0.92);
+        font-size: clamp(10px, 1.2vw, 13px);
+        line-height: 1.2;
+      }
+
+      .steamloader-row-swatch-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), 0 0 10px rgba(255, 255, 255, 0.08);
+        flex: 0 0 auto;
+      }
+
+      .steamloader-row-swatch-label {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
       .steamloader-row-shell-subtle .steamloader-row-title {
         font-size: clamp(15px, 1.75vw, 18px);
         line-height: 1.16;
@@ -769,6 +1649,326 @@
         color: rgba(145, 157, 169, 0.86);
         font-size: clamp(10px, 1.12vw, 12px);
         line-height: 1.32;
+      }
+
+      .steamloader-dialog-button-accordion {
+        min-height: 0 !important;
+        padding: 8px 10px !important;
+        border-radius: 12px !important;
+      }
+
+      .steamloader-accordion-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        width: 100%;
+      }
+
+      .steamloader-accordion-toggle-copy-wrap {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+
+      .steamloader-accordion-toggle-title {
+        color: rgba(226, 233, 240, 0.92);
+        font-size: clamp(12px, 1.36vw, 14px);
+        line-height: 1.2;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .steamloader-accordion-toggle-copy {
+        margin-top: 3px;
+        color: rgba(145, 157, 169, 0.86);
+        font-size: clamp(10px, 1.08vw, 12px);
+        line-height: 1.32;
+      }
+
+      .steamloader-accordion-toggle-arrow {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        color: rgba(187, 197, 208, 0.78);
+        font-size: 12px;
+        line-height: 1;
+        text-transform: lowercase;
+        transform: rotate(0deg);
+        transition: transform 140ms ease;
+      }
+
+      .steamloader-accordion-toggle.is-expanded .steamloader-accordion-toggle-arrow {
+        transform: rotate(180deg);
+      }
+
+      .steamloader-dialog-button-feature {
+        min-height: 0 !important;
+        padding: 0 !important;
+        border-radius: 18px !important;
+        overflow: hidden;
+        background: transparent !important;
+      }
+
+      .steamloader-dialog-button-feature:hover,
+      .steamloader-dialog-button-feature:focus-visible,
+      .steamloader-dialog-button-feature.gpfocus {
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+
+      .steamloader-feature-card {
+        overflow: hidden;
+        border-radius: 18px;
+        border: 1px solid rgba(120, 153, 191, 0.14);
+        background:
+          linear-gradient(180deg, rgba(25, 35, 49, 0.96) 0%, rgba(18, 25, 34, 0.98) 100%);
+      }
+
+      .steamloader-dialog-button-feature:hover .steamloader-feature-card,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-card,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-card {
+        border-color: rgba(131, 188, 255, 0.82);
+        box-shadow:
+          0 0 0 2px rgba(131, 188, 255, 0.78),
+          0 14px 30px rgba(6, 12, 19, 0.34);
+      }
+
+      .steamloader-feature-media-shell {
+        position: relative;
+        aspect-ratio: 2.12 / 1;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at top left, rgba(102, 166, 255, 0.24) 0%, rgba(12, 17, 23, 0) 38%),
+          rgba(8, 13, 19, 0.84);
+      }
+
+      .steamloader-feature-media {
+        width: 100%;
+        height: 100%;
+        display: block;
+        object-fit: cover;
+      }
+
+      .steamloader-feature-media-placeholder {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(222, 230, 237, 0.78);
+      }
+
+      .steamloader-feature-media-placeholder svg {
+        width: 34px;
+        height: 34px;
+      }
+
+      .steamloader-feature-eyebrow {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(10, 15, 21, 0.72);
+        color: rgba(228, 234, 240, 0.86);
+        font-size: 10px;
+        line-height: 1;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        backdrop-filter: blur(8px);
+      }
+
+      .steamloader-feature-status {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        backdrop-filter: blur(8px);
+      }
+
+      .steamloader-feature-body {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px 13px 13px;
+      }
+
+      .steamloader-feature-title {
+        color: rgba(236, 242, 247, 0.96);
+        font-size: clamp(16px, 2vw, 21px);
+        line-height: 1.15;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .steamloader-feature-copy {
+        color: rgba(162, 173, 184, 0.92);
+        font-size: clamp(11px, 1.28vw, 14px);
+        line-height: 1.42;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+      }
+
+      .steamloader-feature-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .steamloader-feature-meta-item {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(204, 214, 224, 0.86);
+        font-size: 10px;
+        line-height: 1;
+      }
+
+      .steamloader-feature-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding-top: 2px;
+      }
+
+      .steamloader-feature-footer-copy {
+        color: rgba(196, 208, 220, 0.84);
+        font-size: 11px;
+        line-height: 1.2;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      .steamloader-feature-footer-chevron {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(196, 208, 220, 0.84);
+      }
+
+      .steamloader-feature-footer-chevron svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      .steamloader-dialog-button-inline-stepper {
+        width: min(100%, 232px) !important;
+        min-height: 0 !important;
+        margin: 2px auto 0 !important;
+        padding: 9px 14px !important;
+        border-radius: 14px !important;
+        background: rgba(255, 255, 255, 0.042) !important;
+      }
+
+      .steamloader-inline-stepper {
+        display: grid;
+        grid-template-columns: 18px minmax(0, 1fr) 18px;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .steamloader-inline-stepper-main {
+        min-width: 0;
+        text-align: center;
+      }
+
+      .steamloader-inline-stepper-title {
+        color: rgba(233, 239, 245, 0.94);
+        font-size: 15px;
+        line-height: 1.15;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+
+      .steamloader-inline-stepper-copy {
+        margin-top: 2px;
+        color: rgba(173, 184, 195, 0.86);
+        font-size: 11px;
+        line-height: 1.2;
+        font-weight: 600;
+      }
+
+      .steamloader-inline-stepper.is-compact .steamloader-inline-stepper-title {
+        font-size: 14px;
+      }
+
+      .steamloader-inline-stepper-arrow {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(196, 208, 220, 0.82);
+      }
+
+      .steamloader-inline-stepper-arrow svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      .steamloader-inline-stepper-arrow.is-disabled {
+        opacity: 0.28;
+      }
+
+      .steamloader-row-shell-global-back {
+        padding: 0;
+      }
+
+      .steamloader-dialog-button-global-back {
+        min-height: 40px !important;
+        padding: 7px 10px !important;
+        border-radius: 13px !important;
+        background: rgba(255, 255, 255, 0.045) !important;
+      }
+
+      .steamloader-dialog-button-global-back:hover,
+      .steamloader-dialog-button-global-back:focus-visible,
+      .steamloader-dialog-button-global-back.gpfocus {
+        background: #edf3f8 !important;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22), 0 8px 24px rgba(0, 0, 0, 0.18) !important;
+      }
+
+      .steamloader-row-shell-global-back .steamloader-row-icon {
+        width: 28px;
+        height: 28px;
+        border-radius: 9px;
+        background: rgba(255, 255, 255, 0.07);
+      }
+
+      .steamloader-row-shell-global-back .steamloader-row-title {
+        font-size: clamp(14px, 1.62vw, 17px);
+        line-height: 1.12;
+        font-weight: 700;
+      }
+
+      .steamloader-row-shell-global-back .steamloader-row-copy {
+        margin-top: 1px;
+        font-size: clamp(10px, 1.08vw, 12px);
+      }
+
+      .steamloader-dialog-button-global-back:hover .steamloader-row-title,
+      .steamloader-dialog-button-global-back:hover .steamloader-row-copy,
+      .steamloader-dialog-button-global-back:hover .steamloader-row-trailing,
+      .steamloader-dialog-button-global-back:focus-visible .steamloader-row-title,
+      .steamloader-dialog-button-global-back:focus-visible .steamloader-row-copy,
+      .steamloader-dialog-button-global-back:focus-visible .steamloader-row-trailing,
+      .steamloader-dialog-button-global-back.gpfocus .steamloader-row-title,
+      .steamloader-dialog-button-global-back.gpfocus .steamloader-row-copy,
+      .steamloader-dialog-button-global-back.gpfocus .steamloader-row-trailing {
+        color: #121923 !important;
+      }
+
+      .steamloader-dialog-button-global-back:hover .steamloader-row-icon,
+      .steamloader-dialog-button-global-back:focus-visible .steamloader-row-icon,
+      .steamloader-dialog-button-global-back.gpfocus .steamloader-row-icon {
+        background: rgba(18, 25, 35, 0.1) !important;
+        color: #121923 !important;
       }
 
       .steamloader-row-shell-home {
@@ -856,9 +2056,45 @@
 
       .steamloader-editor-card {
         margin-top: 10px;
-        padding: 12px 13px;
         border-radius: 16px;
         background: rgba(255, 255, 255, 0.05);
+        transition: box-shadow 0.15s ease;
+      }
+
+      .steamloader-editor-card:has(.steamloader-editor-trigger:focus),
+      .steamloader-editor-card:has(.steamloader-editor-trigger.gpfocus) {
+        box-shadow: 0 0 0 2px rgba(106, 169, 255, 0.72);
+      }
+
+      .steamloader-editor-trigger {
+        display: block;
+        width: 100%;
+        padding: 12px 13px 0;
+        min-height: 0 !important;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 16px 16px 0 0 !important;
+        font: inherit;
+        text-align: left;
+        cursor: default;
+        outline: none;
+      }
+
+      .steamloader-editor-trigger.gpfocus,
+      .steamloader-editor-trigger:focus-visible {
+        background: rgba(237, 243, 248, 0.94) !important;
+      }
+
+      .steamloader-editor-trigger.gpfocus .steamloader-editor-label,
+      .steamloader-editor-trigger.gpfocus .steamloader-editor-help,
+      .steamloader-editor-trigger:focus-visible .steamloader-editor-label,
+      .steamloader-editor-trigger:focus-visible .steamloader-editor-help {
+        color: #121923 !important;
+      }
+
+      .steamloader-editor-card .steamloader-editor-textarea {
+        margin: 9px 13px 12px;
+        width: calc(100% - 26px);
       }
 
       .steamloader-editor-label {
@@ -891,6 +2127,11 @@
         resize: vertical;
       }
 
+      .steamloader-editor-input-secret {
+        min-height: 44px;
+        resize: none;
+      }
+
       .steamloader-editor-textarea:focus {
         outline: none;
         border-color: rgba(106, 169, 255, 0.72);
@@ -909,6 +2150,27 @@
         color: rgba(160, 171, 182, 0.92);
         font-size: clamp(11px, 1.28vw, 14px);
         line-height: 1.4;
+      }
+
+      .steamloader-card-swatch {
+        margin-top: 10px;
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        color: rgba(214, 222, 231, 0.92);
+        font-size: clamp(11px, 1.25vw, 14px);
+      }
+
+      .steamloader-card-swatch-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 0 12px rgba(255, 255, 255, 0.1);
+        flex: 0 0 auto;
+      }
+
+      .steamloader-card-swatch-label {
+        color: rgba(205, 214, 224, 0.94);
       }
 
       .steamloader-card-image-shell {
@@ -1104,8 +2366,19 @@
         display: flex;
         align-items: center;
         justify-content: center;
+        gap: 8px;
         min-height: 24px;
         text-align: center;
+      }
+
+      .steamloader-volume-action-icon {
+        width: 18px;
+        height: 18px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(214, 222, 231, 0.9);
+        flex-shrink: 0;
       }
 
       .steamloader-volume-action-title {
@@ -1210,6 +2483,11 @@
         background: rgba(255, 255, 255, 0.05) !important;
         border-radius: 18px !important;
         box-sizing: border-box;
+        outline: none !important;
+        transition:
+          background 0.12s ease,
+          box-shadow 0.12s ease,
+          transform 0.12s ease;
       }
 
       .steamloader-audio-quick-shell {
@@ -1240,6 +2518,27 @@
 
       .steamloader-audio-quick-button.is-active .steamloader-audio-quick-title,
       .steamloader-audio-quick-button.is-active .steamloader-audio-quick-icon {
+        color: #111824;
+      }
+
+      .steamloader-audio-quick-button.gpfocus,
+      .steamloader-audio-quick-button:focus-visible {
+        transform: translateY(-1px);
+        box-shadow:
+          0 0 0 3px rgba(86, 188, 255, 0.98),
+          0 0 0 7px rgba(86, 188, 255, 0.22),
+          inset 0 0 0 3px rgba(10, 17, 26, 0.72) !important;
+      }
+
+      .steamloader-audio-quick-button.gpfocus:not(.is-active),
+      .steamloader-audio-quick-button:focus-visible:not(.is-active) {
+        background: linear-gradient(180deg, rgba(242, 247, 252, 0.94) 0%, rgba(198, 212, 225, 0.9) 100%) !important;
+      }
+
+      .steamloader-audio-quick-button.gpfocus:not(.is-active) .steamloader-audio-quick-title,
+      .steamloader-audio-quick-button.gpfocus:not(.is-active) .steamloader-audio-quick-icon,
+      .steamloader-audio-quick-button:focus-visible:not(.is-active) .steamloader-audio-quick-title,
+      .steamloader-audio-quick-button:focus-visible:not(.is-active) .steamloader-audio-quick-icon {
         color: #111824;
       }
 
@@ -1438,6 +2737,12 @@
         color: #293544;
       }
 
+      .steamloader-dialog-button.gpfocus .steamloader-accordion-toggle-title,
+      .steamloader-dialog-button.gpfocus .steamloader-accordion-toggle-copy,
+      .steamloader-dialog-button.gpfocus .steamloader-accordion-toggle-arrow {
+        color: #293544;
+      }
+
       .steamloader-dialog-button.gpfocus .steamloader-header-action-shell {
         color: #293544;
       }
@@ -1450,6 +2755,56 @@
       .steamloader-dialog-button.gpfocus .steamloader-badge {
         background: rgba(41, 53, 68, 0.12);
         color: #293544;
+      }
+
+      .steamloader-dialog-button-inline-stepper.gpfocus,
+      .steamloader-dialog-button-inline-stepper:focus-visible {
+        box-shadow: 0 0 0 2px rgba(131, 188, 255, 0.68) !important;
+      }
+
+      .steamloader-dialog-button-inline-stepper.gpfocus .steamloader-inline-stepper-title,
+      .steamloader-dialog-button-inline-stepper:focus-visible .steamloader-inline-stepper-title,
+      .steamloader-dialog-button-inline-stepper.gpfocus .steamloader-inline-stepper-copy,
+      .steamloader-dialog-button-inline-stepper:focus-visible .steamloader-inline-stepper-copy,
+      .steamloader-dialog-button-inline-stepper.gpfocus .steamloader-inline-stepper-arrow,
+      .steamloader-dialog-button-inline-stepper:focus-visible .steamloader-inline-stepper-arrow {
+        color: rgba(243, 248, 252, 0.98) !important;
+      }
+
+      .steamloader-dialog-button-feature:hover .steamloader-feature-title,
+      .steamloader-dialog-button-feature:hover .steamloader-feature-copy,
+      .steamloader-dialog-button-feature:hover .steamloader-feature-footer-copy,
+      .steamloader-dialog-button-feature:hover .steamloader-feature-footer-chevron,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-title,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-copy,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-footer-copy,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-footer-chevron,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-title,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-copy,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-footer-copy,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-footer-chevron {
+        color: rgba(236, 242, 247, 0.96) !important;
+      }
+
+      .steamloader-dialog-button-feature:hover .steamloader-feature-meta-item,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-meta-item,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-meta-item {
+        background: rgba(255, 255, 255, 0.06) !important;
+        color: rgba(204, 214, 224, 0.86) !important;
+      }
+
+      .steamloader-dialog-button-feature:hover .steamloader-feature-eyebrow,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-eyebrow,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-eyebrow {
+        background: rgba(10, 15, 21, 0.72) !important;
+        color: rgba(228, 234, 240, 0.86) !important;
+      }
+
+      .steamloader-dialog-button-feature:hover .steamloader-feature-status,
+      .steamloader-dialog-button-feature:focus-visible .steamloader-feature-status,
+      .steamloader-dialog-button-feature.gpfocus .steamloader-feature-status {
+        background: rgba(10, 15, 21, 0.72) !important;
+        color: rgba(214, 222, 231, 0.9) !important;
       }
 
       .steamloader-dialog-button.gpfocus .steamloader-switch {
@@ -1480,7 +2835,8 @@
         background: #f5f7f9;
       }
 
-      .steamloader-dialog-button.gpfocus .steamloader-volume-action-title {
+      .steamloader-dialog-button.gpfocus .steamloader-volume-action-title,
+      .steamloader-dialog-button.gpfocus .steamloader-volume-action-icon {
         color: #293544;
       }
 
@@ -1665,6 +3021,28 @@
         padding-top: 8px;
       }
 
+      .steamloader-panel-themes-store {
+        padding: 14px 10px 24px;
+        background:
+          radial-gradient(circle at top left, rgba(62, 127, 212, 0.14) 0%, rgba(15, 21, 29, 0) 30%),
+          linear-gradient(180deg, rgba(12, 17, 24, 0.98) 0%, rgba(15, 21, 29, 1) 100%);
+      }
+
+      .steamloader-panel-themes-store .steamloader-header {
+        margin-bottom: 12px;
+      }
+
+      .steamloader-panel-themes-store .steamloader-stack {
+        gap: 12px;
+      }
+
+      .steamloader-panel-themes-store .steamloader-card,
+      .steamloader-panel-themes-store .steamloader-editor-card {
+        border: 1px solid rgba(120, 153, 191, 0.12);
+        background:
+          linear-gradient(180deg, rgba(28, 37, 48, 0.9) 0%, rgba(18, 25, 34, 0.94) 100%);
+      }
+
       .steamloader-status {
         margin-bottom: 10px;
         background: rgba(255, 255, 255, 0.04);
@@ -1759,45 +3137,210 @@
     return "root";
   }
 
-  function rememberCurrentRouteIndex(index) {
-    state.lastSelectedIndexByRoute[getRouteKey(state.route)] = index;
+  function getExpandedSectionRouteKey(sectionKey, route = state.route) {
+    const normalizedSectionKey = typeof sectionKey === "string" ? sectionKey.trim() : "";
+    if (!normalizedSectionKey) {
+      return "";
+    }
+
+    return `${getRouteKey(route)}::${normalizedSectionKey}`;
   }
 
-  function requestFocusForRoute(route, fallbackIndex = null) {
+  function isExpandedSection(sectionKey, defaultExpanded = false, route = state.route) {
+    const routeSectionKey = getExpandedSectionRouteKey(sectionKey, route);
+    if (!routeSectionKey) {
+      return Boolean(defaultExpanded);
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(state.expandedSectionsByRoute, routeSectionKey)) {
+      state.expandedSectionsByRoute[routeSectionKey] = Boolean(defaultExpanded);
+    }
+
+    return Boolean(state.expandedSectionsByRoute[routeSectionKey]);
+  }
+
+  function setExpandedSection(sectionKey, expanded, route = state.route) {
+    const routeSectionKey = getExpandedSectionRouteKey(sectionKey, route);
+    if (!routeSectionKey) {
+      return Boolean(expanded);
+    }
+
+    state.expandedSectionsByRoute[routeSectionKey] = Boolean(expanded);
+    return state.expandedSectionsByRoute[routeSectionKey];
+  }
+
+  function toggleExpandedSection(sectionKey, defaultExpanded = false, route = state.route) {
+    return setExpandedSection(sectionKey, !isExpandedSection(sectionKey, defaultExpanded, route), route);
+  }
+
+  function normalizeFocusSlotKey(value) {
+    if (typeof value !== "string") {
+      return null;
+    }
+
+    const normalized = value.trim();
+    return normalized ? normalized : null;
+  }
+
+  function resolveSlotFocusKey(slot, index = null) {
+    const explicitKey = normalizeFocusSlotKey(slot?.slotKey || slot?.key);
+    if (explicitKey) {
+      return explicitKey;
+    }
+
+    const settingScope = normalizeFocusSlotKey(slot?.settingScope);
+    const settingKey = normalizeFocusSlotKey(slot?.settingKey);
+    if (settingScope && settingKey) {
+      return `setting:${settingScope}:${settingKey}`;
+    }
+
+    const value = slot?.value;
+    if (typeof value === "string" && value.trim()) {
+      return `value:${value.trim()}`;
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return `value:${value}`;
+    }
+
+    const title = normalizeFocusSlotKey(slot?.title);
+    const copy = typeof slot?.copy === "string" ? normalizeFocusSlotKey(slot.copy) : null;
+    if (title && copy) {
+      return `label:${title}::${copy}`;
+    }
+
+    if (title) {
+      return `label:${title}`;
+    }
+
+    return Number.isInteger(index) ? `index:${index}` : null;
+  }
+
+  function rememberCurrentRouteSelection(index, slotOrKey = null) {
+    const routeKey = getRouteKey(state.route);
+    if (Number.isInteger(index)) {
+      state.lastSelectedIndexByRoute[routeKey] = index;
+    }
+
+    const resolvedFocusKey =
+      typeof slotOrKey === "string"
+        ? normalizeFocusSlotKey(slotOrKey)
+        : resolveSlotFocusKey(slotOrKey, index);
+
+    if (resolvedFocusKey) {
+      state.lastSelectedSlotKeyByRoute[routeKey] = resolvedFocusKey;
+    } else {
+      delete state.lastSelectedSlotKeyByRoute[routeKey];
+    }
+  }
+
+  function rememberCurrentRouteIndex(index) {
+    const slot = Array.isArray(state.renderedSlots) && Number.isInteger(index)
+      ? state.renderedSlots[index] || null
+      : null;
+    rememberCurrentRouteSelection(index, slot);
+  }
+
+  function rememberCurrentRouteSlot(index, slot = null) {
+    rememberCurrentRouteSelection(index, slot);
+  }
+
+  function requestFocusForRoute(route, fallbackIndex = null, fallbackSlotKey = null) {
     const routeKey = getRouteKey(route);
     const rememberedIndex = state.lastSelectedIndexByRoute[routeKey];
+    const rememberedSlotKey = normalizeFocusSlotKey(state.lastSelectedSlotKeyByRoute[routeKey]);
+    const explicitSlotKey = normalizeFocusSlotKey(fallbackSlotKey);
 
     state.pendingFocusRouteKey = routeKey;
+    state.pendingFocusSlotKey = explicitSlotKey || rememberedSlotKey;
     state.pendingFocusIndex = Number.isInteger(rememberedIndex)
-      ? rememberedIndex
+      ? Number.isInteger(fallbackIndex)
+        ? fallbackIndex
+        : rememberedIndex
       : Number.isInteger(fallbackIndex)
         ? fallbackIndex
         : null;
   }
 
-  function requestFreshEntryForRoute(route, focusIndex = 0, scrollTop = 0) {
+  function requestRouteEntryFocus(route) {
+    const routeKey = getRouteKey(route);
+    if (state.pendingFocusRouteKey === routeKey) {
+      return;
+    }
+
+    requestFocusForRoute(route, null);
+  }
+
+  function requestFreshEntryForRoute(route, focusIndex = 0, scrollTop = 0, focusSlotKey = null) {
     const routeKey = getRouteKey(route);
     state.pendingFocusRouteKey = routeKey;
+    state.pendingFocusSlotKey = normalizeFocusSlotKey(focusSlotKey);
     state.pendingFocusIndex = Number.isInteger(focusIndex) ? focusIndex : 0;
     state.pendingScrollRouteKey = routeKey;
     state.pendingScrollTop = Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0;
+  }
+
+  function resolveAutoFocusTarget(route, slots = [], fallbackIndex = null) {
+    const routeKey = getRouteKey(route);
+    const hasPendingFocus = state.pendingFocusRouteKey === routeKey;
+    const pendingSlotKey = hasPendingFocus ? normalizeFocusSlotKey(state.pendingFocusSlotKey) : null;
+    if (pendingSlotKey && Array.isArray(slots)) {
+      const matchedIndex = slots.findIndex((slot, index) => resolveSlotFocusKey(slot, index) === pendingSlotKey);
+      if (matchedIndex >= 0) {
+        return matchedIndex;
+      }
+    }
+
+    if (hasPendingFocus && Number.isInteger(state.pendingFocusIndex)) {
+      return state.pendingFocusIndex;
+    }
+
+    if (hasPendingFocus && Number.isInteger(fallbackIndex)) {
+      return fallbackIndex;
+    }
+
+    if (route.screen === "root" && state.pendingEntryAutoFocus) {
+      return 0;
+    }
+
+    return null;
   }
 
   function getPanelScrollContainer() {
     return document.querySelector("#quickaccess_content_7 .steamloader-panel");
   }
 
-  function rememberRouteScroll(route = state.route, scrollTop = null) {
+  function getPanelRouteKey(panel = getPanelScrollContainer()) {
+    return normalizeFocusSlotKey(panel?.getAttribute?.("data-route-key"));
+  }
+
+  function hasPanelLayout(panel = getPanelScrollContainer()) {
+    return panel instanceof HTMLElement && panel.clientHeight > 0 && panel.scrollHeight > 0;
+  }
+
+  function rememberRouteScroll(route = state.route, scrollTop = null, options = {}) {
     const routeKey = getRouteKey(route);
+    const panel = getPanelScrollContainer();
     const resolvedTop = Number.isFinite(scrollTop)
       ? scrollTop
-      : getPanelScrollContainer()?.scrollTop;
+      : panel?.scrollTop;
 
     if (!Number.isFinite(resolvedTop)) {
       return;
     }
 
-    state.lastScrollTopByRoute[routeKey] = Math.max(0, resolvedTop);
+    const nextScrollTop = Math.max(0, resolvedTop);
+    const rememberedTop = state.lastScrollTopByRoute[routeKey];
+    if (
+      !hasPanelLayout(panel) &&
+      nextScrollTop <= 1 &&
+      Number.isFinite(rememberedTop) &&
+      rememberedTop > 1
+    ) {
+      return;
+    }
+
+    state.lastScrollTopByRoute[routeKey] = nextScrollTop;
   }
 
   function requestScrollRestoreForRoute(route, fallbackTop = null) {
@@ -1835,6 +3378,8 @@
       state.pendingScrollAnimationFrame = 0;
     }
 
+    const maxAttempts = 2;
+
     const applyRestore = (attempt = 0) => {
       state.pendingScrollAnimationFrame = window.requestAnimationFrame(() => {
         if (state.pendingScrollRouteKey !== routeKey) {
@@ -1847,8 +3392,8 @@
         }
 
         const panel = getPanelScrollContainer();
-        if (!(panel instanceof HTMLElement)) {
-          if (attempt < 8) {
+        if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
+          if (attempt < maxAttempts) {
             applyRestore(attempt + 1);
           } else {
             clearPendingScrollRestore();
@@ -1856,23 +3401,574 @@
           return;
         }
 
+        ensurePanelInteractionTracker();
         const maxScrollTop = Math.max(0, panel.scrollHeight - panel.clientHeight);
         const nextScrollTop = Math.max(0, Math.min(targetTop, maxScrollTop));
         if (Math.abs(panel.scrollTop - nextScrollTop) > 1) {
           panel.scrollTop = nextScrollTop;
         }
 
-        if (attempt < 4) {
+        if (attempt < maxAttempts) {
           applyRestore(attempt + 1);
           return;
         }
 
-        state.lastScrollTopByRoute[routeKey] = panel.scrollTop;
+        rememberRouteScroll(state.route, panel.scrollTop, { force: true });
         clearPendingScrollRestore();
       });
     };
 
     applyRestore(0);
+  }
+
+  function rememberSlotElementFocus(element) {
+    const focusedNode = element?.closest?.(".steamloader-panel [data-slot-button]") || null;
+    if (!(focusedNode instanceof HTMLElement)) {
+      return false;
+    }
+
+    const panel = focusedNode.closest(".steamloader-panel");
+    const panelRouteKey = getPanelRouteKey(panel);
+    const routeKey = getRouteKey(state.route);
+    if (panelRouteKey && panelRouteKey !== routeKey) {
+      return false;
+    }
+
+    const rawValue = focusedNode.getAttribute("data-slot-button");
+    const parsedValue = Number.parseInt(rawValue || "", 10);
+    const index = Number.isInteger(parsedValue) ? parsedValue : null;
+    const slotKey =
+      normalizeFocusSlotKey(focusedNode.getAttribute("data-slot-key")) ||
+      (Number.isInteger(index) && Array.isArray(state.renderedSlots)
+        ? resolveSlotFocusKey(state.renderedSlots[index], index)
+        : null);
+
+    if (Number.isInteger(index)) {
+      rememberCurrentRouteSelection(index, slotKey || state.renderedSlots?.[index] || null);
+      return true;
+    }
+
+    if (slotKey) {
+      state.lastSelectedSlotKeyByRoute[routeKey] = slotKey;
+      return true;
+    }
+
+    return false;
+  }
+
+  function rememberFocusedSlotFromDom() {
+    const focusedNode =
+      document.querySelector(".steamloader-panel [data-slot-button].gpfocus") ||
+      document.activeElement?.closest?.(".steamloader-panel [data-slot-button]") ||
+      null;
+    return rememberSlotElementFocus(focusedNode);
+  }
+
+  function detachPanelInteractionTracker() {
+    if (state.trackedPanel && state.trackedPanelScrollHandler) {
+      state.trackedPanel.removeEventListener("scroll", state.trackedPanelScrollHandler);
+    }
+
+    if (state.trackedPanel && state.trackedPanelFocusHandler) {
+      state.trackedPanel.removeEventListener("focusin", state.trackedPanelFocusHandler, true);
+    }
+
+    if (state.trackedPanel && state.trackedPanelFocusOutHandler) {
+      state.trackedPanel.removeEventListener("focusout", state.trackedPanelFocusOutHandler, true);
+    }
+
+    state.trackedPanel = null;
+    state.trackedPanelScrollHandler = null;
+    state.trackedPanelFocusHandler = null;
+    state.trackedPanelFocusOutHandler = null;
+  }
+
+  function ensurePanelInteractionTracker() {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement)) {
+      detachPanelInteractionTracker();
+      return;
+    }
+
+    if (state.trackedPanel === panel) {
+      return;
+    }
+
+    detachPanelInteractionTracker();
+    state.trackedPanel = panel;
+
+    const scrollHandler = () => {
+      const panelRouteKey = getPanelRouteKey(panel);
+      if (panelRouteKey && panelRouteKey !== getRouteKey(state.route)) {
+        return;
+      }
+
+      rememberRouteScroll(state.route, panel.scrollTop);
+    };
+    const focusHandler = (event) => {
+      rememberSlotElementFocus(event.target);
+    };
+    const focusOutHandler = () => {
+      window.requestAnimationFrame(() => {
+        if (!state.panelVisible || !hasPanelLayout(panel)) {
+          return;
+        }
+
+        const panelRouteKey = getPanelRouteKey(panel);
+        if (panelRouteKey && panelRouteKey !== getRouteKey(state.route)) {
+          return;
+        }
+
+        if (document.activeElement === document.body) {
+          queuePendingFocusRestore(state.route);
+        }
+      });
+    };
+
+    state.trackedPanelScrollHandler = scrollHandler;
+    state.trackedPanelFocusHandler = focusHandler;
+    state.trackedPanelFocusOutHandler = focusOutHandler;
+    panel.addEventListener("scroll", scrollHandler, { passive: true });
+    panel.addEventListener("focusin", focusHandler, true);
+    panel.addEventListener("focusout", focusOutHandler, true);
+
+    rememberFocusedSlotFromDom();
+  }
+
+  function isEditableFocusTarget(element) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const tagName = element.tagName.toLowerCase();
+    return (
+      tagName === "input" ||
+      tagName === "textarea" ||
+      tagName === "select" ||
+      element.isContentEditable
+    );
+  }
+
+  function getEditorDataKey(element) {
+    return normalizeFocusSlotKey(element?.getAttribute?.("data-editor-key"));
+  }
+
+  function ensureEditorSelectionStore() {
+    if (!state.editorSelectionByKey || typeof state.editorSelectionByKey !== "object") {
+      state.editorSelectionByKey = {};
+    }
+
+    return state.editorSelectionByKey;
+  }
+
+  function rememberEditorSelection(element) {
+    if (!(element instanceof HTMLElement) || !isEditableFocusTarget(element)) {
+      return null;
+    }
+
+    const editorKey = getEditorDataKey(element);
+    if (!editorKey || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") {
+      return null;
+    }
+
+    const value = typeof element.value === "string" ? element.value : "";
+    const selection = {
+      start: Math.max(0, Math.min(value.length, element.selectionStart)),
+      end: Math.max(0, Math.min(value.length, element.selectionEnd)),
+      direction: typeof element.selectionDirection === "string" ? element.selectionDirection : "none",
+      value,
+    };
+
+    ensureEditorSelectionStore()[editorKey] = selection;
+    return selection;
+  }
+
+  function restoreEditorSelection(element, options = {}) {
+    if (
+      !(element instanceof HTMLElement) ||
+      typeof element.setSelectionRange !== "function" ||
+      typeof element.value !== "string"
+    ) {
+      return false;
+    }
+
+    const editorKey = getEditorDataKey(element);
+    const saved = editorKey ? ensureEditorSelectionStore()[editorKey] : null;
+    const valueLength = element.value.length;
+    const fallback = options.preferEnd ? valueLength : null;
+    const startValue = Number.isFinite(saved?.start) ? saved.start : fallback;
+    const endValue = Number.isFinite(saved?.end) ? saved.end : startValue;
+    if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) {
+      return false;
+    }
+
+    const start = Math.max(0, Math.min(valueLength, startValue));
+    const end = Math.max(0, Math.min(valueLength, endValue));
+    const direction = typeof saved?.direction === "string" ? saved.direction : "none";
+
+    try {
+      element.setSelectionRange(start, end, direction);
+      rememberEditorSelection(element);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function markEditorFocused(editorKey, element = null) {
+    if (!editorKey) {
+      return;
+    }
+
+    state.editorFocusActive = true;
+    state.editorFocusCardKey = editorKey;
+    state.editorFocusRouteKey = getRouteKey(state.route);
+  }
+
+  function clearEditorFocus(editorKey = null) {
+    if (editorKey && state.editorFocusCardKey && state.editorFocusCardKey !== editorKey) {
+      return;
+    }
+
+    state.editorFocusActive = false;
+    state.editorFocusCardKey = null;
+    state.editorFocusRouteKey = null;
+  }
+
+  function isEditorFocusForRoute(route = state.route) {
+    return Boolean(
+      state.editorFocusActive &&
+        state.editorFocusCardKey &&
+        (!state.editorFocusRouteKey || state.editorFocusRouteKey === getRouteKey(route)),
+    );
+  }
+
+  function getElementFromNode(node) {
+    if (node instanceof Element) {
+      return node;
+    }
+
+    return node?.parentElement instanceof Element ? node.parentElement : null;
+  }
+
+  function isTextInputContextElement(node) {
+    const element = getElementFromNode(node);
+    if (!element) {
+      return false;
+    }
+
+    if (element instanceof HTMLElement && isEditableFocusTarget(element)) {
+      return true;
+    }
+
+    return Boolean(
+      element.closest?.(
+        "[data-editor-key], input, textarea, select, [contenteditable='true'], [role='textbox']",
+      ),
+    );
+  }
+
+  function shouldSuppressGlobalHotkeysForTextInput(event = null) {
+    return Boolean(
+      Date.now() < (Number(state.steamKeyboardActiveUntil) || 0) ||
+        state.editorFocusActive ||
+        state.editorFocusCardKey ||
+        isTextInputContextElement(event?.target) ||
+        isTextInputContextElement(document.activeElement),
+    );
+  }
+
+  function isCurrentRouteSlotElement(element, route = state.route) {
+    const slotElement = element?.closest?.(".steamloader-panel [data-slot-button]") || null;
+    if (!(slotElement instanceof HTMLElement)) {
+      return false;
+    }
+
+    const panel = slotElement.closest(".steamloader-panel");
+    const panelRouteKey = getPanelRouteKey(panel);
+    const routeKey = getRouteKey(route);
+    return !panelRouteKey || panelRouteKey === routeKey;
+  }
+
+  function hasRouteTextInputFocus(route = state.route) {
+    if (isEditorFocusForRoute(route)) {
+      return true;
+    }
+
+    return (
+      isCurrentRouteSlotElement(document.activeElement, route) &&
+      isTextInputContextElement(document.activeElement)
+    );
+  }
+
+  function findSlotElementByKey(panel, slotKey) {
+    const normalizedKey = normalizeFocusSlotKey(slotKey);
+    if (!normalizedKey || !(panel instanceof HTMLElement)) {
+      return null;
+    }
+
+    for (const element of panel.querySelectorAll("[data-slot-button]")) {
+      if (element.getAttribute("data-slot-key") === normalizedKey) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  function findSlotElementByIndex(panel, index) {
+    if (!(panel instanceof HTMLElement) || !Number.isInteger(index)) {
+      return null;
+    }
+
+    return panel.querySelector(`[data-slot-button="${index}"]`);
+  }
+
+  function isFocusableSlotElement(element) {
+    return Boolean(
+      element instanceof HTMLElement &&
+        !element.hasAttribute("disabled") &&
+        element.getAttribute("aria-disabled") !== "true",
+    );
+  }
+
+  function findFirstFocusableSlotElement(panel) {
+    if (!(panel instanceof HTMLElement)) {
+      return null;
+    }
+
+    for (const element of panel.querySelectorAll("[data-slot-button]")) {
+      if (isFocusableSlotElement(element)) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  function getFocusRestoreTarget(route = state.route) {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
+      return null;
+    }
+
+    const routeKey = getRouteKey(route);
+    const panelRouteKey = getPanelRouteKey(panel);
+    if (panelRouteKey && panelRouteKey !== routeKey) {
+      return null;
+    }
+
+    const hasPendingFocus = state.pendingFocusRouteKey === routeKey;
+    const pendingSlotKey = hasPendingFocus ? normalizeFocusSlotKey(state.pendingFocusSlotKey) : null;
+    const rememberedSlotKey = normalizeFocusSlotKey(state.lastSelectedSlotKeyByRoute[routeKey]);
+    const pendingIndex = hasPendingFocus && Number.isInteger(state.pendingFocusIndex)
+      ? state.pendingFocusIndex
+      : null;
+    const rememberedIndex = state.lastSelectedIndexByRoute[routeKey];
+    const index = Number.isInteger(pendingIndex)
+      ? pendingIndex
+      : Number.isInteger(rememberedIndex)
+        ? rememberedIndex
+        : route.screen === "root"
+          ? 0
+          : null;
+
+    const byKey =
+      findSlotElementByKey(panel, pendingSlotKey) ||
+      findSlotElementByKey(panel, rememberedSlotKey);
+    const byIndex = findSlotElementByIndex(panel, index);
+    const target = [byKey, byIndex, findFirstFocusableSlotElement(panel)]
+      .find((element) => isFocusableSlotElement(element));
+
+    return target || null;
+  }
+
+  function restoreRouteFocus(route = state.route) {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
+      return false;
+    }
+
+    if (!state.panelVisible && !isVisible(getPanelHost())) {
+      return false;
+    }
+
+    const activeElement = document.activeElement;
+    if (panel.contains(activeElement) && isEditableFocusTarget(activeElement)) {
+      const editorKey = getEditorDataKey(activeElement);
+      if (editorKey) {
+        markEditorFocused(editorKey);
+      }
+      rememberEditorSelection(activeElement);
+      return true;
+    }
+
+    if (state.editorFocusActive && state.editorFocusCardKey && !isEditorFocusForRoute(route)) {
+      clearEditorFocus();
+    }
+
+    // If the user was typing in an editor before a re-render, restore to it.
+    if (state.editorFocusActive && state.editorFocusCardKey) {
+      let textarea = null;
+      for (const el of panel.querySelectorAll("[data-editor-key]")) {
+        if (el.getAttribute("data-editor-key") === state.editorFocusCardKey) {
+          textarea = el;
+          break;
+        }
+      }
+      if (textarea instanceof HTMLElement) {
+        textarea.focus({ preventScroll: true });
+        restoreEditorSelection(textarea, { preferEnd: true });
+        return document.activeElement === textarea;
+      }
+      // Textarea not yet in DOM — report not-done so the caller retries
+      return false;
+    }
+
+    if (isCurrentRouteSlotElement(activeElement, route)) {
+      rememberFocusedSlotFromDom();
+      return true;
+    }
+
+    // On Steam Deck, gamepad navigation uses a .gpfocus class instead of browser
+    // focus — document.activeElement stays as document.body. If a slot element
+    // already has gamepad focus, calling target.focus() would trigger Steam's
+    // gamepad-focus re-evaluation, causing the "A SELECT" label and the selected
+    // element's highlight to flicker visually. Skip the focus restore in that case.
+    const gpFocusedSlot = panel.querySelector("[data-slot-button].gpfocus");
+    if (gpFocusedSlot instanceof HTMLElement) {
+      rememberSlotElementFocus(gpFocusedSlot);
+      return true;
+    }
+
+    const target = getFocusRestoreTarget(route);
+    if (!target) {
+      return false;
+    }
+
+    const scrollTop = panel.scrollTop;
+    try {
+      target.focus({ preventScroll: true });
+    } catch {
+      try {
+        target.focus();
+      } catch {
+        return false;
+      }
+    }
+
+    if (Math.abs(panel.scrollTop - scrollTop) > 1) {
+      panel.scrollTop = scrollTop;
+    }
+
+    rememberSlotElementFocus(target);
+    return document.activeElement === target || target.contains(document.activeElement);
+  }
+
+  function clearPendingFocusRestore() {
+    if (state.pendingFocusRestoreAnimationFrame) {
+      window.cancelAnimationFrame(state.pendingFocusRestoreAnimationFrame);
+      state.pendingFocusRestoreAnimationFrame = 0;
+    }
+
+    state.pendingFocusRestoreRouteKey = null;
+  }
+
+  function queuePendingFocusRestore(route = state.route) {
+    const routeKey = getRouteKey(route);
+    state.pendingFocusRestoreRouteKey = routeKey;
+
+    if (state.pendingFocusRestoreAnimationFrame) {
+      window.cancelAnimationFrame(state.pendingFocusRestoreAnimationFrame);
+      state.pendingFocusRestoreAnimationFrame = 0;
+    }
+
+    const applyRestore = (attempt = 0) => {
+      state.pendingFocusRestoreAnimationFrame = window.requestAnimationFrame(() => {
+        if (state.pendingFocusRestoreRouteKey !== routeKey) {
+          return;
+        }
+
+        if (getRouteKey(state.route) !== routeKey) {
+          clearPendingFocusRestore();
+          return;
+        }
+
+        if (restoreRouteFocus(state.route) || attempt >= 2) {
+          clearPendingFocusRestore();
+          return;
+        }
+
+        applyRestore(attempt + 1);
+      });
+    };
+
+    applyRestore();
+  }
+
+  function repairPanelFocusIfNeeded() {
+    if (!state.panelVisible || document.activeElement !== document.body) {
+      return;
+    }
+
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
+      return;
+    }
+
+    const panelRouteKey = getPanelRouteKey(panel);
+    if (panelRouteKey && panelRouteKey !== getRouteKey(state.route)) {
+      return;
+    }
+
+    queuePendingFocusRestore(state.route);
+  }
+
+  function ensureFocusRepairTimer() {
+    if (window.__steamLoaderFocusRepairTimer) {
+      return;
+    }
+
+    window.__steamLoaderFocusRepairTimer = window.setInterval(repairPanelFocusIfNeeded, 500);
+  }
+
+  function ensureFocusRepairHandler() {
+    if (window.__steamLoaderFocusRepairHandler) {
+      return;
+    }
+
+    window.__steamLoaderFocusRepairHandler = () => {
+      window.requestAnimationFrame(repairPanelFocusIfNeeded);
+    };
+    document.addEventListener("focusout", window.__steamLoaderFocusRepairHandler, true);
+  }
+
+  function preparePanelReplacement() {
+    const panel = getPanelScrollContainer();
+    const panelRouteKey = getPanelRouteKey(panel);
+    const routeKey = getRouteKey(state.route);
+
+    if (panel instanceof HTMLElement && hasPanelLayout(panel) && (!panelRouteKey || panelRouteKey === routeKey)) {
+      rememberRouteScroll(state.route, panel.scrollTop, { force: true });
+    }
+
+    // Save editor focus state before the panel DOM is replaced
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof HTMLElement &&
+      isEditableFocusTarget(activeElement) &&
+      panel instanceof HTMLElement &&
+      panel.contains(activeElement)
+    ) {
+      const editorKey = activeElement.getAttribute("data-editor-key");
+      if (editorKey) {
+        markEditorFocused(editorKey, activeElement);
+        rememberEditorSelection(activeElement);
+      }
+    }
+
+    rememberFocusedSlotFromDom();
+    requestScrollRestoreForRoute(state.route);
   }
 
   function getPluginPageIndex(pluginId, pageId) {
@@ -1926,6 +4022,16 @@
     );
   }
 
+  function isThemesStoreThemeRoute(route = state.route) {
+    return Boolean(
+      route &&
+        route.screen === "page" &&
+        route.pluginId === "themes" &&
+        typeof route.pageId === "string" &&
+        route.pageId.startsWith("store-theme-"),
+    );
+  }
+
   function getThemeIdFromRoute(route = state.route) {
     if (!route || route.pluginId !== "themes" || typeof route.pageId !== "string") {
       return null;
@@ -1970,24 +4076,42 @@
     return route.pageId.replace(/^profile-/, "") || null;
   }
 
-  function getThemesBrowseIndex(themeId) {
-    const themes = state.themes.snapshot?.browseThemes;
-    if (!Array.isArray(themes)) {
+  function getThemeStoreIdFromRoute(route = state.route) {
+    if (!route || route.pluginId !== "themes" || typeof route.pageId !== "string") {
       return null;
     }
 
-    const index = themes.findIndex((theme) => theme.id === themeId);
-    return index >= 0 ? index : null;
+    if (!route.pageId.startsWith("store-theme-")) {
+      return null;
+    }
+
+    return route.pageId.replace(/^store-theme-/, "") || null;
+  }
+
+  function getInstalledThemeGroups() {
+    const themes = Array.isArray(state.themes.snapshot?.installedThemes)
+      ? state.themes.snapshot.installedThemes
+      : [];
+
+    return {
+      activeThemes: themes.filter((theme) => Boolean(theme?.enabled)),
+      readyThemes: themes.filter((theme) => !theme?.enabled),
+    };
   }
 
   function getThemesInstalledIndex(themeId) {
-    const themes = state.themes.snapshot?.installedThemes;
-    if (!Array.isArray(themes)) {
-      return null;
+    const { activeThemes, readyThemes } = getInstalledThemeGroups();
+    const activeIndex = activeThemes.findIndex((theme) => theme.id === themeId);
+    if (activeIndex >= 0) {
+      return activeIndex + 1;
     }
 
-    const index = themes.findIndex((theme) => theme.id === themeId);
-    return index >= 0 ? index : null;
+    const readyIndex = readyThemes.findIndex((theme) => theme.id === themeId);
+    if (readyIndex >= 0) {
+      return activeThemes.length + readyIndex + 3;
+    }
+
+    return null;
   }
 
   function getThemeOptionSlotIndex(themeId, optionId) {
@@ -2014,15 +4138,8 @@
     return index >= 0 ? index + 1 : null;
   }
 
-  function getThemesBrowseProfileIndex(profileId) {
-    const browseProfiles = state.themes.snapshot?.profiles?.browseProfiles;
-    const installedProfiles = state.themes.snapshot?.profiles?.installedProfiles;
-    if (!Array.isArray(browseProfiles)) {
-      return null;
-    }
-
-    const index = browseProfiles.findIndex((profile) => profile.id === profileId);
-    return index >= 0 ? index + 1 + (Array.isArray(installedProfiles) ? installedProfiles.length : 0) : null;
+  function getThemeStoreResultSlotKey(storeId) {
+    return storeId ? `theme-store-result-${storeId}` : "";
   }
 
   function getBackNavigation(route = state.route) {
@@ -2077,6 +4194,14 @@
         };
       }
 
+      if (route.pluginId === "smart-home" && route.pageId?.startsWith("room-")) {
+        const roomId = route.pageId.replace(/^room-/, "");
+        return {
+          route: parseRoute("page:smart-home:rooms"),
+          fallbackIndex: getSmartHomeRoomIndex(roomId),
+        };
+      }
+
       if (route.pluginId === "themes" && isThemesThemeOptionRoute(route)) {
         const themeId = getThemeIdFromRoute(route);
         const optionId = getThemeOptionIdFromRoute(route);
@@ -2089,30 +4214,29 @@
 
       if (route.pluginId === "themes" && isThemesThemeRoute(route)) {
         const themeId = getThemeIdFromRoute(route);
-        const origin = themeId ? state.themes.detailOriginByThemeId[themeId] : "store";
-        const pageId = origin === "installed" ? "installed" : "store";
-        const fallbackIndex =
-          origin === "installed"
-            ? getThemesInstalledIndex(themeId)
-            : getThemesBrowseIndex(themeId);
+        const fallbackIndex = getThemesInstalledIndex(themeId);
 
         return {
-          route: parseRoute(`page:themes:${pageId}`),
+          route: parseRoute("page:themes:installed"),
           fallbackIndex,
+        };
+      }
+
+      if (route.pluginId === "themes" && isThemesStoreThemeRoute(route)) {
+        const storeThemeId = getThemeStoreIdFromRoute(route);
+
+        return {
+          route: parseRoute("page:themes:store"),
+          fallbackSlotKey: getThemeStoreResultSlotKey(storeThemeId),
         };
       }
 
       if (route.pluginId === "themes" && isThemesProfileRoute(route)) {
         const profileId = getThemeProfileIdFromRoute(route);
-        const origin = profileId ? state.themes.detailOriginByProfileId[profileId] : "installed";
-        const fallbackIndex =
-          origin === "browse"
-            ? getThemesBrowseProfileIndex(profileId)
-            : getThemesInstalledProfileIndex(profileId);
 
         return {
           route: parseRoute("page:themes:profiles"),
-          fallbackIndex,
+          fallbackIndex: getThemesInstalledProfileIndex(profileId),
         };
       }
 
@@ -2131,7 +4255,11 @@
       return;
     }
 
-    requestFocusForRoute(backNavigation.route, backNavigation.fallbackIndex);
+    requestFocusForRoute(
+      backNavigation.route,
+      backNavigation.fallbackIndex,
+      backNavigation.fallbackSlotKey,
+    );
     setRoute(backNavigation.route);
   }
 
@@ -2151,8 +4279,10 @@
 
   function consumeResolvedFocus(route, autoFocusIndex) {
     if (Number.isInteger(autoFocusIndex) && state.pendingFocusRouteKey === getRouteKey(route)) {
+      rememberCurrentRouteSelection(autoFocusIndex, state.renderedSlots?.[autoFocusIndex] || null);
       state.pendingFocusRouteKey = null;
       state.pendingFocusIndex = null;
+      state.pendingFocusSlotKey = null;
     }
 
     if (
@@ -2237,13 +4367,24 @@
     if (visible && !state.panelVisible) {
       state.panelVisible = true;
       updateHomeReorderInputCapture();
+      ensurePanelInteractionTracker();
 
       if (state.route.screen === "root") {
         state.pendingEntryAutoFocus = true;
         state.renderRevision += 1;
         refreshQuickAccessPanel();
+        queuePendingFocusRestore(state.route);
+        refreshCurrentLiveRouteState();
+        return;
       }
 
+      if (getBackNavigation(state.route)) {
+        requestFreshEntryForRoute(state.route, 0, 0, globalBackSlotKey);
+        queuePendingScrollRestore();
+      }
+
+      queuePendingFocusRestore(state.route);
+      refreshCurrentLiveRouteState();
       return;
     }
 
@@ -2252,6 +4393,8 @@
         clearHomeReorderState({ restoreOriginalOrder: true });
       }
       state.panelVisible = false;
+      clearPendingFocusRestore();
+      clearEditorFocus();
       updateHomeReorderInputCapture();
     }
   }
@@ -2271,6 +4414,7 @@
     state.panelObserverHost = host;
     state.panelObserver = new MutationObserver(() => {
       monitorPanelVisibility();
+      ensurePanelInteractionTracker();
     });
 
     state.panelObserver.observe(host, {
@@ -2297,7 +4441,11 @@
   }
 
   function shouldLoadFrontendComponentRegistry() {
-    if (!window.STFrontendLib?.refreshComponentRegistry || state.nativeUi.registryLoading) {
+    if (
+      !window.STFrontendLib?.refreshComponentRegistry ||
+      state.nativeUi.registryLoading ||
+      usesCustomShellRoute()
+    ) {
       return false;
     }
 
@@ -2324,8 +4472,10 @@
     const nextVersion = state.nativeUi.registrySnapshot?.version || 0;
     const nextAvailableCount = state.nativeUi.registrySnapshot?.availableCount || 0;
     if (nextVersion !== previousVersion || nextAvailableCount !== previousAvailableCount) {
-      state.renderRevision += 1;
-      refreshQuickAccessPanel();
+      if (!state.installed || !state.panelVisible) {
+        state.renderRevision += 1;
+        refreshQuickAccessPanel();
+      }
     }
   }
 
@@ -2909,6 +5059,37 @@
     );
   }
 
+  function HeaderStoreIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 24 24",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M4.6 7.25H19.4L18.45 18.2C18.37 19.05 17.66 19.7 16.81 19.7H7.19C6.34 19.7 5.63 19.05 5.55 18.2L4.6 7.25Z",
+          stroke: "currentColor",
+          strokeWidth: "1.85",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M8.15 9.35V6.85C8.15 4.97 9.67 3.45 11.55 3.45H12.45C14.33 3.45 15.85 4.97 15.85 6.85V9.35",
+          stroke: "currentColor",
+          strokeWidth: "1.85",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M9.15 12.2H14.85",
+          stroke: "currentColor",
+          strokeWidth: "1.85",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
   function HeaderUpdateIcon() {
     return createElement(
       "svg",
@@ -3058,6 +5239,31 @@
     );
   }
 
+  function SmartHomePluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M7.5 17.25L18 8.5L28.5 17.25V28.5H20.75V22.75H15.25V28.5H7.5V17.25Z",
+          stroke: "currentColor",
+          strokeWidth: "2.2",
+          strokeLinejoin: "round",
+        }),
+        createElement("circle", {
+          cx: "24.5",
+          cy: "12",
+          r: "3",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
   function getPluginIconComponent(pluginId) {
     switch (pluginId) {
       case "audio":
@@ -3082,9 +5288,15 @@
         return ArtworkPluginIcon;
       case "themes":
         return ThemesPluginIcon;
+      case "smart-home":
+        return SmartHomePluginIcon;
       case "settings":
         return SettingsPluginIcon;
       default:
+        if (getCommunityPluginDefinition(pluginId)) {
+          return pluginId === "home-assistant" ? SmartHomePluginIcon : HeaderStoreIcon;
+        }
+
         return SteamLoaderIcon;
     }
   }
@@ -3131,6 +5343,692 @@
         }),
       ),
     );
+  }
+
+  function RefreshActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M27 12.75V7.5M27 7.5H21.75M27 7.5L22.25 12.25",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M28 17.5C28 11.7 23.3 7 17.5 7C13.7 7 10.35 9.05 8.55 12.1",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M9 23.25V28.5M9 28.5H14.25M9 28.5L13.75 23.75",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M8 18.5C8 24.3 12.7 29 18.5 29C22.3 29 25.65 26.95 27.45 23.9",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function SaveActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M10 8.5H23.5L28 13V27.5H8V10.5C8 9.4 8.9 8.5 10 8.5Z",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M12.5 8.5V16H22V8.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinejoin: "round",
+        }),
+        createElement("rect", {
+          x: "12",
+          y: "21",
+          width: "12",
+          height: "6",
+          rx: "1.8",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+      ),
+    );
+  }
+
+  function ResetActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M12.25 10.5H7V15.75",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M7 15.75C8.85 10.6 13.75 7 19.5 7C26.85 7 32 12.15 32 19.5C32 26.85 26.85 32 19.5 32C13.95 32 9.25 28.6 7.25 23.75",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function LaunchActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M14 10.5L25.5 18L14 25.5V10.5Z",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
+  function StopActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("rect", {
+          x: "11",
+          y: "11",
+          width: "14",
+          height: "14",
+          rx: "2.5",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
+  function RestartActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M22.5 8H28V13.5",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M28 13.5C25.9 9.55 21.75 7 17 7C10.1 7 4.5 12.6 4.5 19.5C4.5 26.4 10.1 32 17 32C22.2 32 26.65 28.8 28.5 24.25",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function SleepActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M23.5 8C20.45 9.1 18.25 12.05 18.25 15.5C18.25 19.9 21.85 23.5 26.25 23.5C27.3 23.5 28.3 23.3 29.25 22.95C27.65 27.55 23.25 30.85 18.1 30.85C11.6 30.85 6.35 25.6 6.35 19.1C6.35 13 10.95 7.95 16.85 7.35",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function ShutdownActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M18 6.5V16",
+          stroke: "currentColor",
+          strokeWidth: "3",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M11.2 10.25C8.4 12.3 6.6 15.6 6.6 19.35C6.6 25.55 11.65 30.6 17.85 30.6C24.05 30.6 29.1 25.55 29.1 19.35C29.1 15.6 27.3 12.3 24.5 10.25",
+          stroke: "currentColor",
+          strokeWidth: "2.8",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function DeleteActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M10 11.5H26",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M14 11.5V9.5C14 8.4 14.9 7.5 16 7.5H20C21.1 7.5 22 8.4 22 9.5V11.5",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M12 11.5L13 27C13.1 28.45 14.3 29.5 15.75 29.5H20.25C21.7 29.5 22.9 28.45 23 27L24 11.5",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function FolderActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M7.5 11.5H14L16.25 14H28.5V25.5C28.5 26.6 27.6 27.5 26.5 27.5H9.5C8.4 27.5 7.5 26.6 7.5 25.5V11.5Z",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M7.5 15H28.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function InstallActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M18 7.5V21.5",
+          stroke: "currentColor",
+          strokeWidth: "2.8",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M12.5 16.75L18 22.25L23.5 16.75",
+          stroke: "currentColor",
+          strokeWidth: "2.8",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("path", {
+          d: "M9.5 27.5H26.5",
+          stroke: "currentColor",
+          strokeWidth: "2.8",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function EyeActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M4.75 18C7.25 13.15 12.1 10 18 10C23.9 10 28.75 13.15 31.25 18C28.75 22.85 23.9 26 18 26C12.1 26 7.25 22.85 4.75 18Z",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinejoin: "round",
+        }),
+        createElement("circle", {
+          cx: "18",
+          cy: "18",
+          r: "4",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+      ),
+    );
+  }
+
+  function LogActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("rect", {
+          x: "8",
+          y: "8",
+          width: "20",
+          height: "20",
+          rx: "3",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+        createElement("path", {
+          d: "M13 14H23M13 18H23M13 22H19",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function AddActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("circle", {
+          cx: "18",
+          cy: "18",
+          r: "10.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+        createElement("path", {
+          d: "M18 12.5V23.5M12.5 18H23.5",
+          stroke: "currentColor",
+          strokeWidth: "2.8",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function ResolutionActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("rect", {
+          x: "6.5",
+          y: "8.5",
+          width: "23",
+          height: "15",
+          rx: "2.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+        createElement("path", {
+          d: "M13 27.5H23M18 23.5V27.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function RefreshRateActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("path", {
+          d: "M11.5 24.5C13.2 26.65 15.75 28 18.6 28C23.75 28 27.9 23.85 27.9 18.7C27.9 13.55 23.75 9.4 18.6 9.4C15.3 9.4 12.35 11.15 10.7 13.85",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M10.25 18.7H18.75L23 14.45",
+          stroke: "currentColor",
+          strokeWidth: "2.6",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+      ),
+    );
+  }
+
+  function DesktopActionIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
+        createElement("rect", {
+          x: "6.5",
+          y: "8.5",
+          width: "23",
+          height: "15",
+          rx: "2.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+        }),
+        createElement("path", {
+          d: "M10 27.5H26",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("path", {
+          d: "M15 23.5V27.5M21 23.5V27.5",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function normalizeIconLookupText(value) {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+  }
+
+  function findPluginIconByTitle(title) {
+    const normalizedTitle = normalizeIconLookupText(title);
+    if (!normalizedTitle) {
+      return null;
+    }
+
+    const pluginId = getVisiblePlugins().find((plugin) => normalizeIconLookupText(plugin.title) === normalizedTitle)?.id;
+    return pluginId ? getPluginIconComponent(pluginId) : null;
+  }
+
+  function resolveDefaultSlotLeadingIcon(slot, route = state.route) {
+    if (slot?.leadingIcon) {
+      return slot.leadingIcon;
+    }
+
+    const title = normalizeIconLookupText(slot?.title);
+    const copy = normalizeIconLookupText(slot?.copy);
+    const text = `${title} ${copy}`.trim();
+    const role = normalizeIconLookupText(slot?.role);
+    const routePluginId = normalizeIconLookupText(route?.pluginId);
+    const matchedPluginIcon = findPluginIconByTitle(slot?.title);
+
+    if (matchedPluginIcon) {
+      return matchedPluginIcon;
+    }
+
+    if (text.includes("refresh rate")) {
+      return RefreshRateActionIcon;
+    }
+
+    if (text.includes("resolution")) {
+      return ResolutionActionIcon;
+    }
+
+    if (text.includes("output mode") || text.includes("windows desktop")) {
+      return DesktopActionIcon;
+    }
+
+    if (text.includes("steamgriddb") || text.includes("artwork")) {
+      return ArtworkPluginIcon;
+    }
+
+    if (text.includes("cssloader") || text.includes("preset") || text.includes("theme")) {
+      return ThemesPluginIcon;
+    }
+
+    if (text.includes("auto sisr") || text.includes("sisr")) {
+      return AutoSisirPluginIcon;
+    }
+
+    if (text.includes("howlongtobeat") || text.includes("game page")) {
+      return HltbPluginIcon;
+    }
+
+    if (title.startsWith("preview") || text.includes("preview")) {
+      return EyeActionIcon;
+    }
+
+    if (text.includes("journal") || text.includes("log")) {
+      return LogActionIcon;
+    }
+
+    if (title.startsWith("refresh") || text.includes("refresh ")) {
+      return RefreshActionIcon;
+    }
+
+    if (title.startsWith("save") || text.includes("back up")) {
+      return SaveActionIcon;
+    }
+
+    if (text.includes("reset")) {
+      return ResetActionIcon;
+    }
+
+    if (text.includes("remove") || text.includes("exclude") || text.includes("clean up")) {
+      return DeleteActionIcon;
+    }
+
+    if (text.includes("clear")) {
+      return text.includes("cache") ? DeleteActionIcon : ResetActionIcon;
+    }
+
+    if (text.includes("install")) {
+      return InstallActionIcon;
+    }
+
+    if (title.startsWith("add")) {
+      return AddActionIcon;
+    }
+
+    if (text.includes("folder")) {
+      return FolderActionIcon;
+    }
+
+    if (
+      title.startsWith("launch") ||
+      title.startsWith("start") ||
+      title.startsWith("show") ||
+      text.includes("apply preset") ||
+      text.includes("apply this")
+    ) {
+      return LaunchActionIcon;
+    }
+
+    if (title.startsWith("stop")) {
+      return StopActionIcon;
+    }
+
+    if (text.includes("restart")) {
+      return RestartActionIcon;
+    }
+
+    if (text.includes("sleep")) {
+      return SleepActionIcon;
+    }
+
+    if (text.includes("shut down") || text.includes("shutdown")) {
+      return ShutdownActionIcon;
+    }
+
+    if (text.includes("settings")) {
+      return SettingsPluginIcon;
+    }
+
+    if (text.includes("stores")) {
+      return StoreSyncPluginIcon;
+    }
+
+    if (text.includes("windows shell")) {
+      return DesktopActionIcon;
+    }
+
+    if (text.includes("delay")) {
+      return RefreshRateActionIcon;
+    }
+
+    if (text.includes("microphone")) {
+      return MicrophoneIcon;
+    }
+
+    if (text.includes("speaker") || text.includes("playback")) {
+      return AudioPluginIcon;
+    }
+
+    if (text.includes("display")) {
+      return DisplayPluginIcon;
+    }
+
+    if (text.includes("developer") || text.includes("debug")) {
+      return SettingsPluginIcon;
+    }
+
+    if (text.includes("show ") && role === "toggle") {
+      return EyeActionIcon;
+    }
+
+    if (text.includes("download artwork")) {
+      return ArtworkPluginIcon;
+    }
+
+    if (role === "navigation") {
+      switch (routePluginId) {
+        case "display":
+          return DisplayPluginIcon;
+        case "store-sync":
+          return StoreSyncPluginIcon;
+        case "settings":
+          return SettingsPluginIcon;
+        case "themes":
+          return ThemesPluginIcon;
+        case "app-start":
+          return AppStartPluginIcon;
+        case "auto-sisr":
+          return AutoSisirPluginIcon;
+        case "artwork":
+          return ArtworkPluginIcon;
+        case "hltb":
+          return HltbPluginIcon;
+        default:
+          break;
+      }
+    }
+
+    if (role === "command" || role === "action") {
+      switch (routePluginId) {
+        case "processes":
+          return ProcessesPluginIcon;
+        case "store-sync":
+          return StoreSyncPluginIcon;
+        default:
+          break;
+      }
+    }
+
+    return null;
+  }
+
+  function findPluginDefinition(pluginId) {
+    return plugins.find((plugin) => plugin.id === pluginId) || null;
+  }
+
+  function findPluginPageDefinition(pluginId, pageId) {
+    const plugin = findPluginDefinition(pluginId);
+    return plugin?.pages?.find((page) => page.id === pageId) || null;
+  }
+
+  function getRouteTitle(route) {
+    if (!route || route.screen === "root") {
+      return "Tools for Steam";
+    }
+
+    if (route.screen === "plugin") {
+      return findPluginDefinition(route.pluginId)?.title || "Tools for Steam";
+    }
+
+    if (route.screen === "page") {
+      return (
+        findPluginPageDefinition(route.pluginId, route.pageId)?.title ||
+        findPluginDefinition(route.pluginId)?.title ||
+        "Tools for Steam"
+      );
+    }
+
+    return "Tools for Steam";
+  }
+
+  function createGlobalBackSlot(route = state.route) {
+    const backNavigation = getBackNavigation(route);
+    if (!backNavigation) {
+      return null;
+    }
+
+    return {
+      kind: "button",
+      role: "back",
+      title: "Back",
+      copy: `Return to ${getRouteTitle(backNavigation.route)}.`,
+      onClick: () => navigateBackFromRoute(route),
+      disabled: false,
+      badge: "",
+      trailing: "none",
+      switchValue: undefined,
+      switchLabel: "",
+      leadingIcon: BackIcon,
+      buttonClassName: "steamloader-dialog-button steamloader-dialog-button-global-back",
+      buttonStyle: null,
+      buttonProps: null,
+      rowClassName: "steamloader-row-shell-global-back",
+      slotKey: globalBackSlotKey,
+      selected: false,
+      value: globalBackSlotKey,
+      nativeComponentId: "dialogButton",
+    };
+  }
+
+  function withGlobalBackSlot(model, route = state.route) {
+    const backSlot = createGlobalBackSlot(route);
+    if (!backSlot) {
+      return {
+        ...model,
+        topSlots: Array.isArray(model.topSlots) ? model.topSlots : [],
+      };
+    }
+
+    const topSlots = Array.isArray(model.topSlots) ? model.topSlots : [];
+    if (topSlots.some((slot) => resolveSlotFocusKey(slot) === globalBackSlotKey)) {
+      return model;
+    }
+
+    return {
+      ...model,
+      topSlots: [backSlot, ...topSlots],
+    };
+  }
+
+  function getRenderableSlots(model) {
+    return [
+      ...(Array.isArray(model?.topSlots) ? model.topSlots : []),
+      ...(Array.isArray(model?.slots) ? model.slots : []),
+    ];
   }
 
   function NativeDialogButton(content, onClick, options = {}) {
@@ -3187,7 +6085,7 @@
       );
     }
 
-    if (slot.badge) {
+    if (slot.badge && slot.layout !== "feature") {
       return createElement("span", {
         className: "steamloader-badge",
         children: slot.badge,
@@ -3199,6 +6097,197 @@
     }
 
     return createElement(slot.trailing === "back" ? BackIcon : ChevronIcon, {});
+  }
+
+  function buildFallbackRowClassName(slot) {
+    const roleClassName = slot.role ? ` steamtools-row-${slot.role}` : "";
+    const layoutClassName = slot.layout ? ` steamtools-row-layout-${slot.layout}` : "";
+
+    if (slot.leadingIcon) {
+      return slot.rowClassName
+        ? `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName}${layoutClassName} ${slot.rowClassName}`
+        : `steamloader-row-shell steamloader-row-shell-with-icon${roleClassName}${layoutClassName}`;
+    }
+
+    return slot.rowClassName
+      ? `steamloader-row-shell${roleClassName}${layoutClassName} ${slot.rowClassName}`
+      : `steamloader-row-shell${roleClassName}${layoutClassName}`;
+  }
+
+  function createAccordionRowContent(slot) {
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: `steamloader-accordion-toggle${slot.expanded ? " is-expanded" : ""}`,
+        },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-accordion-toggle-copy-wrap" },
+            createElement("div", {
+              className: "steamloader-accordion-toggle-title",
+              children: slot.title,
+            }),
+            slot.copy
+              ? createElement("div", {
+                  className: "steamloader-accordion-toggle-copy",
+                  children: slot.copy,
+                })
+              : null,
+          ),
+        ),
+        createElement("span", {
+          className: "steamloader-accordion-toggle-arrow",
+          children: "v",
+        }),
+      ),
+    );
+  }
+
+  function createFeatureRowContent(slot, trailingContent) {
+    const metaItems = Array.isArray(slot.meta) ? slot.meta.filter(Boolean) : [];
+    const FeatureIcon = slot.leadingIcon;
+
+    return createElement(
+      "div",
+      withChildren(
+        { className: "steamloader-feature-card" },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-feature-media-shell" },
+            slot.mediaImageSrc
+              ? createElement("img", {
+                  className: "steamloader-feature-media",
+                  src: slot.mediaImageSrc,
+                  alt: slot.mediaImageAlt || slot.title || "",
+                })
+              : createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-feature-media-placeholder" },
+                    FeatureIcon ? createElement(FeatureIcon, {}) : null,
+                  ),
+                ),
+            slot.eyebrow
+              ? createElement("span", {
+                  className: "steamloader-feature-eyebrow",
+                  children: slot.eyebrow,
+                })
+              : null,
+            slot.badge
+              ? createElement("span", {
+                  className: "steamloader-badge steamloader-feature-status",
+                  children: slot.badge,
+                })
+              : null,
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-feature-body" },
+            createElement("div", {
+              className: "steamloader-feature-title",
+              children: slot.title,
+            }),
+            slot.copy
+              ? createElement("div", {
+                  className: "steamloader-feature-copy",
+                  children: slot.copy,
+                })
+              : null,
+            metaItems.length
+              ? createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-feature-meta" },
+                    ...metaItems.map((item, metaIndex) =>
+                      createElement("span", {
+                        className: "steamloader-feature-meta-item",
+                        key: `feature-meta-${metaIndex}`,
+                        children: item,
+                      }),
+                    ),
+                  ),
+                )
+              : null,
+            createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-feature-footer" },
+                createElement("span", {
+                  className: "steamloader-feature-footer-copy",
+                  children: slot.footerLabel || "Open",
+                }),
+                trailingContent
+                  ? createElement(
+                      "span",
+                      withChildren(
+                        { className: "steamloader-feature-footer-chevron" },
+                        trailingContent,
+                      ),
+                    )
+                  : null,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  function createInlineStepperRowContent(slot) {
+    const primaryText = slot.title || slot.copy || "";
+    const secondaryText = slot.title && slot.copy ? slot.copy : "";
+
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: `steamloader-inline-stepper${secondaryText ? "" : " is-compact"}`,
+        },
+        createElement(
+          "span",
+          withChildren(
+            {
+              className: `steamloader-inline-stepper-arrow${slot.stepperLeftDisabled ? " is-disabled" : ""}`,
+              "aria-hidden": "true",
+            },
+            createElement(BackIcon, {}),
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-inline-stepper-main" },
+            primaryText
+              ? createElement("div", {
+                  className: "steamloader-inline-stepper-title",
+                  children: primaryText,
+                })
+              : null,
+            secondaryText
+              ? createElement("div", {
+                  className: "steamloader-inline-stepper-copy",
+                  children: secondaryText,
+                })
+              : null,
+          ),
+        ),
+        createElement(
+          "span",
+          withChildren(
+            {
+              className: `steamloader-inline-stepper-arrow${slot.stepperRightDisabled ? " is-disabled" : ""}`,
+              "aria-hidden": "true",
+            },
+            createElement(ChevronIcon, {}),
+          ),
+        ),
+      ),
+    );
   }
 
   function createHeaderActionButton(action) {
@@ -3257,6 +6346,24 @@
             children: line,
           }),
         ),
+        card.swatchHex
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-card-swatch" },
+                createElement("span", {
+                  className: "steamloader-card-swatch-dot",
+                  style: {
+                    background: card.swatchHex,
+                  },
+                }),
+                createElement("span", {
+                  className: "steamloader-card-swatch-label",
+                  children: card.swatchLabel || card.swatchHex,
+                }),
+              ),
+            )
+          : null,
       ),
       `steamloader-card-${index}`,
     );
@@ -3300,43 +6407,317 @@
     );
   }
 
+  function tryInvokeSteamKeyboardOpener(opener, argSets) {
+    for (const args of argSets) {
+      try {
+        opener(...args);
+        return true;
+      } catch {}
+    }
+
+    return false;
+  }
+
+  function tryPostSteamVirtualKeyboardMessage(message) {
+    const payload = {
+      type: "VirtualKeyboardMessage",
+      message,
+    };
+    const payloadText = JSON.stringify(payload);
+    let posted = false;
+
+    try {
+      if (typeof window.SteamClient?.BrowserView?.PostMessageToParent === "function") {
+        window.SteamClient.BrowserView.PostMessageToParent(payload.type, payloadText);
+        posted = true;
+      }
+    } catch {}
+
+    try {
+      if (window.parent && window.parent !== window && typeof window.parent.postMessage === "function") {
+        window.parent.postMessage(payload, "*");
+        posted = true;
+      }
+    } catch {}
+
+    try {
+      if (window.opener && typeof window.opener.postMessage === "function") {
+        window.opener.postMessage(payload, "*");
+        posted = true;
+      }
+    } catch {}
+
+    return posted;
+  }
+
+  let lastTfsSteamKeyboardRequestAt = 0;
+  let lastTfsSteamKeyboardRequestKey = "";
+
+  function markSteamKeyboardLikelyActive() {
+    state.steamKeyboardActiveUntil = Date.now() + 60000;
+  }
+
+  function requestTfsSteamKeyboard(element, description) {
+    if (!apiBase || !(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    markSteamKeyboardLikelyActive();
+
+    const rect = element.getBoundingClientRect();
+    const currentValue = element.value || "";
+    const payload = {
+      label: description || "Text",
+      value: currentValue,
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    const requestKey = JSON.stringify({
+      label: payload.label,
+      value: payload.value,
+      x: Math.round(payload.x),
+      y: Math.round(payload.y),
+      width: Math.round(payload.width),
+      height: Math.round(payload.height),
+    });
+    const now = Date.now();
+
+    if (requestKey === lastTfsSteamKeyboardRequestKey && now - lastTfsSteamKeyboardRequestAt < 650) {
+      markSteamKeyboardLikelyActive();
+      return true;
+    }
+
+    lastTfsSteamKeyboardRequestKey = requestKey;
+    lastTfsSteamKeyboardRequestAt = now;
+
+    try {
+      void fetch(`${apiBase}api/steam/keyboard/show`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function tryOpenSteamKeyboard(element, description) {
+    if (element instanceof HTMLElement) {
+      markSteamKeyboardLikelyActive();
+    }
+
+    if (requestTfsSteamKeyboard(element, description)) {
+      return true;
+    }
+
+    const label = description || "Text";
+    const currentValue = element instanceof HTMLElement ? element.value || "" : "";
+    const rect = element instanceof HTMLElement ? element.getBoundingClientRect() : null;
+    let opened = false;
+
+    try {
+      if (typeof window.navigator?.virtualKeyboard?.show === "function") {
+        window.navigator.virtualKeyboard.show();
+        opened = true;
+      }
+    } catch {}
+
+    opened = tryPostSteamVirtualKeyboardMessage("ShowVirtualKeyboard") || opened;
+
+    const steamInput = window.SteamClient?.Input;
+    if (typeof steamInput?.ShowFloatingGamepadTextInput === "function" && rect) {
+      opened =
+        tryInvokeSteamKeyboardOpener(steamInput.ShowFloatingGamepadTextInput.bind(steamInput), [
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.right), Math.round(rect.bottom)],
+        ]) || opened;
+    }
+
+    if (typeof steamInput?.ShowGamepadTextInput === "function") {
+      opened =
+        tryInvokeSteamKeyboardOpener(steamInput.ShowGamepadTextInput.bind(steamInput), [
+          [0, 0, label, 256, currentValue],
+          [0, 0, label, 1024, currentValue],
+        ]) || opened;
+    }
+
+    const openVrKeyboard = window.SteamClient?.OpenVR?.Keyboard;
+    if (typeof openVrKeyboard?.Show === "function") {
+      opened =
+        tryInvokeSteamKeyboardOpener(openVrKeyboard.Show.bind(openVrKeyboard), [
+          [],
+          [0, 0, 0, label, 256, currentValue, false, 0],
+          [0, 0, label, 256, currentValue],
+          [label, currentValue],
+        ]) || opened;
+    }
+
+    return opened;
+  }
+
+  function queuePendingEditorFocusRestore() {
+    if (!isEditorFocusForRoute() || !state.editorFocusCardKey) {
+      return;
+    }
+
+    clearPendingFocusRestore();
+
+    const editorKey = state.editorFocusCardKey;
+    window.requestAnimationFrame(() => {
+      if (!isEditorFocusForRoute() || state.editorFocusCardKey !== editorKey) {
+        return;
+      }
+      const panel = getPanelScrollContainer();
+      if (!(panel instanceof HTMLElement)) {
+        return;
+      }
+      let textarea = null;
+      for (const el of panel.querySelectorAll("[data-editor-key]")) {
+        if (el.getAttribute("data-editor-key") === editorKey) {
+          textarea = el;
+          break;
+        }
+      }
+      if (textarea instanceof HTMLElement) {
+        textarea.focus({ preventScroll: true });
+        restoreEditorSelection(textarea, { preferEnd: true });
+      }
+    });
+  }
+
   function createEditorCard(editor) {
+    const cardKey = editor.inputKey || editor.cardKey || "steamloader-editor";
+    const editorDataKey = `editor-${cardKey}`;
+    const isSecretEditor = editor.inputType === "password" || editor.secret === true;
+    const editorElementType = isSecretEditor ? "input" : "textarea";
+
+    function focusEditorTextarea() {
+      const panel = getPanelScrollContainer();
+      if (!(panel instanceof HTMLElement)) {
+        return;
+      }
+      let textarea = null;
+      for (const el of panel.querySelectorAll("[data-editor-key]")) {
+        if (el.getAttribute("data-editor-key") === editorDataKey) {
+          textarea = el;
+          break;
+        }
+      }
+      if (textarea instanceof HTMLElement) {
+        markEditorFocused(editorDataKey);
+        textarea.focus({ preventScroll: true });
+        restoreEditorSelection(textarea, { preferEnd: true });
+        tryOpenSteamKeyboard(textarea, editor.label);
+        window.requestAnimationFrame(() => tryOpenSteamKeyboard(textarea, editor.label));
+        window.setTimeout(() => tryOpenSteamKeyboard(textarea, editor.label), 120);
+      }
+    }
+
+    const triggerButton = NativeDialogButton(
+      createElement(
+        "div",
+        withChildren(
+          { className: "steamloader-editor-trigger-content" },
+          createElement("div", {
+            className: "steamloader-editor-label",
+            children: editor.label,
+          }),
+          editor.help
+            ? createElement("div", {
+                className: "steamloader-editor-help",
+                children: editor.help,
+              })
+            : null,
+        ),
+      ),
+      focusEditorTextarea,
+      {
+        slotKey: editorDataKey,
+        className: "steamloader-dialog-button steamloader-editor-trigger",
+        extraProps: {
+          "data-slot-button": editorDataKey,
+          "data-slot-key": editorDataKey,
+          onOKButton: focusEditorTextarea,
+          onActivate: focusEditorTextarea,
+          onGamepadFocus: () => {
+            state.lastSelectedSlotKeyByRoute[getRouteKey(state.route)] = editorDataKey;
+          },
+          onCancelButton: getBackNavigation()
+            ? () => {
+                navigateBackFromRoute();
+              }
+            : undefined,
+          style: {
+            width: "100%",
+            minWidth: 0,
+          },
+        },
+      },
+      `${cardKey}-trigger`,
+    );
+
+    const textareaElement = createElement(editorElementType, {
+      key: editor.inputKey,
+      className: `steamloader-editor-textarea${isSecretEditor ? " steamloader-editor-input-secret" : ""}`,
+      "data-editor-key": editorDataKey,
+      "data-custom-path-input": editor.isCustomPath ? "true" : undefined,
+      type: isSecretEditor ? "password" : undefined,
+      defaultValue: editor.value || "",
+      placeholder: editor.placeholder || "",
+      rows: isSecretEditor ? undefined : editor.rows || 3,
+      spellCheck: false,
+      autoCapitalize: "off",
+      autoCorrect: "off",
+      autoComplete: isSecretEditor ? "new-password" : "off",
+      onClick: (event) => {
+        event.stopPropagation();
+        markEditorFocused(editorDataKey, event.target);
+        rememberEditorSelection(event.target);
+        tryOpenSteamKeyboard(event.target, editor.label);
+      },
+      onFocus: (event) => {
+        markEditorFocused(editorDataKey, event.target);
+      },
+      onBlur: (event) => {
+        rememberEditorSelection(event.target);
+        window.setTimeout(() => {
+          const panel = getPanelScrollContainer();
+          const activeElement = document.activeElement;
+          if (
+            state.editorFocusCardKey !== editorDataKey ||
+            activeElement === document.body ||
+            activeElement?.getAttribute?.("data-editor-key") === editorDataKey
+          ) {
+            return;
+          }
+
+          if (panel instanceof HTMLElement && activeElement instanceof HTMLElement && panel.contains(activeElement)) {
+            clearEditorFocus(editorDataKey);
+          }
+        }, 120);
+      },
+      onInput: (event) => {
+        editor.onInput?.(event.target.value);
+        rememberEditorSelection(event.target);
+      },
+      onSelect: (event) => {
+        rememberEditorSelection(event.target);
+      },
+      onKeyUp: (event) => {
+        rememberEditorSelection(event.target);
+      },
+    });
+
     return createElement(
       "div",
-      withChildren(
-        {
-          className: "steamloader-editor-card",
-        },
-        createElement("div", {
-          className: "steamloader-editor-label",
-          children: editor.label,
-        }),
-        editor.help
-          ? createElement("div", {
-              className: "steamloader-editor-help",
-              children: editor.help,
-            })
-          : null,
-        createElement("textarea", {
-          key: editor.inputKey,
-          className: "steamloader-editor-textarea",
-          "data-custom-path-input": editor.isCustomPath ? "true" : undefined,
-          defaultValue: editor.value || "",
-          placeholder: editor.placeholder || "",
-          rows: editor.rows || 3,
-          spellCheck: false,
-          autoCapitalize: "off",
-          autoCorrect: "off",
-          autoComplete: "off",
-          onClick: (event) => {
-            event.stopPropagation();
-          },
-          onInput: (event) => {
-            editor.onInput?.(event.target.value);
-          },
-        }),
-      ),
-      editor.inputKey || editor.cardKey || "steamloader-editor",
+      withChildren({ className: "steamloader-editor-card" }, triggerButton, textareaElement),
+      cardKey,
     );
   }
 
@@ -3357,74 +6738,102 @@
           getBackNavigation,
           renderTrailingContent,
           handleSlotClick,
+          rememberCurrentRouteIndex,
+          rememberCurrentRouteSlot,
+          resolveSlotFocusKey,
           navigateBackFromRoute,
         },
       );
     }
 
     const backNavigation = getBackNavigation();
-    const rowClassName = slot.leadingIcon
-      ? slot.rowClassName
-        ? `steamloader-row-shell steamloader-row-shell-with-icon ${slot.rowClassName}`
-        : "steamloader-row-shell steamloader-row-shell-with-icon"
-      : slot.rowClassName
-        ? `steamloader-row-shell ${slot.rowClassName}`
-      : "steamloader-row-shell";
+    const trailingContent = renderTrailingContent(slot);
+    const buttonContent =
+      slot.layout === "accordion"
+        ? createAccordionRowContent(slot)
+        : slot.layout === "feature"
+          ? createFeatureRowContent(slot, trailingContent)
+          : slot.layout === "stepper"
+            ? createInlineStepperRowContent(slot)
+          : createElement(
+              "div",
+              withChildren(
+                { className: buildFallbackRowClassName(slot) },
+                slot.leadingIcon
+                  ? createElement(
+                      "div",
+                      withChildren(
+                        { className: "steamloader-row-icon" },
+                        createElement(slot.leadingIcon, {}),
+                      ),
+                    )
+                  : null,
+                createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-row-main" },
+                    createElement("div", {
+                      className: "steamloader-row-title",
+                      children: slot.title,
+                    }),
+                    slot.copy
+                      ? createElement("div", {
+                          className: "steamloader-row-copy",
+                          children: slot.copy,
+                        })
+                      : null,
+                    slot.swatchHex
+                      ? createElement(
+                          "div",
+                          withChildren(
+                            { className: "steamloader-row-swatch" },
+                            createElement("span", {
+                              className: "steamloader-row-swatch-dot",
+                              style: {
+                                background: slot.swatchHex,
+                              },
+                            }),
+                            createElement("span", {
+                              className: "steamloader-row-swatch-label",
+                              children: slot.swatchLabel || slot.swatchHex,
+                            }),
+                          ),
+                        )
+                      : null,
+                  ),
+                ),
+                createElement(
+                  "div",
+                  withChildren(
+                    { className: "steamloader-row-trailing" },
+                    trailingContent,
+                  ),
+                ),
+              ),
+            );
 
     return NativeDialogButton(
-      createElement(
-        "div",
-        withChildren(
-          { className: rowClassName },
-          slot.leadingIcon
-            ? createElement(
-                "div",
-                withChildren(
-                  { className: "steamloader-row-icon" },
-                  createElement(slot.leadingIcon, {}),
-                ),
-              )
-            : null,
-          createElement(
-            "div",
-            withChildren(
-              { className: "steamloader-row-main" },
-              createElement("div", {
-                className: "steamloader-row-title",
-                children: slot.title,
-              }),
-              slot.copy
-                ? createElement("div", {
-                    className: "steamloader-row-copy",
-                    children: slot.copy,
-                  })
-                : null,
-            ),
-          ),
-          createElement(
-            "div",
-            withChildren(
-              { className: "steamloader-row-trailing" },
-              renderTrailingContent(slot),
-            ),
-          ),
-        ),
-      ),
+      buttonContent,
       () => handleSlotClick(index),
       {
         disabled: slot.disabled,
         slotKey: slot.slotKey || null,
         className: slot.buttonClassName || "steamloader-dialog-button",
         extraProps: {
+          ...(slot.buttonProps || {}),
           "data-slot-button": String(index),
+          "data-slot-key": resolveSlotFocusKey(slot, index) || undefined,
           autoFocus: Number.isInteger(autoFocusIndex) && index === autoFocusIndex,
           style: slot.buttonStyle || undefined,
+          onGamepadFocus: () => {
+            rememberCurrentRouteSlot(index, slot);
+            slot.buttonProps?.onGamepadFocus?.();
+          },
           onCancelButton: backNavigation
             ? () => {
                 navigateBackFromRoute();
               }
             : undefined,
-          ...(slot.buttonProps || {}),
         },
       },
     );
@@ -3438,12 +6847,70 @@
     });
   }
 
+  function createSectionHeader(index, title, copy = "", options = {}) {
+    return {
+      index: Number.isInteger(index) ? index : 0,
+      title,
+      copy,
+      icon: options.icon || null,
+      sectionKey: options.sectionKey || `${title}-${index}`,
+    };
+  }
+
+  function getInlineSectionHeaders(model, index) {
+    return (Array.isArray(model?.sectionHeaders) ? model.sectionHeaders : []).filter((section) =>
+      Number.isInteger(section?.index) && section.index === index,
+    );
+  }
+
+  function createInlineSectionHeader(section, key) {
+    const SectionIcon = section?.icon;
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: "steamloader-inline-section",
+          key,
+        },
+        SectionIcon
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-inline-section-mark" },
+                createElement(SectionIcon, {}),
+              ),
+            )
+          : null,
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-inline-section-copy-wrap" },
+            createElement("div", {
+              className: "steamloader-inline-section-title",
+              children: section?.title || "",
+            }),
+            section?.copy
+              ? createElement("div", {
+                  className: "steamloader-inline-section-copy",
+                  children: section.copy,
+                })
+              : null,
+          ),
+        ),
+      ),
+    );
+  }
+
   function hasDividerAfter(model, index) {
     if (Number.isInteger(model?.dividerAfterIndex) && index === model.dividerAfterIndex) {
       return true;
     }
 
     return Array.isArray(model?.dividerAfterIndices) && model.dividerAfterIndices.includes(index);
+  }
+
+  function shouldSeparateAfterSlot(slot) {
+    return slot?.role === "back" || slot?.trailing === "back";
   }
 
   function clampVolume(value) {
@@ -3488,6 +6955,10 @@
       route?.pluginId === "performance" &&
       (route?.pageId === "overlay" || route?.pageId === "tfs-overlay")
     );
+  }
+
+  function usesCustomShellRoute(route = state.route) {
+    return isAudioDashboardRoute(route) || isPerformanceOverlayRoute(route);
   }
 
   function getVolumeValue() {
@@ -3546,26 +7017,132 @@
     }
   }
 
+  function reconcilePlaybackVolumeInfoWithOptimisticValue(volumeInfo) {
+    const desiredVolume = getOptimisticDesiredValue("audio.playback.volume");
+    if (!Number.isFinite(desiredVolume)) {
+      return volumeInfo;
+    }
+
+    const nextValue = snapVolumeToStep(desiredVolume);
+    const currentSnapshotValue = snapVolumeToStep(volumeInfo?.volume);
+    if (Object.is(currentSnapshotValue, nextValue)) {
+      clearOptimisticDesiredValue("audio.playback.volume", desiredVolume);
+      return volumeInfo;
+    }
+
+    const fallbackInfo = state.audio.volumeInfo;
+    const baseInfo =
+      volumeInfo && typeof volumeInfo === "object"
+        ? volumeInfo
+        : fallbackInfo && typeof fallbackInfo === "object"
+          ? fallbackInfo
+          : null;
+
+    if (!baseInfo) {
+      return volumeInfo;
+    }
+
+    return {
+      ...baseInfo,
+      volume: nextValue,
+      isMuted: nextValue <= 0 ? true : false,
+    };
+  }
+
+  function reconcileCaptureVolumeInfoWithOptimisticValue(volumeInfo) {
+    const desiredVolume = getOptimisticDesiredValue("audio.capture.volume");
+    if (!Number.isFinite(desiredVolume)) {
+      return volumeInfo;
+    }
+
+    const nextValue = snapVolumeToStep(desiredVolume);
+    const currentSnapshotValue = snapVolumeToStep(volumeInfo?.volume);
+    if (Object.is(currentSnapshotValue, nextValue)) {
+      clearOptimisticDesiredValue("audio.capture.volume", desiredVolume);
+      return volumeInfo;
+    }
+
+    const fallbackInfo = state.audio.captureVolumeInfo;
+    const baseInfo =
+      volumeInfo && typeof volumeInfo === "object"
+        ? volumeInfo
+        : fallbackInfo && typeof fallbackInfo === "object"
+          ? fallbackInfo
+          : null;
+
+    if (!baseInfo) {
+      return volumeInfo;
+    }
+
+    return {
+      ...baseInfo,
+      volume: nextValue,
+      isMuted: nextValue <= 0 ? true : Boolean(baseInfo.isMuted),
+    };
+  }
+
+  function applyAudioDashboardSnapshotIfCurrent(snapshot, options = {}) {
+    if (!isSnapshotObject(snapshot)) {
+      setAudioDashboardSnapshot(snapshot, options);
+      return true;
+    }
+
+    setAudioDashboardSnapshot(
+      {
+        ...snapshot,
+        playbackVolume: reconcilePlaybackVolumeInfoWithOptimisticValue(snapshot.playbackVolume),
+        captureVolume: reconcileCaptureVolumeInfoWithOptimisticValue(snapshot.captureVolume),
+      },
+      options,
+    );
+    return true;
+  }
+
   function previewSliderVolume(value) {
     const info = state.audio.volumeInfo;
     if (!info) {
       return;
     }
 
+    const nextValue = snapVolumeToStep(value);
     state.audio.volumeInfo = {
       ...info,
-      volume: snapVolumeToStep(value),
+      volume: nextValue,
+      isMuted: nextValue <= 0 ? true : false,
     };
-    refreshAudioVolumePanel();
+
+    if (isAudioDashboardRoute()) {
+      refreshAudioDashboardUi();
+    } else {
+      refreshAudioVolumePanel();
+    }
   }
 
   function queueSliderVolumeCommit(value) {
     const nextValue = snapVolumeToStep(value);
+    setOptimisticDesiredValue("audio.playback.volume", nextValue);
     clearVolumeCommitTimer();
     state.audio.volumeCommitTimer = window.setTimeout(() => {
       state.audio.volumeCommitTimer = 0;
       void setVolume(nextValue);
-    }, 140);
+    }, audioVolumeCommitSettleDelayMs);
+  }
+
+  function stepVolumeSlider(direction, step = 10) {
+    if (!direction) {
+      return false;
+    }
+
+    const currentValue = getVolumeValue();
+    const nextValue = snapVolumeToStep(currentValue + direction * step);
+    if (nextValue === currentValue) {
+      return false;
+    }
+
+    playSliderMoveSound(direction);
+    previewSliderVolume(nextValue);
+    queueSliderVolumeCommit(nextValue);
+    return true;
   }
 
   function previewCaptureSliderVolume(value) {
@@ -3580,16 +7157,34 @@
       volume: nextValue,
       isMuted: nextValue <= 0 ? true : info.isMuted,
     };
-    rerenderAudioDashboard();
+    refreshAudioDashboardUi();
   }
 
   function queueCaptureSliderVolumeCommit(value) {
     const nextValue = snapVolumeToStep(value);
+    setOptimisticDesiredValue("audio.capture.volume", nextValue);
     clearCaptureVolumeCommitTimer();
     state.audio.captureVolumeCommitTimer = window.setTimeout(() => {
       state.audio.captureVolumeCommitTimer = 0;
       void setCaptureVolume(nextValue);
-    }, 140);
+    }, audioVolumeCommitSettleDelayMs);
+  }
+
+  function stepCaptureVolumeSlider(direction, step = 10) {
+    if (!direction) {
+      return false;
+    }
+
+    const currentValue = getCaptureVolumeValue();
+    const nextValue = snapVolumeToStep(currentValue + direction * step);
+    if (nextValue === currentValue) {
+      return false;
+    }
+
+    playSliderMoveSound(direction);
+    previewCaptureSliderVolume(nextValue);
+    queueCaptureSliderVolumeCommit(nextValue);
+    return true;
   }
 
   function startVolumeSliderEditing() {
@@ -3642,10 +7237,7 @@
     event.stopImmediatePropagation?.();
 
     if (isLeft || isRight) {
-      const delta = isLeft ? -10 : 10;
-      const nextValue = getVolumeValue() + delta;
-      previewSliderVolume(nextValue);
-      queueSliderVolumeCommit(nextValue);
+      stepVolumeSlider(isLeft ? -1 : 1);
       return;
     }
 
@@ -3929,10 +7521,7 @@
     }
 
     if (isAudioMixerRoute() && state.audio.mixerSessions.length) {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+      renderPanelDataRefresh();
       return;
     }
 
@@ -3951,16 +7540,17 @@
           }
         : session,
     );
-    rerenderAudioMixerPanel();
+    refreshAudioMixerUi();
   }
 
   function queueAudioMixerVolumeCommit(sessionId, value) {
     const nextValue = snapAudioMixerVolumeToStep(value);
+    setOptimisticDesiredValue(`audio.mixer.${sessionId}.volume`, nextValue);
     clearAudioMixerVolumeCommitTimer(sessionId);
     state.audio.mixerVolumeCommitTimersById[sessionId] = window.setTimeout(() => {
       delete state.audio.mixerVolumeCommitTimersById[sessionId];
       void setAudioMixerSessionVolume(sessionId, nextValue, { optimistic: false });
-    }, 140);
+    }, sliderCommitSettleDelayMs);
   }
 
   function adjustAudioMixerSessionVolume(sessionId, direction, step = 5) {
@@ -3975,10 +7565,11 @@
 
     const currentValue = snapAudioMixerVolumeToStep(session.volume);
     const nextValue = snapAudioMixerVolumeToStep(currentValue + direction * step);
-    if (nextValue === currentValue && !session.isMuted) {
+    if (nextValue === currentValue) {
       return;
     }
 
+    playSliderMoveSound(direction);
     previewAudioMixerSessionVolume(sessionId, nextValue);
     queueAudioMixerVolumeCommit(sessionId, nextValue);
   }
@@ -4023,6 +7614,61 @@
 
   function getPerformanceRuntime() {
     return getPerformanceSnapshot()?.runtime || null;
+  }
+
+  function getPerformanceSnapshotSettingValue(snapshot, settingKey) {
+    const settings = snapshot?.settings;
+    switch (settingKey) {
+      case "overlay-level":
+        return settings?.overlayLevel;
+      case "overlay-position":
+        return settings?.overlayPosition;
+      case "overlay-width":
+        return settings?.overlayWidth;
+      case "overlay-scale":
+        return settings?.overlayScale;
+      case "graph-mode":
+        return settings?.graphMode;
+      case "background-theme":
+        return settings?.backgroundTheme;
+      case "background-opacity":
+        return settings?.backgroundOpacity;
+      case "metric-poll-rate":
+        return settings?.metricPollRate;
+      case "telemetry-period":
+        return settings?.telemetrySamplingPeriodMs;
+      case "metrics-window":
+        return settings?.metricsWindow;
+      case "overlay-draw-rate":
+        return settings?.overlayDrawRate;
+      default:
+        return undefined;
+    }
+  }
+
+  function applyPerformanceSnapshotIfCurrent(snapshot) {
+    const optimisticEntries = getOptimisticDesiredEntries("performance.setting.");
+    if (!optimisticEntries.length) {
+      setPerformanceSnapshot(snapshot);
+      return true;
+    }
+
+    const matchesAllDesiredValues = optimisticEntries.every(([key, desiredValue]) =>
+      Object.is(
+        getPerformanceSnapshotSettingValue(snapshot, key.slice("performance.setting.".length)),
+        desiredValue,
+      ),
+    );
+
+    if (!matchesAllDesiredValues) {
+      return false;
+    }
+
+    setPerformanceSnapshot(snapshot);
+    optimisticEntries.forEach(([key, desiredValue]) => {
+      clearOptimisticDesiredValue(key, desiredValue);
+    });
+    return true;
   }
 
   function getPerformanceVendorOverlays() {
@@ -4078,9 +7724,15 @@
   }
 
   function getPerformanceDraftLevel() {
-    return Number.isInteger(state.performance.draftOverlayLevel)
-      ? state.performance.draftOverlayLevel
-      : getPerformanceOverlayLevel();
+    if (Number.isInteger(state.performance.draftOverlayLevel)) {
+      return state.performance.draftOverlayLevel;
+    }
+
+    if (Number.isInteger(state.performance.pendingOverlayLevelCommit)) {
+      return state.performance.pendingOverlayLevelCommit;
+    }
+
+    return getPerformanceOverlayLevel();
   }
 
   function getPerformanceLevelDefinitionByValue(value) {
@@ -4170,7 +7822,108 @@
     return Math.max(min, Math.min(max, value));
   }
 
-  async function cyclePerformanceOptionSetting(key, currentValue, options, direction = 1) {
+  function clearPerformanceSettingCommitTimer(key) {
+    const timerHandle = state.performance.settingCommitTimersByKey[key];
+    if (!timerHandle) {
+      return;
+    }
+
+    window.clearTimeout(timerHandle);
+    delete state.performance.settingCommitTimersByKey[key];
+  }
+
+  function getPerformanceOptionSettingTitle(key, value) {
+    switch (key) {
+      case "overlay-position":
+        return performancePositionOptions.find((option) => option.value === value)?.title || "Top Left";
+      case "graph-mode":
+        return performanceGraphModeOptions.find((option) => option.value === value)?.title || "Off";
+      case "background-theme":
+        return performanceBackgroundThemeOptions.find((option) => option.value === value)?.title || "Steam Blue";
+      default:
+        return "";
+    }
+  }
+
+  function previewPerformanceSettingValue(key, value) {
+    const snapshot = getPerformanceSnapshot();
+    const settings = getPerformanceSettings();
+    if (!snapshot || !settings) {
+      return false;
+    }
+
+    const nextSettings = {
+      ...settings,
+    };
+
+    switch (key) {
+      case "overlay-position":
+        nextSettings.overlayPosition = value;
+        nextSettings.overlayPositionTitle = getPerformanceOptionSettingTitle(key, value);
+        break;
+      case "overlay-width":
+        nextSettings.overlayWidth = value;
+        break;
+      case "overlay-scale":
+        nextSettings.overlayScale = value;
+        break;
+      case "graph-mode":
+        nextSettings.graphMode = value;
+        nextSettings.graphModeTitle = getPerformanceOptionSettingTitle(key, value);
+        break;
+      case "background-theme":
+        nextSettings.backgroundTheme = value;
+        nextSettings.backgroundThemeTitle = getPerformanceOptionSettingTitle(key, value);
+        break;
+      case "background-opacity":
+        nextSettings.backgroundOpacity = value;
+        break;
+      case "metric-poll-rate":
+        nextSettings.metricPollRate = value;
+        break;
+      case "telemetry-period":
+        nextSettings.telemetrySamplingPeriodMs = value;
+        break;
+      case "metrics-window":
+        nextSettings.metricsWindow = value;
+        break;
+      case "overlay-draw-rate":
+        nextSettings.overlayDrawRate = value;
+        break;
+      default:
+        return false;
+    }
+
+    state.performance.snapshot = {
+      ...snapshot,
+      settings: nextSettings,
+    };
+    return true;
+  }
+
+  function queuePerformanceSettingCommit(key, value) {
+    setOptimisticDesiredValue(`performance.setting.${key}`, value);
+    clearPerformanceSettingCommitTimer(key);
+    state.performance.settingCommitTimersByKey[key] = window.setTimeout(() => {
+      delete state.performance.settingCommitTimersByKey[key];
+
+      if (state.performance.saving) {
+        queuePerformanceSettingCommit(key, value);
+        return;
+      }
+
+      void setPerformanceSettingValue(key, value, {
+        rerenderOnStart: false,
+        rerenderOnComplete: false,
+        syncVisibleSliders: true,
+        reloadOnError: true,
+        optimisticKey: `performance.setting.${key}`,
+        optimisticValue: value,
+      });
+    }, sliderCommitSettleDelayMs);
+  }
+
+  function cyclePerformanceOptionSetting(key, currentValue, options, direction = 1) {
     if (isPerformanceBusy() || !Array.isArray(options) || !options.length || !direction) {
       return;
     }
@@ -4182,10 +7935,14 @@
       return;
     }
 
-    await setPerformanceSettingValue(key, nextValue);
+    playSliderMoveSound(direction);
+    if (previewPerformanceSettingValue(key, nextValue)) {
+      refreshPerformancePanel();
+    }
+    queuePerformanceSettingCommit(key, nextValue);
   }
 
-  async function adjustPerformanceNumberSetting(key, currentValue, direction, step, min, max) {
+  function adjustPerformanceNumberSetting(key, currentValue, direction, step, min, max) {
     if (isPerformanceBusy() || !direction) {
       return;
     }
@@ -4195,7 +7952,11 @@
       return;
     }
 
-    await setPerformanceSettingValue(key, nextValue);
+    playSliderMoveSound(direction);
+    if (previewPerformanceSettingValue(key, nextValue)) {
+      refreshPerformancePanel();
+    }
+    queuePerformanceSettingCommit(key, nextValue);
   }
 
   function getPerformancePanelCopy() {
@@ -4221,43 +7982,114 @@
 
     const installation = getPerformanceInstallation();
     if (installation && installation.elevatedHelperReady === false) {
-      return "Press Prepare Elevated Helper once. Windows will ask for admin permission, then future starts stay silent.";
+      return "Press Prepare Elevated Helper once. Windows will ask for admin permission, then future starts stay silent even after a restart.";
     }
 
-    return state.performance.sliderEditActive
-      ? "Editing Overlay Level. Use Left / Right to choose a preset. Press A or B to apply."
-      : "Press A on Overlay Level, then use Left / Right to switch presets.";
+    return Number.isInteger(state.performance.pendingOverlayLevelCommit) || state.performance.saving
+      ? "Use Left / Right to choose a preset. TFS applies it automatically after a short pause."
+      : "Use Left / Right to switch presets. No A confirmation is needed.";
+  }
+
+  function shouldSyncLivePerformancePanel() {
+    return (
+      isPerformanceOverlayRoute() &&
+      (
+        state.performance.saving ||
+        Number.isInteger(state.performance.pendingOverlayLevelCommit)
+      )
+    );
+  }
+
+  function previewPerformanceOverlayLevel(level) {
+    const snapshot = getPerformanceSnapshot();
+    const settings = getPerformanceSettings();
+    const levelDefinitions = getPerformanceLevelDefinitions();
+    const levelDefinition =
+      levelDefinitions.find((entry) => entry.value === level)
+      || levelDefinitions[0]
+      || null;
+
+    if (!snapshot || !settings || !levelDefinition) {
+      return false;
+    }
+
+    const sourceLevels = Array.isArray(settings.overlayLevels) && settings.overlayLevels.length
+      ? settings.overlayLevels
+      : levelDefinitions;
+
+    state.performance.snapshot = {
+      ...snapshot,
+      settings: {
+        ...settings,
+        overlayLevel: levelDefinition.value,
+        overlayLevelTitle: levelDefinition.title,
+        overlayLevelDescription: levelDefinition.description,
+        overlayLevels: sourceLevels.map((entry) => ({
+          ...entry,
+          selected: entry.value === levelDefinition.value,
+        })),
+      },
+    };
+    return true;
+  }
+
+  function queuePerformanceOverlayLevelCommit(level) {
+    setOptimisticDesiredValue("performance.setting.overlay-level", level);
+    clearPerformanceSettingCommitTimer("overlay-level");
+    state.performance.settingCommitTimersByKey["overlay-level"] = window.setTimeout(() => {
+      delete state.performance.settingCommitTimersByKey["overlay-level"];
+
+      if (state.performance.saving) {
+        queuePerformanceOverlayLevelCommit(level);
+        return;
+      }
+
+      void setPerformanceOverlayLevel(level, {
+        rerenderOnStart: false,
+        rerenderOnComplete: false,
+        clearPendingOverlayCommit: true,
+        optimisticKey: "performance.setting.overlay-level",
+        optimisticValue: level,
+      });
+    }, sliderCommitSettleDelayMs);
+  }
+
+  async function flushPerformanceOverlayLevelCommit() {
+    clearPerformanceSettingCommitTimer("overlay-level");
+
+    const deadline = Date.now() + 3000;
+    while (state.performance.saving && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+    }
+
+    if (state.performance.saving) {
+      return false;
+    }
+
+    const nextLevel = state.performance.pendingOverlayLevelCommit;
+    if (!Number.isInteger(nextLevel)) {
+      return true;
+    }
+
+    return setPerformanceOverlayLevel(nextLevel, {
+      rerenderOnStart: false,
+      rerenderOnComplete: false,
+      clearPendingOverlayCommit: true,
+      optimisticKey: "performance.setting.overlay-level",
+      optimisticValue: nextLevel,
+    });
   }
 
   function startPerformanceSliderEditing() {
-    if (
-      !isPerformanceOverlayRoute() ||
-      isPerformanceBusy() ||
-      state.performance.sliderEditActive
-    ) {
-      return;
-    }
-
-    state.performance.draftOverlayLevel = getPerformanceOverlayLevel();
-    state.performance.sliderEditActive = true;
-    refreshPerformancePanel({ fullRender: true, cueSlider: true });
+    state.performance.sliderEditActive = false;
+    state.performance.draftOverlayLevel = null;
   }
 
   function finishPerformanceSliderEditing(commit = true) {
-    const nextLevel = getPerformanceDraftLevel();
-    const shouldCommit = Boolean(commit && !state.performance.saving);
-
-    if (!state.performance.sliderEditActive && !shouldCommit) {
-      state.performance.draftOverlayLevel = null;
-      return;
-    }
-
     state.performance.sliderEditActive = false;
     state.performance.draftOverlayLevel = null;
-    refreshPerformancePanel({ fullRender: true });
-
-    if (shouldCommit && nextLevel !== getPerformanceOverlayLevel()) {
-      void setPerformanceOverlayLevel(nextLevel);
+    if (commit) {
+      void flushPerformanceOverlayLevelCommit();
     }
   }
 
@@ -4267,23 +8099,24 @@
       return;
     }
 
-    if (!state.performance.sliderEditActive) {
-      state.performance.draftOverlayLevel = getPerformanceOverlayLevel();
-      state.performance.sliderEditActive = true;
-    }
-
     const currentIndex = Math.max(
       0,
       levels.findIndex((level) => level.value === getPerformanceDraftLevel()),
     );
     const nextIndex = Math.max(0, Math.min(levels.length - 1, currentIndex + direction));
     const nextLevel = levels[nextIndex]?.value ?? levels[0].value;
-    state.performance.draftOverlayLevel = nextLevel;
-    refreshPerformancePanel();
-
-    if (nextLevel !== getPerformanceOverlayLevel()) {
-      void setPerformanceOverlayLevel(nextLevel);
+    if (nextLevel === levels[currentIndex]?.value) {
+      return;
     }
+
+    playSliderMoveSound(direction);
+    state.performance.sliderEditActive = false;
+    state.performance.draftOverlayLevel = null;
+    state.performance.pendingOverlayLevelCommit = nextLevel;
+    if (previewPerformanceOverlayLevel(nextLevel)) {
+      refreshPerformancePanel();
+    }
+    queuePerformanceOverlayLevelCommit(nextLevel);
   }
 
   function handlePerformanceSliderKeyDown(event) {
@@ -4351,55 +8184,7 @@
   }
 
   function syncLivePerformancePanelUi() {
-    if (!isPerformanceOverlayRoute()) {
-      return false;
-    }
-
-    const volumeCard = document.querySelector(".steamloader-volume-card");
-    if (!(volumeCard instanceof HTMLElement)) {
-      return false;
-    }
-
-    const levels = getPerformanceLevelDefinitions();
-    const levelValue = getPerformanceDraftLevel();
-    const levelIndex = Math.max(0, levels.findIndex((level) => level.value === levelValue));
-    const percent = `${levels.length > 1 ? (levelIndex / (levels.length - 1)) * 100 : 0}%`;
-    const hintText = state.performance.error || getPerformancePanelHint();
-    const sliderButton = volumeCard.querySelector('.steamloader-volume-slider-fallback-button[data-volume-slider="true"]');
-    const hintNode = volumeCard.querySelector(".steamloader-volume-hint, .steamloader-volume-hint-error");
-    const copyNode = volumeCard.querySelector(".steamloader-volume-copy");
-    const valueNode = volumeCard.querySelector(".steamloader-volume-slider-value");
-    const fillNode = volumeCard.querySelector(".steamloader-volume-slider-fill");
-    const thumbNode = volumeCard.querySelector(".steamloader-volume-slider-thumb");
-
-    if (sliderButton instanceof HTMLElement) {
-      sliderButton.classList.toggle("is-editing", state.performance.sliderEditActive);
-    }
-
-    if (copyNode instanceof HTMLElement) {
-      copyNode.textContent = getPerformancePanelCopy();
-    }
-
-    if (hintNode instanceof HTMLElement) {
-      const hasError = Boolean(state.performance.error);
-      hintNode.classList.toggle("steamloader-volume-hint-error", hasError);
-      hintNode.classList.toggle("steamloader-volume-hint", !hasError);
-      hintNode.textContent = hintText;
-    }
-
-    if (valueNode instanceof HTMLElement) {
-      valueNode.textContent = getPerformanceLevelDisplayText();
-    }
-
-    if (fillNode instanceof HTMLElement) {
-      fillNode.style.width = percent;
-    }
-
-    if (thumbNode instanceof HTMLElement) {
-      thumbNode.style.left = percent;
-    }
-
-    return true;
+    return syncVisibleSlotSliderUi();
   }
 
   function refreshPerformancePanel(options = {}) {
@@ -4409,6 +8194,7 @@
 
     if (options.fullRender !== true && syncLivePerformancePanelUi()) {
       if (options.cueSlider) {
+        state.performance.pendingSliderAutoFocus = false;
         queuePerformanceSliderActivationCue();
       }
 
@@ -4423,10 +8209,25 @@
   }
 
   function renderPanelState(options = {}) {
-    if (options.preserveFocus !== false && !state.pendingFocusRouteKey) {
-      const focusedIndex = getFocusedSlotIndex();
-      if (Number.isInteger(focusedIndex)) {
-        requestFocusForRoute(state.route, focusedIndex);
+    if (document.activeElement instanceof HTMLElement && isEditableFocusTarget(document.activeElement)) {
+      const editorKey = getEditorDataKey(document.activeElement);
+      if (editorKey) {
+        markEditorFocused(editorKey, document.activeElement);
+        rememberEditorSelection(document.activeElement);
+      }
+    }
+
+    if (options.preserveFocus === false && state.pendingFocusRouteKey === getRouteKey(state.route)) {
+      state.pendingFocusRouteKey = null;
+      state.pendingFocusIndex = null;
+      state.pendingFocusSlotKey = null;
+      if (state.route.screen === "root") {
+        state.pendingEntryAutoFocus = false;
+      }
+    } else if (options.preserveFocus !== false && !state.pendingFocusRouteKey) {
+      const focusedSelection = getFocusedSlotState();
+      if (Number.isInteger(focusedSelection.index)) {
+        requestFocusForRoute(state.route, focusedSelection.index, focusedSelection.slotKey);
       }
     }
 
@@ -4441,168 +8242,134 @@
     if (options.preserveScroll !== false) {
       queuePendingScrollRestore();
     }
+
+    if (options.preserveFocus !== false) {
+      queuePendingFocusRestore(state.route);
+      queuePendingEditorFocusRestore();
+    }
+  }
+
+  function getFocusedSlotState() {
+    const focusedNode =
+      document.querySelector(".steamloader-panel [data-slot-button].gpfocus") ||
+      document.activeElement?.closest?.(".steamloader-panel [data-slot-button]") ||
+      null;
+    const slotKeyFromDom = normalizeFocusSlotKey(focusedNode?.getAttribute?.("data-slot-key"));
+    const rawValue = focusedNode?.getAttribute?.("data-slot-button");
+    const parsedValue = Number.parseInt(rawValue || "", 10);
+    const index = Number.isInteger(parsedValue) ? parsedValue : null;
+    const slotKey =
+      slotKeyFromDom ||
+      (Number.isInteger(index) && Array.isArray(state.renderedSlots)
+        ? resolveSlotFocusKey(state.renderedSlots[index], index)
+        : null);
+    return { index, slotKey };
   }
 
   function getFocusedSlotIndex() {
-    const focusedNode = document.querySelector(".steamloader-panel [data-slot-button].gpfocus");
-    const rawValue = focusedNode?.getAttribute?.("data-slot-button");
-    const parsedValue = Number.parseInt(rawValue || "", 10);
-    return Number.isInteger(parsedValue) ? parsedValue : null;
+    return getFocusedSlotState().index;
+  }
+
+  function isCurrentPluginRoute(pluginId) {
+    return state.route?.pluginId === pluginId;
+  }
+
+  function renderPanelDataRefresh() {
+    const focusedSelection = getFocusedSlotState();
+    requestFocusForRoute(state.route, focusedSelection.index, focusedSelection.slotKey);
+    state.renderRevision += 1;
+    renderPanelState();
   }
 
   function rerenderStoreSyncPanel() {
-    if (state.route.pluginId === "store-sync") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("store-sync")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderDisplayPanel() {
-    if (state.route.pluginId === "display") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("display")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderPerformancePanel() {
     if (isPerformanceOverlayRoute()) {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      const fallbackIndex = Number.isInteger(focusedIndex)
-        ? focusedIndex
-        : state.performance.pendingSliderAutoFocus
-          ? 0
-          : null;
-
-      state.performance.pendingSliderAutoFocus = false;
-      requestFocusForRoute(currentRoute, fallbackIndex);
-      setRoute(currentRoute);
+      state.renderRevision += 1;
+      renderPanelState();
       return;
     }
 
-    if (state.route.pluginId === "performance") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("performance")) {
+      state.renderRevision += 1;
+      renderPanelState();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderPowerPanel() {
-    if (state.route.pluginId === "power") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("power")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderProcessesPanel() {
-    if (state.route.pluginId === "processes") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("processes")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderAppStartPanel() {
-    if (state.route.pluginId === "app-start") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("app-start")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderHltbPanel() {
-    if (state.route.pluginId === "hltb") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("hltb")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderArtworkPanel() {
-    if (state.route.pluginId === "artwork") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("artwork")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderAutoSisirPanel() {
-    if (state.route.pluginId === "auto-sisr") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("auto-sisr")) {
+      renderPanelDataRefresh();
       return;
     }
+  }
 
-    state.renderRevision += 1;
-    renderPanelState();
+  function rerenderSmartHomePanel() {
+    if (isCurrentPluginRoute("smart-home")) {
+      renderPanelDataRefresh();
+      return;
+    }
   }
 
   function rerenderThemesPanel() {
     applyActiveThemeCss();
 
-    if (state.route.pluginId === "themes") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+    if (isCurrentPluginRoute("themes")) {
+      renderPanelDataRefresh();
       return;
     }
-
-    state.renderRevision += 1;
-    renderPanelState();
   }
 
   function rerenderGeneralSettingsPanel() {
     if (state.route.pluginId === "settings" || state.route.screen === "root") {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+      renderPanelDataRefresh();
       return;
     }
 
@@ -4770,7 +8537,7 @@
 
     const saved = await sendGeneralSettingsRequest("api/settings/plugins/order", {
       pluginIds: nextOrderIds,
-    });
+    }, { rerenderOnStart: false });
 
     if (!saved) {
       applyLocalPluginOrder(originalOrderIds);
@@ -4894,6 +8661,10 @@
         return;
       }
 
+      if (shouldSuppressGlobalHotkeysForTextInput(event)) {
+        return;
+      }
+
       if (state.homeReorder.active) {
         const isUp = event.key === "ArrowUp";
         const isDown = event.key === "ArrowDown";
@@ -4952,6 +8723,10 @@
       const homeVisible = state.panelVisible && state.route.screen === "root";
 
       if (!homeVisible) {
+        return typeof previous === "function" ? previous(button) : false;
+      }
+
+      if (shouldSuppressGlobalHotkeysForTextInput()) {
         return typeof previous === "function" ? previous(button) : false;
       }
 
@@ -5048,11 +8823,22 @@
   }
 
   function createVolumeActionButton(action, index) {
+    const ActionIcon = action.icon || null;
+
     return NativeDialogButton(
       createElement(
         "div",
         withChildren(
           { className: "steamloader-volume-action-shell" },
+          ActionIcon
+            ? createElement(
+                "div",
+                withChildren(
+                  { className: "steamloader-volume-action-icon" },
+                  createElement(ActionIcon, {}),
+                ),
+              )
+            : null,
           createElement("div", {
             className: "steamloader-volume-action-title",
             children: action.title,
@@ -5124,6 +8910,7 @@
             { className: "steamloader-volume-slider-track-shell", "aria-hidden": "true" },
             createElement("div", {
               className: "steamloader-volume-slider-track",
+              style: slider.trackStyle || undefined,
             }),
             ...Array.from({ length: notchCount }, (_, index) =>
               createElement("span", {
@@ -5138,12 +8925,14 @@
               className: "steamloader-volume-slider-fill",
               style: {
                 width: `${percent}%`,
+                ...(slider.fillStyle || {}),
               },
             }),
             createElement("div", {
               className: "steamloader-volume-slider-thumb",
               style: {
                 left: `${percent}%`,
+                ...(slider.thumbStyle || {}),
               },
             }),
           ),
@@ -5157,6 +8946,11 @@
       createFallbackVolumeSliderContent(slider),
       () => {
         rememberVolumeActionFocus(0);
+        if (slider.isEditing) {
+          slider.onDeactivate?.();
+          return;
+        }
+
         slider.onActivate?.();
       },
       {
@@ -5248,7 +9042,13 @@
         ),
       ),
       () => {
+        rememberCurrentRouteSlot(index, slot);
         rememberVolumeActionFocus(0);
+        if (slider.isEditing) {
+          slider.onDeactivate?.();
+          return;
+        }
+
         slider.onActivate?.();
       },
       {
@@ -5257,11 +9057,12 @@
         className: `steamloader-dialog-button steamloader-volume-slider-fallback-button steamloader-performance-slider-button${slider.isEditing ? " is-editing" : ""}`,
         extraProps: {
           "data-slot-button": String(index),
+          "data-slot-key": resolveSlotFocusKey(slot, index) || undefined,
           "data-volume-slider": "true",
           "data-performance-slider": "true",
           autoFocus: shouldAutoFocus,
           onGamepadFocus: () => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
             rememberVolumeActionFocus(0);
           },
           onCancelButton: () => {
@@ -5273,13 +9074,13 @@
             slider.onCancel?.();
           },
           onMoveLeft: (event) => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
             rememberVolumeActionFocus(0);
             slider.onMoveLeft?.(event);
             return true;
           },
           onMoveRight: (event) => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
             rememberVolumeActionFocus(0);
             slider.onMoveRight?.(event);
             return true;
@@ -5338,7 +9139,7 @@
         ),
       ),
       () => {
-        rememberCurrentRouteIndex(index);
+        rememberCurrentRouteSlot(index, slot);
         panel.onClick?.();
       },
       {
@@ -5347,18 +9148,19 @@
         className: "steamloader-dialog-button steamloader-performance-slider-button",
         extraProps: {
           "data-slot-button": String(index),
+          "data-slot-key": resolveSlotFocusKey(slot, index) || undefined,
           "data-performance-slider": "true",
           autoFocus: shouldAutoFocus,
           onGamepadFocus: () => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
           },
           onMoveLeft: (event) => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
             slider.onMoveLeft?.(event);
             return true;
           },
           onMoveRight: (event) => {
-            rememberCurrentRouteIndex(index);
+            rememberCurrentRouteSlot(index, slot);
             slider.onMoveRight?.(event);
             return true;
           },
@@ -5373,6 +9175,149 @@
         },
       },
     );
+  }
+
+  function createRichValueSliderSlotButton(slot, index, autoFocusIndex) {
+    const panel = slot.panel;
+    const slider = panel?.slider;
+    if (!panel || !slider) {
+      return null;
+    }
+
+    const shouldAutoFocus = Number.isInteger(autoFocusIndex) && autoFocusIndex === index;
+
+    return NativeDialogButton(
+      createElement(
+        "div",
+        withChildren(
+          { className: "steamloader-volume-card" },
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-volume-head" },
+              createElement(
+                "div",
+                withChildren(
+                  { className: "steamloader-volume-copy-wrap" },
+                  createElement("div", {
+                    className: "steamloader-volume-title",
+                    children: panel.title,
+                  }),
+                  createElement("div", {
+                    className: "steamloader-volume-copy",
+                    children: panel.copy,
+                  }),
+                ),
+              ),
+            ),
+          ),
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-volume-slider-wrap" },
+              createFallbackVolumeSliderContent(slider),
+            ),
+          ),
+          createElement("div", {
+            className: panel.error
+              ? "steamloader-volume-hint steamloader-volume-hint-error"
+              : "steamloader-volume-hint",
+            children: panel.error || panel.hint || "Use Left / Right to adjust this value.",
+          }),
+        ),
+      ),
+      () => {
+        rememberCurrentRouteSlot(index, slot);
+        panel.onClick?.();
+      },
+      {
+        disabled: slider.disabled,
+        slotKey: slot.slotKey || `rich-value-slider-${index}`,
+        className: `steamloader-dialog-button steamloader-volume-slider-fallback-button steamloader-performance-slider-button${slider.isEditing ? " is-editing" : ""}`,
+        extraProps: {
+          "data-slot-button": String(index),
+          "data-slot-key": resolveSlotFocusKey(slot, index) || undefined,
+          "data-volume-slider": "true",
+          "data-rich-slider": "true",
+          autoFocus: shouldAutoFocus,
+          onGamepadFocus: () => {
+            rememberCurrentRouteSlot(index, slot);
+          },
+          onMoveLeft: (event) => {
+            rememberCurrentRouteSlot(index, slot);
+            slider.onMoveLeft?.(event);
+            return true;
+          },
+          onMoveRight: (event) => {
+            rememberCurrentRouteSlot(index, slot);
+            slider.onMoveRight?.(event);
+            return true;
+          },
+          onCancelButton: () => {
+            slider.onCancel?.();
+          },
+          style: {
+            width: "100%",
+            minWidth: 0,
+            padding: "0",
+          },
+        },
+      },
+    );
+  }
+
+  function createRichValueSliderSlot(options) {
+    const min = Number.isFinite(options.min) ? options.min : 0;
+    const max = Number.isFinite(options.max) ? options.max : 100;
+    const step = Number.isFinite(options.step) && options.step > 0 ? options.step : 1;
+    const value = Math.max(min, Math.min(max, Number(options.getValue?.() ?? min)));
+    const notchCount = Math.max(2, Math.round((max - min) / step) + 1);
+
+    return {
+      title: options.title,
+      copy: options.copy,
+      onClick: () => {},
+      disabled: Boolean(options.disabled),
+      trailing: "none",
+      slotKey: options.slotKey,
+      forceFallback: true,
+      customRenderer: createRichValueSliderSlotButton,
+      panel: {
+        title: options.title,
+        copy: options.copy,
+        hint: options.hint || "",
+        error: "",
+        onClick: options.onClick || null,
+        slider: {
+          title: options.title,
+          value,
+          min,
+          max,
+          step,
+          notchCount,
+          displayValue: options.displayValue ? options.displayValue(value) : `${value}`,
+          trackStyle: options.trackStyle || null,
+          fillStyle: options.fillStyle || null,
+          thumbStyle: options.thumbStyle || null,
+          disabled: Boolean(options.disabled),
+          isEditing: Boolean(options.isEditing),
+          onCancel: () => {
+            if (typeof options.onCancel === "function") {
+              options.onCancel();
+              return;
+            }
+
+            navigateBackFromRoute();
+          },
+          onMoveLeft: () => {
+            options.onAdjust?.(-1);
+          },
+          onMoveRight: () => {
+            options.onAdjust?.(1);
+          },
+        },
+      },
+    };
   }
 
   function createVolumePanel(panel) {
@@ -5439,13 +9384,14 @@
     );
   }
 
-  function createAudioDashboardButton(control, content, className, autoFocusIndex) {
-    const shouldAutoFocus = Number.isInteger(autoFocusIndex) && autoFocusIndex === control.index;
+  function createAudioDashboardButton(control, content, className, autoFocusIndex, indexOffset = 0) {
+    const controlIndex = control.index + indexOffset;
+    const shouldAutoFocus = Number.isInteger(autoFocusIndex) && autoFocusIndex === controlIndex;
 
     return NativeDialogButton(
       content,
       () => {
-        rememberCurrentRouteIndex(control.index);
+        rememberCurrentRouteIndex(controlIndex);
         control.onClick?.();
       },
       {
@@ -5453,21 +9399,22 @@
         slotKey: control.slotKey || `audio-dashboard-${control.index}`,
         className,
         extraProps: {
-          "data-slot-button": String(control.index),
+          "data-slot-button": String(controlIndex),
+          "data-audio-dashboard-control": getAudioDashboardControlSyncKey(control),
           autoFocus: shouldAutoFocus,
           onGamepadFocus: () => {
-            rememberCurrentRouteIndex(control.index);
+            rememberCurrentRouteIndex(controlIndex);
           },
           onMoveLeft: control.onMoveLeft
             ? (event) => {
-                rememberCurrentRouteIndex(control.index);
+                rememberCurrentRouteIndex(controlIndex);
                 control.onMoveLeft?.(event);
                 return true;
               }
             : undefined,
           onMoveRight: control.onMoveRight
             ? (event) => {
-                rememberCurrentRouteIndex(control.index);
+                rememberCurrentRouteIndex(controlIndex);
                 control.onMoveRight?.(event);
                 return true;
               }
@@ -5484,7 +9431,7 @@
     );
   }
 
-  function createAudioDashboardQuickButton(control, autoFocusIndex) {
+  function createAudioDashboardQuickButton(control, autoFocusIndex, indexOffset = 0) {
     const ControlIcon = control.icon || AudioPluginIcon;
 
     return createAudioDashboardButton(
@@ -5508,10 +9455,16 @@
       ),
       `steamloader-dialog-button steamloader-audio-quick-button${control.active ? " is-active" : ""}`,
       autoFocusIndex,
+      indexOffset,
     );
   }
 
-  function createAudioDashboardSliderButton(control, autoFocusIndex, className = "steamloader-dialog-button steamloader-audio-slider-button") {
+  function createAudioDashboardSliderButton(
+    control,
+    autoFocusIndex,
+    className = "steamloader-dialog-button steamloader-audio-slider-button",
+    indexOffset = 0,
+  ) {
     const slider = {
       title: control.title,
       value: control.value,
@@ -5540,10 +9493,11 @@
       ),
       className,
       autoFocusIndex,
+      indexOffset,
     );
   }
 
-  function createAudioDashboardSelectorButton(control, autoFocusIndex) {
+  function createAudioDashboardSelectorButton(control, autoFocusIndex, indexOffset = 0) {
     return createAudioDashboardButton(
       control,
       createElement(
@@ -5581,10 +9535,11 @@
       ),
       "steamloader-dialog-button steamloader-audio-selector-button",
       autoFocusIndex,
+      indexOffset,
     );
   }
 
-  function createAudioDashboardCommandButton(control, autoFocusIndex) {
+  function createAudioDashboardCommandButton(control, autoFocusIndex, indexOffset = 0) {
     return createAudioDashboardButton(
       control,
       createElement(
@@ -5605,10 +9560,11 @@
       ),
       "steamloader-dialog-button steamloader-audio-selector-button",
       autoFocusIndex,
+      indexOffset,
     );
   }
 
-  function createAudioDashboard(dashboard) {
+  function createAudioDashboard(dashboard, indexOffset = 0) {
     const autoFocusIndex = Number.isInteger(dashboard?.autoFocusIndex) ? dashboard.autoFocusIndex : null;
     const mixerControls = Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : [];
 
@@ -5624,8 +9580,8 @@
               "div",
               withChildren(
                 { className: "steamloader-audio-quick-grid" },
-                createAudioDashboardQuickButton(dashboard.playbackToggle, autoFocusIndex),
-                createAudioDashboardQuickButton(dashboard.captureToggle, autoFocusIndex),
+                createAudioDashboardQuickButton(dashboard.playbackToggle, autoFocusIndex, indexOffset),
+                createAudioDashboardQuickButton(dashboard.captureToggle, autoFocusIndex, indexOffset),
               ),
             ),
             createDivider("audio-dashboard-quick-divider"),
@@ -5633,8 +9589,8 @@
               "div",
               withChildren(
                 { className: "steamloader-audio-slider-stack" },
-                createAudioDashboardSliderButton(dashboard.playbackSlider, autoFocusIndex),
-                createAudioDashboardSliderButton(dashboard.captureSlider, autoFocusIndex),
+                createAudioDashboardSliderButton(dashboard.playbackSlider, autoFocusIndex, undefined, indexOffset),
+                createAudioDashboardSliderButton(dashboard.captureSlider, autoFocusIndex, undefined, indexOffset),
               ),
             ),
           ),
@@ -5652,8 +9608,8 @@
               "div",
               withChildren(
                 { className: "steamloader-audio-selector-stack" },
-                createAudioDashboardSelectorButton(dashboard.playbackSelector, autoFocusIndex),
-                createAudioDashboardSelectorButton(dashboard.captureSelector, autoFocusIndex),
+                createAudioDashboardSelectorButton(dashboard.playbackSelector, autoFocusIndex, indexOffset),
+                createAudioDashboardSelectorButton(dashboard.captureSelector, autoFocusIndex, indexOffset),
               ),
             ),
           ),
@@ -5686,6 +9642,7 @@
                         control,
                         autoFocusIndex,
                         "steamloader-dialog-button steamloader-audio-mixer-button",
+                        indexOffset,
                       ),
                     ),
                   ),
@@ -5697,20 +9654,341 @@
           ),
         ),
         createDivider("audio-dashboard-refresh-divider"),
-        createAudioDashboardCommandButton(dashboard.refreshControl, autoFocusIndex),
+        createAudioDashboardCommandButton(dashboard.refreshControl, autoFocusIndex, indexOffset),
       ),
     );
   }
 
+  function getFallbackSliderDisplayValue(slider) {
+    const min = Number.isFinite(slider?.min) ? slider.min : 0;
+    const max = Number.isFinite(slider?.max) ? slider.max : 100;
+    const value = Math.max(min, Math.min(max, Math.round(Number(slider?.value) || 0)));
+    if (typeof slider?.displayValue === "string" && slider.displayValue.length > 0) {
+      return slider.displayValue;
+    }
+
+    return `${value}${slider?.valueSuffix || ""}`;
+  }
+
+  function getFallbackSliderPercent(slider) {
+    const min = Number.isFinite(slider?.min) ? slider.min : 0;
+    const max = Number.isFinite(slider?.max) ? slider.max : 100;
+    const value = Math.max(min, Math.min(max, Math.round(Number(slider?.value) || 0)));
+    const range = Math.max(1, max - min);
+    return ((value - min) / range) * 100;
+  }
+
+  function syncFallbackSliderVisual(shell, slider) {
+    if (!(shell instanceof HTMLElement) || !slider) {
+      return false;
+    }
+
+    const valueText = getFallbackSliderDisplayValue(slider);
+    const percent = getFallbackSliderPercent(slider);
+    const labelNode = shell.querySelector(".steamloader-volume-slider-label");
+    const valueNode = shell.querySelector(".steamloader-volume-slider-value");
+    const trackNode = shell.querySelector(".steamloader-volume-slider-track");
+    const fillNode = shell.querySelector(".steamloader-volume-slider-fill");
+    const thumbNode = shell.querySelector(".steamloader-volume-slider-thumb");
+
+    if (labelNode instanceof HTMLElement && typeof slider.title === "string") {
+      labelNode.textContent = slider.title;
+    }
+
+    if (valueNode instanceof HTMLElement) {
+      valueNode.textContent = valueText;
+    }
+
+    if (trackNode instanceof HTMLElement) {
+      trackNode.style.cssText = "";
+      Object.assign(trackNode.style, slider.trackStyle || {});
+    }
+
+    if (fillNode instanceof HTMLElement) {
+      fillNode.style.width = `${percent}%`;
+      Object.assign(fillNode.style, slider.fillStyle || {});
+    }
+
+    if (thumbNode instanceof HTMLElement) {
+      thumbNode.style.left = `${percent}%`;
+      Object.assign(thumbNode.style, slider.thumbStyle || {});
+    }
+
+    return true;
+  }
+
+  function buildCurrentSyncModel() {
+    return {
+      ...withGlobalBackSlot(buildScreenModel()),
+      routeKey: getRouteKey(state.route),
+    };
+  }
+
+  function getSliderSlotSyncKey(slot, index = null) {
+    return resolveSlotFocusKey(slot, index) || slot?.slotKey || "";
+  }
+
+  function syncSlotSliderButtonUi(button, slot) {
+    const panel = slot?.panel;
+    const slider = panel?.slider;
+    if (!(button instanceof HTMLElement) || !panel || !slider) {
+      return false;
+    }
+
+    const titleNode = button.querySelector(".steamloader-volume-title");
+    const copyNode = button.querySelector(".steamloader-volume-copy");
+    const hintNode = button.querySelector(".steamloader-volume-hint, .steamloader-volume-hint-error");
+    const sliderShell = button.querySelector(".steamloader-volume-slider-fallback-shell");
+    const hintText = panel.error || panel.hint || "Use Left / Right to adjust this value.";
+
+    button.classList.toggle("is-editing", Boolean(slider.isEditing));
+
+    if (titleNode instanceof HTMLElement) {
+      titleNode.textContent = panel.title || "";
+    }
+
+    if (copyNode instanceof HTMLElement) {
+      copyNode.textContent = panel.copy || "";
+    }
+
+    if (hintNode instanceof HTMLElement) {
+      const hasError = Boolean(panel.error);
+      hintNode.classList.toggle("steamloader-volume-hint-error", hasError);
+      hintNode.classList.toggle("steamloader-volume-hint", !hasError);
+      hintNode.textContent = hintText;
+    }
+
+    return syncFallbackSliderVisual(sliderShell, slider);
+  }
+
+  function syncVisibleSlotSliderUi() {
+    const sliderButtons = Array.from(document.querySelectorAll(".steamloader-performance-slider-button[data-slot-key]"));
+    if (!sliderButtons.length) {
+      return false;
+    }
+
+    const model = buildCurrentSyncModel();
+    const slots = getRenderableSlots(model);
+    const sliderSlotMap = new Map();
+
+    slots.forEach((slot, index) => {
+      if (slot?.panel?.slider) {
+        const syncKey = getSliderSlotSyncKey(slot, index);
+        if (syncKey) {
+          sliderSlotMap.set(syncKey, slot);
+        }
+      }
+    });
+
+    if (!sliderSlotMap.size) {
+      return false;
+    }
+
+    let updated = 0;
+    for (const button of sliderButtons) {
+      const syncKey = button.getAttribute("data-slot-key") || "";
+      const slot = sliderSlotMap.get(syncKey);
+      if (!slot) {
+        return false;
+      }
+
+      if (syncSlotSliderButtonUi(button, slot)) {
+        updated += 1;
+      }
+    }
+
+    return updated > 0;
+  }
+
+  function getAudioDashboardControlSyncKey(control) {
+    if (!control) {
+      return "";
+    }
+
+    return control.slotKey || `audio-dashboard-${control.index}`;
+  }
+
+  function getAudioDashboardControls(dashboard) {
+    return [
+      dashboard?.playbackToggle,
+      dashboard?.captureToggle,
+      dashboard?.playbackSlider,
+      dashboard?.captureSlider,
+      dashboard?.playbackSelector,
+      dashboard?.captureSelector,
+      ...(Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : []),
+      dashboard?.refreshControl,
+    ].filter(Boolean);
+  }
+
+  function syncAudioDashboardButtonUi(button, control) {
+    if (!(button instanceof HTMLElement) || !control) {
+      return false;
+    }
+
+    if (button.querySelector(".steamloader-audio-quick-shell")) {
+      const titleNode = button.querySelector(".steamloader-audio-quick-title");
+      if (titleNode instanceof HTMLElement) {
+        titleNode.textContent = control.title || "";
+      }
+
+      button.classList.toggle("is-active", Boolean(control.active));
+      return true;
+    }
+
+    if (button.querySelector(".steamloader-audio-slider-card")) {
+      syncFallbackSliderVisual(
+        button.querySelector(".steamloader-volume-slider-fallback-shell"),
+        {
+          title: control.title,
+          value: control.value,
+          min: control.min ?? 0,
+          max: control.max ?? 100,
+          step: control.step ?? 5,
+          notchCount: control.notchCount ?? 21,
+          displayValue: control.displayValue,
+          valueSuffix: control.valueSuffix || "%",
+        },
+      );
+
+      const copyNode = button.querySelector(".steamloader-audio-slider-copy");
+      if (copyNode instanceof HTMLElement) {
+        copyNode.textContent = control.copy || "";
+      }
+
+      return true;
+    }
+
+    if (button.querySelector(".steamloader-audio-selector-card")) {
+      const labelNode = button.querySelector(".steamloader-audio-selector-label");
+      const valueNode = button.querySelector(".steamloader-audio-selector-value");
+      const copyNode = button.querySelector(".steamloader-audio-selector-copy");
+
+      if (labelNode instanceof HTMLElement && typeof control.label === "string") {
+        labelNode.textContent = control.label;
+      }
+
+      if (valueNode instanceof HTMLElement) {
+        valueNode.textContent = control.value || control.title || "";
+      }
+
+      if (copyNode instanceof HTMLElement) {
+        copyNode.textContent = control.copy || "";
+      }
+
+      return true;
+    }
+
+    return false;
+  }
+
+  function syncVisibleAudioDashboardUi() {
+    if (!isAudioDashboardRoute()) {
+      return false;
+    }
+
+    const dashboardRoot = document.querySelector(".steamloader-audio-dashboard");
+    if (!(dashboardRoot instanceof HTMLElement)) {
+      return false;
+    }
+
+    const dashboard = buildAudioDashboardModel();
+    const controls = getAudioDashboardControls(dashboard);
+    const buttons = Array.from(document.querySelectorAll("[data-audio-dashboard-control]"));
+    const mixerControls = Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : [];
+    const mixerButtons = buttons.filter((button) => button.classList.contains("steamloader-audio-mixer-button"));
+    const emptyState = dashboardRoot.querySelector(".steamloader-audio-empty-state");
+
+    if (mixerButtons.length !== mixerControls.length) {
+      return false;
+    }
+
+    if (Boolean(emptyState) !== (mixerControls.length === 0)) {
+      return false;
+    }
+
+    const controlMap = new Map(
+      controls.map((control) => [getAudioDashboardControlSyncKey(control), control]),
+    );
+
+    let updated = 0;
+    for (const button of buttons) {
+      const syncKey = button.getAttribute("data-audio-dashboard-control") || "";
+      const control = controlMap.get(syncKey);
+      if (!control) {
+        return false;
+      }
+
+      if (syncAudioDashboardButtonUi(button, control)) {
+        updated += 1;
+      }
+    }
+
+    const mixerSummaryNode = dashboardRoot.querySelector(".steamloader-audio-mixer-header .steamloader-audio-card-copy");
+    if (mixerSummaryNode instanceof HTMLElement) {
+      mixerSummaryNode.textContent = dashboard.mixerSummary || "";
+    }
+
+    if (emptyState instanceof HTMLElement) {
+      emptyState.textContent = dashboard.emptyMixerText || "";
+    }
+
+    return updated > 0;
+  }
+
+  function refreshAudioDashboardUi() {
+    if (syncVisibleAudioDashboardUi()) {
+      return;
+    }
+
+    rerenderAudioDashboard();
+  }
+
+  function refreshAudioMixerUi() {
+    if (isAudioDashboardRoute()) {
+      refreshAudioDashboardUi();
+      return;
+    }
+
+    if (syncVisibleSlotSliderUi()) {
+      return;
+    }
+
+    rerenderAudioMixerPanel();
+  }
+
+  function refreshVisibleSliderSurfaces() {
+    let updated = false;
+
+    if (syncLiveVolumePanelUi()) {
+      updated = true;
+    }
+
+    if (syncVisibleAudioDashboardUi()) {
+      updated = true;
+    }
+
+    if (syncVisibleSlotSliderUi()) {
+      updated = true;
+    }
+
+    return updated;
+  }
+
   function createFrontendRenderHelpers() {
     return {
+      apiBase,
       DefaultIcon: SteamLoaderIcon,
       BackIcon,
       ChevronIcon,
       getBackNavigation,
       handleSlotClick,
       navigateBackFromRoute,
+      getRouteKey: () => getRouteKey(state.route),
       consumeResolvedFocus,
+      rememberCurrentRouteIndex,
+      rememberCurrentRouteSlot,
+      resolveSlotFocusKey,
       consumeVolumeActionAutoFocus,
       rememberVolumeActionFocus,
       getActiveVolumeActionIndex: () => state.audio.activeVolumeActionIndex,
@@ -5718,8 +9996,25 @@
   }
 
   function SteamLoaderPanelShell() {
-    let model = buildScreenModel();
+    let model = withGlobalBackSlot(buildScreenModel());
     const forceCustomShell = isPerformanceOverlayRoute() || isAudioDashboardRoute();
+    const focusSlots = getRenderableSlots(model);
+    const resolvedAutoFocusIndex = resolveAutoFocusTarget(
+      state.route,
+      focusSlots,
+      Number.isInteger(model.autoFocusIndex)
+        ? model.autoFocusIndex
+        : Number.isInteger(model.audioDashboard?.autoFocusIndex)
+          ? model.audioDashboard.autoFocusIndex
+          : null,
+    );
+    let renderedModel = {
+      ...model,
+      autoFocusIndex: resolvedAutoFocusIndex,
+      routeKey: getRouteKey(state.route),
+    };
+    state.renderedSlots = getRenderableSlots(renderedModel);
+    state.slotActions = state.renderedSlots.map((slot) => slot.onClick);
 
     if (!forceCustomShell && window.STFrontendLib?.createPanelShell) {
       try {
@@ -5727,33 +10022,47 @@
           state,
           createElement,
           withChildren,
-          model,
+          renderedModel,
           createFrontendRenderHelpers(),
         );
       } catch (error) {
         state.nativeUi.renderError = error instanceof Error ? error.message : String(error);
         console.warn("[Tools for Steam] Recovered from st-frontend-lib render error.", error);
         model = {
-          ...model,
+          ...withGlobalBackSlot(model),
           error: model.error || "Tools for Steam recovered from an internal UI renderer error.",
         };
+        renderedModel = {
+          ...model,
+          autoFocusIndex: resolvedAutoFocusIndex,
+          routeKey: getRouteKey(state.route),
+        };
+        state.renderedSlots = getRenderableSlots(renderedModel);
+        state.slotActions = state.renderedSlots.map((slot) => slot.onClick);
       }
     }
 
     const HeaderIcon = model.headerIcon === null ? null : model.headerIcon || SteamLoaderIcon;
     const headerActions = Array.isArray(model.headerActions) ? model.headerActions : [];
-    const resolvedAutoFocusIndex =
-      Number.isInteger(model.autoFocusIndex)
-        ? model.autoFocusIndex
-        : Number.isInteger(model.audioDashboard?.autoFocusIndex)
-          ? model.audioDashboard.autoFocusIndex
-          : null;
-    state.slotActions = model.slots.map((slot) => slot.onClick);
     consumeResolvedFocus(state.route, resolvedAutoFocusIndex);
-    const slotChildren = model.slots.flatMap((slot, index) => {
-      const children = [createButtonSlot(slot, index, model.autoFocusIndex)];
-      if (hasDividerAfter(model, index)) {
-        children.push(createDivider(`divider-${index}`));
+    const topSlots = Array.isArray(renderedModel.topSlots) ? renderedModel.topSlots : [];
+    const topSlotChildren = topSlots.flatMap((slot, index) => {
+      const children = [createButtonSlot(slot, index, renderedModel.autoFocusIndex)];
+      if (shouldSeparateAfterSlot(slot)) {
+        children.push(createDivider(`top-back-divider-${index}`));
+      }
+
+      return children;
+    });
+    const slotIndexOffset = topSlots.length;
+    const slotChildren = (Array.isArray(renderedModel.slots) ? renderedModel.slots : []).flatMap((slot, index) => {
+      const slotIndex = slotIndexOffset + index;
+      const sectionHeaders = getInlineSectionHeaders(renderedModel, index).map((section, sectionIndex) =>
+        createInlineSectionHeader(section, `section-${index}-${section.sectionKey || sectionIndex}`),
+      );
+      const children = [...sectionHeaders, createButtonSlot(slot, slotIndex, renderedModel.autoFocusIndex)];
+      if (hasDividerAfter(model, index) || shouldSeparateAfterSlot(slot)) {
+        children.push(createDivider(`divider-${slotIndex}`));
       }
 
       return children;
@@ -5766,6 +10075,7 @@
           className: model.panelClassName
             ? `steamloader-panel ${model.panelClassName}`
             : "steamloader-panel",
+          "data-route-key": renderedModel.routeKey,
         },
         createElement(
           "div",
@@ -5817,11 +10127,14 @@
               : null,
           ),
         ),
-        model.status
-          ? createElement("div", {
-              className: "steamloader-status",
-              children: model.status,
-            })
+        topSlotChildren.length
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-stack steamloader-top-stack" },
+                ...topSlotChildren,
+              ),
+            )
           : null,
         model.error
           ? createElement("div", {
@@ -5829,16 +10142,10 @@
               children: model.error,
             })
           : null,
-        model.note
-          ? createElement("div", {
-              className: "steamloader-note",
-              children: model.note,
-            })
-          : null,
         ...(Array.isArray(model.cards)
           ? model.cards.map((card, index) => createInfoCard(card, index))
           : []),
-        model.audioDashboard ? createAudioDashboard(model.audioDashboard) : null,
+        model.audioDashboard ? createAudioDashboard(model.audioDashboard, topSlots.length) : null,
         model.editor ? createEditorCard(model.editor) : null,
         ...(Array.isArray(model.editors)
           ? model.editors.map((editor, index) => createEditorCard({ ...editor, inputKey: editor.inputKey || `editor-${index}` }))
@@ -5857,6 +10164,10 @@
   }
 
   function handleSlotClick(index) {
+    if (Number.isInteger(index) && Array.isArray(state.renderedSlots)) {
+      rememberCurrentRouteSlot(index, state.renderedSlots[index] || null);
+    }
+
     const action = state.slotActions[index];
     if (typeof action === "function") {
       action();
@@ -5901,23 +10212,20 @@
             startVolumeSliderEditing();
           }
 
-          const nextValue = getVolumeValue() - 10;
-          previewSliderVolume(nextValue);
-          queueSliderVolumeCommit(nextValue);
+          stepVolumeSlider(-1);
         },
         onMoveRight: () => {
           if (!state.audio.sliderEditActive) {
             startVolumeSliderEditing();
           }
 
-          const nextValue = getVolumeValue() + 10;
-          previewSliderVolume(nextValue);
-          queueSliderVolumeCommit(nextValue);
+          stepVolumeSlider(1);
         },
       },
       actions: [
         {
           title: info?.isMuted ? "Unmute" : "Mute",
+          icon: info?.isMuted ? AudioPluginIcon : AudioMuteIcon,
           disabled: state.audio.volumeLoading || !info,
           onCancel: () => {
             navigateBackFromRoute();
@@ -5981,6 +10289,11 @@
           title: elevatedHelperReady
             ? installation?.running ? "Restart TFS FPS Overlay" : "Start TFS FPS Overlay"
             : "Prepare Elevated Helper",
+          icon: !elevatedHelperReady
+            ? SettingsPluginIcon
+            : installation?.running
+              ? RestartActionIcon
+              : LaunchActionIcon,
           disabled: isPerformanceBusy(),
           onClick: () => {
             rememberVolumeActionFocus(1);
@@ -6211,16 +10524,10 @@
           void toggleMute();
         },
         onMoveLeft: () => {
-          const nextValue = getVolumeValue() - 10;
-          const snappedValue = snapVolumeToStep(nextValue);
-          previewSliderVolume(snappedValue);
-          queueSliderVolumeCommit(snappedValue);
+          stepVolumeSlider(-1);
         },
         onMoveRight: () => {
-          const nextValue = getVolumeValue() + 10;
-          const snappedValue = snapVolumeToStep(nextValue);
-          previewSliderVolume(snappedValue);
-          queueSliderVolumeCommit(snappedValue);
+          stepVolumeSlider(1);
         },
       },
       captureSlider: {
@@ -6236,14 +10543,10 @@
           void toggleCaptureMute();
         },
         onMoveLeft: () => {
-          const nextValue = getCaptureVolumeValue() - 10;
-          previewCaptureSliderVolume(nextValue);
-          queueCaptureSliderVolumeCommit(nextValue);
+          stepCaptureVolumeSlider(-1);
         },
         onMoveRight: () => {
-          const nextValue = getCaptureVolumeValue() + 10;
-          previewCaptureSliderVolume(nextValue);
-          queueCaptureSliderVolumeCommit(nextValue);
+          stepCaptureVolumeSlider(1);
         },
       },
       playbackSelector: {
@@ -6347,6 +10650,7 @@
           void preparePerformanceElevatedHelper();
         },
         {
+          slotKey: "performance-overlay-start-stop-primary",
           disabled: isPerformanceBusy(),
         },
       ),
@@ -6364,6 +10668,7 @@
           void preparePerformanceElevatedHelper();
         },
         {
+          slotKey: "performance-overlay-start-stop-secondary",
           disabled: elevatedHelperReady
             ? isPerformanceBusy() || !installation?.running
             : isPerformanceBusy(),
@@ -6376,6 +10681,7 @@
           void togglePerformanceAutoTarget();
         },
         {
+          slotKey: "performance-auto-target-toggle",
           badge: settings?.autoTargetEnabled ? "On" : "Off",
           disabled: isPerformanceBusy(),
         },
@@ -6594,6 +10900,7 @@
           void loadPerformanceState();
         },
         {
+          slotKey: "performance-refresh-state",
           disabled: isPerformanceBusy(),
         },
       ),
@@ -6663,6 +10970,95 @@
 
   function getUpdateSnapshot() {
     return state.updates.snapshot;
+  }
+
+  function isSnapshotObject(snapshot) {
+    return Boolean(snapshot && typeof snapshot === "object");
+  }
+
+  function setPerformanceSnapshot(snapshot, options = {}) {
+    state.performance.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.performance.error = "";
+    }
+  }
+
+  function setProcessesSnapshot(snapshot, options = {}) {
+    state.processes.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.processes.error = "";
+    }
+  }
+
+  function setAppStartSnapshot(snapshot, options = {}) {
+    state.appStart.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.appStart.error = "";
+    }
+  }
+
+  function setGeneralSettingsSnapshot(snapshot, options = {}) {
+    state.generalSettings.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.generalSettings.error = "";
+    }
+
+    if (state.generalSettings.snapshot && options.syncDrafts !== false) {
+      syncSplashDraftsFromSnapshot(options.forceDraftSync === true);
+    }
+  }
+
+  function setUpdateSnapshot(snapshot, options = {}) {
+    state.updates.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.updates.error = "";
+    }
+  }
+
+  function setStoreSyncSnapshot(snapshot, options = {}) {
+    state.storeSync.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.storeSync.error = "";
+    }
+
+    if (!state.storeSync.snapshot) {
+      return;
+    }
+
+    const preserveDrafts = options.preserveDrafts === true;
+    const forceDraftSync = options.forceDraftSync === true;
+
+    if (
+      isCustomLocationsRoute(state.route) &&
+      (forceDraftSync || (!preserveDrafts && !hasRouteTextInputFocus()) || !state.storeSync.customPathDraft)
+    ) {
+      syncCustomPathDraftFromSnapshot(forceDraftSync || !preserveDrafts);
+    }
+
+    const activeTitleId = getStoreSyncTitleRouteId();
+    if (activeTitleId && !preserveDrafts) {
+      clearStoreSyncArtworkPreview(activeTitleId);
+      syncStoreSyncTitleDraftsFromSnapshot(activeTitleId, true);
+    }
+  }
+
+  function setAudioDashboardSnapshot(snapshot, options = {}) {
+    const nextSnapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    state.audio.volumeInfo = nextSnapshot?.playbackVolume || null;
+    state.audio.captureVolumeInfo = nextSnapshot?.captureVolume || null;
+    state.audio.devices = Array.isArray(nextSnapshot?.playbackDevices) ? nextSnapshot.playbackDevices : [];
+    state.audio.captureDevices = Array.isArray(nextSnapshot?.captureDevices) ? nextSnapshot.captureDevices : [];
+    state.audio.mixerSessions = sortAudioMixerSessions(
+      Array.isArray(nextSnapshot?.mixerSessions) ? nextSnapshot.mixerSessions : [],
+    );
+
+    if (options.clearErrors !== false) {
+      state.audio.volumeError = "";
+      state.audio.captureVolumeError = "";
+      state.audio.mixerError = "";
+      state.audio.error = "";
+      state.audio.dashboardError = "";
+    }
   }
 
   function getUpdateChannel() {
@@ -6740,6 +11136,159 @@
       state.autoSisir.pathDraft = path;
       state.autoSisir.pathInputVersion += 1;
     }
+  }
+
+  function getSmartHomeSnapshot() {
+    return state.smartHome.snapshot;
+  }
+
+  function getSmartHomeSettings() {
+    return getSmartHomeSnapshot()?.settings || null;
+  }
+
+  function getSmartHomeOverview() {
+    return getSmartHomeSnapshot()?.overview || null;
+  }
+
+  function getSmartHomeZones() {
+    const zones = getSmartHomeSnapshot()?.zones;
+    return Array.isArray(zones) ? zones : [];
+  }
+
+  function getSmartHomeFlows() {
+    const flows = getSmartHomeSnapshot()?.flows;
+    return Array.isArray(flows) ? flows : [];
+  }
+
+  function getSmartHomeMoods() {
+    const moods = getSmartHomeSnapshot()?.moods;
+    return Array.isArray(moods) ? moods : [];
+  }
+
+  function getSmartHomeUnassignedDevices() {
+    const devices = getSmartHomeSnapshot()?.unassignedDevices;
+    return Array.isArray(devices) ? devices : [];
+  }
+
+  function getSmartHomeZone(zoneId) {
+    if (!zoneId) {
+      return null;
+    }
+
+    return getSmartHomeZones().find((zone) => zone.id === zoneId) || null;
+  }
+
+  function getSmartHomeZoneMoods(zoneId) {
+    if (!zoneId) {
+      return [];
+    }
+
+    return getSmartHomeMoods().filter((mood) => mood.zoneId === zoneId);
+  }
+
+  function getSmartHomeRoomIndex(roomId) {
+    if (!roomId) {
+      return null;
+    }
+
+    if (roomId === "unassigned") {
+      return getSmartHomeZones().length;
+    }
+
+    const index = getSmartHomeZones().findIndex((zone) => zone.id === roomId);
+    return index >= 0 ? index : null;
+  }
+
+  function getSmartHomeDevice(deviceId) {
+    if (!deviceId) {
+      return null;
+    }
+
+    for (const zone of getSmartHomeZones()) {
+      const device = Array.isArray(zone.devices)
+        ? zone.devices.find((entry) => entry.id === deviceId)
+        : null;
+      if (device) {
+        return device;
+      }
+    }
+
+    return getSmartHomeUnassignedDevices().find((device) => device.id === deviceId) || null;
+  }
+
+  function getSmartHomeRoomRouteId(route = state.route) {
+    return route?.pluginId === "smart-home" &&
+      typeof route?.pageId === "string" &&
+      route.pageId.startsWith("room-")
+      ? route.pageId.replace(/^room-/, "")
+      : "";
+  }
+
+  function isSmartHomeBusy() {
+    return state.smartHome.loading || state.smartHome.saving;
+  }
+
+  function getSmartHomeErrorText() {
+    return state.smartHome.error || getSmartHomeSnapshot()?.errorText || "";
+  }
+
+  function syncSmartHomeDraftsFromSnapshot(force = false) {
+    const homey = getSmartHomeSettings()?.homey;
+    if (!homey) {
+      return;
+    }
+
+    const nextBaseUrl = homey.baseUrl || "";
+    if (force || !state.smartHome.baseUrlDraft) {
+      if (state.smartHome.baseUrlDraft !== nextBaseUrl) {
+        state.smartHome.baseUrlDraft = nextBaseUrl;
+        state.smartHome.baseUrlInputVersion += 1;
+      }
+    }
+
+    const nextHomeyId = homey.homeyId || "";
+    if (force || !state.smartHome.homeyIdDraft) {
+      if (state.smartHome.homeyIdDraft !== nextHomeyId) {
+        state.smartHome.homeyIdDraft = nextHomeyId;
+        state.smartHome.homeyIdInputVersion += 1;
+      }
+    }
+
+    if ((force || !state.smartHome.sessionTokenDraft) && state.smartHome.sessionTokenDraft) {
+      state.smartHome.sessionTokenDraft = "";
+      state.smartHome.sessionTokenInputVersion += 1;
+    }
+  }
+
+  function setSmartHomeSnapshot(snapshot, options = {}) {
+    state.smartHome.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    if (options.clearError !== false) {
+      state.smartHome.error = "";
+    }
+
+    if (state.smartHome.snapshot && options.syncDrafts !== false) {
+      syncSmartHomeDraftsFromSnapshot(options.forceDraftSync === true);
+    }
+  }
+
+  function getSmartHomeSliderCommitKey(deviceId, capabilityId) {
+    return `${deviceId}::${capabilityId}`;
+  }
+
+  function clearSmartHomeSliderCommitTimer(commitKey) {
+    const timerHandle = state.smartHome.sliderCommitTimersByKey[commitKey];
+    if (!timerHandle) {
+      return;
+    }
+
+    window.clearTimeout(timerHandle);
+    delete state.smartHome.sliderCommitTimersByKey[commitKey];
+  }
+
+  function clearAllSmartHomeSliderCommitTimers() {
+    Object.keys(state.smartHome.sliderCommitTimersByKey).forEach((commitKey) =>
+      clearSmartHomeSliderCommitTimer(commitKey),
+    );
   }
 
   function getGeneralPluginSettings() {
@@ -7428,7 +11977,7 @@
     return "Ready";
   }
 
-  function createStoreSyncSectionSlot(title, copy, slotKey, showDivider = false) {
+  function createSectionSlot(title, copy, slotKey, showDivider = false) {
     return {
       title,
       copy,
@@ -7458,6 +12007,103 @@
           slotKey || title,
         ),
     };
+  }
+
+  function createStoreSyncSectionSlot(title, copy, slotKey, showDivider = false) {
+    return createSectionSlot(title, copy, slotKey, showDivider);
+  }
+
+  function createThemeStorePagerSlots({
+    currentPage = 1,
+    totalPages = 1,
+    disabled = false,
+    onPrevious = null,
+    onNext = null,
+  } = {}) {
+    if (totalPages <= 1) {
+      return [];
+    }
+
+    const slotKey = "theme-store-pager-top";
+    const canGoPrevious = !disabled && currentPage > 1 && typeof onPrevious === "function";
+    const canGoNext = !disabled && currentPage < totalPages && typeof onNext === "function";
+    const createInlineStepperSlot = window.STFrontendLib?.createInlineStepperSlot
+      || ((title, copy, onMoveLeft, onMoveRight, options = {}) => {
+        const leftDisabled = Boolean(options.leftDisabled);
+        const rightDisabled = Boolean(options.rightDisabled);
+        const externalButtonProps = options.buttonProps || {};
+
+        return {
+          kind: "button",
+          role: "command",
+          title,
+          copy: copy || "",
+          onClick: options.onClick || onMoveRight || onMoveLeft || (() => {}),
+          disabled: Boolean(options.disabled),
+          badge: "",
+          trailing: "none",
+          switchValue: undefined,
+          switchLabel: "",
+          leadingIcon: null,
+          buttonClassName:
+            options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-inline-stepper",
+          buttonStyle: options.buttonStyle || null,
+          buttonProps: {
+            ...externalButtonProps,
+            onMoveLeft: (event) => {
+              externalButtonProps.onMoveLeft?.(event);
+              if (!leftDisabled) {
+                onMoveLeft?.(event);
+              }
+              return true;
+            },
+            onMoveRight: (event) => {
+              externalButtonProps.onMoveRight?.(event);
+              if (!rightDisabled) {
+                onMoveRight?.(event);
+              }
+              return true;
+            },
+          },
+          rowClassName: options.rowClassName || "",
+          slotKey: options.slotKey || options.key || "",
+          selected: Boolean(options.selected),
+          value: options.value,
+          layout: "stepper",
+          expanded: Boolean(options.expanded),
+          eyebrow: options.eyebrow || "",
+          meta: Array.isArray(options.meta) ? options.meta.filter(Boolean) : [],
+          mediaImageSrc: options.mediaImageSrc || "",
+          mediaImageAlt: options.mediaImageAlt || "",
+          footerLabel: options.footerLabel || "",
+          stepperLeftDisabled: leftDisabled,
+          stepperRightDisabled: rightDisabled,
+        };
+      });
+
+    return [
+      createInlineStepperSlot(
+        `${currentPage} / ${totalPages}`,
+        "",
+        () => {
+          onPrevious?.();
+        },
+        () => {
+          onNext?.();
+        },
+        {
+          slotKey,
+          disabled: Boolean(disabled),
+          leftDisabled: !canGoPrevious,
+          rightDisabled: !canGoNext,
+          onClick: canGoNext ? onNext : canGoPrevious ? onPrevious : (() => {}),
+          buttonProps: {
+            "aria-label": `Theme Store page ${currentPage} of ${totalPages}. Use left and right to change pages.`,
+            title: `Theme Store page ${currentPage} of ${totalPages}`,
+          },
+        },
+      ),
+    ];
   }
 
   function getPathFileName(pathValue) {
@@ -7878,22 +12524,192 @@
     return state.themes.snapshot;
   }
 
+  function getThemeIntegration() {
+    return getThemesSnapshot()?.integration || null;
+  }
+
   function getThemeById(themeId) {
     if (!themeId) {
       return null;
     }
 
-    const snapshot = getThemesSnapshot();
-    const installedTheme = snapshot?.installedThemes?.find((theme) => theme.id === themeId);
-    if (installedTheme) {
-      return installedTheme;
+    return getThemesSnapshot()?.installedThemes?.find((theme) => theme.id === themeId) || null;
+  }
+
+  function getThemeSliderChoiceFromSnapshot(snapshot, themeId, optionId) {
+    const theme = snapshot?.installedThemes?.find((entry) => entry.id === themeId);
+    const option = theme?.options?.find((entry) => entry.id === optionId);
+    return option?.selectedChoiceId;
+  }
+
+  function applyThemesSnapshotIfCurrent(snapshot) {
+    const optimisticEntries = getOptimisticDesiredEntries("themes.slider.");
+    if (!optimisticEntries.length) {
+      state.themes.snapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+      applyActiveThemeCss();
+      return true;
     }
 
-    return snapshot?.browseThemes?.find((theme) => theme.id === themeId) || null;
+    const matchesAllDesiredValues = optimisticEntries.every(([key, desiredValue]) => {
+      const routeKey = key.slice("themes.slider.".length);
+      const separatorIndex = routeKey.indexOf("::");
+      if (separatorIndex < 0) {
+        return true;
+      }
+
+      const themeId = routeKey.slice(0, separatorIndex);
+      const optionId = routeKey.slice(separatorIndex + 2);
+      return Object.is(getThemeSliderChoiceFromSnapshot(snapshot, themeId, optionId), desiredValue);
+    });
+
+    if (!matchesAllDesiredValues) {
+      return false;
+    }
+
+    state.themes.snapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+    applyActiveThemeCss();
+    optimisticEntries.forEach(([key, desiredValue]) => {
+      clearOptimisticDesiredValue(key, desiredValue);
+    });
+    return true;
   }
 
   function getThemeProfilesState() {
     return getThemesSnapshot()?.profiles || null;
+  }
+
+  function getThemeStoreCatalog() {
+    return state.themes.storeCatalog || null;
+  }
+
+  function getThemeStoreById(storeThemeId) {
+    if (!storeThemeId) {
+      return null;
+    }
+
+    return (
+      state.themes.storeDetailById?.[storeThemeId] ||
+      getThemeStoreCatalog()?.items?.find((theme) => theme.storeId === storeThemeId) ||
+      null
+    );
+  }
+
+  function getInstalledThemePreview(themeId) {
+    if (!themeId) {
+      return null;
+    }
+
+    return state.themes.installedPreviewByThemeId?.[themeId] || null;
+  }
+
+  function hasInstalledThemePreviewRecord(themeId) {
+    if (!themeId) {
+      return false;
+    }
+
+    return Object.prototype.hasOwnProperty.call(state.themes.installedPreviewByThemeId || {}, themeId);
+  }
+
+  function findInstalledThemePreview(theme) {
+    if (!theme?.id) {
+      return null;
+    }
+
+    const cachedPreview = getInstalledThemePreview(theme.id);
+    if (cachedPreview?.imageSrc) {
+      return cachedPreview;
+    }
+
+    const detailMatch = Object.values(state.themes.storeDetailById || {}).find(
+      (entry) => entry?.themeId === theme.id,
+    );
+    if (detailMatch?.previewImageUrl || detailMatch?.previewThumbnailUrl) {
+      return {
+        imageSrc: detailMatch.previewImageUrl || detailMatch.previewThumbnailUrl || "",
+        imageAlt: `${theme.title} preview`,
+      };
+    }
+
+    const catalogMatch = getThemeStoreCatalog()?.items?.find((entry) => entry?.themeId === theme.id);
+    if (catalogMatch?.previewImageUrl || catalogMatch?.previewThumbnailUrl) {
+      return {
+        imageSrc: catalogMatch.previewImageUrl || catalogMatch.previewThumbnailUrl || "",
+        imageAlt: `${theme.title} preview`,
+      };
+    }
+
+    return cachedPreview;
+  }
+
+  async function ensureInstalledThemePreview(theme) {
+    if (!theme?.id) {
+      return null;
+    }
+
+    const existingPreview = findInstalledThemePreview(theme);
+    if (existingPreview?.imageSrc || hasInstalledThemePreviewRecord(theme.id)) {
+      if (existingPreview) {
+        state.themes.installedPreviewByThemeId[theme.id] = existingPreview;
+      }
+      return existingPreview;
+    }
+
+    state.themes.installedPreviewByThemeId ||= {};
+    state.themes.installedPreviewLoadingByThemeId ||= {};
+    if (state.themes.installedPreviewLoadingByThemeId[theme.id]) {
+      return null;
+    }
+
+    state.themes.installedPreviewLoadingByThemeId[theme.id] = true;
+
+    try {
+      const query = new URLSearchParams({
+        search: theme.id || theme.title || "",
+        filter: "All",
+        order: "Most Downloaded",
+        page: "1",
+        perPage: "8",
+      });
+      const response = await fetch(`${apiBase}api/themes/store?${query.toString()}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Theme preview could not be loaded (${response.status}).`);
+      }
+
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      const normalizedThemeId = String(theme.id || "").trim().toLowerCase();
+      const normalizedThemeTitle = String(theme.title || "").trim().toLowerCase();
+      const normalizedThemeAuthor = String(theme.author || "").trim().toLowerCase();
+      const matchedTheme =
+        items.find((entry) => String(entry?.themeId || "").trim().toLowerCase() === normalizedThemeId) ||
+        items.find(
+          (entry) =>
+            String(entry?.title || "").trim().toLowerCase() === normalizedThemeTitle &&
+            String(entry?.author || "").trim().toLowerCase() === normalizedThemeAuthor,
+        ) ||
+        items.find((entry) => String(entry?.title || "").trim().toLowerCase() === normalizedThemeTitle) ||
+        null;
+
+      state.themes.installedPreviewByThemeId[theme.id] = matchedTheme
+        ? {
+            imageSrc: matchedTheme.previewImageUrl || matchedTheme.previewThumbnailUrl || "",
+            imageAlt: `${theme.title} preview`,
+          }
+        : {
+            imageSrc: "",
+            imageAlt: `${theme.title} preview`,
+          };
+    } catch {
+      state.themes.installedPreviewByThemeId[theme.id] = {
+        imageSrc: "",
+        imageAlt: `${theme.title} preview`,
+      };
+    } finally {
+      state.themes.installedPreviewLoadingByThemeId[theme.id] = false;
+      rerenderThemesPanel();
+    }
+
+    return state.themes.installedPreviewByThemeId[theme.id];
   }
 
   function getThemeProfileById(profileId) {
@@ -7901,13 +12717,7 @@
       return null;
     }
 
-    const profiles = getThemeProfilesState();
-    const installedProfile = profiles?.installedProfiles?.find((profile) => profile.id === profileId);
-    if (installedProfile) {
-      return installedProfile;
-    }
-
-    return profiles?.browseProfiles?.find((profile) => profile.id === profileId) || null;
+    return getThemeProfilesState()?.installedProfiles?.find((profile) => profile.id === profileId) || null;
   }
 
   function getThemeOptionById(themeId, optionId) {
@@ -7928,7 +12738,7 @@
       return option.boolValue ? "On" : "Off";
     }
 
-    if (option.type === "choice") {
+    if (option.type === "choice" || option.type === "slider") {
       return getThemeChoiceTitle(option, option.selectedChoiceId);
     }
 
@@ -7945,9 +12755,9 @@
     }
 
     const lines = [
-      `${theme.author} - v${theme.version}`,
+      `${theme.author} - ${theme.version}`,
       theme.storeDescription || theme.description,
-      `${theme.sourceLabel} - ${theme.downloadCount.toLocaleString()} downloads - ${theme.targets.join(", ")}`,
+      `${theme.sourceLabel} - ${theme.dependencyCount || 0} dependenc${theme.dependencyCount === 1 ? "y" : "ies"} - ${theme.advancedControlCount || 0} advanced control${theme.advancedControlCount === 1 ? "" : "s"}`,
       theme.statusText,
     ];
 
@@ -7963,9 +12773,9 @@
     }
 
     const lines = [
-      `${profile.author} - v${profile.version}`,
+      `${profile.author} - ${profile.version}`,
       profile.description,
-      `${profile.sourceLabel} - ${profile.downloadCount.toLocaleString()} downloads`,
+      `${profile.sourceLabel} - ${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"}`,
       profile.statusText,
       `${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"} in this profile`,
     ];
@@ -7976,13 +12786,130 @@
     };
   }
 
+  function buildThemeStoreSummaryCard(theme) {
+    if (!theme) {
+      return null;
+    }
+
+    const lines = [
+      `${theme.author} - ${theme.version}`,
+      theme.description,
+      `${theme.target} - ${theme.downloadCount.toLocaleString()} download${theme.downloadCount === 1 ? "" : "s"} - ${theme.starCount.toLocaleString()} star${theme.starCount === 1 ? "" : "s"}`,
+      `${theme.dependencyCount} dependenc${theme.dependencyCount === 1 ? "y" : "ies"} - ${theme.statusText}`,
+    ];
+
+    return {
+      title: theme.title,
+      imageSrc: theme.previewImageUrl || theme.previewThumbnailUrl || "",
+      imageAlt: `${theme.title} preview`,
+      lines,
+    };
+  }
+
+  function buildThemeStoreIcon(imageSrc, imageAlt) {
+    if (!imageSrc) {
+      return ThemesPluginIcon;
+    }
+
+    return function ThemeStoreIcon() {
+      return createElement("img", {
+        className: "steamloader-theme-store-icon",
+        src: imageSrc,
+        alt: imageAlt || "",
+      });
+    };
+  }
+
+  function formatCompactThemeStoreCount(value) {
+    const safeValue = Math.max(0, Number(value) || 0);
+    if (safeValue >= 1000000) {
+      return `${(safeValue / 1000000).toFixed(safeValue >= 10000000 ? 0 : 1)}M`;
+    }
+
+    if (safeValue >= 1000) {
+      return `${(safeValue / 1000).toFixed(safeValue >= 100000 ? 0 : 1)}K`;
+    }
+
+    return safeValue.toLocaleString();
+  }
+
+  function getThemeStoreTargetSummary(theme) {
+    const targets = Array.isArray(theme?.targets) ? theme.targets.filter(Boolean) : [];
+    if (targets.length > 0) {
+      return targets.slice(0, 2).join(" + ");
+    }
+
+    return theme?.target || "Big Picture";
+  }
+
+  function buildThemeStoreMetaItems(theme) {
+    if (!theme) {
+      return [];
+    }
+
+    return [
+      theme.author,
+      getThemeStoreTargetSummary(theme),
+      `${formatCompactThemeStoreCount(theme.downloadCount)} downloads`,
+      `${formatCompactThemeStoreCount(theme.starCount)} stars`,
+    ].filter(Boolean);
+  }
+
+  function buildThemeStoreFilterSummary(currentFilter, currentOrder, searchDraft) {
+    const summaryParts = [currentFilter || "All", currentOrder || "Most Downloaded"];
+    const normalizedSearch = typeof searchDraft === "string" ? searchDraft.trim() : "";
+    summaryParts.push(normalizedSearch ? `Search: ${normalizedSearch}` : "No search");
+    return summaryParts.join(" • ");
+  }
+
+  function createThemeSliderSlot(theme, option) {
+    const choices = Array.isArray(option?.choices) ? option.choices : [];
+    const currentChoiceId = option?.selectedChoiceId || choices[0]?.id || "";
+    const currentIndex = Math.max(0, choices.findIndex((choice) => choice.id === currentChoiceId));
+    const advancedHint =
+      option?.advancedControlCount > 0
+        ? ` ${option.advancedControlCount} advanced control${option.advancedControlCount === 1 ? "" : "s"} are not exposed in Quick Access yet.`
+        : "";
+
+    return createPerformanceValueSliderSlot({
+      title: option.title,
+      copy: option.description,
+      hint: `Use Left / Right to adjust this patch. Press A to reset it to the default value.${advancedHint}`,
+      slotKey: `theme-slider-${theme.id}-${option.id}`,
+      min: 0,
+      max: Math.max(0, choices.length - 1),
+      step: 1,
+      disabled: state.themes.loading || state.themes.saving || !theme.installed || choices.length <= 1,
+      getValue: () => {
+        const liveOption = getThemeOptionById(theme.id, option.id) || option;
+        const liveChoiceId = liveOption?.selectedChoiceId || choices[0]?.id || "";
+        const liveIndex = choices.findIndex((choice) => choice.id === liveChoiceId);
+        return liveIndex >= 0 ? liveIndex : currentIndex;
+      },
+      displayValue: (index) => {
+        const safeIndex = Math.max(0, Math.min(choices.length - 1, index));
+        return choices[safeIndex]?.title || currentChoiceId;
+      },
+      onAdjust: (direction) => {
+        adjustThemeRange(theme.id, option.id, direction);
+      },
+      onClick: () => {
+        resetThemeRange(theme.id, option.id);
+      },
+    });
+  }
+
   function resolveThemesStatusText() {
     if (state.themes.saving) {
-      return "Saving theme changes...";
+      return state.themes.operationText || "Saving CSSLoader changes...";
+    }
+
+    if (state.themes.storeLoading) {
+      return "Loading CSSLoader Store...";
     }
 
     if (state.themes.loading) {
-      return "Loading themes...";
+      return "Loading CSSLoader state...";
     }
 
     return getThemesSnapshot()?.statusText || "";
@@ -7992,8 +12919,8 @@
     const installedThemes = Array.isArray(snapshot?.installedThemes) ? snapshot.installedThemes : [];
     const activeCount = installedThemes.filter((theme) => theme.enabled).length;
     return activeCount > 0
-      ? `${installedThemes.length} installed - ${activeCount} active.`
-      : `${installedThemes.length} installed - no active themes.`;
+      ? `${installedThemes.length} installed theme${installedThemes.length === 1 ? "" : "s"} - ${activeCount} active.`
+      : `${installedThemes.length} installed theme${installedThemes.length === 1 ? "" : "s"} - none active.`;
   }
 
   function ensureActiveThemeStyle() {
@@ -8029,15 +12956,10 @@
         throw new Error(payload.message || `Store Sync could not be loaded (${response.status}).`);
       }
 
-      state.storeSync.snapshot = payload && typeof payload === "object" ? payload : null;
-      if (isCustomLocationsRoute(state.route) && !state.storeSync.customPathDraft) {
-        syncCustomPathDraftFromSnapshot(true);
-      }
-      const activeTitleId = getStoreSyncTitleRouteId();
-      if (activeTitleId && !preserveDrafts) {
-        clearStoreSyncArtworkPreview(activeTitleId);
-        syncStoreSyncTitleDraftsFromSnapshot(activeTitleId, true);
-      }
+      setStoreSyncSnapshot(payload, {
+        preserveDrafts,
+        forceDraftSync: !preserveDrafts,
+      });
     } catch (error) {
       state.storeSync.error = error instanceof Error ? error.message : String(error);
       if (showLoading) {
@@ -8049,10 +12971,13 @@
     }
   }
 
-  async function loadGeneralSettingsState() {
+  async function loadGeneralSettingsState(options = {}) {
+    const showLoading = options.showLoading !== false;
     state.generalSettings.loading = true;
     state.generalSettings.error = "";
-    rerenderGeneralSettingsPanel();
+    if (showLoading) {
+      rerenderGeneralSettingsPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}api/settings/state`, { cache: "no-store" });
@@ -8061,14 +12986,119 @@
         throw new Error(payload.message || `Tools for Steam settings could not be loaded (${response.status}).`);
       }
 
-      state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
-      syncSplashDraftsFromSnapshot(true);
+      setGeneralSettingsSnapshot(payload, { forceDraftSync: true });
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
       state.generalSettings.snapshot = null;
     } finally {
       state.generalSettings.loading = false;
       rerenderGeneralSettingsPanel();
+    }
+  }
+
+  function buildCommunityScriptUrl(plugin) {
+    const scriptUrl = String(plugin?.scriptUrl || "").replace(/^\/+/, "");
+    if (!scriptUrl) {
+      return "";
+    }
+
+    const separator = scriptUrl.includes("?") ? "&" : "?";
+    return `${apiBase}${scriptUrl}${separator}v=${encodeURIComponent(plugin.version || plugin.installedVersion || Date.now())}`;
+  }
+
+  function loadCommunityPluginScript(plugin) {
+    const pluginId = String(plugin?.id || "").trim();
+    const version = String(plugin?.version || "").trim();
+    const scriptUrl = buildCommunityScriptUrl(plugin);
+    if (!pluginId || !scriptUrl) {
+      return Promise.resolve(false);
+    }
+
+    window.ToolsForSteamCommunityPlugins ??= {};
+
+    if (
+      state.communityPlugins.scriptVersionsById[pluginId] === version &&
+      window.ToolsForSteamCommunityPlugins[pluginId]
+    ) {
+      return Promise.resolve(true);
+    }
+
+    if (state.communityPlugins.scriptPromisesById[pluginId]) {
+      return state.communityPlugins.scriptPromisesById[pluginId];
+    }
+
+    const scriptId = `steamloader-community-plugin-script-${pluginId}`;
+    document.getElementById(scriptId)?.remove();
+    delete window.ToolsForSteamCommunityPlugins[pluginId];
+
+    const promise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.id = scriptId;
+      script.src = scriptUrl;
+      script.async = false;
+      script.onload = () => {
+        state.communityPlugins.scriptVersionsById[pluginId] = version;
+        delete state.communityPlugins.scriptErrorsById[pluginId];
+        delete state.communityPlugins.scriptPromisesById[pluginId];
+        resolve(true);
+      };
+      script.onerror = () => {
+        const message = `${plugin?.title || pluginId} could not be loaded.`;
+        state.communityPlugins.scriptErrorsById[pluginId] = message;
+        delete state.communityPlugins.scriptPromisesById[pluginId];
+        reject(new Error(message));
+      };
+      document.head.append(script);
+    });
+
+    state.communityPlugins.scriptPromisesById[pluginId] = promise;
+    return promise;
+  }
+
+  async function loadCommunityPluginScripts(pluginsSnapshot) {
+    const loadResults = await Promise.allSettled(
+      (Array.isArray(pluginsSnapshot) ? pluginsSnapshot : []).map((plugin) =>
+        loadCommunityPluginScript(plugin),
+      ),
+    );
+
+    const failed = loadResults.filter((result) => result.status === "rejected");
+    if (failed.length) {
+      state.communityPlugins.error = `${failed.length} community plugin${failed.length === 1 ? "" : "s"} could not be loaded.`;
+    }
+  }
+
+  async function loadCommunityPluginsState(options = {}) {
+    if (state.communityPlugins.loading) {
+      return;
+    }
+
+    const showLoading = options.showLoading !== false;
+    state.communityPlugins.loading = true;
+    state.communityPlugins.error = "";
+    if (showLoading) {
+      rerenderHomePanel();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/plugin-store/community/installed`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Community plugins could not be loaded (${response.status}).`);
+      }
+
+      state.communityPlugins.snapshot = payload && typeof payload === "object"
+        ? payload
+        : { plugins: [] };
+      await loadCommunityPluginScripts(state.communityPlugins.snapshot.plugins);
+    } catch (error) {
+      state.communityPlugins.error = error instanceof Error ? error.message : String(error);
+      state.communityPlugins.snapshot = { plugins: [] };
+    } finally {
+      state.communityPlugins.loading = false;
+      rerenderHomePanel();
     }
   }
 
@@ -8100,7 +13130,7 @@
         throw new Error(payload.message || `Tools for Steam updates could not be loaded (${response.status}).`);
       }
 
-      state.updates.snapshot = payload && typeof payload === "object" ? payload : null;
+      setUpdateSnapshot(payload);
     } catch (error) {
       state.updates.error = error instanceof Error ? error.message : String(error);
       if (force) {
@@ -8108,6 +13138,7 @@
       }
     } finally {
       state.updates.loading = false;
+      updateUpdatesPolling();
       rerenderGeneralSettingsPanel();
     }
   }
@@ -8135,6 +13166,45 @@
     }
   }
 
+  async function loadSmartHomeState(options = {}) {
+    const showLoading = options.showLoading !== false;
+    state.smartHome.loading = true;
+    state.smartHome.error = "";
+    if (showLoading) {
+      rerenderSmartHomePanel();
+    }
+
+    try {
+      const path = options.force === true ? "api/smart-home/refresh" : "api/smart-home/state";
+      const response = await fetch(`${apiBase}${path}`, {
+        method: options.force === true ? "POST" : "GET",
+        headers: options.force === true
+          ? {
+              "Content-Type": "application/json",
+            }
+          : undefined,
+        body: options.force === true ? "{}" : undefined,
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Homey could not be loaded (${response.status}).`);
+      }
+
+      setSmartHomeSnapshot(payload, {
+        forceDraftSync: !hasRouteTextInputFocus(),
+      });
+    } catch (error) {
+      state.smartHome.error = error instanceof Error ? error.message : String(error);
+      if (showLoading) {
+        state.smartHome.snapshot = null;
+      }
+    } finally {
+      state.smartHome.loading = false;
+      rerenderSmartHomePanel();
+    }
+  }
+
   async function loadDisplayModes() {
     state.display.modesLoading = true;
     state.display.error = "";
@@ -8158,10 +13228,13 @@
     }
   }
 
-  async function loadPerformanceState() {
+  async function loadPerformanceState(options = {}) {
+    const showLoading = options.showLoading !== false;
     state.performance.loading = true;
     state.performance.error = "";
-    rerenderPerformancePanel();
+    if (showLoading) {
+      rerenderPerformancePanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}api/performance/state`, { cache: "no-store" });
@@ -8170,13 +13243,16 @@
         throw new Error(payload.message || `Performance could not be loaded (${response.status}).`);
       }
 
-      state.performance.snapshot = payload && typeof payload === "object" ? payload : null;
+      applyPerformanceSnapshotIfCurrent(payload);
     } catch (error) {
       state.performance.error = error instanceof Error ? error.message : String(error);
-      state.performance.snapshot = null;
     } finally {
       state.performance.loading = false;
-      rerenderPerformancePanel();
+      if (showLoading) {
+        rerenderPerformancePanel();
+      } else {
+        refreshPerformancePanel();
+      }
     }
   }
 
@@ -8226,14 +13302,17 @@
     }
   }
 
-  async function loadProcessesState() {
+  async function loadProcessesState(options = {}) {
     if (state.processes.loading) {
       return;
     }
 
+    const showLoading = options.showLoading !== false;
     state.processes.loading = true;
     state.processes.error = "";
-    rerenderProcessesPanel();
+    if (showLoading) {
+      rerenderProcessesPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}api/processes/windows`, { cache: "no-store" });
@@ -8242,7 +13321,7 @@
         throw new Error(payload.message || `Processes could not be loaded (${response.status}).`);
       }
 
-      state.processes.snapshot = payload && typeof payload === "object" ? payload : null;
+      setProcessesSnapshot(payload);
     } catch (error) {
       state.processes.error = error instanceof Error ? error.message : String(error);
       state.processes.snapshot = null;
@@ -8252,10 +13331,13 @@
     }
   }
 
-  async function loadAppStartState() {
+  async function loadAppStartState(options = {}) {
+    const showLoading = options.showLoading !== false;
     state.appStart.loading = true;
     state.appStart.error = "";
-    rerenderAppStartPanel();
+    if (showLoading) {
+      rerenderAppStartPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}api/app-start/state`, { cache: "no-store" });
@@ -8264,7 +13346,7 @@
         throw new Error(payload.message || `App Start could not be loaded (${response.status}).`);
       }
 
-      state.appStart.snapshot = payload && typeof payload === "object" ? payload : null;
+      setAppStartSnapshot(payload);
     } catch (error) {
       state.appStart.error = error instanceof Error ? error.message : String(error);
       state.appStart.snapshot = null;
@@ -8296,34 +13378,147 @@
     }
   }
 
-  async function loadThemesState() {
+  async function loadThemesState(options = {}) {
+    const showLoading = options.showLoading !== false;
     state.themes.loading = true;
     state.themes.error = "";
-    rerenderThemesPanel();
+    if (showLoading) {
+      rerenderThemesPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}api/themes/state`, { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload.message || `Themes could not be loaded (${response.status}).`);
+        throw new Error(payload.message || `CSSLoader state could not be loaded (${response.status}).`);
       }
 
-      state.themes.snapshot = payload && typeof payload === "object" ? payload : null;
-      applyActiveThemeCss();
+      applyThemesSnapshotIfCurrent(payload);
     } catch (error) {
       state.themes.error = error instanceof Error ? error.message : String(error);
-      state.themes.snapshot = null;
-      applyActiveThemeCss();
     } finally {
       state.themes.loading = false;
+      if (showLoading) {
+        rerenderThemesPanel();
+      } else if (state.panelVisible && state.route?.pluginId === "themes") {
+        if (state.themes.error || !syncVisibleSlotSliderUi()) {
+          rerenderThemesPanel();
+        }
+      } else {
+        rerenderThemesPanel();
+      }
+    }
+  }
+
+  async function loadThemesStoreCatalog(options = {}) {
+    const showLoading = options.showLoading !== false;
+    const requestId = state.themes.storeCatalogRequestSequence + 1;
+    state.themes.storeCatalogRequestSequence = requestId;
+    const currentCatalog = getThemeStoreCatalog();
+    const search =
+      options.search !== undefined
+        ? String(options.search || "").trim()
+        : currentCatalog?.search || "";
+    const filter = options.filter || currentCatalog?.filter || "All";
+    const order = options.order || currentCatalog?.order || "Most Downloaded";
+    const page = Number.isFinite(options.page) ? Math.max(1, options.page) : currentCatalog?.page || 1;
+    const perPage = Number.isFinite(options.perPage)
+      ? Math.max(1, options.perPage)
+      : currentCatalog?.perPage || 12;
+    const query = new URLSearchParams({
+      search,
+      filter,
+      order,
+      page: String(page),
+      perPage: String(perPage),
+    });
+
+    state.themes.storeLoading = true;
+    state.themes.error = "";
+    if (showLoading) {
+      rerenderThemesPanel();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/themes/store?${query.toString()}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `CSSLoader Store could not be loaded (${response.status}).`);
+      }
+
+      if (requestId !== state.themes.storeCatalogRequestSequence) {
+        return;
+      }
+
+      state.themes.storeCatalog = payload && typeof payload === "object" ? payload : null;
+      const storeSearchEditorActive =
+        isEditorFocusForRoute() &&
+        typeof state.editorFocusCardKey === "string" &&
+        state.editorFocusCardKey.startsWith("editor-theme-store-search-");
+      if (options.search !== undefined || !storeSearchEditorActive) {
+        state.themes.storeSearchDraft = state.themes.storeCatalog?.search || "";
+      }
+    } catch (error) {
+      if (requestId !== state.themes.storeCatalogRequestSequence) {
+        return;
+      }
+
+      state.themes.error = error instanceof Error ? error.message : String(error);
+      if (!state.themes.storeCatalog) {
+        state.themes.storeCatalog = null;
+      }
+    } finally {
+      if (requestId === state.themes.storeCatalogRequestSequence) {
+        state.themes.storeLoading = false;
+        rerenderThemesPanel();
+      }
+    }
+  }
+
+  async function loadThemesStoreTheme(storeThemeId) {
+    if (!storeThemeId) {
+      return;
+    }
+
+    state.themes.storeLoading = true;
+    state.themes.storeDetailLoadingId = storeThemeId;
+    state.themes.error = "";
+    rerenderThemesPanel();
+
+    try {
+      const response = await fetch(
+        `${apiBase}api/themes/store/theme?storeThemeId=${encodeURIComponent(storeThemeId)}`,
+        { cache: "no-store" },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The CSSLoader Store entry could not be loaded (${response.status}).`);
+      }
+
+      if (payload && typeof payload === "object") {
+        state.themes.storeDetailById[storeThemeId] = payload;
+      }
+    } catch (error) {
+      state.themes.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.themes.storeLoading = false;
+      state.themes.storeDetailLoadingId = "";
       rerenderThemesPanel();
     }
   }
 
-  async function sendPerformanceRequest(path, bodyPayload = null) {
+  async function sendPerformanceRequest(path, bodyPayload = null, options = {}) {
+    if (state.performance.saving) {
+      return false;
+    }
+
+    const rerenderOnStart = options.rerenderOnStart !== false;
+    const rerenderOnComplete = options.rerenderOnComplete !== false;
     state.performance.saving = true;
     state.performance.error = "";
-    rerenderPerformancePanel();
+    if (rerenderOnStart) {
+      rerenderPerformancePanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -8339,47 +13534,86 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.performance.snapshot = payload && typeof payload === "object" ? payload : null;
+      if (
+        (!options.optimisticKey || canApplyOptimisticResponse(options.optimisticKey, options.optimisticValue)) &&
+        applyPerformanceSnapshotIfCurrent(payload)
+      ) {
+        if (options.optimisticKey) {
+          clearOptimisticDesiredValue(options.optimisticKey, options.optimisticValue);
+        }
+      }
       return true;
     } catch (error) {
       state.performance.error = error instanceof Error ? error.message : String(error);
+      if (
+        options.reloadOnError === true &&
+        (!options.optimisticKey || canApplyOptimisticResponse(options.optimisticKey, options.optimisticValue))
+      ) {
+        clearOptimisticDesiredValue(options.optimisticKey);
+        void loadPerformanceState({ showLoading: false });
+      }
       return false;
     } finally {
       state.performance.saving = false;
-      rerenderPerformancePanel();
+      if (options.clearPendingOverlayCommit === true) {
+        state.performance.pendingOverlayLevelCommit = null;
+        state.performance.suppressNextLivePanelRerender = Boolean(
+          !state.performance.error &&
+          state.liveUpdates.connected &&
+          isPerformanceOverlayRoute(),
+        );
+      }
+
+      if (rerenderOnComplete) {
+        rerenderPerformancePanel();
+      } else if (options.syncVisibleSliders === true && state.panelVisible && state.route?.pluginId === "performance") {
+        refreshPerformancePanel();
+      } else if (state.panelVisible && isPerformanceOverlayRoute()) {
+        refreshPerformancePanel();
+      } else if (state.panelVisible && state.route?.pluginId === "performance" && state.performance.error) {
+        rerenderPerformancePanel();
+      }
     }
   }
 
   async function startPerformanceOverlay() {
-    await sendPerformanceRequest("api/performance/overlay/start");
+    await flushPerformanceOverlayLevelCommit();
+    return sendPerformanceRequest("api/performance/overlay/start");
   }
 
   async function preparePerformanceElevatedHelper() {
-    await sendPerformanceRequest("api/performance/elevated-helper/prepare");
+    await flushPerformanceOverlayLevelCommit();
+    return sendPerformanceRequest("api/performance/elevated-helper/prepare");
   }
 
   async function stopPerformanceOverlay() {
-    await sendPerformanceRequest("api/performance/overlay/stop");
+    await flushPerformanceOverlayLevelCommit();
+    return sendPerformanceRequest("api/performance/overlay/stop");
   }
 
-  async function setPerformanceOverlayLevel(level) {
-    await sendPerformanceRequest("api/performance/settings/overlay-level", { level });
+  async function setPerformanceOverlayLevel(level, options = {}) {
+    return sendPerformanceRequest("api/performance/settings/overlay-level", { level }, options);
   }
 
-  async function setPerformanceSettingValue(key, value) {
-    await sendPerformanceRequest("api/performance/settings/value", { key, value });
+  async function setPerformanceSettingValue(key, value, options = {}) {
+    return sendPerformanceRequest("api/performance/settings/value", { key, value }, options);
   }
 
   async function togglePerformanceAutoTarget() {
-    await sendPerformanceRequest("api/performance/settings/auto-target");
+    await flushPerformanceOverlayLevelCommit();
+    return sendPerformanceRequest("api/performance/settings/auto-target");
   }
 
-  async function sendStoreSyncRequest(path, bodyPayload = null, options = {}) {
-    const requestStateKey = options.syncing ? "syncing" : "saving";
+  async function sendSmartHomeRequest(path, bodyPayload = null, options = {}) {
     let succeeded = false;
-    state.storeSync[requestStateKey] = true;
-    state.storeSync.error = "";
-    rerenderStoreSyncPanel();
+    const rerenderOnStart = options.rerenderOnStart !== false;
+    const rerenderOnComplete = options.rerenderOnComplete !== false;
+    const hadError = Boolean(state.smartHome.error);
+    state.smartHome.saving = true;
+    state.smartHome.error = "";
+    if (rerenderOnStart) {
+      rerenderSmartHomePanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -8395,12 +13629,167 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.storeSync.snapshot = payload && typeof payload === "object" ? payload : null;
-      const activeTitleId = getStoreSyncTitleRouteId();
-      if (activeTitleId) {
-        clearStoreSyncArtworkPreview(activeTitleId);
-        syncStoreSyncTitleDraftsFromSnapshot(activeTitleId, true);
+      setSmartHomeSnapshot(payload, {
+        forceDraftSync: options.forceDraftSync === true,
+      });
+      succeeded = true;
+    } catch (error) {
+      state.smartHome.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.smartHome.saving = false;
+      if (rerenderOnComplete) {
+        rerenderSmartHomePanel();
+      } else if (options.syncVisibleSliders === true && state.panelVisible && state.route?.pluginId === "smart-home") {
+        if (state.smartHome.error || hadError || !syncVisibleSlotSliderUi()) {
+          rerenderSmartHomePanel();
+        }
+      } else if (state.panelVisible && state.route?.pluginId === "smart-home" && state.smartHome.error) {
+        rerenderSmartHomePanel();
       }
+    }
+
+    return succeeded;
+  }
+
+  async function saveSmartHomeBaseUrl() {
+    const value = (state.smartHome.baseUrlDraft || "").trim();
+    await sendSmartHomeRequest("api/smart-home/settings/homey/base-url", { value }, { forceDraftSync: true });
+  }
+
+  async function saveSmartHomeHomeyId() {
+    const value = (state.smartHome.homeyIdDraft || "").trim();
+    await sendSmartHomeRequest("api/smart-home/settings/homey/homey-id", { value }, { forceDraftSync: true });
+  }
+
+  async function saveSmartHomeSessionToken() {
+    const value = (state.smartHome.sessionTokenDraft || "").trim();
+    await sendSmartHomeRequest("api/smart-home/settings/homey/session-token", { value }, { forceDraftSync: true });
+  }
+
+  async function clearSmartHomeSessionToken() {
+    state.smartHome.sessionTokenDraft = "";
+    state.smartHome.sessionTokenInputVersion += 1;
+    await sendSmartHomeRequest("api/smart-home/settings/homey/session-token/clear", {}, { forceDraftSync: true });
+  }
+
+  async function refreshSmartHome(force = true) {
+    await loadSmartHomeState({ force, showLoading: true });
+  }
+
+  async function runSmartHomeFlow(flowId, isAdvanced) {
+    if (!flowId) {
+      return;
+    }
+
+    await sendSmartHomeRequest("api/smart-home/flows/run", { flowId, isAdvanced });
+  }
+
+  async function runSmartHomeMood(moodId) {
+    if (!moodId) {
+      return;
+    }
+
+    await sendSmartHomeRequest("api/smart-home/moods/apply", { moodId });
+  }
+
+  async function toggleSmartHomeDevicePower(deviceId, currentValue) {
+    if (!deviceId) {
+      return;
+    }
+
+    previewSmartHomeCapabilityValue(deviceId, "onoff", !Boolean(currentValue));
+    await sendSmartHomeRequest(
+      "api/smart-home/devices/capability",
+      { deviceId, capabilityId: "onoff", value: !Boolean(currentValue) },
+      { rerenderOnComplete: false, syncVisibleSliders: true },
+    );
+  }
+
+  async function commitSmartHomeSliderCapability(deviceId, capabilityId, nextUiValue) {
+    if (!deviceId || !capabilityId) {
+      return;
+    }
+
+    await sendSmartHomeRequest(
+      "api/smart-home/devices/capability",
+      {
+        deviceId,
+        capabilityId,
+        value: convertSmartHomeUiValueToPayload(capabilityId, nextUiValue),
+      },
+      { rerenderOnStart: false, rerenderOnComplete: false, syncVisibleSliders: true },
+    );
+  }
+
+  function queueSmartHomeSliderCommit(deviceId, capabilityId, nextUiValue, delayMs = smartHomeSliderCommitSettleDelayMs) {
+    const commitKey = getSmartHomeSliderCommitKey(deviceId, capabilityId);
+    clearSmartHomeSliderCommitTimer(commitKey);
+    state.smartHome.sliderCommitTimersByKey[commitKey] = window.setTimeout(() => {
+      delete state.smartHome.sliderCommitTimersByKey[commitKey];
+
+      if (state.smartHome.saving) {
+        queueSmartHomeSliderCommit(deviceId, capabilityId, nextUiValue, smartHomeSliderCommitRetryDelayMs);
+        return;
+      }
+
+      void commitSmartHomeSliderCapability(deviceId, capabilityId, nextUiValue);
+    }, delayMs);
+  }
+
+  function setSmartHomeSliderCapability(deviceId, capabilityId, nextUiValue) {
+    if (!deviceId || !capabilityId) {
+      return;
+    }
+
+    previewSmartHomeCapabilityValue(deviceId, capabilityId, nextUiValue, { syncVisibleSliders: true });
+    queueSmartHomeSliderCommit(deviceId, capabilityId, nextUiValue);
+  }
+
+  function stepSmartHomeCapability(deviceId, capabilityId, direction) {
+    const control = getSmartHomeControl(deviceId, capabilityId);
+    if (!control || control.kind !== "slider" || isSmartHomeBusy()) {
+      return;
+    }
+
+    const min = Number.isFinite(control.min) ? control.min : 0;
+    const max = Number.isFinite(control.max) ? control.max : 100;
+    const step = Number.isFinite(control.step) && control.step > 0 ? control.step : 5;
+    const currentValue = Number.isFinite(control.numericValue) ? control.numericValue : min;
+    const nextValue = Math.max(min, Math.min(max, currentValue + (step * (direction < 0 ? -1 : 1))));
+
+    if (Object.is(nextValue, currentValue)) {
+      return;
+    }
+
+    playSliderMoveSound(direction);
+    setSmartHomeSliderCapability(deviceId, capabilityId, nextValue);
+  }
+
+  async function sendStoreSyncRequest(path, bodyPayload = null, options = {}) {
+    const requestStateKey = options.syncing ? "syncing" : "saving";
+    const rerenderOnStart = options.rerenderOnStart !== false;
+    let succeeded = false;
+    state.storeSync[requestStateKey] = true;
+    state.storeSync.error = "";
+    if (rerenderOnStart) {
+      rerenderStoreSyncPanel();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The request failed (${response.status}).`);
+      }
+
+      setStoreSyncSnapshot(payload, { forceDraftSync: true });
       succeeded = true;
     } catch (error) {
       state.storeSync.error = error instanceof Error ? error.message : String(error);
@@ -8412,11 +13801,14 @@
     return succeeded;
   }
 
-  async function sendGeneralSettingsRequest(path, bodyPayload = null) {
+  async function sendGeneralSettingsRequest(path, bodyPayload = null, options = {}) {
     let succeeded = false;
+    const rerenderOnStart = options.rerenderOnStart !== false;
     state.generalSettings.saving = true;
     state.generalSettings.error = "";
-    rerenderGeneralSettingsPanel();
+    if (rerenderOnStart) {
+      rerenderGeneralSettingsPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -8432,8 +13824,7 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.generalSettings.snapshot = payload && typeof payload === "object" ? payload : null;
-      syncSplashDraftsFromSnapshot(true);
+      setGeneralSettingsSnapshot(payload, { forceDraftSync: true });
       succeeded = true;
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
@@ -8445,11 +13836,38 @@
     return succeeded;
   }
 
-  async function sendUpdateRequest(path, bodyPayload = null) {
+  async function openPluginStoreOverlay() {
+    setupPluginStoreBridge();
+    setPluginStoreRemoteActive(true);
+    tryCloseQuickAccessMenuForPluginStore();
+
+    try {
+      const response = await fetch(`${apiBase}api/plugin-store/overlay/open`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The store could not be opened (${response.status}).`);
+      }
+    } catch (error) {
+      setPluginStoreRemoteActive(false);
+      state.generalSettings.error = error instanceof Error ? error.message : String(error);
+      rerenderHomePanel();
+    }
+  }
+
+  async function sendUpdateRequest(path, bodyPayload = null, options = {}) {
     let succeeded = false;
+    const rerenderOnStart = options.rerenderOnStart !== false;
     state.updates.saving = true;
     state.updates.error = "";
-    rerenderGeneralSettingsPanel();
+    if (rerenderOnStart) {
+      rerenderGeneralSettingsPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -8465,7 +13883,7 @@
         throw new Error(payload.message || `The update request failed (${response.status}).`);
       }
 
-      state.updates.snapshot = payload && typeof payload === "object" ? payload : null;
+      setUpdateSnapshot(payload);
       succeeded = true;
     } catch (error) {
       state.updates.error = error instanceof Error ? error.message : String(error);
@@ -8481,14 +13899,14 @@
     const normalizedChannel = channel === "beta" ? "beta" : "stable";
     const snapshot = getUpdateSnapshot();
     if (snapshot) {
-      state.updates.snapshot = {
+      setUpdateSnapshot({
         ...snapshot,
         channel: normalizedChannel,
-      };
+      });
       rerenderGeneralSettingsPanel();
     }
 
-    await sendUpdateRequest("api/updates/channel", { channel: normalizedChannel });
+    await sendUpdateRequest("api/updates/channel", { channel: normalizedChannel }, { rerenderOnStart: false });
   }
 
   async function checkForUpdates() {
@@ -8509,12 +13927,8 @@
     }
 
     const snapshot = getUpdateSnapshot();
-    const updatesVisible =
-      state.route?.screen === "root" ||
-      (state.route?.screen === "page" &&
-        state.route?.pluginId === "settings" &&
-        state.route?.pageId === "updates");
-    if (!updatesVisible || !snapshot?.installInProgress) {
+    const updatesVisible = isUpdatesVisibleRoute();
+    if (!updatesVisible || !snapshot?.installInProgress || !shouldUseLiveUpdatePollingFallback()) {
       return;
     }
 
@@ -8631,7 +14045,7 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.processes.snapshot = payload && typeof payload === "object" ? payload : null;
+      setProcessesSnapshot(payload);
       return true;
     } catch (error) {
       state.processes.error = error instanceof Error ? error.message : String(error);
@@ -8661,7 +14075,7 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.appStart.snapshot = payload && typeof payload === "object" ? payload : null;
+      setAppStartSnapshot(payload);
       return true;
     } catch (error) {
       state.appStart.error = error instanceof Error ? error.message : String(error);
@@ -8672,10 +14086,16 @@
     }
   }
 
-  async function sendThemesRequest(path, bodyPayload = null) {
+  async function sendThemesRequest(path, bodyPayload = null, operationText = "", options = {}) {
+    let succeeded = false;
+    const rerenderOnStart = options.rerenderOnStart !== false;
+    const rerenderOnComplete = options.rerenderOnComplete !== false;
     state.themes.saving = true;
+    state.themes.operationText = operationText || "Saving CSSLoader changes...";
     state.themes.error = "";
-    rerenderThemesPanel();
+    if (rerenderOnStart) {
+      rerenderThemesPanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -8691,14 +14111,39 @@
         throw new Error(payload.message || `The request failed (${response.status}).`);
       }
 
-      state.themes.snapshot = payload && typeof payload === "object" ? payload : null;
-      applyActiveThemeCss();
+      if (
+        (!options.optimisticKey || canApplyOptimisticResponse(options.optimisticKey, options.optimisticValue)) &&
+        applyThemesSnapshotIfCurrent(payload)
+      ) {
+        if (options.optimisticKey) {
+          clearOptimisticDesiredValue(options.optimisticKey, options.optimisticValue);
+        }
+      }
+      succeeded = true;
     } catch (error) {
       state.themes.error = error instanceof Error ? error.message : String(error);
+      if (
+        options.reloadOnError === true &&
+        (!options.optimisticKey || canApplyOptimisticResponse(options.optimisticKey, options.optimisticValue))
+      ) {
+        clearOptimisticDesiredValue(options.optimisticKey);
+        void loadThemesState({ showLoading: false });
+      }
     } finally {
       state.themes.saving = false;
-      rerenderThemesPanel();
+      state.themes.operationText = "";
+      if (rerenderOnComplete) {
+        rerenderThemesPanel();
+      } else if (options.syncVisibleSliders === true && state.panelVisible && state.route?.pluginId === "themes") {
+        if (state.themes.error || !syncVisibleSlotSliderUi()) {
+          rerenderThemesPanel();
+        }
+      } else if (state.panelVisible && state.route?.pluginId === "themes" && state.themes.error) {
+        rerenderThemesPanel();
+      }
     }
+
+    return succeeded;
   }
 
   async function toggleStoreSyncSetting(key) {
@@ -8725,7 +14170,7 @@
       rerenderStoreSyncPanel();
     }
 
-    await sendStoreSyncRequest("api/store-sync/settings/toggle", { key });
+    await sendStoreSyncRequest("api/store-sync/settings/toggle", { key }, { rerenderOnStart: false });
   }
 
   async function setStartupMode(mode) {
@@ -8740,7 +14185,7 @@
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/startup-mode", { mode: normalizedMode });
+    await sendGeneralSettingsRequest("api/settings/startup-mode", { mode: normalizedMode }, { rerenderOnStart: false });
   }
 
   async function toggleHideWindowsShellInConsoleMode() {
@@ -8754,7 +14199,7 @@
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/hide-windows-shell", { value: enabled });
+    await sendGeneralSettingsRequest("api/settings/hide-windows-shell", { value: enabled }, { rerenderOnStart: false });
   }
 
   async function toggleDeveloperDebugEnabled() {
@@ -8768,7 +14213,7 @@
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/developer-debug", { value: enabled });
+    await sendGeneralSettingsRequest("api/settings/developer-debug", { value: enabled }, { rerenderOnStart: false });
   }
 
   async function toggleSplashScreenSetting(key) {
@@ -8796,7 +14241,7 @@
     }
 
     const path = key === "enabled" ? "api/settings/splash/enabled" : "api/settings/splash/show-text";
-    await sendGeneralSettingsRequest(path, { value: enabled });
+    await sendGeneralSettingsRequest(path, { value: enabled }, { rerenderOnStart: false });
   }
 
   async function saveSplashWallpaperPath() {
@@ -8827,39 +14272,31 @@
     await sendGeneralSettingsRequest("api/settings/splash/icon", { value: "" });
   }
 
-  async function adjustSplashExtraDelay(delta) {
+  async function adjustWindowsShellStartDelay(delta) {
     const snapshot = getGeneralSettingsSnapshot();
-    const splash = snapshot?.splashScreen;
-    const nextValue = Math.max(0, Math.min(30, Number(splash?.extraCloseDelaySeconds || 0) + delta));
-    if (snapshot && splash) {
+    const nextValue = Math.max(0, Math.min(30, Number(snapshot?.windowsShellStartDelaySeconds || 0) + delta));
+    if (snapshot) {
       state.generalSettings.snapshot = {
         ...snapshot,
-        splashScreen: {
-          ...splash,
-          extraCloseDelaySeconds: nextValue,
-        },
+        windowsShellStartDelaySeconds: nextValue,
       };
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/splash/extra-delay", { value: nextValue });
+    await sendGeneralSettingsRequest("api/settings/windows-shell-start-delay", { value: nextValue }, { rerenderOnStart: false });
   }
 
-  async function resetSplashExtraDelay() {
+  async function resetWindowsShellStartDelay() {
     const snapshot = getGeneralSettingsSnapshot();
-    const splash = snapshot?.splashScreen;
-    if (snapshot && splash) {
+    if (snapshot) {
       state.generalSettings.snapshot = {
         ...snapshot,
-        splashScreen: {
-          ...splash,
-          extraCloseDelaySeconds: 0,
-        },
+        windowsShellStartDelaySeconds: 0,
       };
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/splash/extra-delay", { value: 0 });
+    await sendGeneralSettingsRequest("api/settings/windows-shell-start-delay", { value: 0 }, { rerenderOnStart: false });
   }
 
   async function togglePluginEnabled(pluginId, enabled) {
@@ -8904,10 +14341,22 @@
         state.autoSisir.snapshot = null;
       }
 
+      if (!enabled && pluginId === "smart-home") {
+        clearAllSmartHomeSliderCommitTimers();
+        state.smartHome.snapshot = null;
+        state.smartHome.baseUrlDraft = "";
+        state.smartHome.homeyIdDraft = "";
+        state.smartHome.sessionTokenDraft = "";
+      }
+
       rerenderGeneralSettingsPanel();
     }
 
-    const saved = await sendGeneralSettingsRequest("api/settings/plugins/enabled", { pluginId, enabled });
+    const saved = await sendGeneralSettingsRequest(
+      "api/settings/plugins/enabled",
+      { pluginId, enabled },
+      { rerenderOnStart: false },
+    );
     if (saved && pluginId === "auto-sisr") {
       state.autoSisir.snapshot = null;
       state.autoSisir.error = "";
@@ -8918,6 +14367,33 @@
       } else {
         renderPanelState();
       }
+    }
+    if (saved && pluginId === "smart-home") {
+      clearAllSmartHomeSliderCommitTimers();
+      state.smartHome.snapshot = null;
+      state.smartHome.error = "";
+      state.smartHome.baseUrlDraft = "";
+      state.smartHome.homeyIdDraft = "";
+      state.smartHome.sessionTokenDraft = "";
+      state.smartHome.baseUrlInputVersion += 1;
+      state.smartHome.homeyIdInputVersion += 1;
+      state.smartHome.sessionTokenInputVersion += 1;
+      if (enabled) {
+        void loadSmartHomeState();
+      } else {
+        renderPanelState();
+      }
+    }
+
+    if (saved) {
+      if (state.route.screen === "root") {
+        rerenderHomePanel();
+      }
+
+      window.SteamLoaderPluginStoreOverlay?.refresh?.({
+        preserveSelection: true,
+        showLoading: false,
+      });
     }
   }
 
@@ -9088,46 +14564,62 @@
     }
   }
 
-  async function toggleThemesSetting(key) {
-    const settings = getThemesSnapshot()?.settings;
-    const propertyMap = {
-      "theme-engine-enabled": "themeEngineEnabled",
-      "show-community-themes": "showCommunityThemes",
-      "single-theme-mode": "singleThemeMode",
-      "auto-enable-on-install": "autoEnableOnInstall",
-    };
-
-    const propertyName = propertyMap[key];
-    if (settings && propertyName && Object.prototype.hasOwnProperty.call(settings, propertyName)) {
-      state.themes.snapshot = {
-        ...state.themes.snapshot,
-        settings: {
-          ...settings,
-          [propertyName]: !Boolean(settings[propertyName]),
-        },
-      };
-      applyActiveThemeCss();
-      rerenderThemesPanel();
-    }
-
-    await sendThemesRequest("api/themes/settings/toggle", { key });
-  }
-
   async function refreshThemesCatalog() {
     await sendThemesRequest("api/themes/catalog/refresh");
   }
 
-  async function installTheme(themeId) {
-    await sendThemesRequest("api/themes/themes/install", {
-      themeId,
-      installed: true,
+  async function openThemesFolder() {
+    await sendThemesRequest("api/themes/folder/open");
+  }
+
+  async function installThemesBackend() {
+    await sendThemesRequest(
+      "api/themes/backend/install",
+      null,
+      "Installing CSSLoader standalone backend...",
+    );
+  }
+
+  async function startThemesBackend() {
+    await sendThemesRequest("api/themes/backend/start");
+  }
+
+  async function setThemesWatchEnabled(enabled) {
+    await sendThemesRequest("api/themes/watch/enabled", { value: enabled });
+  }
+
+  async function installThemesStoreTheme(storeThemeId) {
+    const succeeded = await sendThemesRequest("api/themes/store/install", {
+      storeThemeId,
+    });
+
+    if (succeeded) {
+      const catalog = getThemeStoreCatalog();
+      await loadThemesStoreCatalog({
+        search: catalog?.search || "",
+        filter: catalog?.filter || "All",
+        order: catalog?.order || "Most Downloaded",
+        page: catalog?.page || 1,
+        perPage: catalog?.perPage || 12,
+      });
+      await loadThemesStoreTheme(storeThemeId);
+    }
+  }
+
+  async function searchThemesStore() {
+    await loadThemesStoreCatalog({
+      search: (state.themes.storeSearchDraft || "").trim(),
+      page: 1,
     });
   }
 
-  async function uninstallTheme(themeId) {
-    await sendThemesRequest("api/themes/themes/install", {
-      themeId,
-      installed: false,
+  async function clearThemesStoreSearch() {
+    state.themes.storeSearchDraft = "";
+    state.themes.storeSearchInputVersion += 1;
+    rerenderThemesPanel();
+    await loadThemesStoreCatalog({
+      search: "",
+      page: 1,
     });
   }
 
@@ -9141,33 +14633,16 @@
             ? {
                 ...theme,
                 enabled,
-                statusText: enabled ? "Installed and active" : "Installed",
+                statusText: enabled ? "Active in CSSLoader" : "Ready in CSSLoader",
               }
             : snapshot.settings?.singleThemeMode && enabled
               ? {
                   ...theme,
                   enabled: false,
-                  statusText: theme.installed ? "Installed" : theme.statusText,
+                  statusText: theme.installed ? "Ready in CSSLoader" : theme.statusText,
                 }
               : theme,
         ),
-        browseThemes: Array.isArray(snapshot.browseThemes)
-          ? snapshot.browseThemes.map((theme) =>
-              theme.id === themeId
-                ? {
-                    ...theme,
-                    enabled,
-                    statusText: enabled ? "Installed and active" : "Installed",
-                  }
-                : snapshot.settings?.singleThemeMode && enabled
-                  ? {
-                      ...theme,
-                      enabled: false,
-                      statusText: theme.installed ? "Installed" : theme.statusText,
-                    }
-                  : theme,
-            )
-          : snapshot.browseThemes,
       };
       state.themes.snapshot.statusText = buildOptimisticThemesStatusText(state.themes.snapshot);
       applyActiveThemeCss();
@@ -9200,7 +14675,6 @@
         state.themes.snapshot = {
           ...snapshot,
           installedThemes: snapshot.installedThemes.map(patchTheme),
-          browseThemes: snapshot.browseThemes.map(patchTheme),
         };
         state.themes.snapshot.statusText = buildOptimisticThemesStatusText(state.themes.snapshot);
         rerenderThemesPanel();
@@ -9218,25 +14692,137 @@
     });
   }
 
-  async function adjustThemeRange(themeId, optionId, delta) {
-    await sendThemesRequest("api/themes/themes/option/range/adjust", {
+  function getThemeSliderCommitKey(themeId, optionId) {
+    return `${themeId}::${optionId}`;
+  }
+
+  function getThemeSliderOptimisticKey(themeId, optionId) {
+    return `themes.slider.${getThemeSliderCommitKey(themeId, optionId)}`;
+  }
+
+  function clearThemeSliderCommitTimer(commitKey) {
+    const timerHandle = state.themes.sliderCommitTimersByKey[commitKey];
+    if (!timerHandle) {
+      return;
+    }
+
+    window.clearTimeout(timerHandle);
+    delete state.themes.sliderCommitTimersByKey[commitKey];
+  }
+
+  function previewThemeSliderChoice(themeId, optionId, choiceId) {
+    const snapshot = getThemesSnapshot();
+    if (!snapshot || !choiceId) {
+      return false;
+    }
+
+    let didUpdate = false;
+    state.themes.snapshot = {
+      ...snapshot,
+      installedThemes: snapshot.installedThemes.map((theme) =>
+        theme.id === themeId
+          ? {
+              ...theme,
+              options: theme.options.map((entry) =>
+                entry.id === optionId
+                  ? {
+                      ...entry,
+                      selectedChoiceId: choiceId,
+                    }
+                  : entry,
+              ),
+            }
+          : theme,
+      ),
+    };
+
+    const updatedOption = getThemeOptionById(themeId, optionId);
+    didUpdate = updatedOption?.selectedChoiceId === choiceId;
+    if (didUpdate) {
+      setOptimisticDesiredValue(getThemeSliderOptimisticKey(themeId, optionId), choiceId);
+    }
+    return didUpdate;
+  }
+
+  function queueThemeSliderCommit(path, bodyPayload) {
+    const commitKey = getThemeSliderCommitKey(bodyPayload.themeId, bodyPayload.optionId);
+    const optimisticKey = getThemeSliderOptimisticKey(bodyPayload.themeId, bodyPayload.optionId);
+    const optimisticValue = bodyPayload.choiceId;
+    clearThemeSliderCommitTimer(commitKey);
+    state.themes.sliderCommitTimersByKey[commitKey] = window.setTimeout(() => {
+      delete state.themes.sliderCommitTimersByKey[commitKey];
+
+      if (state.themes.saving) {
+        queueThemeSliderCommit(path, bodyPayload);
+        return;
+      }
+
+      void sendThemesRequest(path, bodyPayload, "", {
+        rerenderOnStart: false,
+        rerenderOnComplete: false,
+        syncVisibleSliders: true,
+        reloadOnError: true,
+        optimisticKey,
+        optimisticValue,
+      });
+    }, sliderCommitSettleDelayMs);
+  }
+
+  function adjustThemeRange(themeId, optionId, delta) {
+    if (!delta) {
+      return;
+    }
+
+    const option = getThemeOptionById(themeId, optionId);
+    const choices = Array.isArray(option?.choices) ? option.choices : [];
+    if (!choices.length) {
+      return;
+    }
+
+    const currentChoiceId = option?.selectedChoiceId || choices[0]?.id || "";
+    const currentIndex = Math.max(0, choices.findIndex((choice) => choice.id === currentChoiceId));
+    const nextIndex = Math.max(0, Math.min(choices.length - 1, currentIndex + delta));
+    const nextChoiceId = choices[nextIndex]?.id || currentChoiceId;
+    if (!nextChoiceId || nextChoiceId === currentChoiceId) {
+      return;
+    }
+
+    playSliderMoveSound(delta);
+    if (previewThemeSliderChoice(themeId, optionId, nextChoiceId)) {
+      syncVisibleSlotSliderUi();
+    }
+
+    queueThemeSliderCommit("api/themes/themes/option/choice", {
       themeId,
       optionId,
-      delta,
+      choiceId: nextChoiceId,
     });
   }
 
   async function resetThemeRange(themeId, optionId) {
-    await sendThemesRequest("api/themes/themes/option/range/reset", {
-      themeId,
-      optionId,
-    });
+    const commitKey = getThemeSliderCommitKey(themeId, optionId);
+    clearThemeSliderCommitTimer(commitKey);
+    clearOptimisticDesiredValue(getThemeSliderOptimisticKey(themeId, optionId));
+    await sendThemesRequest(
+      "api/themes/themes/option/range/reset",
+      {
+        themeId,
+        optionId,
+      },
+      "",
+      {
+        rerenderOnStart: false,
+        rerenderOnComplete: false,
+        syncVisibleSliders: true,
+        reloadOnError: true,
+      },
+    );
   }
 
   async function createThemeProfileFromCurrentSetup() {
     const title = (state.themes.profileDraft || "").trim();
     if (title.length < 3) {
-      state.themes.error = "Enter a profile name with at least 3 characters before saving.";
+      state.themes.error = "Enter a preset name with at least 3 characters before saving.";
       rerenderThemesPanel();
       return;
     }
@@ -9250,12 +14836,6 @@
       state.themes.profileDraftInputVersion += 1;
       rerenderThemesPanel();
     }
-  }
-
-  async function installThemeProfile(profileId) {
-    await sendThemesRequest("api/themes/profiles/install", {
-      profileId,
-    });
   }
 
   async function applyThemeProfile(profileId) {
@@ -9293,10 +14873,14 @@
       rerenderStoreSyncPanel();
     }
 
-    await sendStoreSyncRequest("api/store-sync/stores/enabled", {
-      storeId,
-      enabled,
-    });
+    await sendStoreSyncRequest(
+      "api/store-sync/stores/enabled",
+      {
+        storeId,
+        enabled,
+      },
+      { rerenderOnStart: false },
+    );
   }
 
   async function setStoreSyncPrimaryPath(storeId) {
@@ -9380,10 +14964,14 @@
       (state.storeSync.additionalPathsInputVersionByStoreId[storeId] || 0) + 1;
     rerenderStoreSyncPanel();
 
-    const succeeded = await sendStoreSyncRequest("api/store-sync/stores/additional-paths", {
-      storeId,
-      values: [],
-    });
+    const succeeded = await sendStoreSyncRequest(
+      "api/store-sync/stores/additional-paths",
+      {
+        storeId,
+        values: [],
+      },
+      { rerenderOnStart: false },
+    );
     if (succeeded) {
       syncStoreSyncAdditionalPathsDraftFromSnapshot(storeId, true);
     }
@@ -9439,6 +15027,346 @@
     await sendStoreSyncRequest("api/store-sync/sync", {}, { syncing: true });
   }
 
+  function formatSmartHomeCount(count, singular, plural = `${singular}s`) {
+    const safeCount = Number.isFinite(count) ? count : 0;
+    return `${safeCount} ${safeCount === 1 ? singular : plural}`;
+  }
+
+  function resolveSmartHomeStatusText() {
+    if (state.smartHome.saving) {
+      return "Applying Homey change...";
+    }
+
+    if (state.smartHome.loading) {
+      return "Loading Homey rooms and devices...";
+    }
+
+    return getSmartHomeSnapshot()?.statusText || "Homey is ready when it is configured.";
+  }
+
+  function getSmartHomeControl(deviceId, capabilityId) {
+    const device = typeof deviceId === "string" ? getSmartHomeDevice(deviceId) : deviceId;
+    const controls = Array.isArray(device?.controls) ? device.controls : [];
+    return controls.find((control) => control.capabilityId === capabilityId) || null;
+  }
+
+  function buildSmartHomeRoomSummary(zone) {
+    if (!zone) {
+      return "";
+    }
+
+    return [
+      formatSmartHomeCount(zone.deviceCount || 0, "device"),
+      formatSmartHomeCount(zone.lightCount || 0, "light"),
+    ].join(" - ");
+  }
+
+  function buildSmartHomeFlowSummary(flow) {
+    if (!flow) {
+      return "";
+    }
+
+    const badge = flow.badgeText || (flow.isAdvanced ? "Advanced" : "Flow");
+    const status = flow.triggerable ? "Ready" : flow.broken ? "Broken" : flow.enabled === false ? "Disabled" : "Unavailable";
+    return `${badge} - ${status}`;
+  }
+
+  function buildSmartHomeMoodSummary(mood) {
+    if (!mood) {
+      return "";
+    }
+
+    const roomText = mood.zoneName || mood.zonePath || "Homey";
+    const deviceText = formatSmartHomeCount(mood.deviceCount || 0, "device");
+    return mood.preset
+      ? `${roomText} - ${deviceText} - Preset: ${mood.preset}`
+      : `${roomText} - ${deviceText}`;
+  }
+
+  function buildSmartHomeDeviceCopy(device) {
+    if (!device) {
+      return "";
+    }
+
+    const tags = Array.isArray(device.tags) ? device.tags.filter(Boolean).slice(0, 2) : [];
+    const tagText = tags.length ? ` - ${tags.join(" - ")}` : "";
+    return `${device.statusText || "Ready"}${tagText}`;
+  }
+
+  function buildSmartHomeDeviceSwatchLabel(device) {
+    if (!device?.swatchHex) {
+      return "";
+    }
+
+    return device.swatchLabel
+      ? `${device.swatchLabel} - ${device.swatchHex}`
+      : device.swatchHex;
+  }
+
+  function formatSmartHomeSliderValue(accent, value) {
+    const safeValue = Math.round(Number(value) || 0);
+    return accent === "hue" ? `${safeValue} deg` : `${safeValue}%`;
+  }
+
+  function clampSmartHomeValue(value, min, max) {
+    const safeValue = Number(value) || 0;
+    return Math.max(min, Math.min(max, safeValue));
+  }
+
+  function convertSmartHomeUiValueToPayload(capabilityId, nextUiValue) {
+    const safeValue = Number(nextUiValue) || 0;
+    switch (capabilityId) {
+      case "light_hue":
+        return Math.max(0, Math.min(1, safeValue / 360));
+      case "dim":
+      case "light_saturation":
+      case "light_temperature":
+        return Math.max(0, Math.min(1, safeValue / 100));
+      default:
+        return safeValue;
+    }
+  }
+
+  function buildSmartHomeSliderStyle(device, control) {
+    const previewHex = control.previewHex || device?.swatchHex || "#7CB6FF";
+    switch (control.accent) {
+      case "hue":
+        return {
+          trackStyle: {
+            background:
+              "linear-gradient(90deg, #ff4d4d 0%, #ffb84d 17%, #f6ff4d 33%, #5cff6b 50%, #4dd3ff 67%, #7e6fff 83%, #ff4db8 100%)",
+          },
+          fillStyle: {
+            background:
+              "linear-gradient(90deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0.42) 100%)",
+          },
+          thumbStyle: {
+            background: previewHex,
+          },
+        };
+      case "saturation":
+        return {
+          trackStyle: {
+            background: `linear-gradient(90deg, rgba(255,255,255,0.18) 0%, ${previewHex} 100%)`,
+          },
+          fillStyle: {
+            background: `linear-gradient(90deg, rgba(255,255,255,0.3) 0%, ${previewHex} 100%)`,
+          },
+          thumbStyle: {
+            background: previewHex,
+          },
+        };
+      case "temperature":
+        return {
+          trackStyle: {
+            background: "linear-gradient(90deg, #ffb56d 0%, #ffd7a6 40%, #d2ebff 68%, #8fc7ff 100%)",
+          },
+          fillStyle: {
+            background: "linear-gradient(90deg, rgba(255,186,124,0.65) 0%, rgba(143,199,255,0.75) 100%)",
+          },
+          thumbStyle: {
+            background: previewHex || "#ffd7a6",
+          },
+        };
+      case "brightness":
+        return {
+          trackStyle: {
+            background: "linear-gradient(90deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0.75) 100%)",
+          },
+          fillStyle: {
+            background: `linear-gradient(90deg, rgba(255,255,255,0.45) 0%, ${previewHex} 100%)`,
+          },
+          thumbStyle: {
+            background: previewHex,
+          },
+        };
+      default:
+        return {
+          thumbStyle: previewHex
+            ? {
+                background: previewHex,
+              }
+            : null,
+        };
+    }
+  }
+
+  function buildSmartHomeSwatchFromControls(device) {
+    const hue = Number(getSmartHomeControl(device, "light_hue")?.numericValue);
+    const saturation = Number(getSmartHomeControl(device, "light_saturation")?.numericValue);
+    const brightness = Number(getSmartHomeControl(device, "dim")?.numericValue);
+    const temperature = Number(getSmartHomeControl(device, "light_temperature")?.numericValue);
+    const isOn = Boolean(getSmartHomeControl(device, "onoff")?.booleanValue);
+    const lightness = Math.max(isOn ? 0.2 : 0.12, (Number.isFinite(brightness) ? brightness : 100) / 100);
+
+    if (Number.isFinite(hue)) {
+      const saturationRatio = Math.max(0, Math.min(1, (Number.isFinite(saturation) ? saturation : 100) / 100));
+      return {
+        swatchHex: hsvToHex((hue % 360) / 360, saturationRatio, lightness),
+        swatchLabel: saturationRatio < 0.08 ? "White tone" : `Hue ${Math.round(hue)} deg`,
+      };
+    }
+
+    if (Number.isFinite(temperature)) {
+      const temperatureRatio = Math.max(0, Math.min(1, temperature / 100));
+      return {
+        swatchHex: smartHomeTemperatureToHex(temperatureRatio, lightness),
+        swatchLabel: temperatureRatio < 0.34 ? "Warm white" : temperatureRatio > 0.66 ? "Cool white" : "Neutral white",
+      };
+    }
+
+    return {
+      swatchHex: "",
+      swatchLabel: "",
+    };
+  }
+
+  function buildSmartHomeDeviceStatus(device) {
+    if (!device?.available) {
+      return device?.statusText || "Unavailable";
+    }
+
+    const parts = [];
+    const power = getSmartHomeControl(device, "onoff");
+    const dim = getSmartHomeControl(device, "dim");
+    if (power) {
+      parts.push(power.booleanValue ? "On" : "Off");
+    }
+
+    if (dim && Number.isFinite(dim.numericValue)) {
+      parts.push(`${Math.round(dim.numericValue)}%`);
+    }
+
+    if (device?.supportsColor) {
+      parts.push("Color ready");
+    }
+
+    return parts.length ? parts.join(" - ") : device?.statusText || "Ready";
+  }
+
+  function patchSmartHomeDevice(device, capabilityId, nextUiValue) {
+    if (!device) {
+      return device;
+    }
+
+    const controls = (Array.isArray(device.controls) ? device.controls : []).map((control) => {
+      if (control.capabilityId !== capabilityId) {
+        return control;
+      }
+
+      if (control.kind === "switch") {
+        const boolValue = Boolean(nextUiValue);
+        return {
+          ...control,
+          booleanValue: boolValue,
+          numericValue: boolValue ? 1 : 0,
+          valueLabel: boolValue ? "On" : "Off",
+        };
+      }
+
+      const numericValue = clampSmartHomeValue(nextUiValue, control.min ?? 0, control.max ?? 100);
+      return {
+        ...control,
+        numericValue,
+        valueLabel: formatSmartHomeSliderValue(control.accent, numericValue),
+        previewHex:
+          control.accent === "hue"
+            ? hsvToHex((numericValue % 360) / 360, 1, 1)
+            : control.previewHex,
+      };
+    });
+
+    const nextDevice = {
+      ...device,
+      controls,
+      isOn: Boolean(getSmartHomeControl({ ...device, controls }, "onoff")?.booleanValue),
+    };
+    const swatch = buildSmartHomeSwatchFromControls(nextDevice);
+    nextDevice.swatchHex = swatch.swatchHex;
+    nextDevice.swatchLabel = swatch.swatchLabel;
+    nextDevice.statusText = buildSmartHomeDeviceStatus(nextDevice);
+    return nextDevice;
+  }
+
+  function previewSmartHomeCapabilityValue(deviceId, capabilityId, nextValue, options = {}) {
+    const snapshot = getSmartHomeSnapshot();
+    if (!snapshot) {
+      return;
+    }
+
+    const zones = getSmartHomeZones().map((zone) => ({
+      ...zone,
+      devices: (Array.isArray(zone.devices) ? zone.devices : []).map((device) =>
+        device.id === deviceId ? patchSmartHomeDevice(device, capabilityId, nextValue) : device,
+      ),
+    }));
+    const unassignedDevices = getSmartHomeUnassignedDevices().map((device) =>
+      device.id === deviceId ? patchSmartHomeDevice(device, capabilityId, nextValue) : device,
+    );
+
+    setSmartHomeSnapshot(
+      {
+        ...snapshot,
+        zones,
+        unassignedDevices,
+      },
+      {
+        clearError: false,
+        syncDrafts: false,
+      },
+    );
+
+    if (state.panelVisible && state.route?.pluginId === "smart-home") {
+      if (options.syncVisibleSliders === true && syncVisibleSlotSliderUi()) {
+        return;
+      }
+
+      rerenderSmartHomePanel();
+    }
+  }
+
+  function smartHomeTemperatureToHex(ratio, brightness = 1) {
+    const clampedRatio = Math.max(0, Math.min(1, Number(ratio) || 0));
+    const value = Math.max(0, Math.min(1, Number(brightness) || 0));
+    const warm = { r: 255, g: 171, b: 93 };
+    const cool = { r: 164, g: 214, b: 255 };
+    const red = Math.round((warm.r + ((cool.r - warm.r) * clampedRatio)) * value);
+    const green = Math.round((warm.g + ((cool.g - warm.g) * clampedRatio)) * value);
+    const blue = Math.round((warm.b + ((cool.b - warm.b) * clampedRatio)) * value);
+    return rgbToHex(red, green, blue);
+  }
+
+  function hsvToHex(h, s, v) {
+    const hue = ((Number(h) || 0) % 1 + 1) % 1;
+    const saturation = Math.max(0, Math.min(1, Number(s) || 0));
+    const brightness = Math.max(0, Math.min(1, Number(v) || 0));
+    const sector = Math.floor(hue * 6);
+    const fraction = hue * 6 - sector;
+    const p = brightness * (1 - saturation);
+    const q = brightness * (1 - (fraction * saturation));
+    const t = brightness * (1 - ((1 - fraction) * saturation));
+
+    const palette = [
+      [brightness, t, p],
+      [q, brightness, p],
+      [p, brightness, t],
+      [p, q, brightness],
+      [t, p, brightness],
+      [brightness, p, q],
+    ];
+
+    const [r, g, b] = palette[((sector % 6) + 6) % 6];
+    return rgbToHex(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255));
+  }
+
+  function rgbToHex(r, g, b) {
+    const values = [r, g, b].map((value) => {
+      const safeValue = Math.max(0, Math.min(255, Number(value) || 0));
+      return safeValue.toString(16).padStart(2, "0");
+    });
+    return `#${values.join("").toUpperCase()}`;
+  }
+
   function buildScreenModel() {
     const ui = window.STFrontendLib || {};
     const makeSlot = ui.createSlot || ((title, copy, onClick, options = {}) => ({
@@ -9452,7 +15380,11 @@
       trailing: options.trailing || "chevron",
       switchValue: options.switchValue,
       switchLabel: options.switchLabel || "",
-      leadingIcon: options.leadingIcon || null,
+      leadingIcon: options.leadingIcon || resolveDefaultSlotLeadingIcon({
+        title,
+        copy,
+        role: options.role || "action",
+      }),
       buttonClassName: options.buttonClassName || "",
       buttonStyle: options.buttonStyle || null,
       buttonProps: options.buttonProps || null,
@@ -9460,6 +15392,17 @@
       slotKey: options.slotKey || options.key || "",
       selected: Boolean(options.selected),
       value: options.value,
+      layout: options.layout || "",
+      expanded: Boolean(options.expanded),
+      eyebrow: options.eyebrow || "",
+      meta: Array.isArray(options.meta) ? options.meta.filter(Boolean) : [],
+      mediaImageSrc: options.mediaImageSrc || "",
+      mediaImageAlt: options.mediaImageAlt || "",
+      footerLabel: options.footerLabel || "",
+      swatchHex: options.swatchHex || "",
+      swatchLabel: options.swatchLabel || "",
+      stepperLeftDisabled: Boolean(options.stepperLeftDisabled),
+      stepperRightDisabled: Boolean(options.stepperRightDisabled),
     }));
 
     const makeToggleSlot = ui.createToggleSlot || ((title, copy, value, onClick, options = {}) =>
@@ -9491,12 +15434,69 @@
         trailing: options.trailing || "none",
       }));
 
+    const makeAccordionSlot = ui.createAccordionSlot || ((title, copy, expanded, onClick, options = {}) =>
+      makeCommandSlot(title, copy, onClick, {
+        ...options,
+        layout: "accordion",
+        expanded,
+        buttonClassName:
+          options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-accordion",
+      }));
+
     const makeNavigationSlot = ui.createNavigationSlot || ((title, copy, onClick, options = {}) =>
       makeSlot(title, copy, onClick, {
         ...options,
         role: "navigation",
         trailing: options.trailing || "chevron",
       }));
+
+    const makeFeatureNavigationSlot =
+      ui.createFeatureNavigationSlot || ((title, copy, onClick, options = {}) =>
+        makeNavigationSlot(title, copy, onClick, {
+          ...options,
+          layout: "feature",
+          eyebrow: options.eyebrow || "",
+          meta: Array.isArray(options.meta) ? options.meta : [],
+          mediaImageSrc: options.mediaImageSrc || "",
+          mediaImageAlt: options.mediaImageAlt || title || "",
+          footerLabel: options.footerLabel || "Open",
+          buttonClassName:
+            options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-feature",
+        }));
+
+    const makeInlineStepperSlot =
+      ui.createInlineStepperSlot || ((title, copy, onMoveLeft, onMoveRight, options = {}) => {
+        const leftDisabled = Boolean(options.leftDisabled);
+        const rightDisabled = Boolean(options.rightDisabled);
+        const externalButtonProps = options.buttonProps || {};
+
+        return makeCommandSlot(title, copy, options.onClick || onMoveRight || onMoveLeft || (() => {}), {
+          ...options,
+          layout: "stepper",
+          trailing: "none",
+          stepperLeftDisabled: leftDisabled,
+          stepperRightDisabled: rightDisabled,
+          buttonClassName:
+            options.buttonClassName || "steamloader-dialog-button steamloader-dialog-button-inline-stepper",
+          buttonProps: {
+            ...externalButtonProps,
+            onMoveLeft: (event) => {
+              externalButtonProps.onMoveLeft?.(event);
+              if (!leftDisabled) {
+                onMoveLeft?.(event);
+              }
+              return true;
+            },
+            onMoveRight: (event) => {
+              externalButtonProps.onMoveRight?.(event);
+              if (!rightDisabled) {
+                onMoveRight?.(event);
+              }
+              return true;
+            },
+          },
+        });
+      });
 
     const makeBackSlot = ui.createBackSlot || ((title, copy, onClick, options = {}) =>
       makeSlot(title, copy, onClick, {
@@ -9521,6 +15521,7 @@
       footerLegend: [],
       autoFocusIndex: resolveAutoFocusIndex(state.route),
       panelClassName: "",
+      sectionHeaders: [],
       dividerAfterIndex: null,
       dividerAfterIndices: null,
       audioDashboard: null,
@@ -9529,6 +15530,107 @@
       editor: null,
       slots: [],
     };
+
+    function buildCommunityPluginModel(plugin) {
+      const registryEntry = plugin.registry || getCommunityRegistry()[plugin.id] || null;
+      const routeContext = { ...state.route };
+      const runtime = plugin.runtime || {};
+      if (plugin.loadError || !registryEntry) {
+        return {
+          ...defaultModel,
+          title: plugin.title,
+          subtitle: "Community Plugin",
+          error: plugin.loadError || "This community plugin has not registered a screen yet.",
+          note: "Reload community plugins from the store after installing or updating a plugin.",
+          slots: [
+            makeCommandSlot(
+              "Reload Community Plugins",
+              "Load installed plugin entry points again.",
+              () => loadCommunityPluginsState({ showLoading: true }),
+              { leadingIcon: HeaderStoreIcon },
+            ),
+          ],
+        };
+      }
+
+      if (typeof registryEntry.createScreen !== "function") {
+        return {
+          ...defaultModel,
+          title: plugin.title,
+          subtitle: "Community Plugin",
+          note: "The plugin is installed, but it does not expose a screen yet.",
+          slots: [
+            makeCommandSlot(
+              "Reload Community Plugins",
+              "Load installed plugin entry points again.",
+              () => loadCommunityPluginsState({ showLoading: true }),
+              { leadingIcon: HeaderStoreIcon },
+            ),
+          ],
+        };
+      }
+
+      try {
+        const screenModel = registryEntry.createScreen({
+          route: routeContext,
+          plugin,
+          runtime,
+          refresh: () => renderPanelDataRefresh(),
+          sdk: window.TfsPluginSdk?.create?.(registryEntry.manifest || runtime, { pluginId: plugin.id }),
+        });
+
+        if (!screenModel || typeof screenModel !== "object" || typeof screenModel.then === "function") {
+          return {
+            ...defaultModel,
+            title: plugin.title,
+            subtitle: "Community Plugin",
+            note: "This plugin returned an unsupported screen model. Community screens must be synchronous for now.",
+            slots: [
+              makeCommandSlot(
+                "Reload Community Plugins",
+                "Load installed plugin entry points again.",
+                () => loadCommunityPluginsState({ showLoading: true }),
+                { leadingIcon: HeaderStoreIcon },
+              ),
+            ],
+          };
+        }
+
+        return {
+          ...defaultModel,
+          ...screenModel,
+          title: screenModel.title || plugin.title,
+          subtitle: screenModel.subtitle || "Community Plugin",
+          headerIcon: screenModel.headerIcon === undefined ? getPluginIconComponent(plugin.id) : screenModel.headerIcon,
+          autoFocusIndex: Number.isInteger(screenModel.autoFocusIndex)
+            ? screenModel.autoFocusIndex
+            : resolveAutoFocusIndex(state.route),
+        };
+      } catch (error) {
+        return {
+          ...defaultModel,
+          title: plugin.title,
+          subtitle: "Community Plugin",
+          error: error instanceof Error ? error.message : String(error),
+          slots: [
+            makeCommandSlot(
+              "Reload Community Plugins",
+              "Load installed plugin entry points again.",
+              () => loadCommunityPluginsState({ showLoading: true }),
+              { leadingIcon: HeaderStoreIcon },
+            ),
+          ],
+        };
+      }
+    }
+
+    if (
+      (state.route.screen === "plugin" || state.route.screen === "page") &&
+      state.route.pluginId &&
+      getCommunityPluginDefinition(state.route.pluginId)
+    ) {
+      return buildCommunityPluginModel(getCommunityPluginDefinition(state.route.pluginId));
+    }
 
     if (state.route.screen === "plugin" && state.route.pluginId === "audio") {
       return {
@@ -9554,6 +15656,14 @@
         note: "Open a section to change only one display area at a time.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildDisplayCurrentModeCard()],
+        sectionHeaders: [
+          createSectionHeader(0, "Display Controls", "Open the exact display area you want to change.", {
+            icon: DisplayPluginIcon,
+          }),
+          createSectionHeader(3, "Maintenance", "Refresh Windows mode data when a TV or monitor changed.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndex: 2,
         slots: [
           makeNavigationSlot(
@@ -9606,6 +15716,14 @@
         note: "This uses the same Windows display switch behind Win + P.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildDisplayCurrentModeCard()],
+        sectionHeaders: [
+          createSectionHeader(0, "Switch Output", "Choose which screen stays active right now.", {
+            icon: DesktopActionIcon,
+          }),
+          createSectionHeader(2, "Maintenance", "Reload current Windows display data if the target changed.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndex: 1,
         slots: [
           makeCommandSlot(
@@ -9652,6 +15770,16 @@
         note: "Only resolutions reported by Windows for the active display are selectable.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildDisplayCurrentModeCard()],
+        sectionHeaders: [
+          createSectionHeader(0, "Available Resolutions", "Only presets supported by the active display are shown.", {
+            icon: ResolutionActionIcon,
+          }),
+          ...(resolutionPresets.length
+            ? [createSectionHeader(resolutionPresets.length, "Maintenance", "Reload the preset list if Windows changed outputs.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         dividerAfterIndex: resolutionPresets.length ? resolutionPresets.length - 1 : null,
         slots: [
           ...resolutionPresets.map((preset) =>
@@ -9660,6 +15788,7 @@
               preset.available ? preset.description : "Not available on the current display.",
               () => setDisplayResolutionPreset(preset.id, preset.title),
               {
+                slotKey: `display-resolution-${preset.id}`,
                 disabled: isDisplayBusy() || !preset.available || preset.selected,
                 selected: Boolean(preset.selected),
                 badge: preset.selected ? "Current" : "",
@@ -9695,6 +15824,16 @@
         note: "Refresh choices are filtered for the current resolution.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildDisplayCurrentModeCard()],
+        sectionHeaders: [
+          createSectionHeader(0, "Available Refresh Rates", "Rates are filtered to match the current resolution.", {
+            icon: RefreshRateActionIcon,
+          }),
+          ...(refreshRatePresets.length
+            ? [createSectionHeader(refreshRatePresets.length, "Maintenance", "Reload the preset list if Windows changed outputs.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         dividerAfterIndex: refreshRatePresets.length ? refreshRatePresets.length - 1 : null,
         slots: [
           ...refreshRatePresets.map((preset) =>
@@ -9703,6 +15842,7 @@
               preset.available ? preset.description : "Not available at the current resolution.",
               () => setDisplayRefreshRatePreset(preset.id),
               {
+                slotKey: `display-refresh-rate-${preset.id}`,
                 disabled: isDisplayBusy() || !preset.available || preset.selected,
                 selected: Boolean(preset.selected),
                 badge: preset.selected ? "Current" : "",
@@ -9731,6 +15871,14 @@
         error: state.power.error,
         note: "Use these actions when console mode needs a safe escape hatch or a quick restart.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
+        sectionHeaders: [
+          createSectionHeader(0, "Recovery & Steam", "Use these first when Big Picture or TFS needs a safe reset.", {
+            icon: PowerPluginIcon,
+          }),
+          createSectionHeader(3, "System Power", "These affect the whole PC, so they stay grouped at the end.", {
+            icon: ShutdownActionIcon,
+          }),
+        ],
         cards: [
           {
             title: "Recovery Ready",
@@ -9810,6 +15958,16 @@
         status: resolveProcessesStatusText(),
         error: state.processes.error,
         note: "Only visible top-level app windows are listed here so taskbar hosts and ghost surfaces stay out of the way.",
+        sectionHeaders: [
+          createSectionHeader(0, "Open Windows", "Pick a window to bring it to the foreground.", {
+            icon: ProcessesPluginIcon,
+          }),
+          ...(windows.length
+            ? [createSectionHeader(windows.length, "Maintenance", "Refresh the list after apps open, close, or minimize.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         cards: [
           {
             title: "Window Switcher",
@@ -9826,6 +15984,7 @@
               `${windowInfo.processName}${windowInfo.isMinimized ? " - Minimized" : ""}`,
               () => activateProcessWindow(windowInfo.handle),
               {
+                slotKey: `process-window-${windowInfo.handle}`,
                 disabled: isProcessesBusy(),
                 badge: windowInfo.isForeground
                   ? "Current"
@@ -9862,6 +16021,19 @@
         note: "Add Windows apps once, then start them from Big Picture without reaching for the desktop.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildAppStartSummaryCard(shortcuts)],
+        sectionHeaders: [
+          createSectionHeader(0, "Launcher", "Add new Windows apps or jump into your saved shortcuts.", {
+            icon: AppStartPluginIcon,
+          }),
+          ...(shortcuts.length
+            ? [createSectionHeader(1, "Saved Shortcuts", "These apps are ready to launch from the controller.", {
+                icon: LaunchActionIcon,
+              })]
+            : []),
+          createSectionHeader(shortcuts.length + 1, "Maintenance", "Reload the saved launcher list and the Start Menu catalog.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         slots: [
           makeNavigationSlot(
             "Add App",
@@ -9871,6 +16043,7 @@
               setRoute({ screen: "page", pluginId: "app-start", pageId: "add-app" });
             },
             {
+              slotKey: "app-start-add-app",
               disabled: isAppStartBusy(),
               leadingIcon: AppStartPluginIcon,
             },
@@ -9888,6 +16061,7 @@
                 });
               },
               {
+                slotKey: `app-start-shortcut-${shortcut.id}`,
                 disabled: isAppStartBusy(),
                 leadingIcon: buildAppStartIcon(shortcut.iconDataUri),
               },
@@ -9926,6 +16100,16 @@
             ? "Apps are discovered from the Windows Start Menu so helpers and uninstallers stay mostly out of the list."
             : "Refresh the catalog if an app was installed while Tools for Steam was already running.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
+        sectionHeaders: [
+          createSectionHeader(0, "Detected Start Menu Apps", "Pick any app here to add it into App Start.", {
+            icon: AddActionIcon,
+          }),
+          ...(apps.length
+            ? [createSectionHeader(apps.length, "Maintenance", "Rescan the Start Menu after new installs.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         slots: [
           ...apps.map((app) =>
             makeCommandSlot(
@@ -9933,6 +16117,7 @@
               app.added ? "Already added to App Start." : "Add this app to the launcher.",
               () => addAppStartShortcut(app.id),
               {
+                slotKey: `app-start-catalog-${app.id}`,
                 disabled: isAppStartBusy() || Boolean(app.added),
                 badge: app.added ? "Added" : "",
                 leadingIcon: buildAppStartIcon(app.iconDataUri),
@@ -9968,6 +16153,11 @@
         error: state.appStart.error,
         note: shortcut ? shortcut.sourcePath : "The selected app shortcut could not be found.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
+        sectionHeaders: [
+          createSectionHeader(0, "Launch", "Start the app or remove it from the launcher library.", {
+            icon: LaunchActionIcon,
+          }),
+        ],
         cards: shortcut
           ? [
               {
@@ -10013,6 +16203,17 @@
         status: resolveHltbStatusText(),
         error: state.hltb.error,
         note: "Show HowLongToBeat estimates directly on open Big Picture game pages. The results are cached locally for 12 hours.",
+        sectionHeaders: [
+          createSectionHeader(0, "Overlay", "Turn the game-page module on or off and keep the detail link visible.", {
+            icon: HltbPluginIcon,
+          }),
+          createSectionHeader(1, "Visible Time Blocks", "Choose which estimate categories appear on game pages.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(6, "Cache", "Clear cached matches when you want a fresh lookup.", {
+            icon: DeleteActionIcon,
+          }),
+        ],
         cards: [
           {
             title: "Game Page Overlay",
@@ -10119,6 +16320,17 @@
         status: resolveAutoSisirStatusText(),
         error: state.autoSisir.error,
         note: "Start SISR in marker mode while selected non-Steam games are running. Wrong paths are reported here and will not crash Tools for Steam.",
+        sectionHeaders: [
+          createSectionHeader(0, "Automation", "Control when TFS should start and stop the SISR marker.", {
+            icon: AutoSisirPluginIcon,
+          }),
+          createSectionHeader(2, "Executable Path", "Save or reset the SISR location used for launches.", {
+            icon: FolderActionIcon,
+          }),
+          createSectionHeader(4, "Maintenance", "Reload watched titles and marker state from the backend.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         cards: [
           {
             title: "Marker State",
@@ -10222,6 +16434,16 @@
           titles.length > 0
             ? "Game Pass titles can be watched automatically. Select extra non-Steam games here when they should also start the SISR marker."
             : "No detected non-Steam games are available yet. Run Store Sync once or refresh Auto SISR after adding games.",
+        sectionHeaders: [
+          createSectionHeader(0, "Detected Titles", "Toggle which detected games should trigger the marker automatically.", {
+            icon: EyeActionIcon,
+          }),
+          ...(titles.length
+            ? [createSectionHeader(titles.length, "Maintenance", "Refresh the detected game list after Store Sync changes.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         cards: [
           {
             title: "Selection",
@@ -10277,6 +16499,11 @@
         note: autoSisir?.logPath
           ? `Log file: ${autoSisir.logPath}`
           : "The log file will appear after Auto SISR writes its first trace entry.",
+        sectionHeaders: [
+          createSectionHeader(0, "Maintenance", "Reload the latest trace lines from the log file.", {
+            icon: LogActionIcon,
+          }),
+        ],
         cards: visibleLines.length
           ? visibleLines.map((line, index) => {
               const parts = String(line).split(" | ");
@@ -10326,6 +16553,23 @@
         status: resolveArtworkStatusText(),
         error: state.artwork.error,
         note: "Control the Change Artwork context-menu entry and the SteamGridDB key used for manual artwork browsing.",
+        sectionHeaders: [
+          createSectionHeader(0, "Artwork Picker", "Control how the Big Picture Change Artwork action behaves.", {
+            icon: ArtworkPluginIcon,
+          }),
+          createSectionHeader(2, "SteamGridDB Access", "Save or clear the API key used for manual artwork browsing.", {
+            icon: SaveActionIcon,
+          }),
+          createSectionHeader(4, "Steam Path", "Choose whether artwork writes use a manual or detected Steam path.", {
+            icon: FolderActionIcon,
+          }),
+          createSectionHeader(6, "Result Count", "Increase or reduce the number of results shown per tab.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(8, "Maintenance", "Reload artwork settings from the background host.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         cards: [
           {
             title: "Artwork Picker",
@@ -10452,11 +16696,7 @@
       state.route.pluginId === "audio" &&
       state.route.pageId === "output-device-changer"
     ) {
-      const slots = [
-        makeCommandSlot("Refresh", resolveAudioStatusText(), () => loadAudioDevices(), {
-          disabled: state.audio.loading,
-        }),
-      ];
+      const slots = [];
 
       for (const device of state.audio.devices) {
         slots.push(
@@ -10468,10 +16708,17 @@
               disabled: state.audio.loading || device.isDefault,
               badge: device.isDefault ? "Default device" : "",
               trailing: device.isDefault ? "none" : "chevron",
+              leadingIcon: AudioPluginIcon,
             },
           ),
         );
       }
+
+      slots.push(
+        makeCommandSlot("Refresh", resolveAudioStatusText(), () => loadAudioDevices(), {
+          disabled: state.audio.loading,
+        }),
+      );
 
       return {
         ...defaultModel,
@@ -10484,7 +16731,17 @@
           !state.audio.loading && !state.audio.devices.length
             ? "Active Windows playback devices will appear here."
             : "",
-        dividerAfterIndex: state.audio.devices.length ? 0 : null,
+        sectionHeaders: [
+          createSectionHeader(0, "Playback Devices", "Pick the Windows default output device directly from Quick Access.", {
+            icon: AudioPluginIcon,
+          }),
+          ...(state.audio.devices.length
+            ? [createSectionHeader(state.audio.devices.length, "Maintenance", "Refresh the device list after speakers or headsets change.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
+        dividerAfterIndex: state.audio.devices.length ? state.audio.devices.length - 1 : null,
         slots,
       };
     }
@@ -10522,6 +16779,16 @@
           !state.audio.mixerLoading && !mixerSessions.length
             ? "Start a game, browser tab, or media app and its audio process will appear here."
             : "",
+        sectionHeaders: [
+          createSectionHeader(0, "Per-App Mixer", "Adjust each active session without leaving Quick Access.", {
+            icon: AudioPluginIcon,
+          }),
+          ...(mixerSessions.length
+            ? [createSectionHeader(mixerSlots.length - 1, "Maintenance", "Refresh the session list after apps start or close.", {
+                icon: RefreshActionIcon,
+              })]
+            : []),
+        ],
         dividerAfterIndex: mixerSessions.length ? mixerSessions.length - 1 : null,
         slots: mixerSlots,
       };
@@ -10552,6 +16819,14 @@
         autoFocusIndex: overlayAutoFocusIndex,
         cards: [],
         volumePanel: null,
+        sectionHeaders: [
+          createSectionHeader(0, "Overlay Controls", "Adjust the live overlay and its built-in TFS options first.", {
+            icon: PerformancePluginIcon,
+          }),
+          createSectionHeader(performancePrimarySlots.length, "Readouts & Maintenance", "Review helper status and one-shot actions below.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndices: [0, 3, 9, 13],
         slots: [...performancePrimarySlots, ...overviewSlots],
       };
@@ -10573,6 +16848,14 @@
         note: "Store Sync watches your enabled launchers in the background and keeps the 10 second poll as a fallback.",
         cards: [buildStoreSyncCompactCard(storeSyncSnapshot, "Overview")],
         autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
+        sectionHeaders: [
+          createSectionHeader(0, "Main Areas", "Jump into preview, logs, stores, or detailed settings.", {
+            icon: StoreSyncPluginIcon,
+          }),
+          createSectionHeader(4, "Maintenance", "Reload store state and rebuild the current sync plan.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndices: [1],
         slots: [
           makeNavigationSlot(
@@ -10585,6 +16868,7 @@
               setRoute(targetRoute);
             },
             {
+              slotKey: "store-sync-preview-page",
               disabled: isStoreSyncBusy(),
               badge: previewItemCount > 0 ? `${previewItemCount}` : "",
             },
@@ -10599,6 +16883,7 @@
               setRoute(targetRoute);
             },
             {
+              slotKey: "store-sync-journal-page",
               disabled: isStoreSyncBusy(),
               badge: Array.isArray(storeSyncSnapshot?.journal) ? `${storeSyncSnapshot.journal.length}` : "",
             },
@@ -10613,6 +16898,7 @@
               setRoute(targetRoute);
             },
             {
+              slotKey: "store-sync-stores-page",
               disabled: isStoreSyncBusy(),
               badge: enabledStoreCount > 0 ? `${enabledStoreCount}` : "",
             },
@@ -10627,6 +16913,7 @@
               setRoute(targetRoute);
             },
             {
+              slotKey: "store-sync-settings-page",
               disabled: isStoreSyncBusy(),
             },
           ),
@@ -10659,6 +16946,11 @@
           ? ""
           : "Recent sync activity will appear here after Auto Sync, cleanup deferrals, ownership repair, or manual syncs.",
         cards: [buildStoreSyncCompactCard(storeSyncSnapshot, "Health")],
+        sectionHeaders: [
+          createSectionHeader(0, "Recent Events", "Newest sync and watcher events appear at the top.", {
+            icon: LogActionIcon,
+          }),
+        ],
         dividerAfterIndex: journalEntries.length ? 0 : null,
         slots: journalEntries.map((entry, index) =>
           makeCommandSlot(
@@ -10668,6 +16960,7 @@
               .join(" - "),
             () => {},
             {
+              slotKey: `store-sync-journal-${entry.timestampUtc || index}-${entry.trigger || "entry"}-${entry.message || index}`,
               disabled: true,
               badge: index === 0 ? "Latest" : "",
             },
@@ -10774,6 +17067,7 @@
                   setRoute(targetRoute);
                 },
                 {
+                  slotKey: `store-sync-preview-title-${planEntry.entry.id}`,
                   disabled: isStoreSyncBusy(),
                   badge: buildStoreSyncPreviewBadge(planEntry.entry),
                 },
@@ -10786,6 +17080,7 @@
                 buildStoreSyncPreviewCopy(planEntry.entry),
                 () => {},
                 {
+                  slotKey: `store-sync-preview-item-${planEntry.entry?.id || planIndex}`,
                   disabled: true,
                   badge: buildStoreSyncPreviewBadge(planEntry.entry),
                 },
@@ -10805,6 +17100,7 @@
                     ? clearStoreSyncTitleOverrides(planEntry.entry.id)
                     : setStoreSyncTitleExcluded(planEntry.entry.id, planEntry.action === "exclude"),
                 {
+                  slotKey: `store-sync-preview-action-${planEntry.entry.id}-${planEntry.action}`,
                   disabled: isStoreSyncBusy(),
                   rowClassName: "steamloader-row-shell-subtle",
                   buttonClassName: "steamloader-dialog-button steamloader-dialog-button-subtle",
@@ -10849,6 +17145,17 @@
         status: storeSyncStatus,
         error: state.storeSync.error,
         note: "Adjust manual title rules here, pin important games for Preview, then save before you sync.",
+        sectionHeaders: [
+          createSectionHeader(0, "Preview Behavior", "Control where this title appears and whether it stays excluded.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(2, "Override Rules", "Save or clear custom title and artwork matching rules.", {
+            icon: SaveActionIcon,
+          }),
+          createSectionHeader(4, "Maintenance", "Refresh the source scan when this game changed outside TFS.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndices: [1, 3],
         cards: detectedTitle
           ? [
@@ -10978,6 +17285,17 @@
         error: state.storeSync.error,
         note: "Artwork is built in, and the background watcher keeps Steam synced automatically without a manual sync step.",
         cards: [buildSteamProfileCard(storeSyncSnapshot?.steamProfile)],
+        sectionHeaders: [
+          createSectionHeader(0, "Artwork", "Control downloaded artwork style and animation preference.", {
+            icon: ArtworkPluginIcon,
+          }),
+          createSectionHeader(2, "Shortcut Strategy", "Choose how Store Sync backs up and reuses Steam shortcuts.", {
+            icon: SaveActionIcon,
+          }),
+          createSectionHeader(4, "Cleanup", "Allow TFS to remove managed shortcuts when launchers stop reporting them.", {
+            icon: DeleteActionIcon,
+          }),
+        ],
         dividerAfterIndices: [1, 4],
         slots: [
           makeSettingToggleSlot(
@@ -11055,6 +17373,17 @@
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
         note: "Choose between Shell and Tray startup, then manage the global behavior and plugin list below. Developer debug stays hidden unless you turn it on here.",
+        sectionHeaders: [
+          createSectionHeader(0, "Startup Mode", "Choose how TFS enters Windows and Steam on sign-in.", {
+            icon: SettingsPluginIcon,
+          }),
+          createSectionHeader(2, "Behavior", "Fine-tune shell hiding and debug visibility.", {
+            icon: DesktopActionIcon,
+          }),
+          createSectionHeader(4, "Built-In Plugins", "Show or hide modules and block their background routes.", {
+            icon: SteamLoaderIcon,
+          }),
+        ],
         dividerAfterIndex: 3,
         slots: [
           makeChoiceSlot(
@@ -11066,6 +17395,7 @@
               selected: startupMode === "shell",
               badge: startupMode === "shell" ? "Current" : "",
               trailing: startupMode === "shell" ? "none" : "chevron",
+              leadingIcon: DesktopActionIcon,
             },
           ),
           makeChoiceSlot(
@@ -11077,6 +17407,7 @@
               selected: startupMode === "tray",
               badge: startupMode === "tray" ? "Current" : "",
               trailing: startupMode === "tray" ? "none" : "chevron",
+              leadingIcon: SteamLoaderIcon,
             },
           ),
           makeSettingToggleSlot(
@@ -11125,9 +17456,10 @@
     ) {
       const settings = getGeneralSettingsSnapshot();
       const splash = getSplashScreenSettings();
+      const shellTakeoverMode = settings?.startupMode === "shell";
       const wallpaperPath = splash?.wallpaperPath || "";
       const iconPath = splash?.iconPath || "";
-      const extraDelay = Number(splash?.extraCloseDelaySeconds || 0);
+      const windowsShellStartDelaySeconds = Number(settings?.windowsShellStartDelaySeconds || 0);
 
       return {
         ...defaultModel,
@@ -11135,12 +17467,28 @@
         subtitle: "Splashscreen Themes",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Use full local image paths. Missing files are kept in settings, but the splash falls back safely until the path exists.",
+        note: "Use full local image paths. Missing files are kept in settings, but the splash falls back safely until the path exists. In Shell Takeover mode the splash stays on until Big Picture is visible, then Windows starts later in the background after the hand-off delay.",
+        sectionHeaders: [
+          createSectionHeader(0, "Preview", "Open the splash briefly without running the full startup flow.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(2, "Artwork Paths", "Save or clear the wallpaper and icon used during startup.", {
+            icon: FolderActionIcon,
+          }),
+          createSectionHeader(6, "Windows Hand-Off Delay", "Tune how long Windows waits before restoring behind Big Picture.", {
+            icon: RefreshRateActionIcon,
+          }),
+          createSectionHeader(9, "Maintenance", "Reload splash settings from the current TFS configuration.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         cards: [
           {
             title: "Current Splash",
             lines: [
-              `Splashscreen: ${splash?.enabled === false ? "Hidden" : "Shown"}`,
+              shellTakeoverMode
+                ? "Splashscreen: Always shown until Big Picture is visible"
+                : "Splashscreen: Used when Shell Takeover startup is active",
               `Text: ${splash?.showText === false ? "Hidden" : "Shown"}`,
               wallpaperPath
                 ? `Wallpaper: ${splash?.wallpaperExists ? wallpaperPath : `Missing - ${wallpaperPath}`}`
@@ -11148,7 +17496,8 @@
               iconPath
                 ? `Icon: ${splash?.iconExists ? iconPath : `Missing - ${iconPath}`}`
                 : "Icon: default Tools for Steam icon",
-              `Extra close delay: ${extraDelay}s`,
+              `Additional Windows hand-off delay: ${windowsShellStartDelaySeconds}s`,
+              `Total Windows hand-off delay: ${5 + windowsShellStartDelaySeconds}s after Big Picture is visible`,
             ],
           },
         ],
@@ -11179,20 +17528,9 @@
         slots: [
           makeSettingToggleSlot(
             "tfs-splash",
-            "enabled",
-            "Show Splashscreen",
-            "Show the full-screen Tools for Steam startup splash before Steam takes over.",
-            splash?.enabled !== false,
-            () => toggleSplashScreenSetting("enabled"),
-            {
-              disabled: isGeneralSettingsBusy(),
-            },
-          ),
-          makeSettingToggleSlot(
-            "tfs-splash",
             "show-text",
             "Show Splash Text",
-            "Show startup status text on top of the splash artwork.",
+            "Show startup status text on top of the splash artwork while Shell Takeover is running.",
             splash?.showText !== false,
             () => toggleSplashScreenSetting("show-text"),
             {
@@ -11241,26 +17579,29 @@
           ),
           makeCommandSlot(
             "Shorter Delay",
-            "Close the splash one second sooner after Steam is ready.",
-            () => adjustSplashExtraDelay(-1),
+            "Start Windows one second sooner after Big Picture is visible.",
+            () => adjustWindowsShellStartDelay(-1),
             {
-              disabled: isGeneralSettingsBusy() || extraDelay <= 0,
+              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds <= 0,
+              leadingIcon: RefreshRateActionIcon,
             },
           ),
           makeCommandSlot(
             "Longer Delay",
-            "Keep the splash visible one extra second after Steam is ready.",
-            () => adjustSplashExtraDelay(1),
+            "Wait one extra second before Windows starts in the background.",
+            () => adjustWindowsShellStartDelay(1),
             {
-              disabled: isGeneralSettingsBusy() || extraDelay >= 30,
+              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds >= 30,
+              leadingIcon: RefreshRateActionIcon,
             },
           ),
           makeCommandSlot(
             "Reset Delay",
-            "Close the splash as soon as the normal handoff is complete.",
-            () => resetSplashExtraDelay(),
+            "Use only the default 5 second Windows hand-off delay.",
+            () => resetWindowsShellStartDelay(),
             {
-              disabled: isGeneralSettingsBusy() || extraDelay <= 0,
+              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds <= 0,
+              leadingIcon: RefreshRateActionIcon,
             },
           ),
           makeCommandSlot(
@@ -11298,6 +17639,14 @@
         status: resolveUpdatesStatusText(),
         error: state.updates.error,
         note: "Stable follows the latest full GitHub release. Beta follows the newest GitHub prerelease preview so you can test the newest TFS builds first.",
+        sectionHeaders: [
+          createSectionHeader(0, "Release Channel", "Choose whether TFS follows stable releases or beta previews.", {
+            icon: HeaderUpdateIcon,
+          }),
+          createSectionHeader(2, "Update Actions", "Refresh release metadata or install the newest compatible build.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
         dividerAfterIndex: 1,
         cards: [
           {
@@ -11325,6 +17674,7 @@
               selected: channel === "stable",
               badge: channel === "stable" ? "Current" : "",
               trailing: channel === "stable" ? "none" : "chevron",
+              leadingIcon: HeaderUpdateIcon,
             },
           ),
           makeChoiceSlot(
@@ -11336,6 +17686,7 @@
               selected: channel === "beta",
               badge: channel === "beta" ? "Current" : "Preview",
               trailing: channel === "beta" ? "none" : "chevron",
+              leadingIcon: HeaderUpdateIcon,
             },
           ),
           makeCommandSlot(
@@ -11382,13 +17733,13 @@
       if (!theme || !option) {
         return {
           ...defaultModel,
-          title: "Themes",
+          title: "CSSLoader",
           subtitle: "Theme Option",
           status: themesStatus,
           error: state.themes.error,
-          note: "The requested theme option could not be found.",
+          note: "The requested CSSLoader patch could not be found.",
           slots: [
-            makeCommandSlot("Refresh Themes", "Reload the current theme catalog and state.", () => loadThemesState(), {
+            makeCommandSlot("Refresh CSSLoader State", "Reload the current CSSLoader theme state.", () => loadThemesState(), {
               disabled: state.themes.loading || state.themes.saving,
             }),
           ],
@@ -11406,7 +17757,12 @@
           cards: [
             {
               title: "Current Value",
-              lines: [formatThemeOptionValue(option)],
+              lines: [
+                formatThemeOptionValue(option),
+                ...(option.advancedControlCount > 0
+                  ? [`${option.advancedControlCount} advanced control${option.advancedControlCount === 1 ? "" : "s"} for this patch are not exposed in Quick Access yet.`]
+                  : []),
+              ],
             },
           ],
           slots: option.choices.map((choice) =>
@@ -11493,13 +17849,13 @@
       if (!profile) {
         return {
           ...defaultModel,
-          title: "Themes",
-          subtitle: "Profile",
+          title: "CSSLoader",
+          subtitle: "Preset",
           status: themesStatus,
           error: state.themes.error,
-          note: "The requested theme profile could not be found.",
+          note: "The requested CSSLoader preset could not be found in the installed theme folder.",
           slots: [
-            makeCommandSlot("Refresh Catalog", "Reload theme and profile entries.", () => refreshThemesCatalog(), {
+            makeCommandSlot("Refresh CSSLoader State", "Reload presets from the live CSSLoader backend.", () => refreshThemesCatalog(), {
               disabled: state.themes.loading || state.themes.saving,
             }),
           ],
@@ -11508,50 +17864,39 @@
 
       return {
         ...defaultModel,
-        title: "Themes",
+        title: "CSSLoader",
         subtitle: profile.title,
         status: themesStatus,
         error: state.themes.error,
         note: profile.description,
         cards: [buildThemeProfileSummaryCard(profile)],
-        slots: profile.installed
-          ? [
-              makeCommandSlot(
-                "Apply Profile",
-                "Install any missing themes from this profile and switch the current setup to match it.",
-                () => applyThemeProfile(profile.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                  badge: profile.selected ? "Selected" : "",
-                },
-              ),
-              makeCommandSlot(
-                "Update From Current Setup",
-                "Overwrite this installed profile with the themes and values you are using right now.",
-                () => updateThemeProfile(profile.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-              makeCommandSlot(
-                "Remove Profile",
-                "Remove this profile from your local installed list.",
-                () => removeThemeProfile(profile.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-            ]
-          : [
-              makeCommandSlot(
-                "Download Profile",
-                "Add this profile to your installed profile library.",
-                () => installThemeProfile(profile.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-            ],
+        slots: [
+          makeCommandSlot(
+            "Apply Preset",
+            "Switch CSSLoader to the theme stack saved in this preset.",
+            () => applyThemeProfile(profile.id),
+            {
+              disabled: state.themes.loading || state.themes.saving,
+              badge: profile.selected ? "Selected" : "",
+            },
+          ),
+          makeCommandSlot(
+            "Update From Current Setup",
+            "Overwrite this saved preset with the currently enabled CSSLoader theme stack.",
+            () => updateThemeProfile(profile.id),
+            {
+              disabled: state.themes.loading || state.themes.saving,
+            },
+          ),
+          makeCommandSlot(
+            "Remove Preset",
+            "Delete this saved preset from the installed CSSLoader theme folder.",
+            () => removeThemeProfile(profile.id),
+            {
+              disabled: state.themes.loading || state.themes.saving,
+            },
+          ),
+        ],
       };
     }
 
@@ -11566,13 +17911,13 @@
       if (!theme) {
         return {
           ...defaultModel,
-          title: "Themes",
+          title: "CSSLoader",
           subtitle: "Theme",
           status: themesStatus,
           error: state.themes.error,
-          note: "The requested theme could not be found in the current catalog.",
+          note: "The requested CSSLoader theme could not be found in the current installed library.",
           slots: [
-            makeCommandSlot("Refresh Catalog", "Reload built-in and community theme entries.", () => refreshThemesCatalog(), {
+            makeCommandSlot("Refresh CSSLoader State", "Ask CSSLoader to rescan the installed theme library.", () => refreshThemesCatalog(), {
               disabled: state.themes.loading || state.themes.saving,
             }),
           ],
@@ -11595,7 +17940,10 @@
               );
             }
 
-            state.themes.detailOriginByThemeId[theme.id] ??= "store";
+            if (option.type === "slider" || option.type === "choice") {
+              return createThemeSliderSlot(theme, option);
+            }
+
             return makeNavigationSlot(
               option.title,
               `${option.description} - ${formatThemeOptionValue(option)}`,
@@ -11617,45 +17965,26 @@
 
       return {
         ...defaultModel,
-        title: "Themes",
+        title: "CSSLoader",
         subtitle: theme.title,
         status: themesStatus,
         error: state.themes.error,
         note: theme.description,
         cards: [buildThemeSummaryCard(theme)],
-        slots: theme.installed
-          ? [
-              makeSettingToggleSlot(
-                "themes.theme",
-                theme.id,
-                "Enabled",
-                "Turn this theme on or off and reapply the current theme stack.",
-                Boolean(theme.enabled),
-                () => toggleThemeEnabled(theme.id, !Boolean(theme.enabled)),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-              ...optionSlots,
-              makeCommandSlot(
-                "Uninstall Theme",
-                "Remove this theme from the installed list but keep it available in the store.",
-                () => uninstallTheme(theme.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-            ]
-          : [
-              makeCommandSlot(
-                "Install Theme",
-                "Add this theme to the installed list so you can enable and tune it.",
-                () => installTheme(theme.id),
-                {
-                  disabled: state.themes.loading || state.themes.saving,
-                },
-              ),
-            ],
+        slots: [
+          makeSettingToggleSlot(
+            "themes.theme",
+            theme.id,
+            "Enabled",
+            "Turn this CSSLoader theme on or off without leaving Quick Access.",
+            Boolean(theme.enabled),
+            () => toggleThemeEnabled(theme.id, !Boolean(theme.enabled)),
+            {
+              disabled: state.themes.loading || state.themes.saving,
+            },
+          ),
+          ...optionSlots,
+        ],
       };
     }
 
@@ -11664,50 +17993,437 @@
       state.route.pluginId === "themes" &&
       state.route.pageId === "store"
     ) {
-      const browseThemes = Array.isArray(themesSnapshot?.browseThemes) ? themesSnapshot.browseThemes : [];
+      const integration = getThemeIntegration();
+      const storeCatalog = getThemeStoreCatalog();
+      const storeItems = Array.isArray(storeCatalog?.items) ? storeCatalog.items : [];
+      const availableFilters =
+        Array.isArray(storeCatalog?.availableFilters) && storeCatalog.availableFilters.length > 0
+          ? storeCatalog.availableFilters
+          : ["All"];
+      const availableOrders =
+        Array.isArray(storeCatalog?.availableOrders) && storeCatalog.availableOrders.length > 0
+          ? storeCatalog.availableOrders
+          : ["Most Downloaded"];
+      const currentFilter = storeCatalog?.filter || "All";
+      const currentOrder = storeCatalog?.order || availableOrders[0] || "Most Downloaded";
+      const currentPage = Math.max(1, storeCatalog?.page || 1);
+      const perPage = Math.max(1, storeCatalog?.perPage || 12);
+      const total = Math.max(0, storeCatalog?.total || 0);
+      const totalPages = Math.max(1, Math.ceil(total / perPage));
+      const currentFilterIndex = Math.max(0, availableFilters.findIndex((value) => value === currentFilter));
+      const currentOrderIndex = Math.max(0, availableOrders.findIndex((value) => value === currentOrder));
+      const filtersExpanded = isExpandedSection("themes-store-filters", false);
+      const filterSummary = buildThemeStoreFilterSummary(
+        currentFilter,
+        currentOrder,
+        state.themes.storeSearchDraft,
+      );
+
+      if (!storeCatalog && !state.themes.storeLoading) {
+        void loadThemesStoreCatalog();
+      }
 
       return {
         ...defaultModel,
-        title: "Themes",
-        subtitle: "Store",
+        title: "CSSLoader",
+        subtitle: "Big Picture Store",
+        panelClassName: "steamloader-panel-themes-store",
         status: themesStatus,
         error: state.themes.error,
-        note: "Browse built-in and imported themes that can be installed into Tools for Steam.",
-        cards:
-          themesSnapshot?.settings && !themesSnapshot.settings.showCommunityThemes
-            ? [
-                {
-                  title: "Community Themes Hidden",
-                  lines: ["Turn on Show Community Themes in Themes settings to see the full catalog."],
-                },
-              ]
-            : [],
+        note: "",
+        cards: [
+          {
+            title: "DeckThemes Store",
+            lines: [
+              `${storeItems.length} themes shown right now`,
+              `Page ${currentPage} of ${totalPages}`,
+              `${total.toLocaleString()} total Big Picture themes${integration?.backendReachable ? " - installs ready" : " - browse only until CSSLoader is online"}`,
+            ],
+          },
+        ],
+        editor: filtersExpanded
+          ? {
+              label: "Search Catalog",
+              help: "Search Big Picture themes by title, author, or theme name, then press Search Store below to apply it.",
+              value: state.themes.storeSearchDraft,
+              placeholder: "Round",
+              inputKey: `theme-store-search-${state.themes.storeSearchInputVersion}`,
+              rows: 2,
+              onInput: (value) => {
+                state.themes.storeSearchDraft = value;
+              },
+            }
+          : null,
         slots: [
-          ...browseThemes.map((theme, themeIndex) =>
-            makeNavigationSlot(
+          makeAccordionSlot(
+            "Filters",
+            filterSummary,
+            filtersExpanded,
+            () => {
+              toggleExpandedSection("themes-store-filters", false);
+              rerenderThemesPanel();
+            },
+            {
+              slotKey: "theme-store-filters-toggle",
+              disabled: state.themes.storeLoading && !storeCatalog,
+            },
+          ),
+          ...(filtersExpanded
+            ? [
+                createPerformanceValueSliderSlot({
+                  title: "Filter",
+                  copy: "Switch between Big Picture theme categories.",
+                  hint: "Use Left / Right to change the active filter. Press A to reset to All.",
+                  slotKey: "theme-store-filter",
+                  min: 0,
+                  max: Math.max(0, availableFilters.length - 1),
+                  step: 1,
+                  disabled: state.themes.storeLoading || availableFilters.length <= 1,
+                  getValue: () => {
+                    const liveFilter = getThemeStoreCatalog()?.filter || "All";
+                    const liveIndex = availableFilters.findIndex((value) => value === liveFilter);
+                    return liveIndex >= 0 ? liveIndex : currentFilterIndex;
+                  },
+                  displayValue: (index) => {
+                    const safeIndex = Math.max(0, Math.min(availableFilters.length - 1, index));
+                    return availableFilters[safeIndex] || "All";
+                  },
+                  onAdjust: (direction) => {
+                    const currentCatalog = getThemeStoreCatalog();
+                    const liveFilter = getThemeStoreCatalog()?.filter || "All";
+                    const liveIndex = Math.max(0, availableFilters.findIndex((value) => value === liveFilter));
+                    const nextIndex = Math.max(0, Math.min(availableFilters.length - 1, liveIndex + direction));
+                    const nextFilter = availableFilters[nextIndex] || "All";
+                    if (currentCatalog) {
+                      state.themes.storeCatalog = {
+                        ...currentCatalog,
+                        filter: nextFilter,
+                        page: 1,
+                      };
+                      syncVisibleSlotSliderUi();
+                    }
+                    void loadThemesStoreCatalog({
+                      filter: nextFilter,
+                      page: 1,
+                      showLoading: false,
+                    });
+                  },
+                  onClick: () => {
+                    const currentCatalog = getThemeStoreCatalog();
+                    if (currentCatalog) {
+                      state.themes.storeCatalog = {
+                        ...currentCatalog,
+                        filter: "All",
+                        page: 1,
+                      };
+                      syncVisibleSlotSliderUi();
+                    }
+                    void loadThemesStoreCatalog({
+                      filter: "All",
+                      page: 1,
+                      showLoading: false,
+                    });
+                  },
+                }),
+                createPerformanceValueSliderSlot({
+                  title: "Order",
+                  copy: "Change how DeckThemes results are sorted.",
+                  hint: "Use Left / Right to change sorting. Press A to reset to Most Downloaded.",
+                  slotKey: "theme-store-order",
+                  min: 0,
+                  max: Math.max(0, availableOrders.length - 1),
+                  step: 1,
+                  disabled: state.themes.storeLoading || availableOrders.length <= 1,
+                  getValue: () => {
+                    const liveOrder = getThemeStoreCatalog()?.order || availableOrders[0] || "Most Downloaded";
+                    const liveIndex = availableOrders.findIndex((value) => value === liveOrder);
+                    return liveIndex >= 0 ? liveIndex : currentOrderIndex;
+                  },
+                  displayValue: (index) => {
+                    const safeIndex = Math.max(0, Math.min(availableOrders.length - 1, index));
+                    return availableOrders[safeIndex] || "Most Downloaded";
+                  },
+                  onAdjust: (direction) => {
+                    const currentCatalog = getThemeStoreCatalog();
+                    const liveOrder = getThemeStoreCatalog()?.order || availableOrders[0] || "Most Downloaded";
+                    const liveIndex = Math.max(0, availableOrders.findIndex((value) => value === liveOrder));
+                    const nextIndex = Math.max(0, Math.min(availableOrders.length - 1, liveIndex + direction));
+                    const nextOrder = availableOrders[nextIndex] || "Most Downloaded";
+                    if (currentCatalog) {
+                      state.themes.storeCatalog = {
+                        ...currentCatalog,
+                        order: nextOrder,
+                        page: 1,
+                      };
+                      syncVisibleSlotSliderUi();
+                    }
+                    void loadThemesStoreCatalog({
+                      order: nextOrder,
+                      page: 1,
+                      showLoading: false,
+                    });
+                  },
+                  onClick: () => {
+                    const currentCatalog = getThemeStoreCatalog();
+                    if (currentCatalog) {
+                      state.themes.storeCatalog = {
+                        ...currentCatalog,
+                        order: "Most Downloaded",
+                        page: 1,
+                      };
+                      syncVisibleSlotSliderUi();
+                    }
+                    void loadThemesStoreCatalog({
+                      order: "Most Downloaded",
+                      page: 1,
+                      showLoading: false,
+                    });
+                  },
+                }),
+                makeCommandSlot(
+                  "Search Store",
+                  "Run the current DeckThemes search query.",
+                  () => searchThemesStore(),
+                  {
+                    disabled: state.themes.storeLoading,
+                  },
+                ),
+                makeCommandSlot(
+                  "Clear Search",
+                  "Remove the current query and show the full DeckThemes list again.",
+                  () => clearThemesStoreSearch(),
+                  {
+                    disabled: state.themes.storeLoading || !state.themes.storeSearchDraft,
+                  },
+                ),
+                makeCommandSlot(
+                  "Refresh Store",
+                  "Reload the current DeckThemes search, filters, and install status.",
+                  () =>
+                    loadThemesStoreCatalog({
+                      search: storeCatalog?.search || "",
+                      filter: currentFilter,
+                      order: currentOrder,
+                      page: currentPage,
+                      perPage,
+                    }),
+                  {
+                    disabled: state.themes.storeLoading,
+                  },
+                ),
+              ]
+            : []),
+          createSectionSlot(
+            "Themes",
+            storeItems.length
+              ? "Open any result to see a full preview and install it into CSSLoader."
+              : "No Big Picture themes match the current filter yet.",
+            "theme-store-section-results",
+            true,
+          ),
+          ...createThemeStorePagerSlots({
+            currentPage,
+            totalPages,
+            disabled: state.themes.storeLoading,
+            onPrevious: () => loadThemesStoreCatalog({ page: currentPage - 1 }),
+            onNext: () => loadThemesStoreCatalog({ page: currentPage + 1 }),
+          }),
+          ...storeItems.map((theme) =>
+            makeFeatureNavigationSlot(
               theme.title,
-              `${theme.author} - ${theme.statusText} - ${theme.downloadCount.toLocaleString()} downloads`,
+              theme.description,
               () => {
-                state.themes.detailOriginByThemeId[theme.id] = "store";
-                rememberCurrentRouteIndex(themeIndex);
                 setRoute({
                   screen: "page",
                   pluginId: "themes",
-                  pageId: `theme-${theme.id}`,
+                  pageId: `store-theme-${theme.storeId}`,
                 });
+                void loadThemesStoreTheme(theme.storeId);
               },
               {
-                disabled: state.themes.loading || state.themes.saving,
-                badge: theme.enabled ? "Active" : theme.installed ? "Installed" : theme.sourceLabel,
+                slotKey: getThemeStoreResultSlotKey(theme.storeId),
+                leadingIcon: ThemesPluginIcon,
+                mediaImageSrc: theme.previewImageUrl || theme.previewThumbnailUrl || "",
+                mediaImageAlt: `${theme.title} preview`,
+                eyebrow: `${theme.source || "DeckThemes"} - ${theme.version}`,
+                meta: buildThemeStoreMetaItems(theme),
+                footerLabel: theme.installed
+                  ? theme.installedVersionMatches
+                    ? "Open installed store entry"
+                    : "Open update preview"
+                  : "Open store entry",
+                disabled: state.themes.storeLoading,
+                badge: theme.installed
+                  ? theme.installedVersionMatches
+                    ? "Installed"
+                    : "Update"
+                  : "Install",
               },
             ),
           ),
+          createSectionSlot(
+            "Pages",
+            "Move through the current results page-by-page once you reach the end of the current store view.",
+            "theme-store-section-pages-bottom",
+            true,
+          ),
           makeCommandSlot(
-            "Refresh Catalog",
-            "Reload the current theme catalog and installation state.",
-            () => refreshThemesCatalog(),
+            "Previous Page",
+            "Go back to the previous DeckThemes results page.",
+            () => loadThemesStoreCatalog({ page: currentPage - 1 }),
             {
-              disabled: state.themes.loading || state.themes.saving,
+              leadingIcon: BackIcon,
+              disabled: state.themes.storeLoading || currentPage <= 1,
+            },
+          ),
+          makeCommandSlot(
+            "Next Page",
+            "Open the next DeckThemes results page.",
+            () => loadThemesStoreCatalog({ page: currentPage + 1 }),
+            {
+              leadingIcon: ChevronIcon,
+              disabled: state.themes.storeLoading || currentPage >= totalPages,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "themes" &&
+      isThemesStoreThemeRoute(state.route)
+    ) {
+      const integration = getThemeIntegration();
+      const storeThemeId = getThemeStoreIdFromRoute(state.route);
+      const storeTheme = getThemeStoreById(storeThemeId);
+      const installedTheme = storeTheme ? getThemeById(storeTheme.themeId) : null;
+      const installedPreset = storeTheme ? getThemeProfileById(storeTheme.themeId) : null;
+
+      if (
+        storeThemeId &&
+        (!storeTheme || !storeTheme.description) &&
+        !state.themes.storeLoading &&
+        state.themes.storeDetailLoadingId !== storeThemeId
+      ) {
+        void loadThemesStoreTheme(storeThemeId);
+      }
+
+      if (!storeTheme) {
+        return {
+          ...defaultModel,
+          title: "CSSLoader",
+          subtitle: "Store Entry",
+          status: themesStatus,
+          error: state.themes.error,
+          note: "The requested DeckThemes entry is loading or could not be found.",
+          slots: [
+            makeCommandSlot(
+              "Refresh Store Entry",
+              "Try loading this DeckThemes entry again.",
+              () => loadThemesStoreTheme(storeThemeId),
+              {
+                disabled: state.themes.storeLoading || !storeThemeId,
+              },
+            ),
+          ],
+        };
+      }
+
+      return {
+        ...defaultModel,
+        title: "CSSLoader",
+        subtitle: storeTheme.title,
+        status: themesStatus,
+        error: state.themes.error,
+        note:
+          storeTheme.target === "Profile"
+            ? "This DeckThemes entry installs into CSSLoader as a preset and will appear under Presets after installation."
+            : "Install this Big Picture theme into CSSLoader, then return to Installed Themes to turn it on or adjust its controller-ready patches.",
+        cards: [buildThemeStoreSummaryCard(storeTheme)],
+        slots: [
+          createSectionSlot(
+            "Install",
+            "Use the preview above, then install or update the selected Big Picture theme.",
+            "theme-store-detail-install",
+          ),
+          makeCommandSlot(
+            storeTheme.installed
+              ? storeTheme.installedVersionMatches
+                ? "Reinstall from Store"
+                : "Update from Store"
+              : "Install from Store",
+            integration?.backendReachable
+              ? "Download this DeckThemes Big Picture theme and let CSSLoader install it into the CSSLoader themes folder."
+              : "Start the CSSLoader backend first, then install this DeckThemes Big Picture theme from TFS.",
+            () => installThemesStoreTheme(storeTheme.storeId),
+            {
+              disabled: state.themes.loading || state.themes.saving || state.themes.storeLoading || !integration?.backendReachable,
+              badge: storeTheme.installed
+                ? storeTheme.installedVersionMatches
+                  ? "Installed"
+                  : "Update"
+                : "",
+            },
+          ),
+          ...((installedTheme || installedPreset)
+            ? [
+                createSectionSlot(
+                  "Local Entry",
+                  "Jump from the store preview straight into the installed CSSLoader item.",
+                  "theme-store-detail-local",
+                  true,
+                ),
+              ]
+            : []),
+          ...(installedTheme
+            ? [
+                makeNavigationSlot(
+                  "Open Installed Theme",
+                  "Jump straight to the installed CSSLoader theme entry after reviewing the store version.",
+                  () => {
+                    setRoute({
+                      screen: "page",
+                      pluginId: "themes",
+                      pageId: `theme-${installedTheme.id}`,
+                    });
+                  },
+                  {
+                    disabled: state.themes.loading || state.themes.saving,
+                  },
+                ),
+              ]
+            : []),
+          ...(installedPreset
+            ? [
+                makeNavigationSlot(
+                  "Open Installed Preset",
+                  "Jump straight to the installed CSSLoader preset entry.",
+                  () => {
+                    setRoute({
+                      screen: "page",
+                      pluginId: "themes",
+                      pageId: `profile-${installedPreset.id}`,
+                    });
+                  },
+                  {
+                    disabled: state.themes.loading || state.themes.saving,
+                  },
+                ),
+              ]
+            : []),
+          createSectionSlot(
+            "Store Actions",
+            "Refresh the metadata here whenever you want the latest preview or install state.",
+            "theme-store-detail-actions",
+            Boolean(installedTheme || installedPreset),
+          ),
+          makeCommandSlot(
+            "Refresh Store Entry",
+            "Reload the latest DeckThemes metadata and install status for this entry.",
+            () => loadThemesStoreTheme(storeTheme.storeId),
+            {
+              disabled: state.themes.storeLoading,
             },
           ),
         ],
@@ -11719,39 +18435,166 @@
       state.route.pluginId === "themes" &&
       state.route.pageId === "installed"
     ) {
+      const integration = getThemeIntegration();
       const installedThemes = Array.isArray(themesSnapshot?.installedThemes)
         ? themesSnapshot.installedThemes
         : [];
 
+      if (!integration?.backendReachable) {
+        return {
+          ...defaultModel,
+          title: "CSSLoader",
+          subtitle: "Installed Themes",
+          status: themesStatus,
+          error: state.themes.error,
+          note: integration?.backendInstalled
+            ? "CSSLoader standalone backend is installed, but offline right now. Start it to bring your installed themes back online."
+            : "CSSLoader standalone backend is not installed yet. Install it before trying to manage themes from TFS.",
+          cards: [
+            {
+              title: "CSSLoader Status",
+              lines: [
+                integration?.backendInstalled ? "Standalone backend is installed." : "Standalone backend is missing.",
+                `Backend Path: ${integration?.backendPath || "Unavailable"}`,
+              ],
+            },
+          ],
+          slots: [
+            ...(!integration?.backendInstalled
+              ? [
+                  makeCommandSlot(
+                    "Install CSSLoader Backend",
+                    "Download the official standalone headless backend and let TFS manage it.",
+                    () => installThemesBackend(),
+                    {
+                      disabled: state.themes.loading || state.themes.saving,
+                    },
+                  ),
+                ]
+              : []),
+            ...(integration?.backendInstalled && !integration?.backendReachable
+              ? [
+                  makeCommandSlot(
+                    "Start CSSLoader Backend",
+                    "Launch the standalone CSSLoader backend in the background.",
+                    () => startThemesBackend(),
+                    {
+                      disabled: state.themes.loading || state.themes.saving,
+                    },
+                  ),
+                ]
+              : []),
+            makeCommandSlot(
+              "Open Theme Folder",
+              "Open the CSSLoader themes folder on disk.",
+              () => openThemesFolder(),
+              {
+                disabled: state.themes.loading || state.themes.saving,
+              },
+            ),
+            makeCommandSlot(
+              "Refresh CSSLoader State",
+              "Ask TFS to refresh its live view of the CSSLoader backend.",
+              () => loadThemesState(),
+              {
+                disabled: state.themes.loading || state.themes.saving,
+              },
+            ),
+          ],
+        };
+      }
+
       return {
         ...defaultModel,
-        title: "Themes",
-        subtitle: "Installed",
+        title: "CSSLoader",
+        subtitle: "Installed Themes",
         status: themesStatus,
         error: state.themes.error,
         note:
           installedThemes.length > 0
-            ? "Open an installed theme to enable it, change switches, or tune range and choice options."
-            : "No themes are installed yet. Use the Store to add your first theme.",
-        slots: installedThemes.map((theme, themeIndex) =>
-          makeNavigationSlot(
-            theme.title,
-            `${theme.author} - ${theme.enabled ? "Active" : "Installed"} - ${theme.options.length} setting${theme.options.length === 1 ? "" : "s"}`,
-            () => {
-              state.themes.detailOriginByThemeId[theme.id] = "installed";
-              rememberCurrentRouteIndex(themeIndex);
-              setRoute({
-                screen: "page",
-                pluginId: "themes",
-                pageId: `theme-${theme.id}`,
-              });
-            },
-            {
-              disabled: state.themes.loading || state.themes.saving,
-              badge: theme.enabled ? "Active" : "Installed",
-            },
-          ),
-        ),
+            ? "Active themes stay grouped at the top. Disable one and it drops back into the Ready section below."
+            : "No installed CSSLoader themes were found. Use the Store or drop a theme into the themes folder.",
+        cards: installedThemes.length > 0
+          ? [
+              {
+                title: "Theme Library",
+                lines: [
+                  `${getInstalledThemeGroups().activeThemes.length} active - ${getInstalledThemeGroups().readyThemes.length} ready`,
+                  "Active themes are currently enabled in CSSLoader. Ready themes are installed locally and can be turned on anytime.",
+                ],
+              },
+            ]
+          : [],
+        slots: (() => {
+          if (!installedThemes.length) {
+            return [];
+          }
+
+          const { activeThemes, readyThemes } = getInstalledThemeGroups();
+          const buildThemeSlot = (theme, slotIndex) => {
+            const preview = findInstalledThemePreview(theme);
+            if (
+              !preview?.imageSrc &&
+              !hasInstalledThemePreviewRecord(theme.id) &&
+              !state.themes.loading &&
+              !state.themes.saving
+            ) {
+              void ensureInstalledThemePreview(theme);
+            }
+
+            return makeFeatureNavigationSlot(
+              theme.title,
+              theme.storeDescription || theme.description,
+              () => {
+                rememberCurrentRouteIndex(slotIndex);
+                setRoute({
+                  screen: "page",
+                  pluginId: "themes",
+                  pageId: `theme-${theme.id}`,
+                });
+              },
+              {
+                slotKey: `theme-installed-${theme.id}`,
+                leadingIcon: ThemesPluginIcon,
+                mediaImageSrc: preview?.imageSrc || "",
+                mediaImageAlt: preview?.imageAlt || `${theme.title} preview`,
+                eyebrow: `${theme.author} - ${theme.version}`,
+                meta: [
+                  theme.enabled ? "Active in CSSLoader" : "Ready in CSSLoader",
+                  `${theme.options.length} basic option${theme.options.length === 1 ? "" : "s"}`,
+                  theme.advancedControlCount
+                    ? `${theme.advancedControlCount} advanced`
+                    : `${theme.dependencyCount || 0} dependenc${theme.dependencyCount === 1 ? "y" : "ies"}`,
+                ],
+                footerLabel: "Open installed theme",
+                disabled: state.themes.loading || state.themes.saving,
+                badge: theme.enabled ? "Active" : "Ready",
+              },
+            );
+          };
+
+          return [
+            createSectionSlot(
+              "Active",
+              activeThemes.length
+                ? `${activeThemes.length} theme${activeThemes.length === 1 ? "" : "s"} currently enabled in CSSLoader.`
+                : "No themes are active right now.",
+              "themes-installed-active",
+            ),
+            ...activeThemes.map((theme, index) => buildThemeSlot(theme, index + 1)),
+            createSectionSlot(
+              "Ready",
+              readyThemes.length
+                ? "Installed locally and ready to enable. Disable an active theme and it lands back here."
+                : "Everything local is already active.",
+              "themes-installed-ready",
+              true,
+            ),
+            ...readyThemes.map((theme, index) =>
+              buildThemeSlot(theme, activeThemes.length + index + 3),
+            ),
+          ];
+        })(),
       };
     }
 
@@ -11760,42 +18603,44 @@
       state.route.pluginId === "themes" &&
       state.route.pageId === "profiles"
     ) {
+      const integration = getThemeIntegration();
       const profiles = getThemeProfilesState();
       const installedProfiles = Array.isArray(profiles?.installedProfiles) ? profiles.installedProfiles : [];
-      const browseProfiles = Array.isArray(profiles?.browseProfiles) ? profiles.browseProfiles : [];
       const selectedProfile = getThemeProfileById(profiles?.selectedProfileId);
 
       return {
         ...defaultModel,
-        title: "Themes",
-        subtitle: "Profiles",
+        title: "CSSLoader",
+        subtitle: "Presets",
         status: themesStatus,
         error: state.themes.error,
         note:
-          "Profiles capture a full theme setup so you can save your current stack, apply another one, or download a shared look later.",
+          integration?.backendReachable
+            ? "Presets capture the current CSSLoader theme stack so you can save it, switch to another setup later, or refresh an existing preset after tweaking your active themes."
+            : "CSSLoader needs to be running before TFS can read or update presets.",
         cards: selectedProfile
           ? [
               {
-                title: "Selected Profile",
+                title: "Selected Preset",
                 lines: [
                   selectedProfile.title,
                   profiles?.currentSetupMatchesSelectedProfile
-                    ? "Current setup matches this profile."
-                    : "Current setup differs from the selected profile.",
+                    ? "Current setup matches this preset."
+                    : "Current setup differs from the selected preset.",
                 ],
               },
             ]
           : [
               {
-                title: "No Selected Profile",
-                lines: ["Create or download a profile to keep reusable theme setups ready."],
+                title: "No Active Preset",
+                lines: ["Create or apply a CSSLoader preset to keep reusable theme setups ready."],
               },
             ],
         editor: {
-          label: "New Profile Name",
-          help: `Save the current installed theme stack as a reusable profile. Local themes are read from ${themesSnapshot?.localThemesFolder || "the local themes folder"}.`,
+          label: "New Preset Name",
+          help: `Save the current CSSLoader theme stack as a reusable preset. Installed themes are read from ${themesSnapshot?.localThemesFolder || "the CSSLoader themes folder"}.`,
           value: state.themes.profileDraft,
-          placeholder: "My Steam Deck Night Mode",
+          placeholder: "Living Room Default",
           inputKey: `theme-profile-name-${state.themes.profileDraftInputVersion}`,
           rows: 2,
           onInput: (value) => {
@@ -11804,11 +18649,11 @@
         },
         slots: [
           makeCommandSlot(
-            "Save Current Setup As Profile",
-            "Capture the themes you have installed right now into a reusable profile.",
+            "Save Current Setup As Preset",
+            "Capture the currently enabled CSSLoader themes into a reusable preset.",
             () => createThemeProfileFromCurrentSetup(),
             {
-              disabled: state.themes.loading || state.themes.saving,
+              disabled: state.themes.loading || state.themes.saving || !integration?.backendReachable,
             },
           ),
           ...installedProfiles.map((profile, profileIndex) =>
@@ -11816,7 +18661,6 @@
               profile.title,
               `${profile.statusText} - ${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"}`,
               () => {
-                state.themes.detailOriginByProfileId[profile.id] = "installed";
                 rememberCurrentRouteIndex(profileIndex + 1);
                 setRoute({
                   screen: "page",
@@ -11824,34 +18668,16 @@
                   pageId: `profile-${profile.id}`,
                 });
               },
-              {
-                disabled: state.themes.loading || state.themes.saving,
-                badge: profile.selected ? "Selected" : profile.matchesCurrentSetup ? "Current" : "Installed",
-              },
-            ),
+            {
+              slotKey: `theme-profile-${profile.id}`,
+              disabled: state.themes.loading || state.themes.saving,
+              badge: profile.selected ? "Selected" : profile.matchesCurrentSetup ? "Current" : "Installed",
+            },
           ),
-          ...browseProfiles.map((profile, browseIndex) =>
-            makeNavigationSlot(
-              profile.title,
-              `${profile.author} - ${profile.downloadCount.toLocaleString()} downloads - ${profile.themes.length} theme${profile.themes.length === 1 ? "" : "s"}`,
-              () => {
-                state.themes.detailOriginByProfileId[profile.id] = "browse";
-                rememberCurrentRouteIndex(installedProfiles.length + 1 + browseIndex);
-                setRoute({
-                  screen: "page",
-                  pluginId: "themes",
-                  pageId: `profile-${profile.id}`,
-                });
-              },
-              {
-                disabled: state.themes.loading || state.themes.saving,
-                badge: "Download",
-              },
-            ),
           ),
           makeCommandSlot(
-            "Refresh Catalog",
-            "Reload local themes, theme profiles, and built-in catalog entries.",
+            "Refresh CSSLoader State",
+            "Reload installed CSSLoader themes, presets, and load errors from the backend.",
             () => refreshThemesCatalog(),
             {
               disabled: state.themes.loading || state.themes.saving,
@@ -11866,56 +18692,96 @@
       state.route.pluginId === "themes" &&
       state.route.pageId === "settings"
     ) {
-      const settings = themesSnapshot?.settings;
+      const integration = getThemeIntegration();
+      const loadErrors = Array.isArray(integration?.loadErrors) ? integration.loadErrors : [];
+      const loadErrorLines = loadErrors
+        .slice(0, 3)
+        .map((entry) => `${entry.title}: ${entry.message}`);
+
+      if (loadErrors.length > 3) {
+        loadErrorLines.push(`${loadErrors.length - 3} more CSSLoader load error(s) are not shown here.`);
+      }
 
       return {
         ...defaultModel,
-        title: "Themes",
+        title: "CSSLoader",
         subtitle: "Settings",
         status: themesStatus,
         error: state.themes.error,
-        note: `These settings control how the theme framework behaves across the whole Tools for Steam shell. Local themes are loaded from ${themesSnapshot?.localThemesFolder || "the local themes folder"}.`,
+        note: "TFS defers Steam theming to the standalone CSSLoader backend. Use the actions below to install, start, and manage that backend.",
+        cards: [
+          {
+            title: "Backend Status",
+            lines: [
+              `Backend: ${integration?.backendReachable ? "Connected" : "Offline"}`,
+              `Standalone: ${integration?.backendInstalled ? "Installed" : "Missing"}`,
+              `Watch Folder: ${integration?.watchEnabled ? "Enabled" : "Disabled"}`,
+              `Theme Path: ${integration?.themePath || themesSnapshot?.localThemesFolder || "Unavailable"}`,
+              `Backend Path: ${integration?.backendPath || "Unavailable"}`,
+              `Backend Version: ${integration?.backendVersion ?? "Unknown"}`,
+            ],
+          },
+          ...(loadErrorLines.length
+            ? [
+                {
+                  title: "Load Errors",
+                  lines: loadErrorLines,
+                },
+              ]
+            : []),
+        ],
         slots: [
-          makeSettingToggleSlot(
-            "themes",
-            "theme-engine-enabled",
-            "Theme Engine Enabled",
-            "Apply active theme CSS into the current Tools for Steam surfaces.",
-            Boolean(settings?.themeEngineEnabled),
-            () => toggleThemesSetting("theme-engine-enabled"),
+          ...(!integration?.backendInstalled
+            ? [
+                makeCommandSlot(
+                  "Install CSSLoader Backend",
+                  "Download the official standalone headless backend from DeckThemes and let TFS manage it.",
+                  () => installThemesBackend(),
+                  {
+                    disabled: state.themes.loading || state.themes.saving,
+                  },
+                ),
+              ]
+            : []),
+          ...(integration?.backendInstalled && !integration?.backendReachable
+            ? [
+                makeCommandSlot(
+                  "Start CSSLoader Backend",
+                  "Launch the standalone CSSLoader backend so TFS can read live theme state again.",
+                  () => startThemesBackend(),
+                  {
+                    disabled: state.themes.loading || state.themes.saving,
+                  },
+                ),
+              ]
+            : []),
+          makeCommandSlot(
+            "Open Theme Folder",
+            "Open the CSSLoader themes folder on disk.",
+            () => openThemesFolder(),
             {
               disabled: state.themes.loading || state.themes.saving,
             },
           ),
-          makeSettingToggleSlot(
-            "themes",
-            "show-community-themes",
-            "Show Community Themes",
-            "Include community-made catalog entries in the theme store.",
-            Boolean(settings?.showCommunityThemes),
-            () => toggleThemesSetting("show-community-themes"),
-            {
-              disabled: state.themes.loading || state.themes.saving,
-            },
-          ),
-          makeSettingToggleSlot(
-            "themes",
-            "single-theme-mode",
-            "Single Theme Mode",
-            "Keep only one theme active at a time when you enable a new one.",
-            Boolean(settings?.singleThemeMode),
-            () => toggleThemesSetting("single-theme-mode"),
-            {
-              disabled: state.themes.loading || state.themes.saving,
-            },
-          ),
-          makeSettingToggleSlot(
-            "themes",
-            "auto-enable-on-install",
-            "Auto-Enable On Install",
-            "Turn a freshly installed theme on as soon as it is added.",
-            Boolean(settings?.autoEnableOnInstall),
-            () => toggleThemesSetting("auto-enable-on-install"),
+          ...(integration?.backendReachable
+            ? [
+                makeSettingToggleSlot(
+                  "themes",
+                  "watch-enabled",
+                  "Watch Theme Folder",
+                  "Let CSSLoader watch the CSSLoader themes folder and reload when files change.",
+                  Boolean(integration?.watchEnabled),
+                  () => setThemesWatchEnabled(!Boolean(integration?.watchEnabled)),
+                  {
+                    disabled: state.themes.loading || state.themes.saving,
+                  },
+                ),
+              ]
+            : []),
+          makeCommandSlot(
+            "Refresh CSSLoader State",
+            "Reload the current backend state, themes, presets, and load errors.",
+            () => refreshThemesCatalog(),
             {
               disabled: state.themes.loading || state.themes.saving,
             },
@@ -11954,6 +18820,7 @@
               setRoute(targetRoute);
             },
             {
+              slotKey: `store-sync-store-${store.id}`,
               disabled: isStoreSyncBusy(),
               badge: buildStoreSyncStoreBadge(store),
             },
@@ -12111,6 +18978,7 @@
                   setRoute(targetRoute);
                 },
                 {
+                  slotKey: `store-sync-title-${title.id}`,
                   disabled: isStoreSyncBusy(),
                   badge: buildStoreSyncPreviewBadge(previewEntry),
                 },
@@ -12130,6 +18998,613 @@
         editors: storeEditors.length ? storeEditors : null,
         dividerAfterIndex: detectedTitleSlots.length ? managementSlots.length - 1 : null,
         slots: [...managementSlots, ...detectedTitleSlots],
+      };
+    }
+
+    if (
+      state.route.screen === "plugin" &&
+      state.route.pluginId === "smart-home"
+    ) {
+      const overview = getSmartHomeOverview();
+      const settings = getSmartHomeSettings();
+      const homey = settings?.homey;
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: "Homey-first room and flow control",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: homey?.isConfigured
+          ? "Open Rooms to expand devices with power, brightness, hue, saturation, and white temperature controls. Moods and flows are ready as quick scenes."
+          : "Phase 1 uses a stored Homey Web API session token. The provider-neutral room and device UI is being shaped so Home Assistant can plug into the same foundation later.",
+        sectionHeaders: [
+          createSectionHeader(0, "Main Areas", "Jump into rooms, moods, flows, or the saved Homey connection.", {
+            icon: SmartHomePluginIcon,
+          }),
+          createSectionHeader(4, "Maintenance", "Reload the Homey snapshot after changes outside TFS.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Discovery",
+            lines: [
+              formatSmartHomeCount(overview?.zoneCount || 0, "room"),
+              formatSmartHomeCount(overview?.deviceCount || 0, "device"),
+              formatSmartHomeCount(overview?.lightCount || 0, "light"),
+              formatSmartHomeCount(overview?.flowCount || 0, "flow"),
+              formatSmartHomeCount(overview?.moodCount || 0, "mood"),
+            ],
+          },
+          {
+            title: "Connection",
+            lines: [
+              `Provider: ${settings?.activeProviderId === "homey" ? "Homey" : settings?.activeProviderId || "Homey"}`,
+              `Address: ${homey?.baseUrl || "Not saved yet"}`,
+              homey?.sessionTokenConfigured ? "Session token is stored locally." : "Session token not saved yet.",
+              homey?.statusText || "Waiting for connection details.",
+            ],
+          },
+        ],
+        slots: [
+          makeNavigationSlot(
+            "Rooms",
+            `${formatSmartHomeCount(overview?.zoneCount || 0, "room")} with discoverable devices.`,
+            () => {
+              const targetRoute = { screen: "page", pluginId: "smart-home", pageId: "rooms" };
+              requestFreshEntryForRoute(targetRoute, 0, 0);
+              setRoute(targetRoute);
+            },
+            {
+              badge: `${overview?.zoneCount || 0}`,
+              leadingIcon: SmartHomePluginIcon,
+            },
+          ),
+          makeNavigationSlot(
+            "Moods",
+            `${formatSmartHomeCount(overview?.moodCount || 0, "mood")} saved as Homey room themes.`,
+            () => {
+              const targetRoute = { screen: "page", pluginId: "smart-home", pageId: "moods" };
+              requestFreshEntryForRoute(targetRoute, 0, 0);
+              setRoute(targetRoute);
+            },
+            {
+              badge: `${overview?.moodCount || 0}`,
+              leadingIcon: SmartHomePluginIcon,
+            },
+          ),
+          makeNavigationSlot(
+            "Flows",
+            `${formatSmartHomeCount(overview?.flowCount || 0, "flow")} and quick scene trigger.`,
+            () => {
+              const targetRoute = { screen: "page", pluginId: "smart-home", pageId: "flows" };
+              requestFreshEntryForRoute(targetRoute, 0, 0);
+              setRoute(targetRoute);
+            },
+            {
+              badge: `${overview?.flowCount || 0}`,
+              leadingIcon: SmartHomePluginIcon,
+            },
+          ),
+          makeNavigationSlot(
+            "Settings",
+            "Save the Homey address, optional Homey id, and current session token.",
+            () => {
+              const targetRoute = { screen: "page", pluginId: "smart-home", pageId: "settings" };
+              requestFreshEntryForRoute(targetRoute, 0, 0);
+              setRoute(targetRoute);
+            },
+            {
+              leadingIcon: SettingsPluginIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Homey",
+            "Reload rooms, moods, devices, and flows from the active Homey connection.",
+            () => refreshSmartHome(true),
+            {
+              disabled: isSmartHomeBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "smart-home" &&
+      state.route.pageId === "rooms"
+    ) {
+      const zones = getSmartHomeZones();
+      const unassignedDevices = getSmartHomeUnassignedDevices();
+      const roomSlots = [
+        ...zones.map((zone, zoneIndex) =>
+          makeNavigationSlot(
+            zone.name,
+            buildSmartHomeRoomSummary(zone),
+            () => {
+              rememberCurrentRouteIndex(zoneIndex);
+              const targetRoute = {
+                screen: "page",
+                pluginId: "smart-home",
+                pageId: `room-${zone.id}`,
+              };
+              requestFreshEntryForRoute(targetRoute, 0, 0);
+              setRoute(targetRoute);
+            },
+            {
+              slotKey: `smart-home-room-${zone.id}`,
+              badge: `${zone.deviceCount || 0}`,
+              leadingIcon: SmartHomePluginIcon,
+            },
+          ),
+        ),
+        ...(unassignedDevices.length
+          ? [
+              makeNavigationSlot(
+                "Unassigned Devices",
+                `${formatSmartHomeCount(unassignedDevices.length, "device")} without a Homey room.`,
+                () => {
+                  const targetRoute = {
+                    screen: "page",
+                    pluginId: "smart-home",
+                    pageId: "room-unassigned",
+                  };
+                  requestFreshEntryForRoute(targetRoute, 0, 0);
+                  setRoute(targetRoute);
+                },
+                {
+                  slotKey: "smart-home-room-unassigned",
+                  badge: `${unassignedDevices.length}`,
+                  leadingIcon: SmartHomePluginIcon,
+                },
+              ),
+            ]
+          : []),
+      ];
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: "Rooms",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: roomSlots.length
+          ? "Each room opens its own expandable device list so we can keep moods, sliders, and color controls focused and controller-friendly."
+          : "No Homey rooms with devices are available yet. Save your connection first, then refresh Homey.",
+        sectionHeaders: [
+          createSectionHeader(0, "Discovered Rooms", "Open a room to expand lights, switches, and controllable devices.", {
+            icon: SmartHomePluginIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Room Summary",
+            lines: [
+              formatSmartHomeCount(zones.length, "room"),
+              formatSmartHomeCount(getSmartHomeOverview()?.deviceCount || 0, "device"),
+              formatSmartHomeCount(getSmartHomeOverview()?.moodCount || 0, "mood"),
+              unassignedDevices.length ? `${unassignedDevices.length} device${unassignedDevices.length === 1 ? "" : "s"} outside a room.` : "All discovered devices are assigned to a room.",
+            ],
+          },
+        ],
+        slots: roomSlots.length
+          ? roomSlots
+          : [
+              makeCommandSlot(
+                "Refresh Homey",
+                "Try another Homey refresh right now.",
+                () => refreshSmartHome(true),
+                {
+                  disabled: isSmartHomeBusy(),
+                },
+              ),
+            ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "smart-home" &&
+      state.route.pageId === "flows"
+    ) {
+      const flows = getSmartHomeFlows();
+      const standardFlows = flows.filter((flow) => !flow.isAdvanced);
+      const advancedFlows = flows.filter((flow) => flow.isAdvanced);
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: "Flows",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: flows.length
+          ? "Use flows as scenes: movie mode, lights off, bedtime, or whole-room changes from the controller."
+          : "No Homey flows were discovered yet.",
+        sectionHeaders: [
+          createSectionHeader(0, "Flows", "Standard Homey flows appear first.", {
+            icon: SmartHomePluginIcon,
+          }),
+          ...(advancedFlows.length
+            ? [createSectionHeader(standardFlows.length, "Advanced Flows", "Advanced flows are kept together below.", {
+                icon: SmartHomePluginIcon,
+              })]
+            : []),
+        ],
+        cards: [
+          {
+            title: "Scene Library",
+            lines: [
+              formatSmartHomeCount(standardFlows.length, "flow"),
+              formatSmartHomeCount(advancedFlows.length, "advanced flow", "advanced flows"),
+              flows.some((flow) => flow.triggerable)
+                ? "Triggerable scenes are ready."
+                : "Flows are listed, but Homey did not mark any as triggerable yet.",
+            ],
+          },
+        ],
+        slots: flows.length
+          ? flows.map((flow) =>
+              makeCommandSlot(
+                flow.name,
+                flow.description || buildSmartHomeFlowSummary(flow),
+                () => runSmartHomeFlow(flow.id, flow.isAdvanced),
+                {
+                  slotKey: `smart-home-flow-${flow.id}`,
+                  disabled: isSmartHomeBusy() || !flow.triggerable,
+                  badge: flow.badgeText || "",
+                  leadingIcon: SmartHomePluginIcon,
+                },
+              ),
+            )
+          : [
+              makeCommandSlot(
+                "Refresh Homey",
+                "Reload the flow list from Homey.",
+                () => refreshSmartHome(true),
+                {
+                  disabled: isSmartHomeBusy(),
+                },
+              ),
+            ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "smart-home" &&
+      state.route.pageId === "moods"
+    ) {
+      const moods = getSmartHomeMoods();
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: "Moods",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: moods.length
+          ? "Homey moods behave like saved room themes. Trigger one to restage multiple lamp states at once."
+          : "No Homey moods were discovered yet.",
+        sectionHeaders: [
+          createSectionHeader(0, "Moods", "Apply saved Homey room moods and lighting themes.", {
+            icon: SmartHomePluginIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Mood Library",
+            lines: [
+              formatSmartHomeCount(moods.length, "mood"),
+              moods.some((mood) => mood.zoneName)
+                ? "Room-linked moods are ready."
+                : "Moods are listed even when Homey does not attach a room name.",
+            ],
+          },
+        ],
+        slots: moods.length
+          ? moods.map((mood) =>
+              makeCommandSlot(
+                mood.name,
+                mood.description || buildSmartHomeMoodSummary(mood),
+                () => runSmartHomeMood(mood.id),
+                {
+                  slotKey: `smart-home-mood-${mood.id}`,
+                  disabled: isSmartHomeBusy(),
+                  badge: mood.badgeText || "Mood",
+                  leadingIcon: SmartHomePluginIcon,
+                },
+              ),
+            )
+          : [
+              makeCommandSlot(
+                "Refresh Homey",
+                "Reload the mood list from Homey.",
+                () => refreshSmartHome(true),
+                {
+                  disabled: isSmartHomeBusy(),
+                },
+              ),
+            ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "smart-home" &&
+      state.route.pageId === "settings"
+    ) {
+      const settings = getSmartHomeSettings();
+      const homey = settings?.homey;
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: "Settings",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: "Phase 1 is a practical Homey connection screen. The provider-neutral room, device, and slider models are already being shaped so we can bring Home Assistant and later a store-backed integration model into the same surface.",
+        sectionHeaders: [
+          createSectionHeader(0, "Connection", "Save the Homey address and a valid session token for the Web API.", {
+            icon: SmartHomePluginIcon,
+          }),
+          createSectionHeader(5, "Provider Foundation", "Homey is live first. Home Assistant is the next target on the same UI contract.", {
+            icon: SettingsPluginIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Current Homey Link",
+            lines: [
+              `Address: ${homey?.baseUrl || "Not saved yet"}`,
+              `Homey id: ${homey?.homeyId || "Optional / empty"}`,
+              homey?.sessionTokenConfigured ? "Session token is stored." : "Session token is not stored.",
+              homey?.statusText || "Waiting for connection details.",
+            ],
+          },
+          {
+            title: "Provider Roadmap",
+            lines: (Array.isArray(settings?.providers) ? settings.providers : []).map((provider) =>
+              `${provider.title}: ${provider.supported ? "Supported now" : "Planned next"}${provider.selected ? " - selected" : ""}`,
+            ),
+          },
+        ],
+        editors: [
+          {
+            label: "Homey Address or IP",
+            help: "Examples: homey.local, 192.168.1.42, or a full Homey Web API URL. TFS normalizes this before saving.",
+            value: state.smartHome.baseUrlDraft,
+            placeholder: "http://homey.local",
+            rows: 2,
+            inputKey: `smart-home-base-url-${state.smartHome.baseUrlInputVersion}`,
+            onInput: (value) => {
+              state.smartHome.baseUrlDraft = value;
+            },
+          },
+          {
+            label: "Homey Id (Optional)",
+            help: "Reserved for future pairing and provider expansion. Safe to leave blank for the first Homey phase.",
+            value: state.smartHome.homeyIdDraft,
+            placeholder: "Optional Homey id",
+            rows: 2,
+            inputKey: `smart-home-homey-id-${state.smartHome.homeyIdInputVersion}`,
+            onInput: (value) => {
+              state.smartHome.homeyIdDraft = value;
+            },
+          },
+          {
+            label: "Session Token",
+            help: "Paste the active Homey Web API session token we use for phase 1. This stays local in TFS settings.",
+            value: state.smartHome.sessionTokenDraft,
+            placeholder: "Paste Homey session token",
+            rows: 3,
+            inputKey: `smart-home-session-token-${state.smartHome.sessionTokenInputVersion}`,
+            onInput: (value) => {
+              state.smartHome.sessionTokenDraft = value;
+            },
+          },
+        ],
+        slots: [
+          makeCommandSlot(
+            "Save Address",
+            "Store the normalized Homey address used for device and flow discovery.",
+            () => saveSmartHomeBaseUrl(),
+            {
+              disabled: isSmartHomeBusy(),
+              leadingIcon: SaveActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Save Homey Id",
+            "Store the optional Homey id for later pairing work and provider expansion.",
+            () => saveSmartHomeHomeyId(),
+            {
+              disabled: isSmartHomeBusy(),
+              leadingIcon: SaveActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Save Session Token",
+            "Use this token for Homey Web API discovery and control requests.",
+            () => saveSmartHomeSessionToken(),
+            {
+              disabled: isSmartHomeBusy(),
+              leadingIcon: SaveActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Clear Session Token",
+            "Forget the saved token while keeping the Homey address and provider foundation.",
+            () => clearSmartHomeSessionToken(),
+            {
+              disabled: isSmartHomeBusy() || !homey?.sessionTokenConfigured,
+              leadingIcon: DeleteActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Connection",
+            "Test the current Homey settings and reload rooms, devices, and flows.",
+            () => refreshSmartHome(true),
+            {
+              disabled: isSmartHomeBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "smart-home" &&
+      (state.route.pageId?.startsWith("room-") || state.route.pageId === "room-unassigned")
+    ) {
+      const roomId = getSmartHomeRoomRouteId(state.route);
+      const room = roomId === "unassigned"
+        ? null
+        : getSmartHomeZone(roomId);
+      const roomMoods = room ? getSmartHomeZoneMoods(room.id) : [];
+      const devices = roomId === "unassigned"
+        ? getSmartHomeUnassignedDevices()
+        : Array.isArray(room?.devices) ? room.devices : [];
+      const sectionPrefix = roomId || "unassigned";
+      const moodSlots = roomMoods.map((mood) =>
+        makeCommandSlot(
+          mood.name,
+          mood.description || buildSmartHomeMoodSummary(mood),
+          () => runSmartHomeMood(mood.id),
+          {
+            slotKey: `smart-home-room-mood-${mood.id}`,
+            disabled: isSmartHomeBusy(),
+            badge: mood.badgeText || "Mood",
+            leadingIcon: SmartHomePluginIcon,
+          },
+        ),
+      );
+      const deviceSlots = devices.flatMap((device) => {
+        const expandedSectionKey = `smart-home-device-${sectionPrefix}-${device.id}`;
+        const expanded = isExpandedSection(expandedSectionKey, false);
+        const headerSlot = makeAccordionSlot(
+          device.name,
+          buildSmartHomeDeviceCopy(device),
+          expanded,
+          () => {
+            toggleExpandedSection(expandedSectionKey, false);
+            rerenderSmartHomePanel();
+          },
+          {
+            slotKey: `smart-home-device-${device.id}`,
+            badge: !device.available ? "Offline" : device.isOn ? "On" : "Off",
+            leadingIcon: SmartHomePluginIcon,
+            swatchHex: device.swatchHex || "",
+            swatchLabel: buildSmartHomeDeviceSwatchLabel(device),
+          },
+        );
+
+        if (!expanded) {
+          return [headerSlot];
+        }
+
+        const controls = Array.isArray(device.controls) ? device.controls : [];
+        const controlSlots = controls.length
+          ? controls.map((control) => {
+              if (control.kind === "switch") {
+                return makeSettingToggleSlot(
+                  "smart-home",
+                  `${device.id}:${control.capabilityId}`,
+                  control.title,
+                  control.copy,
+                  Boolean(control.booleanValue),
+                  () => toggleSmartHomeDevicePower(device.id, control.booleanValue),
+                  {
+                    disabled: isSmartHomeBusy() || !control.enabled,
+                    badge: control.booleanValue ? "On" : "Off",
+                    leadingIcon: SmartHomePluginIcon,
+                  },
+                );
+              }
+
+              const sliderStyle = buildSmartHomeSliderStyle(device, control);
+              return createRichValueSliderSlot({
+                title: control.title,
+                copy: control.copy,
+                hint: "Use Left / Right to adjust this value. Homey sends it after a short pause.",
+                slotKey: `smart-home-control-${device.id}-${control.capabilityId}`,
+                min: control.min ?? 0,
+                max: control.max ?? 100,
+                step: control.step ?? 5,
+                disabled: isSmartHomeBusy() || !control.enabled,
+                trackStyle: sliderStyle.trackStyle,
+                fillStyle: sliderStyle.fillStyle,
+                thumbStyle: sliderStyle.thumbStyle,
+                getValue: () => getSmartHomeControl(device.id, control.capabilityId)?.numericValue ?? control.numericValue,
+                displayValue: (value) => formatSmartHomeSliderValue(control.accent, value),
+                onAdjust: (direction) => {
+                  stepSmartHomeCapability(device.id, control.capabilityId, direction);
+                },
+              });
+            })
+          : [
+              makeCommandSlot(
+                "No Quick Controls Yet",
+                "This Homey device was discovered, but phase 1 does not expose one of its capabilities yet.",
+                () => {},
+                {
+                  disabled: true,
+                  leadingIcon: SmartHomePluginIcon,
+                },
+              ),
+            ];
+
+        return [headerSlot, ...controlSlots];
+      });
+
+      return {
+        ...defaultModel,
+        title: "Homey",
+        subtitle: roomId === "unassigned" ? "Unassigned Devices" : room?.name || "Room",
+        status: resolveSmartHomeStatusText(),
+        error: getSmartHomeErrorText(),
+        note: roomId === "unassigned"
+          ? "These devices are available from Homey but are not mapped to a room right now."
+          : `${room?.path || room?.name || "Room"} - expand a device to reach power, color, and brightness controls.`,
+        sectionHeaders: [
+          ...(moodSlots.length
+            ? [createSectionHeader(0, "Moods", "Apply the saved Homey room themes before fine-tuning devices.", {
+                icon: SmartHomePluginIcon,
+              })]
+            : []),
+          createSectionHeader(moodSlots.length, "Devices", "Expand a device to reveal the available quick controls.", {
+            icon: SmartHomePluginIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: roomId === "unassigned" ? "Unassigned Devices" : room?.name || "Room",
+            lines: [
+              room ? buildSmartHomeRoomSummary(room) : formatSmartHomeCount(devices.length, "device"),
+              roomMoods.length ? formatSmartHomeCount(roomMoods.length, "mood") : null,
+              room?.path && room?.path !== room?.name ? `Path: ${room.path}` : null,
+              devices.some((device) => device.supportsColor)
+                ? "Color-capable lamps show their current swatch directly in the list."
+                : "Expand a device to reach its supported quick controls.",
+            ].filter(Boolean),
+          },
+        ],
+        slots: moodSlots.length || deviceSlots.length
+          ? [...moodSlots, ...deviceSlots]
+          : [
+              makeCommandSlot(
+                "Refresh Homey",
+                "Reload this room from Homey.",
+                () => refreshSmartHome(true),
+                {
+                  disabled: isSmartHomeBusy(),
+                },
+              ),
+            ],
       };
     }
 
@@ -12164,7 +19639,7 @@
               : plugin.id === "hltb"
                 ? "Use Settings to choose which HowLongToBeat values appear on the open game page."
               : plugin.id === "themes"
-                ? "Use Store, Installed, Profiles, and Settings to build up a reusable Tools for Steam theme library."
+                ? "Use Installed Themes, Store, Presets, and Settings to control CSSLoader from Quick Access."
                 : plugin.id === "settings"
                   ? "General Tools for Steam options live here, separate from plugin-specific settings."
                   : "",
@@ -12201,6 +19676,10 @@
         ? formatUpdateInstallStatus(updateSnapshot)
       : updateReady
         ? getUpdateHeadline(updateSnapshot)
+      : state.communityPlugins.loading
+        ? "Loading community plugins..."
+      : state.communityPlugins.error
+        ? state.communityPlugins.error
         : "";
     const homeDebugNote = getDeveloperDebugNote("home-reorder", "waiting for Y input...");
     const homeNote = state.homeReorder.active
@@ -12249,6 +19728,21 @@
               },
             ]
           : []),
+        {
+          title: "Store",
+          icon: HeaderStoreIcon,
+          disabled: state.homeReorder.active || state.generalSettings.saving,
+          buttonStyle: {
+            width: "30px",
+            height: "30px",
+            minWidth: "30px",
+            minHeight: "30px",
+            padding: "0",
+          },
+          onClick: () => {
+            void openPluginStoreOverlay();
+          },
+        },
         {
           title: "Settings",
           icon: HeaderSettingsIcon,
@@ -12351,8 +19845,9 @@
   function setRoute(route) {
     const previousRoute = state.route;
     const previousRouteKey = getRouteKey(previousRoute);
-    const currentScrollTop = getPanelScrollContainer()?.scrollTop;
-    if (Number.isFinite(currentScrollTop)) {
+    const currentPanel = getPanelScrollContainer();
+    const currentScrollTop = currentPanel?.scrollTop;
+    if (Number.isFinite(currentScrollTop) && hasPanelLayout(currentPanel)) {
       state.lastScrollTopByRoute[previousRouteKey] = Math.max(0, currentScrollTop);
     }
 
@@ -12361,16 +19856,26 @@
     }
 
     const nextRouteKey = getRouteKey(route);
+    const shouldFocusGlobalBackOnEntry =
+      previousRouteKey !== nextRouteKey &&
+      route?.screen !== "root" &&
+      Boolean(getBackNavigation(route));
     const hasExplicitScrollRestore =
       state.pendingScrollRouteKey === nextRouteKey &&
       Number.isFinite(state.pendingScrollTop);
-    if (!hasExplicitScrollRestore) {
+    if (!hasExplicitScrollRestore && !shouldFocusGlobalBackOnEntry) {
       requestScrollRestoreForRoute(
         route,
         previousRouteKey === nextRouteKey && Number.isFinite(currentScrollTop)
           ? currentScrollTop
           : null,
       );
+    }
+
+    if (shouldFocusGlobalBackOnEntry) {
+      requestFreshEntryForRoute(route, 0, 0, globalBackSlotKey);
+    } else {
+      requestRouteEntryFocus(route);
     }
 
     if (state.homeReorder.active && route.screen !== "root") {
@@ -12404,12 +19909,20 @@
       route.pluginId === "performance" &&
       (route.pageId === "overlay" || route.pageId === "tfs-overlay");
 
-    state.audio.pendingVolumeActionAutoFocus = isAudioVolumePage;
+    if (previousRouteKey !== nextRouteKey) {
+      state.audio.pendingVolumeActionAutoFocus = isAudioVolumePage;
+    } else if (!isAudioVolumePage) {
+      state.audio.pendingVolumeActionAutoFocus = false;
+    }
     if (state.audio.pendingVolumeActionAutoFocus) {
       state.audio.activeVolumeActionIndex = 0;
     }
 
-    state.performance.pendingSliderAutoFocus = isPerformanceOverlayPage;
+    if (previousRouteKey !== nextRouteKey) {
+      state.performance.pendingSliderAutoFocus = isPerformanceOverlayPage;
+    } else if (!isPerformanceOverlayPage) {
+      state.performance.pendingSliderAutoFocus = false;
+    }
 
     if (!isAudioVolumePage && state.audio.sliderEditActive) {
       finishVolumeSliderEditing(false);
@@ -12515,6 +20028,15 @@
     }
 
     if (
+      route.pluginId === "smart-home" &&
+      !state.smartHome.loading &&
+      !state.smartHome.snapshot &&
+      !state.smartHome.error
+    ) {
+      void loadSmartHomeState();
+    }
+
+    if (
       route.pluginId === "processes" &&
       !state.processes.loading &&
       !state.processes.snapshot &&
@@ -12577,11 +20099,13 @@
     updateProcessesPolling();
     updateAudioMixerPolling();
     updateStoreSyncPolling();
+    updateSmartHomePolling();
     updateUpdatesPolling();
     updateHomeReorderInputCapture();
 
     refreshQuickAccessPanel();
     queuePendingScrollRestore();
+    queuePendingFocusRestore(state.route);
   }
 
   async function loadAudioVolume() {
@@ -12655,7 +20179,9 @@
       }
 
       state.audio.devices = Array.isArray(payload) ? payload : [];
-      await loadAudioVolume();
+      if (!hasConnectedLiveUpdates()) {
+        await loadAudioDashboardState({ showLoading: false });
+      }
     } catch (error) {
       state.audio.error = error instanceof Error ? error.message : String(error);
     } finally {
@@ -12694,6 +20220,9 @@
       }
 
       state.audio.captureDevices = Array.isArray(payload) ? payload : [];
+      if (!hasConnectedLiveUpdates()) {
+        await loadAudioDashboardState({ showLoading: false });
+      }
     } catch (error) {
       state.audio.error = error instanceof Error ? error.message : String(error);
     } finally {
@@ -12712,7 +20241,11 @@
     state.audio.volumeMutationSequence = requestId;
     state.audio.volumeLoading = true;
     state.audio.volumeError = "";
-    refreshAudioVolumePanel();
+    if (isAudioDashboardRoute()) {
+      refreshAudioDashboardUi();
+    } else {
+      refreshAudioVolumePanel();
+    }
 
     try {
       const response = await fetch(`${apiBase}${path}`, {
@@ -12729,19 +20262,25 @@
       }
 
       if (requestId === state.audio.volumeMutationSequence) {
-        state.audio.volumeInfo =
-          responsePayload && typeof responsePayload === "object" ? responsePayload : null;
+        const responseVolume = snapVolumeToStep(responsePayload?.volume);
+        if (canApplyOptimisticResponse("audio.playback.volume", responseVolume)) {
+          state.audio.volumeInfo =
+            responsePayload && typeof responsePayload === "object" ? responsePayload : null;
+          clearOptimisticDesiredValue("audio.playback.volume", responseVolume);
+        }
       }
     } catch (error) {
       if (requestId === state.audio.volumeMutationSequence) {
         state.audio.volumeError = error instanceof Error ? error.message : String(error);
+        clearOptimisticDesiredValue("audio.playback.volume");
       }
     } finally {
       if (requestId === state.audio.volumeMutationSequence) {
         state.audio.volumeLoading = false;
-        refreshAudioVolumePanel();
         if (isAudioDashboardRoute()) {
-          rerenderAudioDashboard();
+          refreshAudioDashboardUi();
+        } else {
+          refreshAudioVolumePanel();
         }
       }
     }
@@ -12749,6 +20288,7 @@
 
   async function setVolume(volume) {
     const nextValue = snapVolumeToStep(volume);
+    setOptimisticDesiredValue("audio.playback.volume", nextValue);
     const info = state.audio.volumeInfo;
     if (info) {
       state.audio.volumeInfo = {
@@ -12757,7 +20297,7 @@
         isMuted: nextValue <= 0 ? true : false,
       };
       if (isAudioDashboardRoute()) {
-        rerenderAudioDashboard();
+        refreshAudioDashboardUi();
       } else {
         refreshAudioVolumePanel();
       }
@@ -12774,7 +20314,7 @@
         isMuted: !info.isMuted,
       };
       if (isAudioDashboardRoute()) {
-        rerenderAudioDashboard();
+        refreshAudioDashboardUi();
       } else {
         refreshAudioVolumePanel({ fullRender: true });
       }
@@ -12789,7 +20329,7 @@
     state.audio.captureVolumeLoading = true;
     state.audio.captureVolumeError = "";
     if (isAudioDashboardRoute()) {
-      rerenderAudioDashboard();
+      refreshAudioDashboardUi();
     }
 
     try {
@@ -12807,18 +20347,23 @@
       }
 
       if (requestId === state.audio.captureVolumeMutationSequence) {
-        state.audio.captureVolumeInfo =
-          responsePayload && typeof responsePayload === "object" ? responsePayload : null;
+        const responseVolume = snapVolumeToStep(responsePayload?.volume);
+        if (canApplyOptimisticResponse("audio.capture.volume", responseVolume)) {
+          state.audio.captureVolumeInfo =
+            responsePayload && typeof responsePayload === "object" ? responsePayload : null;
+          clearOptimisticDesiredValue("audio.capture.volume", responseVolume);
+        }
       }
     } catch (error) {
       if (requestId === state.audio.captureVolumeMutationSequence) {
         state.audio.captureVolumeError = error instanceof Error ? error.message : String(error);
+        clearOptimisticDesiredValue("audio.capture.volume");
       }
     } finally {
       if (requestId === state.audio.captureVolumeMutationSequence) {
         state.audio.captureVolumeLoading = false;
         if (isAudioDashboardRoute()) {
-          rerenderAudioDashboard();
+          refreshAudioDashboardUi();
         }
       }
     }
@@ -12826,6 +20371,7 @@
 
   async function setCaptureVolume(volume) {
     const nextValue = snapVolumeToStep(volume);
+    setOptimisticDesiredValue("audio.capture.volume", nextValue);
     const info = state.audio.captureVolumeInfo;
     if (info) {
       state.audio.captureVolumeInfo = {
@@ -12834,7 +20380,7 @@
         isMuted: nextValue <= 0 ? true : false,
       };
       if (isAudioDashboardRoute()) {
-        rerenderAudioDashboard();
+        refreshAudioDashboardUi();
       }
     }
 
@@ -12849,7 +20395,7 @@
         isMuted: !info.isMuted,
       };
       if (isAudioDashboardRoute()) {
-        rerenderAudioDashboard();
+        refreshAudioDashboardUi();
       }
     }
 
@@ -12858,10 +20404,7 @@
 
   function rerenderAudioDashboard() {
     if (isAudioDashboardRoute()) {
-      const currentRoute = { ...state.route };
-      const focusedIndex = getFocusedSlotIndex();
-      requestFocusForRoute(currentRoute, focusedIndex);
-      setRoute(currentRoute);
+      renderPanelDataRefresh();
       return;
     }
 
@@ -12885,20 +20428,16 @@
       }
 
       const payload = await response.json();
-      state.audio.volumeInfo = payload?.playbackVolume || null;
-      state.audio.captureVolumeInfo = payload?.captureVolume || null;
-      state.audio.devices = Array.isArray(payload?.playbackDevices) ? payload.playbackDevices : [];
-      state.audio.captureDevices = Array.isArray(payload?.captureDevices) ? payload.captureDevices : [];
-      state.audio.mixerSessions = sortAudioMixerSessions(Array.isArray(payload?.mixerSessions) ? payload.mixerSessions : []);
-      state.audio.volumeError = "";
-      state.audio.captureVolumeError = "";
-      state.audio.mixerError = "";
-      state.audio.error = "";
+      applyAudioDashboardSnapshotIfCurrent(payload);
     } catch (error) {
       state.audio.dashboardError = error instanceof Error ? error.message : String(error);
     } finally {
       state.audio.dashboardLoading = false;
-      rerenderAudioDashboard();
+      if (showLoading) {
+        rerenderAudioDashboard();
+      } else {
+        refreshAudioDashboardUi();
+      }
     }
   }
 
@@ -12931,7 +20470,6 @@
     }
 
     await setDefaultDevice(nextDevice.id);
-    await loadAudioDashboardState({ showLoading: false });
   }
 
   async function cycleCaptureDevice(direction = 1) {
@@ -12948,7 +20486,6 @@
     }
 
     await setDefaultCaptureDevice(nextDevice.id);
-    await loadAudioDashboardState({ showLoading: false });
   }
 
   async function loadAudioMixerSessions(options = {}) {
@@ -12975,7 +20512,11 @@
       }
     } finally {
       state.audio.mixerLoading = false;
-      rerenderAudioMixerPanel();
+      if (showLoading) {
+        rerenderAudioMixerPanel();
+      } else {
+        refreshAudioMixerUi();
+      }
     }
   }
 
@@ -12985,6 +20526,7 @@
     }
 
     const nextValue = snapAudioMixerVolumeToStep(volume);
+    setOptimisticDesiredValue(`audio.mixer.${sessionId}.volume`, nextValue);
     const requestId = (state.audio.mixerMutationSequenceById[sessionId] || 0) + 1;
     state.audio.mixerMutationSequenceById[sessionId] = requestId;
     state.audio.mixerError = "";
@@ -12992,7 +20534,7 @@
     if (options.optimistic !== false) {
       previewAudioMixerSessionVolume(sessionId, nextValue);
     } else {
-      rerenderAudioMixerPanel();
+      refreshAudioMixerUi();
     }
 
     try {
@@ -13010,17 +20552,22 @@
       }
 
       if (requestId === state.audio.mixerMutationSequenceById[sessionId]) {
-        upsertAudioMixerSession(payload && typeof payload === "object" ? payload : null);
+        const responseVolume = snapAudioMixerVolumeToStep(payload?.volume ?? nextValue);
+        if (canApplyOptimisticResponse(`audio.mixer.${sessionId}.volume`, responseVolume)) {
+          upsertAudioMixerSession(payload && typeof payload === "object" ? payload : null);
+          clearOptimisticDesiredValue(`audio.mixer.${sessionId}.volume`, responseVolume);
+        }
       }
     } catch (error) {
       if (requestId === state.audio.mixerMutationSequenceById[sessionId]) {
         state.audio.mixerError = error instanceof Error ? error.message : String(error);
+        clearOptimisticDesiredValue(`audio.mixer.${sessionId}.volume`);
       }
 
       void loadAudioMixerSessions({ showLoading: false });
     } finally {
       if (requestId === state.audio.mixerMutationSequenceById[sessionId]) {
-        rerenderAudioMixerPanel();
+        refreshAudioMixerUi();
       }
     }
   }
@@ -13041,7 +20588,7 @@
         ...session,
         isMuted: !session.isMuted,
       });
-      rerenderAudioMixerPanel();
+      refreshAudioMixerUi();
     }
 
     try {
@@ -13069,7 +20616,7 @@
       void loadAudioMixerSessions({ showLoading: false });
     } finally {
       if (requestId === state.audio.mixerMutationSequenceById[sessionId]) {
-        rerenderAudioMixerPanel();
+        refreshAudioMixerUi();
       }
     }
   }
@@ -13196,19 +20743,344 @@
     return getAppStartSnapshot()?.statusText || "Add apps to launch them from Steam.";
   }
 
+  function supportsLiveUpdates() {
+    return typeof EventSource === "function";
+  }
+
+  function hasConnectedLiveUpdates() {
+    return supportsLiveUpdates() && state.liveUpdates.connected;
+  }
+
+  function shouldUseLiveUpdatePollingFallback() {
+    return !supportsLiveUpdates() || !hasConnectedLiveUpdates();
+  }
+
+  function clearLiveUpdateRetryTimer() {
+    if (state.liveUpdates.retryTimer) {
+      window.clearTimeout(state.liveUpdates.retryTimer);
+      state.liveUpdates.retryTimer = 0;
+    }
+  }
+
+  function closeLiveUpdateSource() {
+    const source = state.liveUpdates.source;
+    if (source) {
+      source.onopen = null;
+      source.onmessage = null;
+      source.onerror = null;
+
+      try {
+        source.close();
+      } catch {
+      }
+    }
+
+    state.liveUpdates.source = null;
+    state.liveUpdates.connected = false;
+  }
+
+  function scheduleLiveUpdateReconnect(delayMs = 3000) {
+    if (!supportsLiveUpdates() || state.liveUpdates.retryTimer || state.liveUpdates.source) {
+      return;
+    }
+
+    state.liveUpdates.retryTimer = window.setTimeout(() => {
+      state.liveUpdates.retryTimer = 0;
+      ensureLiveUpdateConnection();
+    }, delayMs);
+  }
+
+  function refreshLiveUpdatePollingFallbacks() {
+    updateProcessesPolling();
+    updateAudioMixerPolling();
+    updateStoreSyncPolling();
+    updateSmartHomePolling();
+    updateUpdatesPolling();
+  }
+
+  function isUpdatesVisibleRoute() {
+    return (
+      state.route?.screen === "root" ||
+      (state.route?.screen === "page" &&
+        state.route?.pluginId === "settings" &&
+        state.route?.pageId === "updates")
+    );
+  }
+
+  function isGeneralSettingsVisibleRoute(route = state.route) {
+    return route?.pluginId === "settings" || route?.screen === "root";
+  }
+
+  function refreshCurrentLiveRouteState() {
+    if (!state.panelVisible) {
+      return;
+    }
+
+    if (state.route?.pluginId === "processes") {
+      if (!state.processes.loading && !state.processes.activating) {
+        void loadProcessesState({ showLoading: false });
+      }
+      return;
+    }
+
+    if (state.route?.pluginId === "audio") {
+      if (
+        isAudioDashboardRoute() &&
+        !state.audio.dashboardLoading &&
+        !state.audio.volumeLoading &&
+        !state.audio.captureVolumeLoading &&
+        !hasPendingAudioMixerCommits() &&
+        !state.audio.volumeCommitTimer &&
+        !state.audio.captureVolumeCommitTimer
+      ) {
+        void loadAudioDashboardState({ showLoading: false });
+      } else if (isAudioMixerRoute() && !state.audio.mixerLoading && !hasPendingAudioMixerCommits()) {
+        void loadAudioMixerSessions({ showLoading: false });
+      }
+      return;
+    }
+
+    if (state.route?.pluginId === "store-sync") {
+      if (!isStoreSyncBusy() && !hasRouteTextInputFocus()) {
+        void loadStoreSyncState({ showLoading: false, preserveDrafts: true });
+      }
+      return;
+    }
+
+    if (state.route?.pluginId === "performance") {
+      if (!isPerformanceBusy()) {
+        void loadPerformanceState({ showLoading: false });
+      }
+      return;
+    }
+
+    if (state.route?.pluginId === "app-start") {
+      if (!isAppStartBusy()) {
+        void loadAppStartState({ showLoading: false });
+      }
+      return;
+    }
+
+    if (state.route?.pluginId === "smart-home") {
+      if (!isSmartHomeBusy()) {
+        void loadSmartHomeState({ force: false, showLoading: false });
+      }
+      return;
+    }
+
+    if (isGeneralSettingsVisibleRoute()) {
+      if (!state.generalSettings.loading && !state.generalSettings.saving) {
+        void loadGeneralSettingsState({ showLoading: false });
+      }
+
+      if (isUpdatesVisibleRoute() && !state.updates.loading && !state.updates.saving) {
+        void loadUpdateState({ force: false, showLoading: false });
+      }
+      return;
+    }
+
+    if (isUpdatesVisibleRoute() && getUpdateSnapshot()?.installInProgress) {
+      if (!state.updates.loading && !state.updates.saving) {
+        void loadUpdateState({ force: false, showLoading: false });
+      }
+    }
+  }
+
+  function applyLiveUpdatePayload(topic, payload) {
+    if (!isSnapshotObject(payload)) {
+      return false;
+    }
+
+    switch (topic) {
+      case "audio.dashboard":
+      case "audio.mixer":
+      applyAudioDashboardSnapshotIfCurrent(payload);
+        if (state.panelVisible && state.route?.pluginId === "audio") {
+          if (isSystemVolumeRoute()) {
+            refreshAudioVolumePanel();
+          } else if (isAudioDashboardRoute()) {
+            refreshAudioDashboardUi();
+          } else if (isAudioMixerRoute()) {
+            refreshAudioMixerUi();
+          } else {
+            rerenderAudioDashboard();
+          }
+        }
+        return true;
+      case "processes.state":
+        setProcessesSnapshot(payload);
+        if (state.panelVisible && state.route?.pluginId === "processes") {
+          rerenderProcessesPanel();
+        }
+        return true;
+      case "store-sync.state": {
+        const preserveDrafts = hasRouteTextInputFocus() || isStoreSyncBusy();
+        setStoreSyncSnapshot(payload, {
+          preserveDrafts,
+          forceDraftSync: !preserveDrafts,
+        });
+        if (state.panelVisible && state.route?.pluginId === "store-sync" && !hasRouteTextInputFocus()) {
+          rerenderStoreSyncPanel();
+        }
+        return true;
+      }
+      case "settings.state": {
+        setGeneralSettingsSnapshot(payload, {
+          forceDraftSync: !hasRouteTextInputFocus(),
+        });
+        if (state.panelVisible && isGeneralSettingsVisibleRoute()) {
+          rerenderGeneralSettingsPanel();
+        }
+        return true;
+      }
+      case "plugin-store.state":
+        void loadCommunityPluginsState({ showLoading: false });
+        if (state.panelVisible && state.route?.screen === "root") {
+          rerenderHomePanel();
+        }
+
+        return true;
+      case "updates.state":
+        setUpdateSnapshot(payload);
+        updateUpdatesPolling();
+        if (state.panelVisible && isUpdatesVisibleRoute()) {
+          rerenderGeneralSettingsPanel();
+        }
+        return true;
+      case "performance.state": {
+        const shouldUseLiveRefresh =
+          shouldSyncLivePerformancePanel() ||
+          (isPerformanceOverlayRoute() && state.performance.suppressNextLivePanelRerender);
+        if (!applyPerformanceSnapshotIfCurrent(payload)) {
+          return true;
+        }
+
+        state.performance.suppressNextLivePanelRerender = false;
+        if (state.panelVisible && state.route?.pluginId === "performance") {
+          if (shouldUseLiveRefresh) {
+            refreshPerformancePanel();
+          } else {
+            rerenderPerformancePanel();
+          }
+        }
+        return true;
+      }
+      case "app-start.state":
+        setAppStartSnapshot(payload);
+        if (state.panelVisible && state.route?.pluginId === "app-start") {
+          rerenderAppStartPanel();
+        }
+        return true;
+      case "smart-home.state":
+        setSmartHomeSnapshot(payload, {
+          forceDraftSync: !hasRouteTextInputFocus(),
+        });
+        if (state.panelVisible && state.route?.pluginId === "smart-home") {
+          rerenderSmartHomePanel();
+        }
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  function handleLiveUpdateMessage(message) {
+    const topic = typeof message?.topic === "string" ? message.topic : "";
+    if (!topic) {
+      return;
+    }
+
+    if (applyLiveUpdatePayload(topic, message?.payload)) {
+      return;
+    }
+
+    switch (topic) {
+      case "audio.dashboard":
+      case "audio.mixer":
+      case "processes.state":
+      case "store-sync.state":
+      case "updates.state":
+      case "settings.state":
+      case "performance.state":
+      case "app-start.state":
+      case "smart-home.state":
+      case "plugin-store.state":
+        refreshCurrentLiveRouteState();
+        return;
+      default:
+        return;
+    }
+  }
+
+  function ensureLiveUpdateConnection() {
+    if (!supportsLiveUpdates() || state.liveUpdates.source) {
+      return;
+    }
+
+    clearLiveUpdateRetryTimer();
+
+    try {
+      const source = new EventSource(`${apiBase}api/events`);
+      state.liveUpdates.source = source;
+      state.liveUpdates.connected = false;
+
+      source.onopen = () => {
+        if (state.liveUpdates.source !== source) {
+          return;
+        }
+
+        state.liveUpdates.connected = true;
+        refreshLiveUpdatePollingFallbacks();
+        refreshCurrentLiveRouteState();
+      };
+
+      source.onmessage = (event) => {
+        if (state.liveUpdates.source !== source) {
+          return;
+        }
+
+        state.liveUpdates.connected = true;
+        state.liveUpdates.lastMessageAt = Date.now();
+
+        try {
+          handleLiveUpdateMessage(JSON.parse(event.data));
+        } catch {
+        }
+      };
+
+      source.onerror = () => {
+        if (state.liveUpdates.source !== source) {
+          return;
+        }
+
+        state.liveUpdates.connected = false;
+        refreshLiveUpdatePollingFallbacks();
+
+        if (source.readyState === EventSource.CLOSED) {
+          closeLiveUpdateSource();
+          scheduleLiveUpdateReconnect();
+        }
+      };
+    } catch {
+      state.liveUpdates.connected = false;
+      refreshLiveUpdatePollingFallbacks();
+      scheduleLiveUpdateReconnect(5000);
+    }
+  }
+
   function updateProcessesPolling() {
     if (window.__steamToolsProcessesPollTimer) {
       window.clearInterval(window.__steamToolsProcessesPollTimer);
       window.__steamToolsProcessesPollTimer = null;
     }
 
-    if (state.route.pluginId !== "processes") {
+    if (state.route.pluginId !== "processes" || !shouldUseLiveUpdatePollingFallback()) {
       return;
     }
 
     window.__steamToolsProcessesPollTimer = window.setInterval(() => {
       if (!state.processes.loading && !state.processes.activating) {
-        void loadProcessesState();
+        void loadProcessesState({ showLoading: false });
       }
     }, 2500);
   }
@@ -13219,7 +21091,7 @@
       window.__steamToolsAudioMixerPollTimer = null;
     }
 
-    if (state.route?.pluginId !== "audio") {
+    if (state.route?.pluginId !== "audio" || !shouldUseLiveUpdatePollingFallback()) {
       return;
     }
 
@@ -13251,7 +21123,7 @@
       window.__steamToolsStoreSyncPollTimer = null;
     }
 
-    if (state.route?.pluginId !== "store-sync") {
+    if (state.route?.pluginId !== "store-sync" || !shouldUseLiveUpdatePollingFallback()) {
       return;
     }
 
@@ -13261,10 +21133,27 @@
     }
 
     window.__steamToolsStoreSyncPollTimer = window.setInterval(() => {
-      if (!isStoreSyncBusy()) {
+      if (!isStoreSyncBusy() && !hasRouteTextInputFocus()) {
         void loadStoreSyncState({ showLoading: false, preserveDrafts: true });
       }
     }, 10000);
+  }
+
+  function updateSmartHomePolling() {
+    if (window.__steamToolsSmartHomePollTimer) {
+      window.clearInterval(window.__steamToolsSmartHomePollTimer);
+      window.__steamToolsSmartHomePollTimer = null;
+    }
+
+    if (state.route?.pluginId !== "smart-home" || !shouldUseLiveUpdatePollingFallback()) {
+      return;
+    }
+
+    window.__steamToolsSmartHomePollTimer = window.setInterval(() => {
+      if (!isSmartHomeBusy() && !hasRouteTextInputFocus()) {
+        void loadSmartHomeState({ force: false, showLoading: false });
+      }
+    }, 6000);
   }
 
   async function switchDisplayMode(mode) {
@@ -13392,10 +21281,23 @@
       } catch {
       }
     }
+
+    if (state.pendingScrollRouteKey === getRouteKey(state.route)) {
+      queuePendingScrollRestore();
+    }
+
+    queuePendingFocusRestore(state.route);
   }
 
   function refreshQuickAccessPanel() {
     install();
+  }
+
+  function createInstalledPanelElement(panelKey, revision = state.renderRevision) {
+    return createElement(SteamLoaderPanelShell, {
+      key: panelKey,
+      __steamLoaderRevision: revision,
+    });
   }
 
   function isInjectedTabElement(element, type) {
@@ -13418,14 +21320,40 @@
       changed = true;
     }
 
-    const panelRevision = tab.panel?.props?.__steamLoaderRevision;
-    if (!isInjectedTabElement(tab.panel, SteamLoaderPanelShell) || panelRevision !== state.renderRevision) {
-      tab.panel = createElement(
-        SteamLoaderPanelShell,
-        { __steamLoaderRevision: state.renderRevision },
-        `steamloader-panel-${state.renderRevision}`,
-      );
+    // Use persistent state to determine what's actually installed in the React tree.
+    // We cannot rely on tab.panel.key because soundtrackTab is a fresh object on every
+    // Steam re-render — tab.panel is always undefined from Steam's perspective.
+    const currentRouteKey = getRouteKey(state.route);
+    const expectedPanelKey = `steamloader-panel-${currentRouteKey}`;
+    const isRouteChange = state.installedPanelKey !== expectedPanelKey;
+    const isRevisionChange = state.installedPanelRevision !== state.renderRevision;
+
+    if (isRouteChange) {
+      // Route changed or first injection: prepare scroll/focus state, then mount fresh panel.
+      preparePanelReplacement();
+      state.installedPanelKey = expectedPanelKey;
+      state.installedPanelRevision = state.renderRevision;
+      state.installedPanelElement = createInstalledPanelElement(expectedPanelKey, state.renderRevision);
+      tab.panel = state.installedPanelElement;
       changed = true;
+      queuePendingScrollRestore();
+      queuePendingFocusRestore(state.route);
+      queuePendingEditorFocusRestore();
+    } else if (isRevisionChange) {
+      // Same route, SteamLoader state changed: update props, keep same key.
+      // React reconciles (DOM-diff) — no unmount, no flicker, focus preserved.
+      state.installedPanelRevision = state.renderRevision;
+      state.installedPanelElement = createInstalledPanelElement(expectedPanelKey, state.renderRevision);
+      tab.panel = state.installedPanelElement;
+      changed = true;
+    } else {
+      // Steam's own re-render (clock tick, notification, etc.) with no SteamLoader state
+      // change. Reuse the existing panel element so React can keep the subtree stable.
+      if (!state.installedPanelElement) {
+        state.installedPanelElement = createInstalledPanelElement(expectedPanelKey, state.renderRevision);
+      }
+      tab.panel = state.installedPanelElement;
+      // changed stays false — prevents a redundant invalidate() call.
     }
 
     tab.className = "";
@@ -13485,10 +21413,14 @@
     applyActiveThemeCss();
     cleanupLegacyNodes();
     captureNativeUi();
+    ensureLiveUpdateConnection();
+    setupPluginStoreBridge();
     ensureVolumeSliderHotkeys();
     ensureAudioDashboardHotkeys();
     ensurePerformanceSliderHotkeys();
     ensureHomeReorderHotkeys();
+    ensureFocusRepairTimer();
+    ensureFocusRepairHandler();
     updateHomeReorderInputCapture();
 
     if (shouldLoadFrontendComponentRegistry()) {
@@ -13501,6 +21433,10 @@
 
     if (!state.generalSettings.loading && !state.generalSettings.snapshot && !state.generalSettings.error) {
       void loadGeneralSettingsState();
+    }
+
+    if (!state.communityPlugins.loading && !state.communityPlugins.snapshot && !state.communityPlugins.error) {
+      void loadCommunityPluginsState({ showLoading: false });
     }
 
     if (!state.updates.loading && !state.updates.snapshot && !state.updates.error) {
@@ -13579,6 +21515,16 @@
     state.installed = true;
     return true;
   }
+
+  window.__steamLoaderPluginStoreOverlayBridge = {
+    togglePluginEnabled,
+    refreshSettings: () => loadGeneralSettingsState({ showLoading: false }),
+    refreshCommunityPlugins: () => loadCommunityPluginsState({ showLoading: false }),
+    refreshVisiblePanel: () => {
+      state.renderRevision += 1;
+      renderPanelState();
+    },
+  };
 
   return install() ? "injected" : "waiting";
 })();

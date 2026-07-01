@@ -2,19 +2,40 @@
   const apiBase = "__STEAMLOADER_API_BASE__";
   const stateVersion = 14;
   const themeScanEventName = "steamtools:theme-scan-complete";
+  const localizedText = (...codes) => String.fromCharCode(...codes);
+  const localizedSignals = Object.freeze({
+    play: localizedText(83, 80, 73, 69, 76, 69, 78),
+    playtime: localizedText(83, 80, 73, 69, 76, 90, 69, 73, 84),
+    lastPlayed: localizedText(90, 85, 76, 69, 84, 90, 84, 32, 71, 69, 83, 80, 73, 69, 76, 84),
+    activityAscii: localizedText(65, 75, 84, 73, 86, 73, 84, 65, 84),
+    activityNative: localizedText(65, 75, 84, 73, 86, 73, 84, 196, 84),
+    yourStuff: localizedText(73, 72, 82, 69, 32, 68, 73, 78, 71, 69),
+    gameInfo: localizedText(83, 80, 73, 69, 76, 73, 78, 70, 79),
+    achievements: localizedText(69, 82, 70, 79, 76, 71, 69),
+    lastSession: localizedText(76, 69, 84, 90, 84, 69, 32, 83, 73, 84, 90, 85, 78, 71),
+    manage: localizedText(86, 69, 82, 87, 65, 76, 84, 69, 78),
+    friendsPlaying: localizedText(70, 82, 69, 85, 78, 68, 69, 44, 32, 68, 73, 69, 32, 83, 80, 73, 69, 76, 69, 78),
+    spaceRequired: localizedText(83, 80, 69, 73, 67, 72, 69, 82, 80, 76, 65, 84, 90),
+    recentGames: localizedText(86, 79, 82, 32, 75, 85, 82, 90, 69, 77, 32, 71, 69, 83, 80, 73, 69, 76, 84),
+    libraryMore: localizedText(77, 69, 72, 82, 32, 73, 78, 32, 73, 72, 82, 69, 82, 32, 66, 73, 66, 76, 73, 79, 84, 72, 69, 75),
+    whatsNew: localizedText(87, 65, 83, 32, 73, 83, 84, 32, 78, 69, 85),
+    recommended: localizedText(69, 77, 80, 70, 79, 72, 76, 69, 78),
+    allGames: localizedText(65, 76, 76, 69, 32, 83, 80, 73, 69, 76, 69),
+    installed: localizedText(73, 78, 83, 84, 65, 76, 76, 73, 69, 82, 84),
+  });
   const detailViewMarkers = [
-    "SPIELZEIT",
+    localizedSignals.playtime,
     "PLAYTIME",
     "PLAY TIME",
-    "AKTIVITÄT",
+    localizedSignals.activityNative,
     "ACTIVITY",
-    "ERFOLGE",
+    localizedSignals.achievements,
     "ACHIEVEMENTS",
-    "LETZTE SITZUNG",
+    localizedSignals.lastSession,
     "LAST SESSION",
-    "VERWALTEN",
+    localizedSignals.manage,
     "MANAGE",
-    "FREUNDE, DIE SPIELEN",
+    localizedSignals.friendsPlaying,
     "FRIENDS WHO PLAY",
   ];
   const appIdPatterns = [
@@ -316,22 +337,22 @@
     const signals = [
       "PLAY TIME",
       "PLAYTIME",
-      "SPIELZEIT",
+      localizedSignals.playtime,
       "LAST PLAYED",
-      "ZULETZT GESPIELT",
+      localizedSignals.lastPlayed,
       "STEAM CLOUD",
       "CONTROLLER",
       "ACTIVITY",
-      "AKTIVITAT",
+      localizedSignals.activityAscii,
       "YOUR STUFF",
-      "IHRE DINGE",
+      localizedSignals.yourStuff,
       "COMMUNITY",
       "GAME INFO",
-      "SPIELINFO",
+      localizedSignals.gameInfo,
       "ACHIEVEMENTS",
-      "ERFOLGE",
+      localizedSignals.achievements,
       "SPACE REQUIRED",
-      "SPEICHERPLATZ",
+      localizedSignals.spaceRequired,
     ];
 
     return signals.reduce((count, signal) => count + (text.includes(signal) ? 1 : 0), 0);
@@ -345,22 +366,22 @@
 
     const hubSignals = [
       "RECENT GAMES",
-      "VOR KURZEM GESPIELT",
+      localizedSignals.recentGames,
       "VIEW MORE IN YOUR LIBRARY",
-      "MEHR IN IHRER BIBLIOTHEK",
+      localizedSignals.libraryMore,
       "WHAT'S NEW",
-      "WAS IST NEU",
+      localizedSignals.whatsNew,
       "RECOMMENDED",
-      "EMPFOHLEN",
+      localizedSignals.recommended,
     ];
 
     const detailSignals = getDetailTextSignalCount(container);
     const hasCloudOrTabs =
       text.includes("STEAM CLOUD") ||
       text.includes("YOUR STUFF") ||
-      text.includes("IHRE DINGE") ||
+      text.includes(localizedSignals.yourStuff) ||
       text.includes("GAME INFO") ||
-      text.includes("SPIELINFO");
+      text.includes(localizedSignals.gameInfo);
 
     return hubSignals.some((signal) => text.includes(signal)) && (!hasCloudOrTabs || detailSignals < 3);
   }
@@ -386,18 +407,18 @@
     const detailSignals = getDetailTextSignalCount(document.body);
     const hasLibraryTabs =
       text.includes("ALL GAMES") ||
-      text.includes("ALLE SPIELE") ||
+      text.includes(localizedSignals.allGames) ||
       text.includes("INSTALLED") ||
-      text.includes("INSTALLIERT") ||
+      text.includes(localizedSignals.installed) ||
       text.includes("NON-STEAM") ||
       text.includes("SOUNDTRACKS") ||
       text.includes("CONTROLLER FRIENDLY");
     const hasDetailChrome =
       text.includes("STEAM CLOUD") ||
       text.includes("YOUR STUFF") ||
-      text.includes("IHRE DINGE") ||
+      text.includes(localizedSignals.yourStuff) ||
       text.includes("GAME INFO") ||
-      text.includes("SPIELINFO");
+      text.includes(localizedSignals.gameInfo);
 
     state.lastSurfaceProbeIsLibraryGrid = hasLibraryTabs && (!hasDetailChrome || detailSignals < 3);
     return Boolean(state.lastSurfaceProbeIsLibraryGrid);
@@ -672,12 +693,12 @@
         rect.top >= containerRect.top + 180 &&
         rect.top <= containerRect.top + 470 &&
         (text.includes("PLAYTIME") ||
-          text.includes("SPIELZEIT") ||
+          text.includes(localizedSignals.playtime) ||
           text.includes("LAST PLAYED") ||
-          text.includes("ZULETZT GESPIELT") ||
+          text.includes(localizedSignals.lastPlayed) ||
           text.includes("CONTROLLER") ||
           text.startsWith("PLAY ") ||
-          text.startsWith("SPIELEN ")))
+          text.startsWith(`${localizedSignals.play} `)))
       );
     });
 

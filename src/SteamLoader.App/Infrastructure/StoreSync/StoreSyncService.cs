@@ -112,6 +112,35 @@ public sealed class StoreSyncService
         "debug"
     ];
 
+    private static readonly IReadOnlyDictionary<string, string> BattleNetProductToTitle =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["wow"] = "World of Warcraft",
+            ["wow_classic"] = "World of Warcraft Classic",
+            ["wow_classic_era"] = "World of Warcraft Classic Era",
+            ["wowt"] = "World of Warcraft PTR",
+            ["wow_beta"] = "World of Warcraft Beta",
+            ["d3"] = "Diablo III",
+            ["fenris"] = "Diablo IV",
+            ["anbs"] = "Diablo Immortal",
+            ["s1"] = "StarCraft: Remastered",
+            ["s2"] = "StarCraft II",
+            ["hs_beta"] = "Hearthstone",
+            ["hero"] = "Heroes of the Storm",
+            ["prometheus"] = "Overwatch 2",
+            ["viper"] = "Call of Duty: Black Ops 4",
+            ["lazarus"] = "Call of Duty: Modern Warfare",
+            ["zeus"] = "Call of Duty: Black Ops Cold War",
+            ["fore"] = "Call of Duty: Vanguard",
+            ["odin"] = "Call of Duty: Modern Warfare II",
+            ["w3"] = "Warcraft III: Reforged",
+            ["auks"] = "Warcraft Rumble",
+            ["clnt"] = "Call of Duty HQ",
+        };
+
+    private static readonly HashSet<string> BattleNetSkipProducts =
+        new(StringComparer.OrdinalIgnoreCase) { "bna", "agent", "bts", "bts2", "battlenet" };
+
     private static readonly StoreDefinition[] StoreDefinitions =
     [
         new(
@@ -122,7 +151,7 @@ public sealed class StoreSyncService
         new(
             "gog-galaxy",
             "GOG Galaxy",
-            "Checks GOG registry entries and imports classic Windows installs without another launcher.",
+            "Checks GOG registry entries and `goggame-*.info` manifests for reliable title and executable data.",
             SupportsAdditionalPaths: true),
         new(
             "xbox-game-pass",
@@ -138,6 +167,21 @@ public sealed class StoreSyncService
             "ea-app",
             "EA App",
             "Detects EA App and legacy Origin installs from registry data, common EA library folders, and extra scan folders on other drives.",
+            SupportsAdditionalPaths: true),
+        new(
+            "battle-net",
+            "Battle.net",
+            "Reads installed Blizzard titles from the Battle.net client configuration file.",
+            SupportsAdditionalPaths: true),
+        new(
+            "amazon-games",
+            "Amazon Games",
+            "Reads installed titles from the Amazon Games Launcher data directory.",
+            SupportsAdditionalPaths: true),
+        new(
+            "itch-io",
+            "itch.io",
+            "Scans the itch.io apps folder and reads `receipt.json` metadata for accurate game titles.",
             SupportsAdditionalPaths: true),
         new(
             "custom-locations",
@@ -167,6 +211,8 @@ public sealed class StoreSyncService
     private DateTimeOffset? _lastAutomaticCheckAtUtc;
     private DateTimeOffset? _lastAutomaticTriggerAtUtc;
     private string _lastAutomaticTriggerSource = string.Empty;
+    // Tracks the last time TFS itself wrote shortcuts.vdf so we can detect Steam overwriting it.
+    private DateTimeOffset _shortcutsFileLastOwnedWriteAtUtc = DateTimeOffset.MinValue;
 
     internal StoreSyncService(
         StoreSyncSettingsStore settingsStore,
@@ -260,6 +306,38 @@ public sealed class StoreSyncService
             }
 
             _scheduledAutomationWrites.AddFirst(new ScheduledAutomationWriteState(normalizedPath, ignoreUntilUtc));
+
+            // Record the timestamp of our own write so we can detect Steam overwriting the file later.
+            _shortcutsFileLastOwnedWriteAtUtc = DateTimeOffset.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// Clears the sync-signature cache when shortcuts.vdf has been modified externally by Steam
+    /// (i.e., after a Steam restart that wiped our non-Steam shortcuts).
+    /// Must be called inside <see cref="_gate"/>.
+    /// </summary>
+    private void InvalidateSyncSignaturesIfShortcutsModifiedExternally(string? shortcutsPath)
+    {
+        if (string.IsNullOrWhiteSpace(shortcutsPath) || !File.Exists(shortcutsPath))
+        {
+            return;
+        }
+
+        // Allow 20 seconds grace to avoid reacting to our own write if the clock resolution is low.
+        const double GraceSeconds = 20.0;
+        try
+        {
+            var fileMtime = new DateTimeOffset(File.GetLastWriteTimeUtc(shortcutsPath), TimeSpan.Zero);
+            if (fileMtime > _shortcutsFileLastOwnedWriteAtUtc.AddSeconds(GraceSeconds))
+            {
+                _recentAppliedSyncSignatures.Clear();
+                // Advance our own-write stamp so we don't keep clearing on subsequent polls.
+                _shortcutsFileLastOwnedWriteAtUtc = fileMtime;
+            }
+        }
+        catch
+        {
         }
     }
 
@@ -722,6 +800,10 @@ public sealed class StoreSyncService
                 return false;
             }
 
+            // Detect if Steam has rewritten shortcuts.vdf since our last write (e.g. after a restart)
+            // and clear the cached signature so we force a re-sync.
+            InvalidateSyncSignaturesIfShortcutsModifiedExternally(profile.ShortcutsPath);
+
             var storeSnapshots = BuildStoreSnapshots(configuration);
             var analysis = BuildSyncAnalysis(
                 configuration,
@@ -1022,6 +1104,50 @@ public sealed class StoreSyncService
 
                     break;
                 }
+                case "battle-net":
+                {
+                    var configPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "Battle.net",
+                        "Battle.net.config");
+                    addFileTarget(configPath);
+                    foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
+                    {
+                        addDirectoryTarget(extraRoot);
+                    }
+
+                    break;
+                }
+                case "amazon-games":
+                {
+                    var gamesDataPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "Amazon Games",
+                        "Data",
+                        "Games");
+                    addDirectoryTarget(gamesDataPath, "*.json");
+                    foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
+                    {
+                        addDirectoryTarget(extraRoot);
+                    }
+
+                    break;
+                }
+                case "itch-io":
+                {
+                    var itchAppsPath = ResolveItchAppsPath();
+                    if (!string.IsNullOrWhiteSpace(itchAppsPath))
+                    {
+                        addDirectoryTarget(itchAppsPath, "receipt.json");
+                    }
+
+                    foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
+                    {
+                        addDirectoryTarget(extraRoot);
+                    }
+
+                    break;
+                }
                 case "custom-locations":
                 {
                     foreach (var root in BuildConfiguredCustomScanRoots(storeConfiguration))
@@ -1206,6 +1332,13 @@ public sealed class StoreSyncService
                     effectiveTitle,
                     out existingShortcut);
             }
+
+            ResetResolvedPlaceholderArtworkState(
+                configuration,
+                titleId,
+                manifestEntry,
+                effectiveArtworkTitle,
+                ref artworkCache);
 
             if (existingShortcut is not null &&
                 ShouldTreatShortcutAsManaged(manifestEntry, existingShortcut))
@@ -1548,6 +1681,11 @@ public sealed class StoreSyncService
             return StoreSyncActionKind.RefreshManaged;
         }
 
+        if (IsManifestLifecycleManaged(manifestEntry))
+        {
+            return StoreSyncActionKind.RefreshManaged;
+        }
+
         if (existingShortcut is not null)
         {
             return configuration.TakeOverExistingShortcuts
@@ -1594,7 +1732,9 @@ public sealed class StoreSyncService
         return actionKind switch
         {
             StoreSyncActionKind.Create => "A new managed shortcut will be created.",
-            StoreSyncActionKind.RefreshManaged => "An existing Tools for Steam shortcut will be refreshed.",
+            StoreSyncActionKind.RefreshManaged => existingShortcut is null
+                ? "The managed Tools for Steam shortcut will be refreshed or recreated if Steam has not loaded it yet."
+                : "An existing Tools for Steam shortcut will be refreshed.",
             StoreSyncActionKind.AdoptExisting => $"Existing Steam shortcut {existingShortcut?.AppId:x8} will be reused without creating a duplicate.",
             StoreSyncActionKind.SkipExisting => "Steam already has this title and takeover is turned off.",
             StoreSyncActionKind.Excluded => "This title is excluded by a manual override.",
@@ -1733,6 +1873,9 @@ public sealed class StoreSyncService
             "xbox-game-pass" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanXboxGames()),
             "ubisoft-connect" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanUbisoftConnect()),
             "ea-app" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanEaApp()),
+            "battle-net" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanBattleNet()),
+            "amazon-games" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanAmazonGames()),
+            "itch-io" => MergeStoreScanWithAdditionalPaths(definition, configuration, ScanItchIo()),
             "custom-locations" => ScanCustomLocations(BuildConfiguredCustomScanRoots(configuration)),
             _ => new StoreScanResult(false, false, "Unknown store", "The store definition is not supported.", [], [], []),
         };
@@ -1818,6 +1961,7 @@ public sealed class StoreSyncService
     private StoreScanResult ScanGogGames()
     {
         var games = new List<StoreGameEntry>();
+        var seenExecutables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var roots = new[]
         {
             Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\GOG.com\Games"),
@@ -1838,28 +1982,38 @@ public sealed class StoreSyncService
                             continue;
                         }
 
-                        var title =
+                        var registryTitle =
                             gameKey.GetValue("gameName") as string
                             ?? gameKey.GetValue("GAMENAME") as string
-                            ?? gameKey.GetValue("DisplayName") as string
-                            ?? subKeyName;
+                            ?? gameKey.GetValue("DisplayName") as string;
 
-                        var installPath =
+                        var installPath = NormalizePath(
                             gameKey.GetValue("path") as string
                             ?? gameKey.GetValue("PATH") as string
-                            ?? string.Empty;
+                            ?? string.Empty);
+
+                        if (string.IsNullOrWhiteSpace(installPath))
+                        {
+                            continue;
+                        }
+
+                        // Prefer goggame-*.info manifests for accurate title and primary executable.
+                        var (infoTitle, infoExe) = TryFindGogGameInfoEntry(installPath);
 
                         var executableHint =
-                            gameKey.GetValue("exe") as string
+                            infoExe
+                            ?? gameKey.GetValue("exe") as string
                             ?? gameKey.GetValue("gameExe") as string
                             ?? gameKey.GetValue("launchCommand") as string
                             ?? string.Empty;
 
                         var executablePath = ResolveExecutablePath(installPath, executableHint);
-                        if (string.IsNullOrWhiteSpace(executablePath))
+                        if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
                         {
                             continue;
                         }
+
+                        var title = FirstNonEmpty(infoTitle, registryTitle, subKeyName)!;
 
                         games.Add(new StoreGameEntry(
                             "gog-galaxy",
@@ -1880,6 +2034,84 @@ public sealed class StoreSyncService
         {
             return new StoreScanResult(false, false, "Error", exception.Message, [], [], []);
         }
+    }
+
+    /// <summary>
+    /// Reads the first matching <c>goggame-*.info</c> JSON file in <paramref name="installPath"/> and
+    /// returns the authoritative game title and the path of the primary executable task.
+    /// </summary>
+    private static (string? Title, string? ExecutablePath) TryFindGogGameInfoEntry(string installPath)
+    {
+        if (string.IsNullOrWhiteSpace(installPath) || !Directory.Exists(installPath))
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            foreach (var infoFile in Directory.EnumerateFiles(installPath, "goggame-*.info", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(infoFile));
+                    var root = document.RootElement;
+
+                    var title = GetJsonString(root, "gameName");
+
+                    // playTasks array: find the primary FileTask executable.
+                    string? executablePath = null;
+                    if (root.TryGetProperty("playTasks", out var tasks) && tasks.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var task in tasks.EnumerateArray())
+                        {
+                            var taskType = GetJsonString(task, "type");
+                            if (!string.Equals(taskType, "FileTask", StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            var isPrimary = task.TryGetProperty("isPrimary", out var isPrimaryProp)
+                                && isPrimaryProp.ValueKind == JsonValueKind.True;
+                            var relPath = GetJsonString(task, "path");
+                            if (string.IsNullOrWhiteSpace(relPath))
+                            {
+                                continue;
+                            }
+
+                            var candidatePath = Path.IsPathRooted(relPath)
+                                ? NormalizePath(relPath)
+                                : NormalizePath(Path.Combine(installPath, relPath));
+
+                            if (!File.Exists(candidatePath))
+                            {
+                                continue;
+                            }
+
+                            if (isPrimary)
+                            {
+                                executablePath = candidatePath;
+                                break;
+                            }
+
+                            executablePath ??= candidatePath;
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(title) || !string.IsNullOrWhiteSpace(executablePath))
+                    {
+                        return (title, executablePath);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return (null, null);
     }
 
     private StoreScanResult ScanXboxGames()
@@ -2099,6 +2331,392 @@ public sealed class StoreSyncService
         {
             return new StoreScanResult(false, false, "Error", exception.Message, [], [], []);
         }
+    }
+
+    private StoreScanResult ScanBattleNet()
+    {
+        var configPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Battle.net",
+            "Battle.net.config");
+
+        if (!File.Exists(configPath))
+        {
+            return new StoreScanResult(false, false, "Not installed", "Battle.net was not detected on this system.", [], [configPath], []);
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(configPath));
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("Games", out var gamesElement) || gamesElement.ValueKind != JsonValueKind.Object)
+            {
+                return new StoreScanResult(true, true, "Ready", "Battle.net is installed but no game library entries were found.", [configPath], [], []);
+            }
+
+            var games = new List<StoreGameEntry>();
+            var seenExecutables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var gameProperty in gamesElement.EnumerateObject())
+            {
+                var productKey = gameProperty.Name;
+                if (BattleNetSkipProducts.Contains(productKey))
+                {
+                    continue;
+                }
+
+                var gameDir = GetJsonString(gameProperty.Value, "GameDir");
+                if (string.IsNullOrWhiteSpace(gameDir))
+                {
+                    continue;
+                }
+
+                var normalizedGameDir = NormalizePath(gameDir);
+                if (string.IsNullOrWhiteSpace(normalizedGameDir) || !Directory.Exists(normalizedGameDir))
+                {
+                    continue;
+                }
+
+                var executablePath = FindBestExecutable(normalizedGameDir);
+                if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
+                {
+                    continue;
+                }
+
+                BattleNetProductToTitle.TryGetValue(productKey, out var productTitle);
+                var title = FirstNonEmpty(
+                    productTitle,
+                    TryReadExecutableTitle(executablePath),
+                    Path.GetFileName(normalizedGameDir));
+
+                if (string.IsNullOrWhiteSpace(title))
+                {
+                    continue;
+                }
+
+                games.Add(new StoreGameEntry(
+                    "battle-net",
+                    BuildStoreItemId("battlenet", productKey, normalizedGameDir, executablePath),
+                    PrettifyTitle(title),
+                    executablePath,
+                    Path.GetDirectoryName(executablePath) ?? normalizedGameDir,
+                    string.Empty));
+            }
+
+            return new StoreScanResult(
+                true,
+                true,
+                "Ready",
+                games.Count > 0
+                    ? $"{games.Count} installed title{(games.Count == 1 ? string.Empty : "s")} detected."
+                    : "Battle.net is installed but no installed game directories were found.",
+                [configPath],
+                [],
+                games);
+        }
+        catch (Exception exception)
+        {
+            return new StoreScanResult(false, false, "Error", exception.Message, [configPath], [], []);
+        }
+    }
+
+    private StoreScanResult ScanAmazonGames()
+    {
+        var gamesDataPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Amazon Games",
+            "Data",
+            "Games");
+
+        if (!Directory.Exists(gamesDataPath))
+        {
+            return new StoreScanResult(false, false, "Not installed", "Amazon Games was not detected on this system.", [], [gamesDataPath], []);
+        }
+
+        try
+        {
+            var games = new List<StoreGameEntry>();
+            var seenExecutables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var gameFolder in Directory.GetDirectories(gamesDataPath))
+            {
+                var game = TryCreateAmazonGame(gameFolder, seenExecutables);
+                if (game is not null)
+                {
+                    games.Add(game);
+                }
+            }
+
+            return new StoreScanResult(
+                true,
+                true,
+                "Ready",
+                games.Count > 0
+                    ? $"{games.Count} installed title{(games.Count == 1 ? string.Empty : "s")} detected."
+                    : "Amazon Games is installed but no installed titles were found.",
+                [gamesDataPath],
+                [],
+                games);
+        }
+        catch (Exception exception)
+        {
+            return new StoreScanResult(false, false, "Error", exception.Message, [gamesDataPath], [], []);
+        }
+    }
+
+    private static StoreGameEntry? TryCreateAmazonGame(string gameFolder, HashSet<string> seenExecutables)
+    {
+        var gameId = Path.GetFileName(gameFolder);
+        string? title = null;
+        string? installDirectory = null;
+        string? mainExecutable = null;
+
+        try
+        {
+            foreach (var jsonFile in Directory.EnumerateFiles(gameFolder, "*.json"))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(jsonFile));
+                    var root = document.RootElement;
+
+                    title ??= FirstNonEmpty(
+                        GetJsonString(root, "title"),
+                        GetJsonString(root, "productTitle"),
+                        GetJsonString(root, "localTitle"),
+                        GetJsonString(root, "name"));
+                    installDirectory ??= FirstNonEmpty(
+                        GetJsonString(root, "installDirectory"),
+                        GetJsonString(root, "installDir"),
+                        GetJsonString(root, "InstallDir"),
+                        GetJsonString(root, "installPath"));
+                    mainExecutable ??= FirstNonEmpty(
+                        GetJsonString(root, "mainExecutable"),
+                        GetJsonString(root, "executableFile"),
+                        GetJsonString(root, "launchExecutable"),
+                        GetJsonString(root, "exeInWorkingDirectory"));
+                }
+                catch
+                {
+                    // Ignore malformed JSON files.
+                }
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        var normalizedInstallDir = NormalizePath(installDirectory);
+        if (string.IsNullOrWhiteSpace(normalizedInstallDir) || !Directory.Exists(normalizedInstallDir))
+        {
+            return null;
+        }
+
+        var executablePath = ResolveExecutablePath(normalizedInstallDir, mainExecutable);
+        if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
+        {
+            return null;
+        }
+
+        var resolvedTitle = FirstNonEmpty(
+            title,
+            TryReadExecutableTitle(executablePath),
+            Path.GetFileName(normalizedInstallDir));
+
+        if (string.IsNullOrWhiteSpace(resolvedTitle))
+        {
+            return null;
+        }
+
+        return new StoreGameEntry(
+            "amazon-games",
+            BuildStoreItemId("amazon", gameId, normalizedInstallDir, executablePath),
+            PrettifyTitle(resolvedTitle),
+            executablePath,
+            Path.GetDirectoryName(executablePath) ?? normalizedInstallDir,
+            string.Empty);
+    }
+
+    private StoreScanResult ScanItchIo()
+    {
+        var itchAppsPath = ResolveItchAppsPath();
+        if (string.IsNullOrWhiteSpace(itchAppsPath))
+        {
+            return new StoreScanResult(false, false, "Not installed", "itch.io was not detected on this system.", [], [], []);
+        }
+
+        if (!Directory.Exists(itchAppsPath))
+        {
+            return new StoreScanResult(false, false, "Not installed", "The itch.io apps folder was not found.", [], [itchAppsPath], []);
+        }
+
+        try
+        {
+            var games = new List<StoreGameEntry>();
+            var seenExecutables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var gameFolder in Directory.GetDirectories(itchAppsPath))
+            {
+                if (ShouldSkipCustomCandidateDirectory(gameFolder))
+                {
+                    continue;
+                }
+
+                var game = TryCreateItchGame(gameFolder, seenExecutables);
+                if (game is not null)
+                {
+                    games.Add(game);
+                }
+            }
+
+            return new StoreScanResult(
+                true,
+                true,
+                "Ready",
+                games.Count > 0
+                    ? $"{games.Count} installed title{(games.Count == 1 ? string.Empty : "s")} detected."
+                    : "itch.io is installed but no installed titles were found.",
+                [itchAppsPath],
+                [],
+                games);
+        }
+        catch (Exception exception)
+        {
+            return new StoreScanResult(false, false, "Error", exception.Message, [itchAppsPath], [], []);
+        }
+    }
+
+    private static string? ResolveItchAppsPath()
+    {
+        // Check if itch.io is installed by looking for the executable.
+        var itchExePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "itch",
+            "itch.exe");
+        var defaultAppsPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "itch",
+            "apps");
+
+        if (!File.Exists(itchExePath) && !Directory.Exists(defaultAppsPath))
+        {
+            return null;
+        }
+
+        // Try reading the configured apps directory from preferences.json.
+        var prefsPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "itch",
+            "preferences.json");
+
+        if (File.Exists(prefsPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(prefsPath));
+                var root = document.RootElement;
+
+                if (root.TryGetProperty("install_location", out var installLocation))
+                {
+                    var path = installLocation.ValueKind == JsonValueKind.String
+                        ? installLocation.GetString()
+                        : GetJsonString(installLocation, "path");
+
+                    var normalized = NormalizePath(path);
+                    if (!string.IsNullOrWhiteSpace(normalized))
+                    {
+                        return normalized;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return defaultAppsPath;
+    }
+
+    private static StoreGameEntry? TryCreateItchGame(string gameFolder, HashSet<string> seenExecutables)
+    {
+        string? title = null;
+        string? gameId = null;
+
+        // Try receipt.json.gz first (compressed, used by newer butler versions).
+        var receiptGzPath = Path.Combine(gameFolder, "receipt.json.gz");
+        if (File.Exists(receiptGzPath))
+        {
+            try
+            {
+                using var fileStream = File.OpenRead(receiptGzPath);
+                using var gzipStream = new System.IO.Compression.GZipStream(
+                    fileStream, System.IO.Compression.CompressionMode.Decompress);
+                using var reader = new StreamReader(gzipStream, Encoding.UTF8);
+                var json = reader.ReadToEnd();
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                if (root.TryGetProperty("game", out var gameElement))
+                {
+                    title = GetJsonString(gameElement, "title");
+                    gameId = gameElement.TryGetProperty("id", out var idElement)
+                        ? idElement.ToString()
+                        : null;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // Fall back to uncompressed receipt.json.
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            var receiptJsonPath = Path.Combine(gameFolder, "receipt.json");
+            if (File.Exists(receiptJsonPath))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(receiptJsonPath));
+                    var root = document.RootElement;
+                    if (root.TryGetProperty("game", out var gameElement))
+                    {
+                        title = GetJsonString(gameElement, "title");
+                        gameId = gameElement.TryGetProperty("id", out var idElement)
+                            ? idElement.ToString()
+                            : null;
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        var executablePath = FindBestExecutable(gameFolder);
+        if (string.IsNullOrWhiteSpace(executablePath) || !seenExecutables.Add(executablePath))
+        {
+            return null;
+        }
+
+        var resolvedTitle = FirstNonEmpty(
+            title,
+            TryReadExecutableTitle(executablePath),
+            Path.GetFileName(gameFolder));
+
+        if (string.IsNullOrWhiteSpace(resolvedTitle))
+        {
+            return null;
+        }
+
+        return new StoreGameEntry(
+            "itch-io",
+            BuildStoreItemId("itch", gameId ?? Path.GetFileName(gameFolder), gameFolder, executablePath),
+            PrettifyTitle(resolvedTitle),
+            executablePath,
+            Path.GetDirectoryName(executablePath) ?? gameFolder,
+            string.Empty);
     }
 
     private static IEnumerable<string> GetXboxCandidateRoots()
@@ -2354,14 +2972,44 @@ public sealed class StoreSyncService
         try
         {
             var stateText = Encoding.UTF8.GetString(File.ReadAllBytes(statePath));
-            var titleMatch = Regex.Match(
+
+            // Pattern 1: full registry path (older Ubisoft Connect versions).
+            var m = Regex.Match(
                 stateText,
                 @"HKEY_(?:LOCAL_MACHINE|CURRENT_USER)\\SOFTWARE(?:\\WOW6432Node)?\\Ubisoft\\(?<title>[^\\\r\n]+)\\InstallDir",
                 RegexOptions.IgnoreCase);
-            if (titleMatch.Success)
+            if (m.Success)
             {
-                var title = titleMatch.Groups["title"].Value.Trim();
+                var title = m.Groups["title"].Value.Trim();
                 if (!string.IsNullOrWhiteSpace(title))
+                {
+                    return title;
+                }
+            }
+
+            // Pattern 2: bare Ubisoft registry segment without HKEY_ prefix (newer binary format).
+            m = Regex.Match(
+                stateText,
+                @"SOFTWARE(?:\\WOW6432Node)?\\Ubisoft\\(?<title>[^\\\r\n\x00-\x1F]+?)(?:\\InstallDir|[\x00-\x1F]|$)",
+                RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var title = m.Groups["title"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(title))
+                {
+                    return title;
+                }
+            }
+
+            // Pattern 3: game name stored as a plain UTF-8 / Latin-1 string near "Name" or "name" markers.
+            m = Regex.Match(
+                stateText,
+                @"[Nn]ame\x00{0,4}(?<title>[A-Za-z][^\x00-\x1F]{3,80})",
+                RegexOptions.None);
+            if (m.Success)
+            {
+                var title = m.Groups["title"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(title) && !title.Contains('\\'))
                 {
                     return title;
                 }
@@ -2775,16 +3423,17 @@ public sealed class StoreSyncService
             }
 
             var shellVisuals = gameElement.Element("ShellVisuals");
-            var title = FirstNonEmpty(
+            var title = ResolveXboxTitle(
+                candidateRoot,
+                executablePath,
                 executableElement?.Attribute("OverrideDisplayName")?.Value,
                 shellVisuals?.Attribute("DefaultDisplayName")?.Value,
-                shellVisuals?.Attribute("Description")?.Value,
-                Path.GetFileName(candidateRoot))!;
+                shellVisuals?.Attribute("Description")?.Value);
 
             game = new StoreGameEntry(
                 "xbox-game-pass",
                 BuildStoreItemId("xbox", configPath, candidateRoot),
-                PrettifyTitle(title),
+                title,
                 executablePath,
                 Path.GetDirectoryName(executablePath) ?? candidateRoot,
                 string.Empty);
@@ -3113,6 +3762,13 @@ public sealed class StoreSyncService
                 throw new InvalidOperationException("Steam profile data could not be resolved.");
             }
             var storeSnapshots = BuildStoreSnapshots(configuration);
+            var existingEntries = _shortcutFile.Read(profile.ShortcutsPath).ToList();
+            var existingShortcutEntries = existingEntries
+                .Select((entry, index) => TryParseExistingShortcutEntry(entry, index))
+                .Where(entry => entry is not null)
+                .Cast<ExistingShortcutEntry>()
+                .ToList();
+            var analysis = BuildSyncAnalysis(configuration, storeSnapshots, existingShortcutEntries);
 
             steamWasRunning = IsSteamRunning();
             if (steamWasRunning)
@@ -3122,7 +3778,7 @@ public sealed class StoreSyncService
                     () => TryApplyLiveShortcutSyncAsync(
                         configuration,
                         profile,
-                        BuildSyncAnalysis(configuration, storeSnapshots, LoadExistingShortcuts(profile)),
+                        analysis,
                         liveShortcutTimeout.Token),
                     maxAttempts: 2,
                     initialDelay: TimeSpan.FromMilliseconds(250),
@@ -3151,13 +3807,25 @@ public sealed class StoreSyncService
                 BackupShortcuts(profile.ShortcutsPath, startedAt);
             }
 
-            var existingEntries = _shortcutFile.Read(profile.ShortcutsPath).ToList();
-            var existingShortcutEntries = existingEntries
-                .Select((entry, index) => TryParseExistingShortcutEntry(entry, index))
-                .Where(entry => entry is not null)
-                .Cast<ExistingShortcutEntry>()
-                .ToList();
-            var analysis = BuildSyncAnalysis(configuration, storeSnapshots, existingShortcutEntries);
+            if (usedLiveShortcutSync)
+            {
+                await PersistLiveShortcutSyncMirrorAsync(
+                    profile.ShortcutsPath,
+                    analysis,
+                    liveShortcutAppIds,
+                    CancellationToken.None);
+            }
+            else
+            {
+                existingEntries = _shortcutFile.Read(profile.ShortcutsPath).ToList();
+                existingShortcutEntries = existingEntries
+                    .Select((entry, index) => TryParseExistingShortcutEntry(entry, index))
+                    .Where(entry => entry is not null)
+                    .Cast<ExistingShortcutEntry>()
+                    .ToList();
+                analysis = BuildSyncAnalysis(configuration, storeSnapshots, existingShortcutEntries);
+            }
+
             syncSignature ??= BuildDesiredSyncSignature(configuration, analysis);
             var managedEntries = new List<ManagedShortcutEntry>();
             var entryIndexesToRemove = new HashSet<int>();
@@ -3351,6 +4019,18 @@ public sealed class StoreSyncService
                     liveShortcutAppIds);
             }
 
+            // Sync Steam collections (one per store) — best-effort, never blocks completion.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await TrySyncCollectionsLiveAsync(analysis, liveShortcutAppIds, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            });
+
             if (restartSteamForSync || (launchSteamWhenFinished && !IsSteamRunning()))
             {
                 LaunchSteam(configuration.LaunchBigPictureAfterSync);
@@ -3518,6 +4198,235 @@ public sealed class StoreSyncService
             response.AppIdsByTitleId ?? new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase));
     }
 
+    private async Task PersistLiveShortcutSyncMirrorAsync(
+        string shortcutsPath,
+        StoreSyncAnalysis analysis,
+        IReadOnlyDictionary<string, uint> liveShortcutAppIds,
+        CancellationToken cancellationToken)
+    {
+        await RetryAsync(
+            () =>
+            {
+                var entries = _shortcutFile.Read(shortcutsPath).ToList();
+                if (!TryBuildLiveShortcutMirrorEntries(entries, analysis, liveShortcutAppIds, out var mirroredEntries))
+                {
+                    return Task.CompletedTask;
+                }
+
+                RememberExpectedAutomationWrite(shortcutsPath, ExpectedAutomationWriteIgnoreDuration);
+                _shortcutFile.Write(shortcutsPath, mirroredEntries);
+                return Task.CompletedTask;
+            },
+            maxAttempts: 3,
+            initialDelay: TimeSpan.FromMilliseconds(250),
+            cancellationToken);
+    }
+
+    private static bool TryBuildLiveShortcutMirrorEntries(
+        IReadOnlyList<Dictionary<string, object?>> existingEntries,
+        StoreSyncAnalysis analysis,
+        IReadOnlyDictionary<string, uint> liveShortcutAppIds,
+        out List<Dictionary<string, object?>> mirroredEntries)
+    {
+        var parsedEntries = existingEntries
+            .Select((entry, index) => TryParseExistingShortcutEntry(entry, index))
+            .Where(entry => entry is not null)
+            .Cast<ExistingShortcutEntry>()
+            .ToArray();
+        var replacementByIndex = new Dictionary<int, Dictionary<string, object?>>();
+        var removalIndices = new HashSet<int>();
+        var appendedEntries = new List<Dictionary<string, object?>>();
+        var changed = false;
+
+        foreach (var item in analysis.Items)
+        {
+            var liveAppId = ResolveLiveShortcutAppId(item, liveShortcutAppIds);
+            switch (item.ActionKind)
+            {
+                case StoreSyncActionKind.Create:
+                {
+                    var createdEntry = CreateShortcutEntry(item, liveAppId).Entry;
+                    if (TryFindMirrorEntryIndices(parsedEntries, item, liveAppId, out var createIndices))
+                    {
+                        foreach (var duplicateIndex in createIndices.Skip(1))
+                        {
+                            removalIndices.Add(duplicateIndex);
+                            changed = true;
+                        }
+
+                        var primaryIndex = createIndices[0];
+                        if (!ShortcutEntriesEquivalent(existingEntries[primaryIndex], createdEntry))
+                        {
+                            replacementByIndex[primaryIndex] = createdEntry;
+                            changed = true;
+                        }
+                    }
+                    else
+                    {
+                        appendedEntries.Add(createdEntry);
+                        changed = true;
+                    }
+
+                    break;
+                }
+                case StoreSyncActionKind.RefreshManaged:
+                {
+                    var refreshedEntry = CreateShortcutEntry(item, liveAppId, item.ExistingShortcut?.Entry).Entry;
+                    if (TryFindMirrorEntryIndices(parsedEntries, item, liveAppId, out var refreshIndices))
+                    {
+                        foreach (var duplicateIndex in refreshIndices.Skip(1))
+                        {
+                            removalIndices.Add(duplicateIndex);
+                            changed = true;
+                        }
+
+                        var refreshIndex = refreshIndices[0];
+                        if (!ShortcutEntriesEquivalent(existingEntries[refreshIndex], refreshedEntry))
+                        {
+                            replacementByIndex[refreshIndex] = refreshedEntry;
+                            changed = true;
+                        }
+                    }
+                    else
+                    {
+                        appendedEntries.Add(refreshedEntry);
+                        changed = true;
+                    }
+
+                    break;
+                }
+                case StoreSyncActionKind.AdoptExisting:
+                {
+                    if (!TryFindMirrorEntryIndices(parsedEntries, item, liveAppId, out var adoptIndices))
+                    {
+                        break;
+                    }
+
+                    foreach (var duplicateIndex in adoptIndices.Skip(1))
+                    {
+                        removalIndices.Add(duplicateIndex);
+                        changed = true;
+                    }
+
+                    var adoptIndex = adoptIndices[0];
+                    var adoptedEntry = CloneShortcutEntry(existingEntries[adoptIndex]);
+                    if (ApplyManagedOwnershipMetadata(adoptedEntry, item.Game.StoreId, item.TitleId))
+                    {
+                        replacementByIndex[adoptIndex] = adoptedEntry;
+                        changed = true;
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        foreach (var cleanupCandidate in analysis.CleanupCandidates)
+        {
+            if (TryFindCleanupMirrorEntryIndex(parsedEntries, cleanupCandidate, out var cleanupIndex))
+            {
+                removalIndices.Add(cleanupIndex);
+                changed = true;
+            }
+        }
+
+        mirroredEntries = new List<Dictionary<string, object?>>(existingEntries.Count - removalIndices.Count + appendedEntries.Count);
+        for (var index = 0; index < existingEntries.Count; index++)
+        {
+            if (removalIndices.Contains(index))
+            {
+                continue;
+            }
+
+            mirroredEntries.Add(
+                replacementByIndex.TryGetValue(index, out var replacementEntry)
+                    ? replacementEntry
+                    : existingEntries[index]);
+        }
+
+        mirroredEntries.AddRange(appendedEntries);
+        return changed;
+    }
+
+    private static bool TryFindMirrorEntryIndices(
+        IReadOnlyList<ExistingShortcutEntry> parsedEntries,
+        StoreSyncAnalysisItem item,
+        uint targetAppId,
+        out int[] indices)
+    {
+        indices = parsedEntries
+            .Where(entry =>
+                OwnershipRepairMatches(entry, item, targetAppId) ||
+                (item.ExistingShortcut is not null && entry.AppId == item.ExistingShortcut.AppId) ||
+                (!string.IsNullOrWhiteSpace(entry.ManagedTitleId) &&
+                 string.Equals(entry.ManagedTitleId, item.TitleId, StringComparison.OrdinalIgnoreCase)))
+            .Select(entry => entry.Index)
+            .Distinct()
+            .OrderBy(index => index)
+            .ToArray();
+
+        return indices.Length > 0;
+    }
+
+    private static bool TryFindCleanupMirrorEntryIndex(
+        IReadOnlyList<ExistingShortcutEntry> parsedEntries,
+        StoreSyncCleanupCandidate cleanupCandidate,
+        out int index)
+    {
+        index = -1;
+        var matchedEntry = parsedEntries.FirstOrDefault(entry =>
+            entry.AppId == cleanupCandidate.ExistingShortcut.AppId ||
+            (!string.IsNullOrWhiteSpace(entry.ManagedTitleId) &&
+             string.Equals(entry.ManagedTitleId, cleanupCandidate.TitleId, StringComparison.OrdinalIgnoreCase)));
+        if (matchedEntry is null)
+        {
+            return false;
+        }
+
+        index = matchedEntry.Index;
+        return true;
+    }
+
+    private static Dictionary<string, object?> CloneShortcutEntry(Dictionary<string, object?> source)
+    {
+        var clone = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in source)
+        {
+            clone[key] = value switch
+            {
+                Dictionary<string, object?> nestedDictionary => CloneShortcutEntry(nestedDictionary),
+                _ => value,
+            };
+        }
+
+        return clone;
+    }
+
+    private static bool ShortcutEntriesEquivalent(
+        Dictionary<string, object?> left,
+        Dictionary<string, object?> right)
+    {
+        return string.Equals(
+            JsonSerializer.Serialize(CanonicalizeShortcutValue(left)),
+            JsonSerializer.Serialize(CanonicalizeShortcutValue(right)),
+            StringComparison.Ordinal);
+    }
+
+    private static object? CanonicalizeShortcutValue(object? value)
+    {
+        return value switch
+        {
+            Dictionary<string, object?> dictionary => dictionary
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    pair => pair.Key,
+                    pair => CanonicalizeShortcutValue(pair.Value),
+                    StringComparer.OrdinalIgnoreCase),
+            IEnumerable<object?> sequence => sequence.Select(CanonicalizeShortcutValue).ToArray(),
+            _ => value,
+        };
+    }
+
     private async Task<OwnershipRepairResult> RepairManagedShortcutOwnershipAsync(
         string shortcutsPath,
         StoreSyncAnalysis analysis,
@@ -3540,6 +4449,14 @@ public sealed class StoreSyncService
                 () =>
                 {
                     var entries = _shortcutFile.Read(shortcutsPath).ToList();
+                    if (liveSyncUsed &&
+                        TryBuildLiveShortcutMirrorEntries(entries, analysis, liveShortcutAppIds, out var mirroredEntries))
+                    {
+                        RememberExpectedAutomationWrite(shortcutsPath, ExpectedAutomationWriteIgnoreDuration);
+                        _shortcutFile.Write(shortcutsPath, mirroredEntries);
+                        entries = _shortcutFile.Read(shortcutsPath).ToList();
+                    }
+
                     if (entries.Count == 0)
                     {
                         if (liveSyncUsed)
@@ -3824,11 +4741,12 @@ public sealed class StoreSyncService
             .ToArray();
 
         var updateOperations = analysis.Items
-            .Where(item => item.ActionKind == StoreSyncActionKind.RefreshManaged && item.ExistingShortcut is not null)
+            .Where(item => item.ActionKind == StoreSyncActionKind.RefreshManaged)
             .Select(item => new LiveShortcutSyncUpdateOperation(
                 item.TitleId,
-                item.ExistingShortcut!.AppId,
+                ResolveRefreshShortcutAppId(item),
                 item.TargetAppId,
+                item.ExistingShortcut is null,
                 item.EffectiveTitle,
                 NormalizePath(item.Game.ExecutablePath),
                 NormalizePath(item.Game.StartDirectory),
@@ -3848,6 +4766,21 @@ public sealed class StoreSyncService
             createOperations,
             updateOperations,
             removeOperations);
+    }
+
+    private static uint ResolveRefreshShortcutAppId(StoreSyncAnalysisItem item)
+    {
+        if (item.ExistingShortcut is not null && item.ExistingShortcut.AppId != 0)
+        {
+            return item.ExistingShortcut.AppId;
+        }
+
+        if (item.ManifestEntry is not null && item.ManifestEntry.AppId != 0)
+        {
+            return item.ManifestEntry.AppId;
+        }
+
+        return item.TargetAppId;
     }
 
     private static string BuildLiveShortcutSyncExpression(LiveShortcutSyncPlan plan)
@@ -3917,23 +4850,18 @@ public sealed class StoreSyncService
     for (const operation of plan.createOperations ?? []) {
       attemptedCount += 1;
       try {
-        let liveAppId = operation.targetAppId >>> 0;
-        let appliedToExistingShortcut = await tryApplyToShortcut(liveAppId, operation);
-        if (!appliedToExistingShortcut) {
-          const createdAppId = Number(await invoke(
-            "AddShortcut",
-            operation.name,
-            operation.executablePath,
-            toText(operation.launchOptions),
-            operation.startDirectory));
-          if (!Number.isFinite(createdAppId) || createdAppId <= 0) {
-            throw new Error("Steam returned an invalid shortcut id.");
-          }
-
-          liveAppId = createdAppId >>> 0;
-          await applyShortcutFields(liveAppId, operation);
+        const createdAppId = Number(await invoke(
+          "AddShortcut",
+          operation.name,
+          operation.executablePath,
+          toText(operation.launchOptions),
+          operation.startDirectory));
+        if (!Number.isFinite(createdAppId) || createdAppId <= 0) {
+          throw new Error("Steam returned an invalid shortcut id.");
         }
 
+        const liveAppId = createdAppId >>> 0;
+        await applyShortcutFields(liveAppId, operation);
         appIdsByTitleId[operation.titleId] = liveAppId;
       } catch (error) {
         errors.push(`Create ${operation.titleId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -3944,8 +4872,12 @@ public sealed class StoreSyncService
       attemptedCount += 1;
       try {
         let liveAppId = operation.appId >>> 0;
-        let appliedToExistingShortcut = await tryApplyToShortcut(liveAppId, operation);
-        if (!appliedToExistingShortcut) {
+        let appliedToExistingShortcut = false;
+        if (!operation.forceCreate) {
+          appliedToExistingShortcut = await tryApplyToShortcut(liveAppId, operation);
+        }
+
+        if (!appliedToExistingShortcut && !operation.forceCreate) {
           const fallbackAppId = operation.targetAppId >>> 0;
           if (fallbackAppId && fallbackAppId !== liveAppId) {
             liveAppId = fallbackAppId;
@@ -3954,7 +4886,18 @@ public sealed class StoreSyncService
         }
 
         if (!appliedToExistingShortcut) {
-          throw new Error("Steam could not find the managed live shortcut to refresh.");
+          const createdAppId = Number(await invoke(
+            "AddShortcut",
+            operation.name,
+            operation.executablePath,
+            toText(operation.launchOptions),
+            operation.startDirectory));
+          if (!Number.isFinite(createdAppId) || createdAppId <= 0) {
+            throw new Error("Steam could not find the managed live shortcut to refresh or recreate.");
+          }
+
+          liveAppId = createdAppId >>> 0;
+          await applyShortcutFields(liveAppId, operation);
         }
 
         appIdsByTitleId[operation.titleId] = liveAppId;
@@ -4165,6 +5108,12 @@ public sealed class StoreSyncService
 
         var manifestEntry = item.ManifestEntry;
         if (manifestEntry is null)
+        {
+            return true;
+        }
+
+        if (IsWindowsResourcePlaceholder(manifestEntry.ArtworkTitle) &&
+            !string.Equals(manifestEntry.ArtworkTitle, item.EffectiveArtworkTitle, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -4814,6 +5763,23 @@ public sealed class StoreSyncService
         return PrettifyTitle(Path.GetFileName(candidateRoot));
     }
 
+    private static string ResolveXboxTitle(
+        string candidateRoot,
+        string executablePath,
+        string? overrideDisplayName,
+        string? shellDisplayName,
+        string? shellDescription)
+    {
+        return FirstMeaningfulTitle(
+                   overrideDisplayName,
+                   shellDisplayName,
+                   shellDescription,
+                   TryReadXboxTitleFromAppxManifest(candidateRoot),
+                   TryReadExecutableTitle(executablePath),
+                   Path.GetFileName(candidateRoot))
+               ?? BuildDetectedTitle(candidateRoot, executablePath);
+    }
+
     private static string? TryReadExecutableTitle(string executablePath)
     {
         try
@@ -4841,6 +5807,102 @@ public sealed class StoreSyncService
         }
 
         return null;
+    }
+
+    private static string? TryReadXboxTitleFromAppxManifest(string candidateRoot)
+    {
+        var appxManifestPath = FindXboxAppxManifest(candidateRoot);
+        if (string.IsNullOrWhiteSpace(appxManifestPath) || !File.Exists(appxManifestPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var document = XDocument.Load(appxManifestPath, LoadOptions.None);
+            var root = document.Root;
+            if (root is null)
+            {
+                return null;
+            }
+
+            var manifestNamespace = root.Name.Namespace;
+            var propertiesElement = root.Element(manifestNamespace + "Properties");
+            var displayName = propertiesElement?.Element(manifestNamespace + "DisplayName")?.Value;
+
+            var visualElementsDisplayName = root
+                .Descendants()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "VisualElements", StringComparison.OrdinalIgnoreCase))
+                ?.Attribute("DisplayName")
+                ?.Value;
+
+            return FirstMeaningfulTitle(
+                displayName,
+                visualElementsDisplayName,
+                Path.GetFileName(candidateRoot));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? FindXboxAppxManifest(string candidateRoot)
+    {
+        foreach (var manifestPath in new[]
+        {
+            Path.Combine(candidateRoot, "appxmanifest.xml"),
+            Path.Combine(candidateRoot, "Content", "appxmanifest.xml")
+        })
+        {
+            if (File.Exists(manifestPath))
+            {
+                return manifestPath;
+            }
+        }
+
+        try
+        {
+            return Directory.EnumerateFiles(candidateRoot, "appxmanifest.xml", SearchOption.AllDirectories)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? FirstMeaningfulTitle(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            var trimmed = value.Trim();
+            if (IsWindowsResourcePlaceholder(trimmed))
+            {
+                continue;
+            }
+
+            return PrettifyTitle(trimmed);
+        }
+
+        return null;
+    }
+
+    private static bool IsWindowsResourcePlaceholder(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) ||
+               trimmed.StartsWith("ms resource:", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeToken(string? value)
@@ -5230,6 +6292,37 @@ public sealed class StoreSyncService
         }
     }
 
+    private static void ResetResolvedPlaceholderArtworkState(
+        StoreSyncConfiguration configuration,
+        string titleId,
+        StoreSyncManifestEntry? manifestEntry,
+        string effectiveArtworkTitle,
+        ref StoreSyncArtworkCacheEntry? artworkCache)
+    {
+        if (manifestEntry is null)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(manifestEntry.ArtworkTitle) ||
+            string.Equals(manifestEntry.ArtworkTitle, effectiveArtworkTitle, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (!IsWindowsResourcePlaceholder(manifestEntry.ArtworkTitle) &&
+            !IsWindowsResourcePlaceholder(manifestEntry.Title) &&
+            !IsWindowsResourcePlaceholder(manifestEntry.EffectiveTitle))
+        {
+            return;
+        }
+
+        configuration.ArtworkMatchCache.Remove(titleId);
+        artworkCache = null;
+        manifestEntry.SteamGridDbGameId = null;
+        manifestEntry.ArtworkLocked = false;
+    }
+
     private static void AddArtworkTarget(
         IDictionary<uint, StoreSyncArtworkTarget> targets,
         StoreSyncAnalysisItem item,
@@ -5249,37 +6342,42 @@ public sealed class StoreSyncService
             appId,
             new[] { item.Game.Title, item.EffectiveTitle, item.Game.ExecutablePath, item.Game.StartDirectory },
             artworkCache?.GameId,
-            artworkCache?.MatchName ?? string.Empty);
+            artworkCache?.MatchName ?? string.Empty,
+            item.Game.StoreId);
     }
 
-    private static ManagedShortcutEntry CreateShortcutEntry(StoreSyncAnalysisItem item)
+    private static ManagedShortcutEntry CreateShortcutEntry(
+        StoreSyncAnalysisItem item,
+        uint? appIdOverride = null,
+        Dictionary<string, object?>? seedEntry = null)
     {
-        var appId = item.TargetAppId;
-        var entry = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        var appId = appIdOverride ?? item.TargetAppId;
+        var entry = seedEntry is null
+            ? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+            : CloneShortcutEntry(seedEntry);
+
+        entry["appid"] = unchecked((int)appId);
+        entry["appname"] = item.EffectiveTitle;
+        entry["Exe"] = QuotePath(item.Game.ExecutablePath);
+        entry["StartDir"] = QuotePath(item.Game.StartDirectory);
+        entry["icon"] = item.Game.ExecutablePath;
+        entry["ShortcutPath"] = ManagedShortcutMarker;
+        entry["LaunchOptions"] = item.Game.LaunchOptions;
+        entry["IsHidden"] = 0;
+        entry["AllowDesktopConfig"] = 1;
+        entry["AllowOverlay"] = 1;
+        entry["OpenVR"] = 0;
+        entry["Devkit"] = 0;
+        entry["DevkitGameID"] = string.Empty;
+        entry["DevkitOverrideAppID"] = 0;
+        entry["LastPlayTime"] = entry.TryGetValue("LastPlayTime", out var lastPlayTimeValue) ? lastPlayTimeValue ?? 0 : 0;
+        entry["FlatpakAppID"] = string.Empty;
+        entry["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["appid"] = unchecked((int)appId),
-            ["appname"] = item.EffectiveTitle,
-            ["Exe"] = QuotePath(item.Game.ExecutablePath),
-            ["StartDir"] = QuotePath(item.Game.StartDirectory),
-            ["icon"] = item.Game.ExecutablePath,
-            ["ShortcutPath"] = ManagedShortcutMarker,
-            ["LaunchOptions"] = item.Game.LaunchOptions,
-            ["IsHidden"] = 0,
-            ["AllowDesktopConfig"] = 1,
-            ["AllowOverlay"] = 1,
-            ["OpenVR"] = 0,
-            ["Devkit"] = 0,
-            ["DevkitGameID"] = string.Empty,
-            ["DevkitOverrideAppID"] = 0,
-            ["LastPlayTime"] = 0,
-            ["FlatpakAppID"] = string.Empty,
-            ["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["0"] = "Tools for Steam",
-                ["1"] = "Store Sync",
-                ["2"] = item.Game.StoreId,
-                ["3"] = item.TitleId,
-            },
+            ["0"] = "Tools for Steam",
+            ["1"] = "Store Sync",
+            ["2"] = item.Game.StoreId,
+            ["3"] = item.TitleId,
         };
 
         return new ManagedShortcutEntry(item.Game, appId, entry);
@@ -5706,6 +6804,7 @@ public sealed class StoreSyncService
         string TitleId,
         uint AppId,
         uint TargetAppId,
+        bool ForceCreate,
         string Name,
         string ExecutablePath,
         string StartDirectory,
@@ -5739,4 +6838,158 @@ public sealed class StoreSyncService
     private sealed record LiveShortcutSyncResult(
         bool Applied,
         Dictionary<string, uint> AppIdsByTitleId);
+
+    // ── Store Collections ─────────────────────────────────────────────────────
+
+    private sealed record StoreCollectionEntry(
+        string StoreId,
+        string DisplayName,
+        IReadOnlyList<uint> AppIds);
+
+    private sealed record StoreCollectionSyncPlan(
+        IReadOnlyList<StoreCollectionEntry> StoreCollections);
+
+    private sealed record StoreCollectionSyncResponse(
+        bool Available,
+        bool Success,
+        List<string> Errors);
+
+    /// <summary>
+    /// Groups all active (non-excluded) synced items by store and asks Steam via CDP
+    /// to create or update one collection per store.  Silently no-ops when CDP is unavailable.
+    /// </summary>
+    private async Task TrySyncCollectionsLiveAsync(
+        StoreSyncAnalysis analysis,
+        IReadOnlyDictionary<string, uint> liveShortcutAppIds,
+        CancellationToken cancellationToken)
+    {
+        // Build one entry per store that has at least one active game.
+        var byStore = new Dictionary<string, (string DisplayName, List<uint> AppIds)>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in analysis.Items)
+        {
+            if (item.ActionKind == StoreSyncActionKind.Excluded)
+            {
+                continue;
+            }
+
+            var appId = ResolveLiveShortcutAppId(item, liveShortcutAppIds);
+            if (appId == 0)
+            {
+                continue;
+            }
+
+            var storeId = item.Game.StoreId;
+            if (string.IsNullOrWhiteSpace(storeId))
+            {
+                continue;
+            }
+
+            if (!byStore.TryGetValue(storeId, out var entry))
+            {
+                entry = (ResolveStoreTitle(storeId), []);
+                byStore[storeId] = entry;
+            }
+
+            entry.AppIds.Add(appId);
+        }
+
+        if (byStore.Count == 0)
+        {
+            return;
+        }
+
+        var plan = new StoreCollectionSyncPlan(
+            byStore
+                .Select(kv => new StoreCollectionEntry(kv.Key, kv.Value.DisplayName, kv.Value.AppIds))
+                .ToList());
+
+        try
+        {
+            var target = await _steamDevToolsClient.GetSharedJsContextTargetAsync(cancellationToken).ConfigureAwait(false);
+            if (target is null)
+            {
+                return;
+            }
+
+            var evaluation = await _steamDevToolsClient.EvaluateAsync(
+                target.WebSocketDebuggerUrl,
+                BuildCollectionSyncExpression(plan),
+                cancellationToken).ConfigureAwait(false);
+
+            if (!evaluation.Success)
+            {
+                _journal.Append("debug", "collections", "Store collection sync via CDP was not successful.", evaluation.ErrorMessage ?? string.Empty);
+                return;
+            }
+
+            _journal.Append("debug", "collections", $"Store collection sync via CDP completed for {byStore.Count} store(s).");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _journal.Append("debug", "collections", "Store collection sync via CDP threw an exception.", ex.Message);
+        }
+    }
+
+    private static string BuildCollectionSyncExpression(StoreCollectionSyncPlan plan)
+    {
+        var planJson = JsonSerializer.Serialize(plan, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        return $$"""
+(async () => {
+  try {
+    const plan = {{planJson}};
+    const col = window.SteamClient?.Collections;
+    if (!col) {
+      return { available: false, success: false, errors: ["SteamClient.Collections not available in SharedJSContext."] };
+    }
+
+    // Fetch existing user collections.
+    let existing = [];
+    try {
+      const raw = await (col.GetUserCollectionList?.() ?? Promise.resolve([]));
+      existing = Array.isArray(raw) ? raw : [];
+    } catch {
+      existing = [];
+    }
+
+    const errors = [];
+
+    for (const entry of plan.storeCollections ?? []) {
+      try {
+        // Match by display name (case-insensitive).
+        const found = existing.find(c =>
+          (c.displayName ?? c.name ?? "").toLowerCase() === entry.displayName.toLowerCase());
+
+        if (!found) {
+          // Create a new collection and populate it.
+          const newCol = await (col.CreateCollection?.(entry.displayName) ?? Promise.resolve(null));
+          const newId = newCol?.id ?? newCol;
+          if (newId && entry.appIds.length > 0) {
+            await col.AddToCollection?.(newId, entry.appIds.map(Number));
+          }
+        } else {
+          // Add any games that aren't already in the collection (additive — never removes).
+          const currentApps = new Set(
+            (found.apps ?? found.added ?? []).map(Number));
+          const toAdd = entry.appIds.map(Number).filter(id => !currentApps.has(id));
+          if (toAdd.length > 0) {
+            await col.AddToCollection?.(found.id, toAdd);
+          }
+        }
+      } catch (err) {
+        errors.push(`${entry.displayName}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return { available: true, success: errors.length === 0, errors };
+  } catch (err) {
+    return {
+      available: false,
+      success: false,
+      errors: [err instanceof Error ? err.message : String(err)]
+    };
+  }
+})()
+""";
+    }
 }
