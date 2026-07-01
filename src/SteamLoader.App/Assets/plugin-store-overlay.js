@@ -789,8 +789,8 @@
         min-width: 0;
         min-height: 0;
         display: grid;
-        grid-template-rows: auto auto minmax(0, 1fr);
-        padding: 58px 34px 28px;
+        grid-template-rows: auto auto minmax(0, 1fr) auto;
+        padding: 50px 34px 18px;
         background: #101720;
       }
 
@@ -938,25 +938,39 @@
       .steamloader-plugin-store-gallery {
         height: 100%;
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 14px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-rows: repeat(4, minmax(0, 1fr));
+        grid-auto-rows: minmax(0, 1fr);
+        gap: 12px;
         overflow: auto;
-        padding: 0 0 18px;
+        padding: 0 0 8px;
         align-content: start;
         scrollbar-color: rgba(238, 243, 248, 0.28) transparent;
       }
 
       .steamloader-plugin-store-card {
+        position: relative;
         display: grid;
         grid-template-columns: minmax(0, 1fr);
         grid-template-rows: auto minmax(0, 1fr);
         align-items: stretch;
-        gap: 12px;
-        min-height: 298px;
-        padding: 14px 15px 16px;
+        gap: 8px;
+        min-height: 0;
+        padding: 12px;
         border-radius: 24px;
         background: #343a42;
         box-shadow: none;
+        overflow: hidden;
+      }
+
+      .steamloader-plugin-store-card::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border: 3px solid transparent;
+        border-radius: inherit;
+        pointer-events: none;
+        transition: border-color 120ms ease, box-shadow 120ms ease;
       }
 
       .steamloader-plugin-store-card:hover,
@@ -964,14 +978,27 @@
       .steamloader-plugin-store-card.is-controller-focus {
         background: #48515d;
         box-shadow:
-          inset 0 0 0 3px rgba(238, 243, 248, 0.16),
-          0 10px 26px rgba(0, 0, 0, 0.18);
+          0 10px 26px rgba(0, 0, 0, 0.18),
+          0 0 0 4px rgba(238, 243, 248, 0.1);
         transform: none;
+      }
+
+      .steamloader-plugin-store-card:hover::after,
+      .steamloader-plugin-store-card:focus-visible::after,
+      .steamloader-plugin-store-card.is-controller-focus::after {
+        border-color: rgba(238, 243, 248, 0.96);
+        box-shadow:
+          inset 0 0 0 2px rgba(255, 255, 255, 0.12),
+          0 0 0 2px rgba(238, 243, 248, 0.16);
       }
 
       .steamloader-plugin-store-card.is-selected {
         background: #3d454f;
-        box-shadow: none;
+        box-shadow: inset 0 0 0 2px rgba(238, 243, 248, 0.14);
+      }
+
+      .steamloader-plugin-store-card.is-selected::after {
+        border-color: rgba(238, 243, 248, 0.34);
       }
 
       .steamloader-plugin-store-card-main {
@@ -982,7 +1009,7 @@
       }
 
       .steamloader-plugin-store-card-title {
-        font-size: clamp(20px, 1.5vw, 27px);
+        font-size: clamp(17px, 1.2vw, 22px);
         line-height: 1.05;
         letter-spacing: -0.055em;
       }
@@ -994,25 +1021,26 @@
 
       .steamloader-plugin-store-card-description {
         display: -webkit-box;
-        -webkit-line-clamp: 2;
+        -webkit-line-clamp: 1;
         -webkit-box-orient: vertical;
         overflow: hidden;
         color: rgba(190, 201, 213, 0.64);
-        font-size: 12px;
+        font-size: 11px;
       }
 
       .steamloader-plugin-store-badges {
         display: flex;
         flex-wrap: wrap;
-        gap: 6px;
-        margin-top: 4px;
+        gap: 5px;
+        margin-top: 2px;
       }
 
       .steamloader-plugin-store-badge {
-        min-height: 22px;
+        min-height: 19px;
+        padding: 0 7px;
         background: rgba(255, 255, 255, 0.08);
         color: rgba(238, 243, 248, 0.76);
-        font-size: 9px;
+        font-size: 8px;
       }
 
       .steamloader-plugin-store-badge.is-built-in,
@@ -1025,27 +1053,27 @@
         display: flex;
         align-items: center;
         justify-content: flex-start;
-        gap: 10px;
+        gap: 8px;
         flex-wrap: wrap;
-        margin-top: 5px;
+        margin-top: 2px;
       }
 
       .steamloader-plugin-store-card-preview {
         width: 100%;
-        height: 152px;
-        border-radius: 22px;
+        height: clamp(74px, 10vh, 116px);
+        border-radius: 20px;
         background: transparent;
         box-shadow: none;
         overflow: hidden;
         isolation: isolate;
-        clip-path: inset(0 round 22px);
+        clip-path: inset(0 round 20px);
       }
 
       .steamloader-plugin-store-card-preview img {
         object-fit: contain;
         background: transparent;
-        border-radius: 22px;
-        clip-path: inset(0 round 22px);
+        border-radius: 20px;
+        clip-path: inset(0 round 20px);
       }
 
       .steamloader-plugin-store-card-placeholder {
@@ -1062,29 +1090,73 @@
       }
 
       .steamloader-plugin-store-actions .steamloader-plugin-store-button {
-        min-height: 28px;
+        min-height: 24px;
         border-radius: 999px;
-        padding: 0 10px;
-        font-size: 10px;
+        padding: 0 9px;
+        font-size: 9px;
+      }
+
+      .steamloader-plugin-store-controller-bar {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 34px;
+        min-height: 56px;
+        padding: 8px 0 0;
+        color: rgba(238, 243, 248, 0.9);
+        font-size: 18px;
+        font-weight: 950;
+        letter-spacing: 0.01em;
+      }
+
+      .steamloader-plugin-store-controller-hint {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        text-transform: uppercase;
+      }
+
+      .steamloader-plugin-store-controller-key {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 48px;
+        height: 36px;
+        padding: 0 14px;
+        border-radius: 999px;
+        background: #eef3f8;
+        color: #17212c;
+        font-size: 18px;
+        font-weight: 950;
+        line-height: 1;
+      }
+
+      .steamloader-plugin-store-controller-label {
+        color: rgba(238, 243, 248, 0.72);
       }
 
       @media (max-width: 1280px) {
         .steamloader-plugin-store-main {
-          padding: 42px 22px 24px;
+          padding: 40px 22px 16px;
+        }
+
+        .steamloader-plugin-store-gallery {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-rows: repeat(4, minmax(0, 1fr));
         }
 
         .steamloader-plugin-store-card {
           grid-template-columns: minmax(0, 1fr);
-          min-height: 274px;
+          min-height: 0;
           border-radius: 24px;
         }
 
         .steamloader-plugin-store-card-preview {
-          height: 132px;
+          height: clamp(72px, 9vh, 104px);
         }
 
         .steamloader-plugin-store-card-title {
-          font-size: 21px;
+          font-size: 19px;
         }
       }
 
@@ -1107,6 +1179,24 @@
         .steamloader-plugin-store-card-preview {
           display: block;
           height: 128px;
+        }
+
+        .steamloader-plugin-store-gallery {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          grid-template-rows: none;
+          grid-auto-rows: minmax(220px, auto);
+        }
+
+        .steamloader-plugin-store-controller-bar {
+          min-height: 46px;
+          gap: 18px;
+          font-size: 14px;
+        }
+
+        .steamloader-plugin-store-controller-key {
+          min-width: 40px;
+          height: 30px;
+          font-size: 14px;
         }
       }
     `;
@@ -2589,6 +2679,21 @@
     browser.append(gallery);
     content.append(browser);
     main.append(content);
+
+    const controllerBar = createNode("div", "steamloader-plugin-store-controller-bar");
+    controllerBar.setAttribute("aria-hidden", "true");
+    const openHint = createNode("div", "steamloader-plugin-store-controller-hint");
+    openHint.append(
+      createNode("span", "steamloader-plugin-store-controller-key", "A"),
+      createNode("span", "steamloader-plugin-store-controller-label", "Open"),
+    );
+    const closeHint = createNode("div", "steamloader-plugin-store-controller-hint");
+    closeHint.append(
+      createNode("span", "steamloader-plugin-store-controller-key", "B"),
+      createNode("span", "steamloader-plugin-store-controller-label", "Close"),
+    );
+    controllerBar.append(openHint, closeHint);
+    main.append(controllerBar);
 
     surface.append(main);
     root.append(surface);
