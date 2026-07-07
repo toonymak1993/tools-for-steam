@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 100;
+  const stateVersion = 103;
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
   const smartHomeSliderCommitSettleDelayMs = 1000;
@@ -67,6 +67,10 @@
 
     if (previousState?.pluginStoreBridge?.activationFallbackTimer) {
       window.clearTimeout(previousState.pluginStoreBridge.activationFallbackTimer);
+    }
+
+    if (previousState?.pluginStoreBridge?.quickAccessRestoreTimer) {
+      window.clearTimeout(previousState.pluginStoreBridge.quickAccessRestoreTimer);
     }
 
     if (previousState?.pluginStoreBridge?.overlayStatePollTimer) {
@@ -225,6 +229,8 @@
             titleOverrideInputVersionById: {},
             artworkTitleOverrideInputVersionById: {},
             excludedDraftById: {},
+            unifySteamAuthDraftByStoreId: {},
+            unifySteamAuthInputVersionByStoreId: {},
             artworkPreviewByTitleId: {},
             artworkPreviewLoadingByTitleId: {},
             pinnedTitleIds: readStoreSyncPinnedTitleIds(),
@@ -368,6 +374,9 @@
             previousCatchAllGamepadInput: null,
             catchAllButtonState: {},
             keyHandler: null,
+            quickAccessClosedForStore: false,
+            quickAccessRestoreTimer: 0,
+            quickAccessRestoreAttempts: 0,
           },
           steamKeyboardActiveUntil: 0,
         });
@@ -414,8 +423,11 @@
       }
 
       body.steamloader-plugin-store-remote-active #QuickAccess-NA {
+        display: none !important;
         opacity: 0 !important;
+        visibility: hidden !important;
         pointer-events: none !important;
+        transition: none !important;
       }
     `;
     document.head.append(style);
@@ -703,8 +715,42 @@
     }, 3800);
   }
 
+  function clearPluginStoreQuickAccessRestoreTimer() {
+    const bridge = state.pluginStoreBridge;
+    if (bridge.quickAccessRestoreTimer) {
+      window.clearTimeout(bridge.quickAccessRestoreTimer);
+      bridge.quickAccessRestoreTimer = 0;
+    }
+  }
+
+  function schedulePluginStoreQuickAccessRestore(delayMs = 140) {
+    const bridge = state.pluginStoreBridge;
+    if (!bridge.quickAccessClosedForStore) {
+      return;
+    }
+
+    clearPluginStoreQuickAccessRestoreTimer();
+    bridge.quickAccessRestoreTimer = window.setTimeout(() => {
+      bridge.quickAccessRestoreTimer = 0;
+      if (bridge.remoteActive) {
+        return;
+      }
+
+      bridge.quickAccessRestoreAttempts += 1;
+      const restored = tryOpenQuickAccessMenuForPluginStore();
+      if (!restored && bridge.quickAccessRestoreAttempts < 6) {
+        schedulePluginStoreQuickAccessRestore(180);
+        return;
+      }
+
+      bridge.quickAccessClosedForStore = false;
+      bridge.quickAccessRestoreAttempts = 0;
+    }, delayMs);
+  }
+
   function setPluginStoreRemoteActive(active, options = {}) {
     const bridge = state.pluginStoreBridge;
+    const wasActive = Boolean(bridge.remoteActive);
     const nextActive = Boolean(active);
     bridge.remoteActive = nextActive;
     bridge.remoteActiveExpiresAt = nextActive
@@ -712,6 +758,8 @@
       : 0;
 
     if (nextActive) {
+      clearPluginStoreQuickAccessRestoreTimer();
+      bridge.quickAccessRestoreAttempts = 0;
       installPluginStoreCatchAllInput();
       installPluginStoreKeyTrap();
       schedulePluginStoreBridgeFallbackRelease();
@@ -721,6 +769,10 @@
       if (bridge.activationFallbackTimer) {
         window.clearTimeout(bridge.activationFallbackTimer);
         bridge.activationFallbackTimer = 0;
+      }
+
+      if (wasActive) {
+        schedulePluginStoreQuickAccessRestore();
       }
     }
 
@@ -802,9 +854,14 @@
   function tryCloseQuickAccessMenuForPluginStore() {
     const closeMethodNames = [
       "CloseSideMenus",
+      "CloseSideMenu",
       "HideSideMenus",
+      "HideSideMenu",
+      "DismissSideMenus",
+      "DismissSideMenu",
       "CloseQuickAccessMenu",
       "HideQuickAccessMenu",
+      "DismissQuickAccessMenu",
     ];
     const setVisibleMethodNames = [
       "SetQuickAccessMenuVisible",
@@ -813,19 +870,29 @@
       "SetSideMenuOpen",
     ];
     const candidates = [
+      window.GamepadUI,
       window.GamepadUI?.Router,
       window.GamepadUI?.NavigationManager,
+      window.SteamUIStore,
       window.SteamUIStore?.MenuStore,
       window.SteamUIStore?.SideMenuStore,
       window.SteamClient?.UI,
       window.SteamClient?.Overlay,
+      window.SteamClient?.Input,
+      window.SteamClient?.System,
       window.SteamClient,
     ];
 
     for (const candidate of candidates) {
       if (
         tryInvokePluginStoreCloseCandidate(candidate, closeMethodNames, [[]]) ||
-        tryInvokePluginStoreCloseCandidate(candidate, setVisibleMethodNames, [[false], ["quickaccess", false]])
+        tryInvokePluginStoreCloseCandidate(candidate, setVisibleMethodNames, [
+          [false],
+          ["quickaccess", false],
+          ["QuickAccess", false],
+          ["quick-access", false],
+          ["quickAccess", false],
+        ])
       ) {
         return true;
       }
@@ -859,6 +926,99 @@
     }
 
     return false;
+  }
+
+  function tryOpenQuickAccessMenuForPluginStore() {
+    const openMethodNames = [
+      "OpenQuickAccessMenu",
+      "ShowQuickAccessMenu",
+      "OpenSideMenus",
+      "OpenSideMenu",
+      "ShowSideMenus",
+      "ShowSideMenu",
+    ];
+    const setVisibleMethodNames = [
+      "SetQuickAccessMenuVisible",
+      "SetQuickAccessVisible",
+      "SetSideMenuVisible",
+      "SetSideMenuOpen",
+    ];
+    const menuArgs = [
+      [],
+      ["quickaccess"],
+      ["QuickAccess"],
+      ["quick-access"],
+      ["quickAccess"],
+    ];
+    const candidates = [
+      window.GamepadUI,
+      window.GamepadUI?.Router,
+      window.GamepadUI?.NavigationManager,
+      window.SteamUIStore,
+      window.SteamUIStore?.MenuStore,
+      window.SteamUIStore?.SideMenuStore,
+      window.SteamClient?.UI,
+      window.SteamClient?.Overlay,
+      window.SteamClient?.Input,
+      window.SteamClient?.System,
+      window.SteamClient,
+    ];
+
+    for (const candidate of candidates) {
+      if (
+        tryInvokePluginStoreCloseCandidate(candidate, openMethodNames, menuArgs) ||
+        tryInvokePluginStoreCloseCandidate(candidate, setVisibleMethodNames, [
+          [true],
+          ["quickaccess", true],
+          ["QuickAccess", true],
+          ["quick-access", true],
+          ["quickAccess", true],
+        ])
+      ) {
+        return true;
+      }
+    }
+
+    const runtime = findRuntime();
+    const propsList = [
+      runtime?.qamNode?.memoizedProps,
+      runtime?.qamNode?.pendingProps,
+      runtime?.qamNode?.return?.memoizedProps,
+      runtime?.qamNode?.return?.pendingProps,
+    ].filter(Boolean);
+
+    for (const props of propsList) {
+      for (const [key, value] of Object.entries(props)) {
+        if (typeof value !== "function" || !/(open|show|display|visible)/i.test(key)) {
+          continue;
+        }
+
+        try {
+          value(true);
+          return true;
+        } catch {
+          try {
+            value();
+            return true;
+          } catch {
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function closeQuickAccessMenuForPluginStoreSession() {
+    const bridge = state.pluginStoreBridge;
+    clearPluginStoreQuickAccessRestoreTimer();
+    bridge.quickAccessRestoreAttempts = 0;
+    const closed = tryCloseQuickAccessMenuForPluginStore();
+    if (closed) {
+      bridge.quickAccessClosedForStore = true;
+    }
+
+    return closed;
   }
 
   function normalizeOptimisticValueKey(key) {
@@ -992,6 +1152,12 @@
           description: "Manage individual launcher sources and custom paths",
         },
       ],
+    },
+    {
+      id: "unifystore",
+      title: "Storefront",
+      description: "Fullscreen launcher for Epic and GOG libraries",
+      pages: [],
     },
     {
       id: "auto-sisr",
@@ -5281,6 +5447,7 @@
       case "hltb":
         return HltbPluginIcon;
       case "store-sync":
+      case "unifystore":
         return StoreSyncPluginIcon;
       case "auto-sisr":
         return AutoSisirPluginIcon;
@@ -11040,6 +11207,7 @@
       clearStoreSyncArtworkPreview(activeTitleId);
       syncStoreSyncTitleDraftsFromSnapshot(activeTitleId, true);
     }
+
   }
 
   function setAudioDashboardSnapshot(snapshot, options = {}) {
@@ -11303,6 +11471,20 @@
     const stores = getStoreSyncSnapshot()?.stores;
     return Array.isArray(stores) ? stores.find((store) => store.id === storeId) || null : null;
   }
+
+  function getUnifySteamSnapshot() {
+    return getStoreSyncSnapshot()?.unifySteam || null;
+  }
+
+  function getUnifySteamStores() {
+    const stores = getUnifySteamSnapshot()?.stores;
+    return Array.isArray(stores) ? stores : [];
+  }
+
+  function getUnifySteamStore(storeId) {
+    return getUnifySteamStores().find((store) => store.id === storeId) || null;
+  }
+
 
   function readStoreSyncPinnedTitleIds() {
     try {
@@ -11884,6 +12066,65 @@
           : `${queuedCount} review item${queuedCount === 1 ? "" : "s"} queued`,
       ],
     };
+  }
+
+  function buildUnifySteamOverviewCard(snapshot = getUnifySteamSnapshot()) {
+    const stores = Array.isArray(snapshot?.stores) ? snapshot.stores : [];
+    const installedCount = stores.reduce((total, store) => total + (Number(store.installedCount) || 0), 0);
+    const libraryCount = stores.reduce((total, store) => total + (Number(store.availableCount) || 0), 0);
+
+    return {
+      title: "Storefront",
+      lines: [
+        `${installedCount} installed / ${libraryCount} in library`,
+        snapshot?.statusText || "Waiting for setup.",
+        snapshot?.detailText || "Sign in and refresh Epic or GOG to build the cached library.",
+      ].filter(Boolean),
+    };
+  }
+
+  function buildUnifySteamStoreCopy(store) {
+    if (!store) {
+      return "Storefront store unavailable.";
+    }
+
+    return [
+      `${store.installedCount || 0} installed / ${store.availableCount || 0} total`,
+      store.accountName ? `Signed in as ${store.accountName}` : store.statusText || "",
+      store.detailText || "",
+    ]
+      .filter(Boolean)
+      .join(" - ");
+  }
+
+  function buildUnifySteamGameCopy(game) {
+    if (!game) {
+      return "Library item unavailable.";
+    }
+
+    return [
+      game.statusText || "",
+      game.version ? `Version ${game.version}` : "",
+      game.detailText || "",
+    ]
+      .filter(Boolean)
+      .join(" - ");
+  }
+
+  function buildUnifySteamGameBadge(game) {
+    if (!game) {
+      return "";
+    }
+
+    if (game.syncedToSteam) {
+      return "Synced";
+    }
+
+    if (game.installed) {
+      return "Installed";
+    }
+
+    return "Available";
   }
 
   function buildStoreSyncPreviewBadge(entry) {
@@ -13839,7 +14080,7 @@
   async function openPluginStoreOverlay() {
     setupPluginStoreBridge();
     setPluginStoreRemoteActive(true);
-    tryCloseQuickAccessMenuForPluginStore();
+    closeQuickAccessMenuForPluginStoreSession();
 
     try {
       const response = await fetch(`${apiBase}api/plugin-store/overlay/open`, {
@@ -13856,6 +14097,30 @@
     } catch (error) {
       setPluginStoreRemoteActive(false);
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
+      rerenderHomePanel();
+    }
+  }
+
+  async function openUnifyStoreOverlay() {
+    setupPluginStoreBridge();
+    setPluginStoreRemoteActive(true);
+    closeQuickAccessMenuForPluginStoreSession();
+
+    try {
+      const response = await fetch(`${apiBase}api/unifystore/overlay/open`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Storefront could not be opened (${response.status}).`);
+      }
+    } catch (error) {
+      setPluginStoreRemoteActive(false);
+      state.storeSync.error = error instanceof Error ? error.message : String(error);
       rerenderHomePanel();
     }
   }
@@ -14881,6 +15146,80 @@
       },
       { rerenderOnStart: false },
     );
+  }
+
+  async function toggleUnifySteamStoreEnabled(storeId, enabled) {
+    const snapshot = getStoreSyncSnapshot();
+    if (snapshot?.unifySteam?.stores) {
+      state.storeSync.snapshot = {
+        ...snapshot,
+        unifySteam: {
+          ...snapshot.unifySteam,
+          stores: snapshot.unifySteam.stores.map((store) =>
+            store.id === storeId
+              ? {
+                  ...store,
+                  enabled,
+                }
+              : store,
+          ),
+        },
+      };
+      rerenderStoreSyncPanel();
+    }
+
+    await sendStoreSyncRequest(
+      "api/store-sync/unifysteam/stores/enabled",
+      {
+        storeId,
+        enabled,
+      },
+      { rerenderOnStart: false },
+    );
+  }
+
+  async function refreshUnifySteam(storeId = "") {
+    await sendStoreSyncRequest("api/store-sync/unifysteam/refresh", {
+      value: storeId,
+    });
+  }
+
+  async function startUnifySteamLogin(storeId) {
+    await sendStoreSyncRequest("api/store-sync/unifysteam/stores/login", {
+      value: storeId,
+    });
+  }
+
+  async function refreshUnifyStore(storeId = "") {
+    await sendStoreSyncRequest("api/unifystore/stores/refresh", {
+      value: storeId,
+    });
+  }
+
+  async function startUnifyStoreLogin(storeId) {
+    await sendStoreSyncRequest("api/unifystore/stores/login", {
+      value: storeId,
+    });
+  }
+
+  async function submitUnifySteamAuthCode(storeId) {
+    const draft = (state.storeSync.unifySteamAuthDraftByStoreId[storeId] || "").trim();
+    if (!draft) {
+      state.storeSync.error = "Paste the login code or page URL first.";
+      rerenderStoreSyncPanel();
+      return;
+    }
+
+    const succeeded = await sendStoreSyncRequest("api/store-sync/unifysteam/stores/auth-code", {
+      storeId,
+      value: draft,
+    });
+
+    if (succeeded) {
+      state.storeSync.unifySteamAuthDraftByStoreId[storeId] = "";
+      state.storeSync.unifySteamAuthInputVersionByStoreId[storeId] =
+        (state.storeSync.unifySteamAuthInputVersionByStoreId[storeId] || 0) + 1;
+    }
   }
 
   async function setStoreSyncPrimaryPath(storeId) {
@@ -19608,6 +19947,132 @@
       };
     }
 
+    if (state.route.screen === "plugin" && state.route.pluginId === "unifystore") {
+      const stores = getUnifySteamStores();
+      const installedCount = stores.reduce((total, store) => total + (Number(store.installedCount) || 0), 0);
+      const libraryCount = stores.reduce((total, store) => total + (Number(store.availableCount) || 0), 0);
+      const authEditors = stores
+        .filter((store) => store.supportsManualCodeAuth)
+        .map((store) => {
+          const inputVersion = state.storeSync.unifySteamAuthInputVersionByStoreId[store.id] || 0;
+          return {
+            label: `${store.title || "Store"} Login Code`,
+            help: store.id === "epic-games"
+              ? "After Epic login, paste the authorizationCode JSON, the code, or the final page URL here."
+              : "After GOG login, paste the final URL or code here.",
+            value: state.storeSync.unifySteamAuthDraftByStoreId[store.id] || "",
+            placeholder: store.id === "epic-games"
+              ? '{"authorizationCode":"..."}'
+              : "https://embed.gog.com/on_login_success?code=...",
+            inputKey: `unifystore-login-code-${store.id}-${inputVersion}`,
+            rows: 2,
+            onInput: (value) => {
+              state.storeSync.unifySteamAuthDraftByStoreId[store.id] = value;
+            },
+          };
+        });
+      const storeSlots = stores.flatMap((store) => [
+        makeCommandSlot(
+          `${store.title || "Store"} Login`,
+          store.authReady
+            ? `Signed in${store.accountName ? ` as ${store.accountName}` : ""}.`
+            : store.detailText || "Open the store login flow.",
+          () => startUnifyStoreLogin(store.id),
+          {
+            slotKey: `unifystore-login-${store.id}`,
+            disabled: isStoreSyncBusy(),
+            leadingIcon: StoreSyncPluginIcon,
+          },
+        ),
+        makeCommandSlot(
+          `Save ${store.title || "Store"} Login Code`,
+          "Paste the browser login result above, then save it locally for Storefront.",
+          () => submitUnifySteamAuthCode(store.id),
+          {
+            slotKey: `unifystore-save-login-${store.id}`,
+            disabled: isStoreSyncBusy() || !store.supportsManualCodeAuth,
+            leadingIcon: SaveActionIcon,
+          },
+        ),
+        makeCommandSlot(
+          `Refresh ${store.title || "Store"}`,
+          buildUnifySteamStoreCopy(store),
+          () => refreshUnifyStore(store.id),
+          {
+            slotKey: `unifystore-refresh-${store.id}`,
+            disabled: isStoreSyncBusy() || !store.enabled,
+            leadingIcon: RefreshActionIcon,
+          },
+        ),
+      ]);
+
+      return {
+        ...defaultModel,
+        title: "Storefront",
+        subtitle: "Epic and GOG in one fullscreen launcher",
+        status: storeSyncStatus,
+        error: state.storeSync.error,
+        note: "Open the fullscreen surface to browse stores with LB/RB, mark installed games, and install or launch directly.",
+        editors: authEditors.length ? authEditors : null,
+        cards: [
+          {
+            title: "Storefront",
+            lines: [
+              `${installedCount} installed / ${libraryCount} in account libraries`,
+              getUnifySteamSnapshot()?.statusText || "Waiting for Epic or GOG setup.",
+              getUnifySteamSnapshot()?.detailText || "Login and refresh to populate the fullscreen launcher.",
+            ].filter(Boolean),
+          },
+        ],
+        autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
+        sectionHeaders: [
+          createSectionHeader(0, "Launcher", "Jump into the dedicated fullscreen library.", {
+            icon: StoreSyncPluginIcon,
+          }),
+          createSectionHeader(2, "Accounts", "Login and refresh the store libraries used by Storefront.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        dividerAfterIndices: [1],
+        slots: [
+          makeCommandSlot(
+            "Open Fullscreen",
+            "Launch Storefront with controller navigation, Epic/GOG tabs, and install-ready game cards.",
+            () => openUnifyStoreOverlay(),
+            {
+              slotKey: "unifystore-open-fullscreen",
+              disabled: isStoreSyncBusy(),
+              leadingIcon: StoreSyncPluginIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Libraries",
+            "Reload Epic and GOG account libraries before opening the fullscreen launcher.",
+            () => refreshUnifyStore(),
+            {
+              slotKey: "unifystore-refresh-all",
+              disabled: isStoreSyncBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+          ...(storeSlots.length
+            ? storeSlots
+            : [
+                makeCommandSlot(
+                  "Load Store State",
+                  "Reload Store Sync so Epic and GOG account status can appear here.",
+                  () => loadStoreSyncState(),
+                  {
+                    slotKey: "unifystore-load-state",
+                    disabled: isStoreSyncBusy(),
+                    leadingIcon: RefreshActionIcon,
+                  },
+                ),
+              ]),
+        ],
+      };
+    }
+
     if (state.route.screen === "plugin") {
       const plugin = plugins.find((entry) => entry.id === state.route.pluginId);
       if (plugin) {
@@ -19773,6 +20238,11 @@
           }
 
           rememberCurrentRouteIndex(pluginIndex);
+          if (plugin.id === "unifystore") {
+            void openUnifyStoreOverlay();
+            return;
+          }
+
           const targetRoute =
             plugin.id === "artwork"
               ? { screen: "page", pluginId: "artwork", pageId: "settings" }
@@ -21451,7 +21921,6 @@
 
     state.reactElementSymbol = runtime.soundtrackTab.tab.$$typeof;
     state.qamNode = runtime.qamNode;
-    state.forceHosts = runtime.forceHosts;
     const liveTabsChanged = mutateLiveTabs(rootFiber);
     ensurePanelObserver();
 

@@ -6,7 +6,8 @@ public static class SteamLoaderPluginCatalog
     [
         new("processes", "Processes", "Window switcher for visible app windows.", true),
         new("app-start", "App Start", "Controller launcher for selected Windows apps.", true),
-        new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, and artwork updates.", true),
+        new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true),
+        new("unifystore", "Storefront", "Fullscreen launcher for connected Epic and GOG account libraries.", true),
         new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),

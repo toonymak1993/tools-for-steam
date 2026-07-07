@@ -46,6 +46,12 @@
       "description": "Declared SDK capabilities. Known v1 permissions are frontend, storage, secrets, and network.",
       "items": {
         "type": "string",
+        "enum": [
+          "frontend",
+          "storage",
+          "secrets",
+          "network"
+        ],
         "pattern": "^[a-z0-9][a-z0-9._-]*$",
         "examples": [
           "frontend",

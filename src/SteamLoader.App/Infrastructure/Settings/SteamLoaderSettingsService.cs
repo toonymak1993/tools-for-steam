@@ -509,6 +509,14 @@ public sealed class SteamLoaderSettingsService
             }
         }
 
+        if (!seen.Contains("unifystore") && seen.Contains("store-sync"))
+        {
+            var storeSyncIndex = normalized.FindIndex(id =>
+                string.Equals(id, "store-sync", StringComparison.OrdinalIgnoreCase));
+            normalized.Insert(storeSyncIndex + 1, "unifystore");
+            seen.Add("unifystore");
+        }
+
         foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
         {
             if (seen.Add(plugin.Id))

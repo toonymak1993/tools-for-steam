@@ -68,12 +68,13 @@
           },
           "packagePath": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^(?![A-Za-z]:)(?!/)(?!\\\\)(?!.*(^|[/\\\\])\\.\\.([/\\\\]|$)).+\\.zip$"
           },
           "packageUrl": {
             "type": "string",
             "format": "uri",
-            "pattern": "^https?://"
+            "pattern": "^https?://.*\\.zip(\\?.*)?$"
           },
           "packageSha256": {
             "type": "string",

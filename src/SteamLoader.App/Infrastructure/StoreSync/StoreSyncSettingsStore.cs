@@ -60,6 +60,8 @@ public sealed class StoreSyncSettingsStore
         configuration.TitleOverrides ??= new Dictionary<string, StoreSyncTitleOverride>(StringComparer.OrdinalIgnoreCase);
         configuration.Manifest ??= new Dictionary<string, StoreSyncManifestEntry>(StringComparer.OrdinalIgnoreCase);
         configuration.ArtworkMatchCache ??= new Dictionary<string, StoreSyncArtworkCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        configuration.UnifySteam ??= new UnifySteamConfiguration();
+        configuration.UnifySteam.Stores ??= new Dictionary<string, UnifySteamStoreConfiguration>(StringComparer.OrdinalIgnoreCase);
 
         if (configuration.SyncBehaviorVersion < 2)
         {
@@ -88,6 +90,20 @@ public sealed class StoreSyncSettingsStore
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        foreach (var storeId in new[] { "epic-games", "gog-galaxy" })
+        {
+            if (!configuration.UnifySteam.Stores.TryGetValue(storeId, out var unifyStoreConfiguration) || unifyStoreConfiguration is null)
+            {
+                configuration.UnifySteam.Stores[storeId] = new UnifySteamStoreConfiguration();
+                continue;
+            }
+
+            unifyStoreConfiguration.ToolPath = NormalizeStoredPath(unifyStoreConfiguration.ToolPath);
+            unifyStoreConfiguration.AuthPath = NormalizeStoredPath(unifyStoreConfiguration.AuthPath);
+            unifyStoreConfiguration.Cache ??= new UnifySteamLibraryCache();
+            unifyStoreConfiguration.Cache.Games ??= [];
         }
     }
 
@@ -141,6 +157,8 @@ public sealed class StoreSyncConfiguration
 
     public Dictionary<string, StoreSyncArtworkCacheEntry> ArtworkMatchCache { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
+
+    public UnifySteamConfiguration UnifySteam { get; set; } = new();
 
     public StoreSyncLastSyncState? LastSync { get; set; }
 }
@@ -205,4 +223,53 @@ public sealed class StoreSyncArtworkCacheEntry
     public string MatchName { get; set; } = string.Empty;
 
     public DateTimeOffset UpdatedAtUtc { get; set; }
+}
+
+public sealed class UnifySteamConfiguration
+{
+    public Dictionary<string, UnifySteamStoreConfiguration> Stores { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed class UnifySteamStoreConfiguration
+{
+    public bool Enabled { get; set; } = true;
+
+    public string ToolPath { get; set; } = string.Empty;
+
+    public string AuthPath { get; set; } = string.Empty;
+
+    public UnifySteamLibraryCache Cache { get; set; } = new();
+}
+
+public sealed class UnifySteamLibraryCache
+{
+    public string AccountName { get; set; } = string.Empty;
+
+    public string StatusText { get; set; } = string.Empty;
+
+    public string DetailText { get; set; } = string.Empty;
+
+    public string LastError { get; set; } = string.Empty;
+
+    public DateTimeOffset? RefreshedAtUtc { get; set; }
+
+    public List<UnifySteamGameCacheEntry> Games { get; set; } = [];
+}
+
+public sealed class UnifySteamGameCacheEntry
+{
+    public string Id { get; set; } = string.Empty;
+
+    public string Title { get; set; } = string.Empty;
+
+    public bool Installed { get; set; }
+
+    public string InstallPath { get; set; } = string.Empty;
+
+    public string ExecutablePath { get; set; } = string.Empty;
+
+    public string Version { get; set; } = string.Empty;
+
+    public string ImageUrl { get; set; } = string.Empty;
 }

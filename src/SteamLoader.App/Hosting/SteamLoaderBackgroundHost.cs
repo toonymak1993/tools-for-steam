@@ -4,6 +4,7 @@ using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Hltb;
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.PluginStore;
@@ -98,10 +99,12 @@ public sealed class SteamLoaderBackgroundHost
         var executablePath =
             Environment.ProcessPath
             ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+        var handheldDevice = new HandheldDeviceDetection().Detect();
         var steamClientLaunchService = new SteamClientLaunchService(
             httpClient,
             DebugEndpoint,
-            steamInstallationService);
+            steamInstallationService,
+            isHandheld: handheldDevice.IsHandheld);
         var powerActionService = new PowerActionService(
             steamClientLaunchService,
             shellService,
@@ -120,7 +123,8 @@ public sealed class SteamLoaderBackgroundHost
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
+            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
+            EmbeddedAssetReader.ReadText("Assets/unifystore-overlay.js"));
 
         var appStartService = new AppStartService(Path.Combine(dataDirectory, "app-start.json"));
         var autoSisirService = new AutoSisirService(
@@ -138,6 +142,9 @@ public sealed class SteamLoaderBackgroundHost
             storeSyncService,
             smartHomeService,
             () => steamLoaderSettingsService.IsPluginEnabled("smart-home"));
+        var controllerShortcutService = new ControllerShortcutService(
+            isEnabled: () => true,
+            sendControlDigitAsync: digit => devToolsClient.SendControlDigitShortcutAsync(digit, cancellationToken));
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
@@ -181,6 +188,8 @@ public sealed class SteamLoaderBackgroundHost
         var storeSyncAutomationTask = storeSyncAutomationService.RunAsync(storeSyncAutomationCts.Token);
         using var liveStatePublisherCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var liveStatePublisherTask = liveStatePublisher.RunAsync(liveStatePublisherCts.Token);
+        using var controllerShortcutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var controllerShortcutTask = controllerShortcutService.RunAsync(controllerShortcutCts.Token);
 
         try
         {
@@ -192,6 +201,15 @@ public sealed class SteamLoaderBackgroundHost
             try
             {
                 await liveStatePublisherTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await controllerShortcutCts.CancelAsync();
+            try
+            {
+                await controllerShortcutTask;
             }
             catch (OperationCanceledException)
             {

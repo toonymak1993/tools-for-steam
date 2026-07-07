@@ -38,6 +38,10 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _showStartupSplash;
     private bool _showFirstRunSetup;
     private bool _windowsShellStarted;
+    // Fixed head start before the console-mode splash is taken down and the
+    // session is handed back to Windows (Steam keeps loading behind it).
+    private static readonly TimeSpan SplashHandOffDelay = TimeSpan.FromSeconds(10);
+
     private Task? _shellBootstrapMonitorTask;
     private SteamLoaderHostStatus? _lastKnownStatus;
     private int _stableBigPictureVisiblePollCount;
@@ -363,11 +367,12 @@ public sealed class MainWindowViewModel : BindableBase
             await StartAsync();
         }
 
-        if (_runStartupSyncOnInitialize && !_startupSyncTriggered)
-        {
-            _startupSyncTriggered = true;
-            await TriggerStartupSyncAsync();
-        }
+        // Startup sync intentionally disabled: the background Store Sync
+        // automation keeps the library in sync during runtime, so there is no
+        // need to run - and wait on - a sync at boot. This keeps console-mode
+        // startup fast (Steam is already launched first).
+        _ = _runStartupSyncOnInitialize;
+        _ = _startupSyncTriggered;
 
         if (_consoleStartupMode)
         {
@@ -790,44 +795,20 @@ public sealed class MainWindowViewModel : BindableBase
 
     private async Task MonitorShellBootstrapAsync()
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(180);
-        ShellHandOffReadiness? readiness = null;
+        // Simple, predictable hand-off: give Steam a fixed head start, then take
+        // the splash down and hand the session back to Windows. No Big Picture
+        // window/title detection - Steam keeps loading behind the scenes either
+        // way, and the old detection was locale-fragile and could hang the splash.
+        await Task.Delay(SplashHandOffDelay);
 
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            readiness = CaptureShellHandOffReadiness();
+        // Clear the splash WITHOUT the fade: fading it out briefly reveals the
+        // manager UI underneath it. Clearing the flag directly triggers the
+        // window's hide-to-tray, so the manager UI never appears in console mode -
+        // Tools for Steam just runs in the background.
+        ShowStartupSplash = false;
+        ShowFirstRunSetup = false;
 
-            if (readiness.WindowsShellHandOffReady)
-            {
-                break;
-            }
-
-            await Task.Delay(900);
-            await RefreshAsync();
-        }
-
-        readiness ??= CaptureShellHandOffReadiness();
-
-        if (!readiness.BigPictureVisible)
-        {
-            ServiceStateText = "Steam needs more time";
-            ServiceDetailText = _shellBootstrapMode
-                ? "Starting Windows Desktop recovery while Tools for Steam keeps trying in the tray."
-                : "Keeping Tools for Steam alive while Steam continues to start.";
-            SteamStateText = "Steam was not ready before the console-mode timeout.";
-
-            await DismissStartupSplashAsync();
-            CompleteShellBootstrap();
-            return;
-        }
-
-        if (ShowStartupSplash)
-        {
-            await DismissStartupSplashAsync();
-            TryFocusSteamWindow();
-        }
-
-        await WaitBeforeWindowsShellHandoffAsync();
+        TryFocusSteamWindow();
         CompleteShellBootstrap();
     }
 
@@ -863,6 +844,21 @@ public sealed class MainWindowViewModel : BindableBase
             WindowsShellHandOffReady: windowsShellHandOffReady);
     }
 
+    private static bool IsBigPictureWindowTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        // Steam titles the Gamepad UI window "Big-Picture" (with a hyphen), and
+        // localized builds add suffixes (e.g. German "Big-Picture-Modus"). The
+        // old space-only check ("Big Picture") never matched those, which left
+        // startup stuck at "waiting for the Big Picture window" even though Big
+        // Picture was already up. Normalise the separators so all variants match.
+        return title.Replace('-', ' ').Contains("Big Picture", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsSteamBigPictureWindowVisible()
     {
         var processes = Process.GetProcessesByName("steamwebhelper");
@@ -874,7 +870,7 @@ public sealed class MainWindowViewModel : BindableBase
                 {
                     if (!process.HasExited &&
                         process.MainWindowHandle != IntPtr.Zero &&
-                        process.MainWindowTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase))
+                        IsBigPictureWindowTitle(process.MainWindowTitle))
                     {
                         return true;
                     }

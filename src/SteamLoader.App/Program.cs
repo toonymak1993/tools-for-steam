@@ -17,6 +17,14 @@ public static class Program
     {
         _installerMutex = new Mutex(false, SteamLoaderRuntime.InstallerMutexName);
 
+        var unifyLaunchIndex = Array.FindIndex(args, argument =>
+            string.Equals(argument, "--unifysteam-launch", StringComparison.OrdinalIgnoreCase));
+        if (unifyLaunchIndex >= 0)
+        {
+            var unifyTarget = unifyLaunchIndex + 1 < args.Length ? args[unifyLaunchIndex + 1] : string.Empty;
+            return Infrastructure.StoreSync.UnifySteamLauncher.Run(unifyTarget);
+        }
+
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.BackgroundArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
@@ -51,6 +59,19 @@ public static class Program
 
         var shellBootstrapMode = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.ShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+
+        // Resolve Steam early and, in console/shell startup, launch Big Picture as
+        // the very first action - before shell setup, settings and the launcher
+        // sync - so its (slow, on handhelds) cold start begins immediately and
+        // everything else happens while Steam is already loading.
+        var steamInstallationService = new SteamInstallationService(
+            new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+        if (shellBootstrapMode)
+        {
+            SteamClientLaunchService.RequestSteamStartForTools(steamInstallationService);
+        }
+
         if (shellBootstrapMode)
         {
             var bootstrapShellService = new WindowsShellService();
@@ -89,10 +110,6 @@ public static class Program
         {
             settingsService.CompleteFirstRunSetup();
         }
-
-        var steamInstallationService = new SteamInstallationService(
-            new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
 
         if (startHiddenInTray && !runStartupSync)
         {

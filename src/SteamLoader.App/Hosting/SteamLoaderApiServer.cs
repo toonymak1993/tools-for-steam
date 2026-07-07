@@ -48,6 +48,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly HttpListener _listener;
     private readonly Action _requestShutdown;
     private readonly object _artworkOpenRequestLock = new();
+    private readonly object _unifyStoreOverlayLock = new();
     private ArtworkOpenRequest? _latestArtworkOpenRequest;
     private DateTimeOffset _latestArtworkOpenRequestAt = DateTimeOffset.MinValue;
     private string _latestArtworkOpenRequestKey = string.Empty;
@@ -57,6 +58,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private UpdateCheckSnapshot? _cachedUpdateSnapshot;
     private Task? _activeUpdateInstallTask;
     private Task? _acceptLoopTask;
+    private bool _unifyStoreOverlayOpen;
 
     public SteamLoaderApiServer(
         IAudioOutputDeviceService audioOutputDeviceService,
@@ -2232,6 +2234,127 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/overlay/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    GetUnifyStoreOverlayState(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/overlay/open")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    SetUnifyStoreOverlayOpen(true),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/overlay/close")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    SetUnifyStoreOverlayOpen(false),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/refresh")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                var storeSyncSnapshot = _storeSyncService.RefreshUnifySteam(payload?.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/login")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Storefront store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.StartUnifySteamLogin(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/games/launch")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<UnifyStoreLaunchRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.GameId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Storefront store ID and game ID are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryStartUnifyStoreLaunch(payload.StoreId, payload.GameId, out var launchMessage))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = launchMessage },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new
+                    {
+                        message = launchMessage,
+                        snapshot = _storeSyncService.GetSnapshot()
+                    },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/performance/state")
             {
                 await WriteJsonAsync(
@@ -3135,6 +3258,108 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/unifysteam/refresh")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                var storeSyncSnapshot = _storeSyncService.RefreshUnifySteam(payload?.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/unifysteam/stores/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStoreEnabledRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Storefront store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamStoreEnabled(payload.StoreId, payload.Enabled);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/unifysteam/stores/login")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Storefront store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.StartUnifySteamLogin(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store-sync/unifysteam/stores/auth-code")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePathRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Storefront store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.CompleteUnifySteamManualAuth(payload.StoreId, payload.Value ?? string.Empty);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/store-sync/titles/artwork-preview")
             {
@@ -3589,6 +3814,83 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             : appId;
     }
 
+    private PluginStoreOverlayState GetUnifyStoreOverlayState()
+    {
+        lock (_unifyStoreOverlayLock)
+        {
+            return new PluginStoreOverlayState(_unifyStoreOverlayOpen);
+        }
+    }
+
+    private PluginStoreOverlayState SetUnifyStoreOverlayOpen(bool open)
+    {
+        lock (_unifyStoreOverlayLock)
+        {
+            _unifyStoreOverlayOpen = open;
+            return new PluginStoreOverlayState(_unifyStoreOverlayOpen);
+        }
+    }
+
+    private bool TryStartUnifyStoreLaunch(string storeId, string gameId, out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+
+        if (normalizedStoreId is not ("epic-games" or "gog-galaxy"))
+        {
+            message = "Storefront can launch Epic and GOG games right now.";
+            return false;
+        }
+
+        if (!IsSafeUnifyStoreLaunchId(normalizedGameId))
+        {
+            message = "The Storefront game ID is invalid.";
+            return false;
+        }
+
+        var snapshot = _storeSyncService.GetSnapshot();
+        var gameState = snapshot.UnifySteam.Stores
+            .Where(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(store => store.Games)
+            .FirstOrDefault(game => string.Equals(game.Id, normalizedGameId, StringComparison.OrdinalIgnoreCase));
+        if (gameState is null)
+        {
+            message = "The selected game is not in the cached Storefront library. Refresh Epic or GOG first.";
+            return false;
+        }
+
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            message = "Tools for Steam could not resolve its launcher executable.";
+            return false;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = false,
+        };
+        startInfo.ArgumentList.Add("--unifysteam-launch");
+        startInfo.ArgumentList.Add($"{normalizedStoreId}:{normalizedGameId}");
+        Process.Start(startInfo);
+
+        message = normalizedStoreId.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) && !gameState.Installed
+            ? "Opening the GOG Galaxy game page. Install the game there, then refresh Storefront."
+            : "Storefront started the launcher. If the game is not installed yet, the store tool will download it first.";
+        return true;
+    }
+
+    private static bool IsSafeUnifyStoreLaunchId(string value)
+    {
+        return !string.IsNullOrWhiteSpace(value) &&
+               value.All(character =>
+                   char.IsLetterOrDigit(character) ||
+                   character is '_' or '-' or '.');
+    }
+
     private static bool TryResolvePluginId(string? path, out string pluginId)
     {
         pluginId = string.Empty;
@@ -3611,6 +3913,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/hltb"] = "hltb",
             ["/api/smart-home"] = "smart-home",
             ["/api/store-sync"] = "store-sync",
+            ["/api/unifystore"] = "unifystore",
             ["/api/themes"] = "themes",
             ["/api/power"] = "power"
         };
@@ -3963,6 +4266,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetPluginStorePluginRequest(string PluginId);
 
     private sealed record PluginStoreInputRequest(string Action, string Source);
+
+    private sealed record UnifyStoreLaunchRequest(string StoreId, string GameId);
 
     private sealed record SetStoreEnabledRequest(string StoreId, bool Enabled);
 

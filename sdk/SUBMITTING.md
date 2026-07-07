@@ -87,6 +87,7 @@ my-plugin.zip
 ```
 
 `images` is required. Plugins without an image are not listed in the store.
+`packageSha256` is required. Plugins without a checksum are shown as blocked and cannot be installed.
 
 ## Permission Review
 
@@ -98,6 +99,18 @@ Use the smallest permission set possible:
 - `network`: sends HTTP/HTTPS requests through the core network proxy.
 
 If a plugin declares `secrets` or `network`, the pull request should explain what service it connects to and why the permission is needed.
+Unknown permissions are rejected by the installer. Keep the permission list small and exact.
+
+## Package Limits
+
+The store rejects packages that are too large or unsafe to extract:
+
+- 64 MB maximum zip size.
+- 128 MB maximum extracted size.
+- 512 files maximum.
+- 32 MB maximum per extracted file.
+- No absolute paths or `..` segments inside the zip.
+- `packagePath` must be relative to the catalog file; use `packageUrl` for hosted packages.
 
 ## Local Test
 

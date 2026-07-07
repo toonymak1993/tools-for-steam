@@ -13,7 +13,7 @@ Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins shoul
 - Advanced users can override the feed by creating `data/plugin-store/catalog-source.json` with `{ "catalogUrl": "https://example.com/catalog.json" }`.
 - Each catalog entry points to a zip package through `packagePath` or `packageUrl`.
 - Each zip package must contain `tfs-plugin.json` at its root.
-- The installer validates manifest id, version, SDK version, entry point, and optional SHA-256 checksum before installing.
+- The installer validates manifest id, name, version, SDK version, entry point, permissions, package size, zip paths, and the required SHA-256 checksum before installing.
 - Installed community plugins live under `data/plugin-store/community/<plugin-id>`.
 - SDK data lives under `data/plugin-store/sdk-data/<plugin-id>`.
 - Built-in plugins remain part of the app and can only be hidden from Home.
@@ -138,7 +138,19 @@ Rules enforced today:
 - `version` must match the catalog entry version.
 - `sdkVersion` must use major version `1`.
 - `entryPoint` must be a relative JavaScript path inside the package.
-- `permissions` must contain simple lowercase identifiers.
+- `permissions` must contain only SDK v1 permissions: `frontend`, `storage`, `secrets`, and `network`.
+
+## Package Safety Rules
+
+The app rejects packages that do not fit the v1 store safety contract:
+
+- `packageSha256` is required for every downloadable catalog entry.
+- Package files must be `.zip`.
+- Remote `packageUrl` values must use HTTP or HTTPS.
+- Local `packagePath` values must be relative to the catalog file and stay inside that catalog folder.
+- Packages are limited to 64 MB compressed, 128 MB extracted, 512 files, and 32 MB per extracted file.
+- Zip entries may not escape the package root.
+- Unknown permissions are rejected instead of ignored.
 
 ## Network Example
 

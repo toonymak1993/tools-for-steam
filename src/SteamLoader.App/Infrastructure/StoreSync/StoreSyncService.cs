@@ -199,6 +199,7 @@ public sealed class StoreSyncService
     private readonly SteamInstallationService _steamInstallationService;
     private readonly SteamDevToolsClient _steamDevToolsClient;
     private readonly StoreSyncJournal _journal;
+    private readonly UnifySteamService _unifySteamService;
     private Task? _activeSyncTask;
     private Task? _activeOwnershipRepairFollowUpTask;
     private readonly LinkedList<AppliedSyncSignatureState> _recentAppliedSyncSignatures = new();
@@ -230,6 +231,7 @@ public sealed class StoreSyncService
         _steamInstallationService = steamInstallationService;
         _steamDevToolsClient = steamDevToolsClient;
         _journal = journal;
+        _unifySteamService = new UnifySteamService(journal);
     }
 
     internal void UpdateAutomationWatchers(int watcherCount, bool watchersActive)
@@ -553,6 +555,53 @@ public sealed class StoreSyncService
             var configuration = _settingsStore.Load();
             var storeConfiguration = GetStoreConfiguration(configuration, storeId);
             storeConfiguration.Enabled = enabled;
+            _settingsStore.Save(configuration);
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot SetUnifySteamStoreEnabled(string storeId, bool enabled)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            var storeConfiguration = GetUnifySteamStoreConfiguration(configuration, storeId);
+            storeConfiguration.Enabled = enabled;
+            _settingsStore.Save(configuration);
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot RefreshUnifySteam(string? storeId)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            _unifySteamService.RefreshLibraries(configuration, storeId);
+            _settingsStore.Save(configuration);
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot StartUnifySteamLogin(string storeId)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            _unifySteamService.StartLogin(configuration, storeId);
+            _settingsStore.Save(configuration);
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot CompleteUnifySteamManualAuth(string storeId, string value)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Load();
+            _unifySteamService.CompleteManualCodeAuth(configuration, storeId, value);
+            // Load the library right away so a successful paste needs no extra refresh click.
+            _unifySteamService.RefreshLibraries(configuration, storeId);
             _settingsStore.Save(configuration);
             return BuildSnapshot(configuration);
         }
@@ -891,6 +940,7 @@ public sealed class StoreSyncService
                     DetectedTitles: []);
             })
             .ToList();
+        var unifySteam = _unifySteamService.BuildSnapshot(configuration, stores);
 
         return new StoreSyncSnapshot(
             profile,
@@ -905,6 +955,7 @@ public sealed class StoreSyncService
                 TakeOverExistingShortcuts: configuration.TakeOverExistingShortcuts,
                 CleanupMissingTitles: configuration.CleanupMissingTitles),
             stores,
+            unifySteam,
             BuildEmptyPreviewState(),
             configuration.LastSync,
             BuildHealthState(stores, BuildEmptyPreviewState(), journal),
@@ -943,6 +994,7 @@ public sealed class StoreSyncService
                     .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
                     .ToArray()))
             .ToList();
+        var unifySteam = _unifySteamService.BuildSnapshot(configuration, stores);
 
         return new StoreSyncSnapshot(
             profile,
@@ -957,6 +1009,7 @@ public sealed class StoreSyncService
                 TakeOverExistingShortcuts: configuration.TakeOverExistingShortcuts,
                 CleanupMissingTitles: configuration.CleanupMissingTitles),
             stores,
+            unifySteam,
             analysis.Preview,
             configuration.LastSync,
             BuildHealthState(stores, analysis.Preview, journal),
@@ -965,7 +1018,7 @@ public sealed class StoreSyncService
 
     private List<StoreSnapshot> BuildStoreSnapshots(StoreSyncConfiguration configuration)
     {
-        return StoreDefinitions
+        var snapshots = StoreDefinitions
             .Select(definition =>
             {
                 var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
@@ -973,6 +1026,197 @@ public sealed class StoreSyncService
                 return new StoreSnapshot(definition, storeConfiguration, scan);
             })
             .ToList();
+
+        // Virtual store: not-yet-installed games from the connected launcher accounts
+        // become Steam shortcuts that download + start the game on first launch.
+        snapshots.Add(BuildUnifySteamStoreSnapshot(configuration, snapshots));
+        return snapshots;
+    }
+
+    private const string UnifySteamStoreId = "unifysteam";
+
+    private static readonly StoreDefinition UnifySteamStoreDefinition = new(
+        UnifySteamStoreId,
+        "Storefront",
+        "Games from your connected launcher accounts that are not installed yet. Click Play in Steam to download and start them.");
+
+    private StoreSnapshot BuildUnifySteamStoreSnapshot(
+        StoreSyncConfiguration configuration,
+        IReadOnlyList<StoreSnapshot> scannedSnapshots)
+    {
+        var storeConfiguration = GetStoreConfiguration(configuration, UnifySteamStoreId);
+        var games = new List<StoreGameEntry>();
+        var launcherPath = NormalizePath(Environment.ProcessPath ?? string.Empty);
+        var launcherDirectory = string.IsNullOrWhiteSpace(launcherPath)
+            ? string.Empty
+            : Path.GetDirectoryName(launcherPath) ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(launcherPath) || !File.Exists(launcherPath))
+        {
+            return new StoreSnapshot(
+                UnifySteamStoreDefinition,
+                storeConfiguration,
+                new StoreScanResult(
+                    IsReady: false,
+                    CanCleanupMissingTitles: false,
+                    "Unavailable",
+                    "The Tools for Steam launcher path could not be resolved.",
+                    Array.Empty<string>(),
+                    Array.Empty<string>(),
+                    games));
+        }
+
+        // Titles that are already installed and detected by the regular store scans
+        // must not get a second (downloader) shortcut. Matching happens twice:
+        // exact store item ID (precise) and aggressively normalized title (fuzzy).
+        var detectedGames = scannedSnapshots
+            .Where(snapshot => snapshot.Configuration.Enabled && snapshot.Scan.IsReady)
+            .SelectMany(snapshot => snapshot.Scan.Games)
+            .ToList();
+
+        var detectedTitleKeys = new HashSet<string>(
+            detectedGames
+                .Select(game => NormalizeUnifyTitleKey(game.Title))
+                .Where(key => !string.IsNullOrWhiteSpace(key)),
+            StringComparer.Ordinal);
+
+        var detectedItemKeys = new HashSet<string>(
+            detectedGames
+                .Where(game => !string.IsNullOrWhiteSpace(game.StoreItemId))
+                .Select(game => $"{NormalizeKey(game.StoreId)}|{NormalizeStoreItemId(game.StoreItemId)}"),
+            StringComparer.Ordinal);
+
+        var seenTitleKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        // Epic first: when the same game is owned in both stores only one shortcut is created,
+        // preferring the Epic copy because the legendary install/launch path is the most robust.
+        foreach (var unifyStoreId in new[] { "epic-games", "gog-galaxy" })
+        {
+            if (configuration.UnifySteam?.Stores is null ||
+                !configuration.UnifySteam.Stores.TryGetValue(unifyStoreId, out var unifyStore) ||
+                unifyStore is null ||
+                !unifyStore.Enabled ||
+                unifyStore.Cache?.Games is null)
+            {
+                continue;
+            }
+
+            foreach (var game in unifyStore.Cache.Games)
+            {
+                // Note: games installed via legendary/gogdl intentionally keep their
+                // UnifySteam shortcut - the launcher starts them directly. Only titles
+                // detected by the regular store scans (real launcher installs) are skipped.
+                if (game is null ||
+                    string.IsNullOrWhiteSpace(game.Id) ||
+                    string.IsNullOrWhiteSpace(game.Title))
+                {
+                    continue;
+                }
+
+                var itemKey = $"{NormalizeKey(unifyStoreId)}|{NormalizeStoreItemId(game.Id)}";
+                if (detectedItemKeys.Contains(itemKey))
+                {
+                    continue;
+                }
+
+                var titleKey = NormalizeUnifyTitleKey(game.Title);
+                if (string.IsNullOrWhiteSpace(titleKey) ||
+                    detectedTitleKeys.Contains(titleKey) ||
+                    !seenTitleKeys.Add(titleKey))
+                {
+                    continue;
+                }
+
+                games.Add(new StoreGameEntry(
+                    UnifySteamStoreId,
+                    $"{unifyStoreId}:{game.Id}",
+                    game.Title,
+                    launcherPath,
+                    launcherDirectory,
+                    $"--unifysteam-launch {unifyStoreId}:{game.Id}"));
+            }
+        }
+
+        var isReady = games.Count > 0;
+        return new StoreSnapshot(
+            UnifySteamStoreDefinition,
+            storeConfiguration,
+            new StoreScanResult(
+                IsReady: isReady,
+                CanCleanupMissingTitles: isReady,
+                isReady ? "Ready" : "No games",
+                isReady
+                    ? $"{games.Count} installable launcher game(s) are synced as download shortcuts."
+                    : "Sign in to a launcher store and refresh its library to sync installable games.",
+                Array.Empty<string>(),
+                Array.Empty<string>(),
+                games));
+    }
+
+    /// <summary>
+    /// Aggressive title key for duplicate detection across stores: lowercase,
+    /// keeps only letters and digits so "The Witcher: Enhanced Edition",
+    /// "The Witcher - Enhanced Edition" and trademark symbols all collapse.
+    /// </summary>
+    private static string NormalizeUnifyTitleKey(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var builder = new System.Text.StringBuilder(value.Length);
+        foreach (var character in value.ToLowerInvariant())
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                builder.Append(character);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private Task? _activeUnifyRefreshTask;
+    private DateTimeOffset _lastUnifyAutoRefreshAtUtc = DateTimeOffset.MinValue;
+    private static readonly TimeSpan UnifyAutoRefreshInterval = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// Refreshes the UnifySteam launcher libraries in the background when they are stale.
+    /// Called from the automation loop; unconfigured stores are skipped silently.
+    /// </summary>
+    public void TryRunAutomaticUnifySteamRefresh()
+    {
+        lock (_gate)
+        {
+            if (_activeUnifyRefreshTask is { IsCompleted: false })
+            {
+                return;
+            }
+
+            if (DateTimeOffset.UtcNow - _lastUnifyAutoRefreshAtUtc < UnifyAutoRefreshInterval)
+            {
+                return;
+            }
+
+            _lastUnifyAutoRefreshAtUtc = DateTimeOffset.UtcNow;
+            _activeUnifyRefreshTask = Task.Run(() =>
+            {
+                try
+                {
+                    lock (_gate)
+                    {
+                        var configuration = _settingsStore.Load();
+                        _unifySteamService.RefreshLibraries(configuration, storeId: null, skipUnconfigured: true);
+                        _settingsStore.Save(configuration);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    _journal.Append("warning", "unifysteam", "Automatic Storefront library refresh failed.", exception.Message);
+                }
+            });
+        }
     }
 
     internal IReadOnlyList<StoreSyncWatchTarget> GetAutomationWatchTargets()
@@ -1821,6 +2065,11 @@ public sealed class StoreSyncService
 
     private static string ResolveStoreTitle(string storeId)
     {
+        if (string.Equals(storeId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
+        {
+            return UnifySteamStoreDefinition.Title;
+        }
+
         return ResolveStoreDefinition(storeId)?.Title ?? storeId;
     }
 
@@ -5235,6 +5484,24 @@ public sealed class StoreSyncService
         return storeConfiguration;
     }
 
+    private static UnifySteamStoreConfiguration GetUnifySteamStoreConfiguration(StoreSyncConfiguration configuration, string storeId)
+    {
+        configuration.UnifySteam ??= new UnifySteamConfiguration();
+        configuration.UnifySteam.Stores ??= new Dictionary<string, UnifySteamStoreConfiguration>(StringComparer.OrdinalIgnoreCase);
+
+        if (!configuration.UnifySteam.Stores.TryGetValue(storeId, out var storeConfiguration) || storeConfiguration is null)
+        {
+            storeConfiguration = new UnifySteamStoreConfiguration();
+            configuration.UnifySteam.Stores[storeId] = storeConfiguration;
+        }
+
+        storeConfiguration.ToolPath ??= string.Empty;
+        storeConfiguration.AuthPath ??= string.Empty;
+        storeConfiguration.Cache ??= new UnifySteamLibraryCache();
+        storeConfiguration.Cache.Games ??= [];
+        return storeConfiguration;
+    }
+
     private static string ResolveValidatedDirectoryPath(
         string path,
         string missingValueMessage,
@@ -6044,6 +6311,22 @@ public sealed class StoreSyncService
         var expectedAppId = SteamShortcutIds.ComputeAppId(effectiveTitle, game.ExecutablePath);
         var manifestAppId = manifestEntry?.AppId ?? 0;
 
+        if (string.Equals(game.StoreId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
+        {
+            return TryFindExistingUnifySteamShortcut(
+                existingEntries,
+                game,
+                manifestEntry,
+                normalizedExecutablePath,
+                normalizedStartDirectory,
+                normalizedLaunchOptions,
+                normalizedRawTitle,
+                normalizedEffectiveTitle,
+                expectedAppId,
+                manifestAppId,
+                out existingShortcut);
+        }
+
         existingShortcut = existingEntries
             .Where(entry => string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(entry => entry.IsManaged)
@@ -6077,6 +6360,66 @@ public sealed class StoreSyncService
                     : string.Equals(entry.StartDirectory, normalizedStartDirectory, StringComparison.OrdinalIgnoreCase)
                         ? 1
                         : 2)
+            .FirstOrDefault();
+
+        return existingShortcut is not null;
+    }
+
+    private static bool TryFindExistingUnifySteamShortcut(
+        IReadOnlyList<ExistingShortcutEntry> existingEntries,
+        StoreGameEntry game,
+        StoreSyncManifestEntry? manifestEntry,
+        string normalizedExecutablePath,
+        string normalizedStartDirectory,
+        string normalizedLaunchOptions,
+        string normalizedRawTitle,
+        string normalizedEffectiveTitle,
+        uint expectedAppId,
+        uint manifestAppId,
+        out ExistingShortcutEntry? existingShortcut)
+    {
+        static bool TitleMatches(ExistingShortcutEntry entry, string normalizedRawTitle, string normalizedEffectiveTitle)
+        {
+            var normalizedEntryTitle = NormalizeKey(entry.AppName);
+            return string.Equals(normalizedEntryTitle, normalizedEffectiveTitle, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalizedEntryTitle, normalizedRawTitle, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var manifestTitleId = manifestEntry?.TitleId ?? string.Empty;
+        existingShortcut = existingEntries
+            .Where(entry => string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase))
+            .Select(entry =>
+            {
+                var launchOptionsMatch =
+                    !string.IsNullOrWhiteSpace(normalizedLaunchOptions) &&
+                    string.Equals(NormalizeLaunchOptions(entry.LaunchOptions), normalizedLaunchOptions, StringComparison.OrdinalIgnoreCase);
+                var startDirectoryMatch =
+                    string.IsNullOrWhiteSpace(normalizedStartDirectory) ||
+                    string.IsNullOrWhiteSpace(entry.StartDirectory) ||
+                    string.Equals(entry.StartDirectory, normalizedStartDirectory, StringComparison.OrdinalIgnoreCase);
+                var titleMatches = TitleMatches(entry, normalizedRawTitle, normalizedEffectiveTitle);
+                var managedTitleMatch =
+                    entry.IsManaged &&
+                    string.Equals(entry.ManagedStoreId, game.StoreId, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(manifestTitleId) &&
+                    string.Equals(entry.ManagedTitleId, manifestTitleId, StringComparison.OrdinalIgnoreCase);
+
+                var score = managedTitleMatch
+                    ? 0
+                    : launchOptionsMatch && titleMatches
+                        ? 1
+                        : launchOptionsMatch
+                            ? 2
+                            : titleMatches && startDirectoryMatch && (entry.AppId == expectedAppId || (manifestAppId != 0 && entry.AppId == manifestAppId))
+                                ? 3
+                                : int.MaxValue;
+
+                return new { Entry = entry, Score = score };
+            })
+            .Where(candidate => candidate.Score < int.MaxValue)
+            .OrderBy(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.Entry.Index)
+            .Select(candidate => candidate.Entry)
             .FirstOrDefault();
 
         return existingShortcut is not null;
@@ -6863,7 +7206,10 @@ public sealed class StoreSyncService
         IReadOnlyDictionary<string, uint> liveShortcutAppIds,
         CancellationToken cancellationToken)
     {
-        // Build one entry per store that has at least one active game.
+        // Build one entry per store that has at least one active game. UnifySteam
+        // shortcuts are intentionally added twice: once to the unified tab and
+        // once to their source store tab, so Epic/GOG tabs show the full account
+        // library rather than only locally installed games.
         var byStore = new Dictionary<string, (string DisplayName, List<uint> AppIds)>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var item in analysis.Items)
@@ -6879,19 +7225,24 @@ public sealed class StoreSyncService
                 continue;
             }
 
-            var storeId = item.Game.StoreId;
-            if (string.IsNullOrWhiteSpace(storeId))
+            foreach (var collectionStore in ResolveCollectionStoresForItem(item))
             {
-                continue;
-            }
+                if (string.IsNullOrWhiteSpace(collectionStore.StoreId))
+                {
+                    continue;
+                }
 
-            if (!byStore.TryGetValue(storeId, out var entry))
-            {
-                entry = (ResolveStoreTitle(storeId), []);
-                byStore[storeId] = entry;
-            }
+                if (!byStore.TryGetValue(collectionStore.StoreId, out var entry))
+                {
+                    entry = (collectionStore.DisplayName, []);
+                    byStore[collectionStore.StoreId] = entry;
+                }
 
-            entry.AppIds.Add(appId);
+                if (!entry.AppIds.Contains(appId))
+                {
+                    entry.AppIds.Add(appId);
+                }
+            }
         }
 
         if (byStore.Count == 0)
@@ -6929,6 +7280,50 @@ public sealed class StoreSyncService
         {
             _journal.Append("debug", "collections", "Store collection sync via CDP threw an exception.", ex.Message);
         }
+    }
+
+    private static IEnumerable<StoreCollectionEntry> ResolveCollectionStoresForItem(StoreSyncAnalysisItem item)
+    {
+        var storeId = item.Game.StoreId;
+        if (string.IsNullOrWhiteSpace(storeId))
+        {
+            yield break;
+        }
+
+        yield return new StoreCollectionEntry(storeId, ResolveStoreTitle(storeId), []);
+
+        if (!string.Equals(storeId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase) ||
+            !TryResolveUnifySteamSourceStoreId(item.Game.StoreItemId, out var sourceStoreId))
+        {
+            yield break;
+        }
+
+        yield return new StoreCollectionEntry(sourceStoreId, ResolveStoreTitle(sourceStoreId), []);
+    }
+
+    private static bool TryResolveUnifySteamSourceStoreId(string storeItemId, out string sourceStoreId)
+    {
+        sourceStoreId = string.Empty;
+        if (string.IsNullOrWhiteSpace(storeItemId))
+        {
+            return false;
+        }
+
+        var separatorIndex = storeItemId.IndexOf(':', StringComparison.Ordinal);
+        if (separatorIndex <= 0)
+        {
+            return false;
+        }
+
+        var candidate = storeItemId[..separatorIndex].Trim();
+        if (string.IsNullOrWhiteSpace(candidate) ||
+            string.Equals(candidate, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        sourceStoreId = candidate;
+        return true;
     }
 
     private static string BuildCollectionSyncExpression(StoreCollectionSyncPlan plan)

@@ -163,6 +163,134 @@ public sealed class SteamDevToolsClient
             null);
     }
 
+    /// <summary>
+    /// Delivers a Ctrl+&lt;digit&gt; shortcut straight into Steam's Big Picture UI
+    /// through the CEF debugger (Input.dispatchKeyEvent). Because the key event is
+    /// injected into Steam's own renderer, it triggers the built-in Gamepad UI
+    /// shortcuts (Ctrl+1 = STEAM menu, Ctrl+2 = Quick Access) reliably, regardless
+    /// of which window currently holds OS keyboard focus. Returns false if Big
+    /// Picture is not running or the event could not be delivered.
+    /// </summary>
+    public async Task<bool> SendControlDigitShortcutAsync(int digit, CancellationToken cancellationToken)
+    {
+        if (digit is < 0 or > 9)
+        {
+            return false;
+        }
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(3));
+        var operationToken = timeoutCts.Token;
+
+        try
+        {
+            var target = await GetBigPictureTargetAsync(operationToken)
+                ?? await GetSharedJsContextTargetAsync(operationToken);
+            if (target is null || string.IsNullOrEmpty(target.WebSocketDebuggerUrl))
+            {
+                return false;
+            }
+
+            using var webSocket = new ClientWebSocket();
+            await webSocket.ConnectAsync(new Uri(target.WebSocketDebuggerUrl), operationToken);
+
+            var key = digit.ToString();
+            var code = $"Digit{digit}";
+            var virtualKeyCode = 0x30 + digit; // VK_0 .. VK_9
+            const int ctrlModifier = 2;        // CDP modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
+
+            // Ctrl down, <digit> down (Ctrl held), <digit> up, Ctrl up.
+            await SendKeyEventAsync(webSocket, "rawKeyDown", "Control", "ControlLeft", 0x11, ctrlModifier, operationToken);
+            await SendKeyEventAsync(webSocket, "rawKeyDown", key, code, virtualKeyCode, ctrlModifier, operationToken);
+            await SendKeyEventAsync(webSocket, "keyUp", key, code, virtualKeyCode, ctrlModifier, operationToken);
+            var lastCommandId = await SendKeyEventAsync(webSocket, "keyUp", "Control", "ControlLeft", 0x11, 0, operationToken);
+
+            // Wait for Steam to acknowledge the final event so the socket isn't
+            // closed before the whole sequence is processed.
+            await WaitForAckAsync(webSocket, lastCommandId, operationToken);
+
+            try
+            {
+                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, operationToken);
+            }
+            catch
+            {
+            }
+
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<int> SendKeyEventAsync(
+        ClientWebSocket webSocket,
+        string type,
+        string key,
+        string code,
+        int windowsVirtualKeyCode,
+        int modifiers,
+        CancellationToken cancellationToken)
+    {
+        var commandId = Interlocked.Increment(ref _nextCommandId);
+        var command = new Dictionary<string, object?>
+        {
+            ["id"] = commandId,
+            ["method"] = "Input.dispatchKeyEvent",
+            ["params"] = new Dictionary<string, object?>
+            {
+                ["type"] = type,
+                ["modifiers"] = modifiers,
+                ["windowsVirtualKeyCode"] = windowsVirtualKeyCode,
+                ["nativeVirtualKeyCode"] = windowsVirtualKeyCode,
+                ["key"] = key,
+                ["code"] = code,
+            },
+        };
+
+        var payloadBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(command, JsonOptions));
+        await webSocket.SendAsync(payloadBytes, WebSocketMessageType.Text, true, cancellationToken);
+        return commandId;
+    }
+
+    private static async Task WaitForAckAsync(
+        ClientWebSocket webSocket,
+        int expectedCommandId,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var responseText = await ReceiveMessageAsync(webSocket, cancellationToken);
+            if (string.IsNullOrWhiteSpace(responseText))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(responseText);
+                var root = document.RootElement;
+                if (root.ValueKind == JsonValueKind.Object &&
+                    root.TryGetProperty("id", out var idElement) &&
+                    idElement.TryGetInt32(out var actualCommandId) &&
+                    actualCommandId == expectedCommandId)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                return;
+            }
+        }
+    }
+
     private static async Task<string> ReceiveMessageAsync(ClientWebSocket webSocket, CancellationToken cancellationToken)
     {
         var buffer = new byte[64 * 1024];

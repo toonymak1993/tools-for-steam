@@ -20,8 +20,20 @@ public sealed class PluginStoreService
     private const int MaxPluginNetworkRequestBytes = 512 * 1024;
     private const int MaxPluginNetworkResponseBytes = 1024 * 1024;
     private const int MaxCommunityCatalogBytes = 1024 * 1024;
+    private const long MaxCommunityPackageBytes = 64L * 1024 * 1024;
+    private const long MaxCommunityPackageExtractedBytes = 128L * 1024 * 1024;
+    private const long MaxCommunityPackageEntryBytes = 32L * 1024 * 1024;
+    private const int MaxCommunityPackageEntries = 512;
     private const string DefaultCommunityCatalogUrl =
         "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json";
+
+    private static readonly HashSet<string> SupportedPluginPermissions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        PermissionStorage,
+        PermissionSecrets,
+        PermissionNetwork,
+        "frontend"
+    };
 
     private static readonly string ShopPictureDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
@@ -289,25 +301,44 @@ public sealed class PluginStoreService
 
         try
         {
+            ValidatePackageZip(zipPath);
             ValidatePackageHash(zipPath, plugin);
             ExtractZipSafely(zipPath, tempDirectory);
 
             var replacementRoot = ResolveExtractedPluginRoot(tempDirectory);
             var manifest = ValidatePluginManifest(replacementRoot, plugin);
-            ReplaceCommunityPluginDirectory(targetDirectory, replacementRoot);
-
-            var installedState = LoadInstalledState();
-            installedState.Plugins[plugin.Id] = new InstalledCommunityPluginData
+            var backupDirectory = MoveExistingCommunityPluginToBackup(targetDirectory);
+            var committed = false;
+            try
             {
-                Version = plugin.Version,
-                ManifestVersion = manifest.Version,
-                SdkVersion = manifest.SdkVersion,
-                EntryPoint = manifest.EntryPoint,
-                Permissions = manifest.Permissions,
-                InstalledAtUtc = DateTimeOffset.UtcNow
-            };
+                MoveCommunityPluginReplacement(targetDirectory, replacementRoot);
 
-            SaveInstalledState(installedState);
+                var installedState = LoadInstalledState();
+                installedState.Plugins[plugin.Id] = new InstalledCommunityPluginData
+                {
+                    Version = plugin.Version,
+                    ManifestVersion = manifest.Version,
+                    SdkVersion = manifest.SdkVersion,
+                    EntryPoint = manifest.EntryPoint,
+                    Permissions = manifest.Permissions,
+                    InstalledAtUtc = DateTimeOffset.UtcNow
+                };
+
+                SaveInstalledState(installedState);
+                committed = true;
+            }
+            catch
+            {
+                RestoreCommunityPluginBackup(targetDirectory, backupDirectory);
+                throw;
+            }
+            finally
+            {
+                if (committed && !string.IsNullOrWhiteSpace(backupDirectory))
+                {
+                    TryDeleteDirectory(backupDirectory);
+                }
+            }
         }
         finally
         {
@@ -937,14 +968,19 @@ public sealed class PluginStoreService
         var sdkVersion = installedPlugin?.SdkVersion ?? string.Empty;
         var entryPoint = installedPlugin?.EntryPoint ?? string.Empty;
         var permissions = installedPlugin?.Permissions ?? [];
+        var hasPackageSource = plugin.HasPackageSource;
+        var hasPackageChecksum = !string.IsNullOrWhiteSpace(plugin.PackageSha256);
+        var canInstall = hasPackageSource && hasPackageChecksum;
 
-        var statusText = !plugin.HasPackageSource
+        var statusText = !hasPackageSource
             ? "Listed in the catalog, but not downloadable yet."
-            : !isInstalled
-                ? "Ready to install from the community catalog."
-                : hasUpdate
-                    ? "Installed locally. A newer catalog version is available."
-                    : "Installed locally and up to date.";
+            : !hasPackageChecksum
+                ? "Listed in the catalog, but blocked because the package checksum is missing."
+                : !isInstalled
+                    ? "Ready to install from the community catalog."
+                    : hasUpdate
+                        ? "Installed locally. A newer catalog version is available."
+                        : "Installed locally and up to date.";
 
         var tags = new List<string>();
         if (!string.IsNullOrWhiteSpace(plugin.Category))
@@ -979,7 +1015,7 @@ public sealed class PluginStoreService
             IsInstalled: isInstalled,
             IsEnabled: isInstalled,
             CanToggleVisibility: false,
-            CanInstall: plugin.HasPackageSource,
+            CanInstall: canInstall,
             CanUninstall: isInstalled,
             HasUpdate: hasUpdate,
             StatusText: statusText,
@@ -1049,7 +1085,9 @@ public sealed class PluginStoreService
                 ?? new CommunityCatalogFileData();
             var catalogDirectory = Path.GetDirectoryName(_catalogPath) ?? _rootPath;
             var plugins = (data.Plugins ?? [])
-                .Select(plugin => NormalizeCommunityPlugin(plugin))
+                .Select(plugin => TryNormalizeCommunityPlugin(plugin, out var normalizedPlugin) ? normalizedPlugin : null)
+                .Where(plugin => plugin is not null)
+                .Cast<CommunityCatalogPluginData>()
                 .Where(plugin => !string.IsNullOrWhiteSpace(plugin.Id) && plugin.Images.Length > 0)
                 .GroupBy(plugin => plugin.Id, StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
@@ -1076,6 +1114,22 @@ public sealed class PluginStoreService
                 StatusText: $"The community catalog could not be read ({exception.Message}).",
                 CatalogDirectory: Path.GetDirectoryName(_catalogPath) ?? _rootPath,
                 Plugins: []);
+        }
+    }
+
+    private static bool TryNormalizeCommunityPlugin(
+        CommunityCatalogPluginData? plugin,
+        out CommunityCatalogPluginData normalizedPlugin)
+    {
+        try
+        {
+            normalizedPlugin = NormalizeCommunityPlugin(plugin);
+            return true;
+        }
+        catch
+        {
+            normalizedPlugin = new CommunityCatalogPluginData();
+            return false;
         }
     }
 
@@ -1114,14 +1168,20 @@ public sealed class PluginStoreService
     {
         if (!string.IsNullOrWhiteSpace(plugin.PackagePath))
         {
-            var packagePath = Path.IsPathRooted(plugin.PackagePath)
-                ? plugin.PackagePath
-                : Path.GetFullPath(Path.Combine(catalog.CatalogDirectory, plugin.PackagePath));
+            if (Path.IsPathRooted(plugin.PackagePath))
+            {
+                throw new InvalidOperationException("Local community package paths must be relative to the catalog file.");
+            }
+
+            var packagePath = Path.GetFullPath(Path.Combine(catalog.CatalogDirectory, plugin.PackagePath));
+            EnsureWithinPathRoot(packagePath, catalog.CatalogDirectory);
+            EnsureZipFileName(packagePath);
             if (!File.Exists(packagePath))
             {
                 throw new InvalidOperationException("The configured community package could not be found.");
             }
 
+            ValidatePackageZip(packagePath);
             return packagePath;
         }
 
@@ -1135,14 +1195,28 @@ public sealed class PluginStoreService
             throw new InvalidOperationException("Remote community packages must use HTTP or HTTPS.");
         }
 
+        EnsureZipFileName(packageUri.AbsolutePath);
+
         var tempDirectory = Path.Combine(_rootPath, "tmp");
         Directory.CreateDirectory(tempDirectory);
 
         var destinationPath = Path.Combine(tempDirectory, $"{plugin.Id}-{Guid.NewGuid():N}.zip");
+        using var request = new HttpRequestMessage(HttpMethod.Get, packageUri);
+        using var response = await _httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength > MaxCommunityPackageBytes)
+        {
+            throw new InvalidOperationException("The community package is too large.");
+        }
+
+        await using var packageStream = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var destinationStream = File.Create(destinationPath);
-        await using var packageStream = await _httpClient.GetStreamAsync(packageUri, cancellationToken);
-        await packageStream.CopyToAsync(destinationStream, cancellationToken);
+        await CopyPackageWithLimitAsync(packageStream, destinationStream, cancellationToken);
         await destinationStream.FlushAsync(cancellationToken);
+        ValidatePackageZip(destinationPath);
         return destinationPath;
     }
 
@@ -1209,12 +1283,65 @@ public sealed class PluginStoreService
         return catalogUri.ToString();
     }
 
+    private static void EnsureZipFileName(string pathOrUrlPath)
+    {
+        if (!Path.GetExtension(pathOrUrlPath).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Community packages must be zip files.");
+        }
+    }
+
+    private static void ValidatePackageZip(string zipPath)
+    {
+        EnsureZipFileName(zipPath);
+        var info = new FileInfo(zipPath);
+        if (!info.Exists)
+        {
+            throw new InvalidOperationException("The configured community package could not be found.");
+        }
+
+        if (info.Length <= 0)
+        {
+            throw new InvalidOperationException("The community package is empty.");
+        }
+
+        if (info.Length > MaxCommunityPackageBytes)
+        {
+            throw new InvalidOperationException("The community package is too large.");
+        }
+    }
+
+    private static async Task CopyPackageWithLimitAsync(
+        Stream source,
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[64 * 1024];
+        long totalBytes = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken);
+            if (read <= 0)
+            {
+                break;
+            }
+
+            totalBytes += read;
+            if (totalBytes > MaxCommunityPackageBytes)
+            {
+                throw new InvalidOperationException("The community package is too large.");
+            }
+
+            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+        }
+    }
+
     private static void ValidatePackageHash(string zipPath, CommunityCatalogPluginData plugin)
     {
         var expectedHash = NormalizeSha256(plugin.PackageSha256);
         if (expectedHash.Length == 0)
         {
-            return;
+            throw new InvalidOperationException("Community packages must publish a SHA-256 checksum.");
         }
 
         using var stream = File.OpenRead(zipPath);
@@ -1262,6 +1389,11 @@ public sealed class PluginStoreService
             StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("The community plugin manifest version does not match the catalog entry.");
+        }
+
+        if (string.IsNullOrWhiteSpace(manifest.Name))
+        {
+            throw new InvalidOperationException("The community plugin manifest requires a name.");
         }
 
         var sdkVersion = NormalizeVersion(manifest.SdkVersion);
@@ -1320,6 +1452,11 @@ public sealed class PluginStoreService
                     throw new InvalidOperationException("The community plugin manifest contains an invalid permission.");
                 }
 
+                if (!SupportedPluginPermissions.Contains(permission))
+                {
+                    throw new InvalidOperationException($"The community plugin manifest declares an unsupported permission ({permission}).");
+                }
+
                 return permission;
             })
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1353,21 +1490,60 @@ public sealed class PluginStoreService
         return path;
     }
 
-    private void ReplaceCommunityPluginDirectory(string targetDirectory, string sourceDirectory)
+    private string MoveExistingCommunityPluginToBackup(string targetDirectory)
     {
         EnsureWithinCommunityRoot(targetDirectory);
-        EnsureWithinPathRoot(sourceDirectory, _rootPath);
 
         var targetParent = Path.GetDirectoryName(targetDirectory)
             ?? throw new InvalidOperationException("Unable to resolve the target plugin directory.");
         Directory.CreateDirectory(targetParent);
 
-        if (Directory.Exists(targetDirectory))
+        if (!Directory.Exists(targetDirectory))
         {
-            Directory.Delete(targetDirectory, recursive: true);
+            return string.Empty;
         }
 
+        var backupDirectory = Path.Combine(
+            _rootPath,
+            "tmp",
+            $"{Path.GetFileName(targetDirectory)}-backup-{Guid.NewGuid():N}");
+        EnsureWithinPathRoot(backupDirectory, _rootPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(backupDirectory) ?? Path.Combine(_rootPath, "tmp"));
+        Directory.Move(targetDirectory, backupDirectory);
+        return backupDirectory;
+    }
+
+    private void MoveCommunityPluginReplacement(string targetDirectory, string sourceDirectory)
+    {
+        EnsureWithinCommunityRoot(targetDirectory);
+        EnsureWithinPathRoot(sourceDirectory, _rootPath);
+        if (Directory.Exists(targetDirectory))
+        {
+            throw new InvalidOperationException("The target community plugin directory already exists.");
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(targetDirectory)
+            ?? throw new InvalidOperationException("Unable to resolve the target plugin directory."));
         Directory.Move(sourceDirectory, targetDirectory);
+    }
+
+    private void RestoreCommunityPluginBackup(string targetDirectory, string backupDirectory)
+    {
+        EnsureWithinCommunityRoot(targetDirectory);
+        if (string.IsNullOrWhiteSpace(backupDirectory))
+        {
+            TryDeleteDirectory(targetDirectory);
+            return;
+        }
+
+        if (!Directory.Exists(backupDirectory))
+        {
+            return;
+        }
+
+        EnsureWithinPathRoot(backupDirectory, _rootPath);
+        TryDeleteDirectory(targetDirectory);
+        Directory.Move(backupDirectory, targetDirectory);
     }
 
     private static string ResolveExtractedPluginRoot(string extractionDirectory)
@@ -1389,6 +1565,8 @@ public sealed class PluginStoreService
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
 
         using var archive = ZipFile.OpenRead(zipPath);
+        var fileCount = 0;
+        long extractedBytes = 0;
         foreach (var entry in archive.Entries)
         {
             if (string.IsNullOrWhiteSpace(entry.FullName))
@@ -1406,6 +1584,23 @@ public sealed class PluginStoreService
             {
                 Directory.CreateDirectory(targetPath);
                 continue;
+            }
+
+            fileCount += 1;
+            if (fileCount > MaxCommunityPackageEntries)
+            {
+                throw new InvalidOperationException("The community package contains too many files.");
+            }
+
+            if (entry.Length > MaxCommunityPackageEntryBytes)
+            {
+                throw new InvalidOperationException("The community package contains a file that is too large.");
+            }
+
+            extractedBytes += entry.Length;
+            if (extractedBytes > MaxCommunityPackageExtractedBytes)
+            {
+                throw new InvalidOperationException("The community package is too large after extraction.");
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
@@ -1443,7 +1638,24 @@ public sealed class PluginStoreService
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_installedStatePath) ?? _rootPath);
             state.Plugins ??= new Dictionary<string, InstalledCommunityPluginData>(StringComparer.OrdinalIgnoreCase);
-            File.WriteAllText(_installedStatePath, JsonSerializer.Serialize(state, JsonOptions));
+            var tempPath = $"{_installedStatePath}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                File.WriteAllText(tempPath, JsonSerializer.Serialize(state, JsonOptions), Encoding.UTF8);
+                if (File.Exists(_installedStatePath))
+                {
+                    File.Replace(tempPath, _installedStatePath, destinationBackupFileName: null);
+                }
+                else
+                {
+                    File.Move(tempPath, _installedStatePath);
+                }
+            }
+            catch
+            {
+                TryDeleteFile(tempPath);
+                throw;
+            }
         }
     }
 
@@ -1512,7 +1724,7 @@ public sealed class PluginStoreService
     private static string NormalizeInputAction(string? action)
     {
         var normalized = (action ?? string.Empty).Trim().ToLowerInvariant();
-        return normalized is "up" or "down" or "left" or "right" or "a" or "b" or "previous-section" or "next-section"
+        return normalized is "up" or "down" or "left" or "right" or "a" or "b" or "search-back" or "previous-section" or "next-section"
             ? normalized
             : string.Empty;
     }

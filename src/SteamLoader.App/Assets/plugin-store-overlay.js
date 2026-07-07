@@ -1,6 +1,6 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 9;
+  const stateVersion = 17;
   const closedPollMs = 700;
   const openPollMs = 2200;
   const inputStorageKey = "ToolsForSteamPluginStoreInput";
@@ -23,6 +23,14 @@
 
     if (previousState?.apiInputPollTimer) {
       window.clearInterval(previousState.apiInputPollTimer);
+    }
+
+    if (previousState?.searchRenderTimer) {
+      window.clearTimeout(previousState.searchRenderTimer);
+    }
+
+    if (previousState?.storeKeyboardLayerTimer) {
+      window.clearTimeout(previousState.storeKeyboardLayerTimer);
     }
 
     if (previousState?.overlayAnnounceTimer) {
@@ -82,7 +90,15 @@
           error: "",
           snapshot: null,
           selectedPluginId: "",
+          contextMenuPluginId: "",
           activeSection: "discover",
+          storePageIndex: 0,
+          searchQuery: "",
+          searchPadOpen: false,
+          searchRenderTimer: 0,
+          searchKeyboardActiveUntil: 0,
+          storeKeyboardLayerTimer: 0,
+          imageReadyUrls: new Set(),
           root: null,
           focusPending: false,
           focusItems: [],
@@ -122,6 +138,15 @@
     ["installed", "Installed", "Everything already present on this machine."],
     ["updates", "Updates", "Entries that currently publish a newer version."],
   ];
+  const storeGridColumns = 3;
+  const storePageSize = 6;
+  const searchKeyboardRows = [
+    ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
+    ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
+    ["Z", "X", "C", "V", "B", "N", "M", "0", "1", "2"],
+    ["3", "4", "5", "6", "7", "8", "9", "-", "Space", "Back"],
+    ["Clear", "Done"],
+  ];
 
   const builtInStoreOrder = new Map([
     ["performance", 10],
@@ -137,6 +162,140 @@
     ["display", 110],
     ["auto-sisr", 120],
   ]);
+
+  let lastStoreKeyboardRequestAt = 0;
+  let lastStoreKeyboardRequestKey = "";
+
+  function setStoreKeyboardLayer(active) {
+    const root = state.root || document.getElementById("steamloader-plugin-store-root");
+    root?.classList.toggle("is-keyboard-open", Boolean(active));
+
+    if (state.storeKeyboardLayerTimer) {
+      window.clearTimeout(state.storeKeyboardLayerTimer);
+      state.storeKeyboardLayerTimer = 0;
+    }
+
+    if (active) {
+      state.storeKeyboardLayerTimer = window.setTimeout(() => {
+        state.storeKeyboardLayerTimer = 0;
+        const currentRoot = state.root || document.getElementById("steamloader-plugin-store-root");
+        currentRoot?.classList.remove("is-keyboard-open");
+      }, 60000);
+    }
+  }
+
+  function markStoreKeyboardActive() {
+    state.searchKeyboardActiveUntil = Date.now() + 60000;
+    setStoreKeyboardLayer(true);
+  }
+
+  function tryInvokeStoreKeyboardOpener(opener, argSets) {
+    for (const args of argSets) {
+      try {
+        opener(...args);
+        return true;
+      } catch {
+      }
+    }
+
+    return false;
+  }
+
+  function requestStoreSteamKeyboard(element, description = "Search") {
+    if (!apiBase || !(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const payload = {
+      label: description,
+      value: element.value || "",
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+    const requestKey = JSON.stringify({
+      label: payload.label,
+      value: payload.value,
+      x: Math.round(payload.x),
+      y: Math.round(payload.y),
+      width: Math.round(payload.width),
+      height: Math.round(payload.height),
+    });
+    const now = Date.now();
+
+    if (requestKey === lastStoreKeyboardRequestKey && now - lastStoreKeyboardRequestAt < 650) {
+      return true;
+    }
+
+    lastStoreKeyboardRequestKey = requestKey;
+    lastStoreKeyboardRequestAt = now;
+
+    try {
+      void fetch(`${apiBase}api/steam/keyboard/show`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function tryOpenStoreSteamKeyboard(element, description = "Search", force = false) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    element.focus({ preventScroll: true });
+    if (!force && Date.now() < (state.searchKeyboardActiveUntil || 0)) {
+      setStoreKeyboardLayer(true);
+      return true;
+    }
+
+    markStoreKeyboardActive();
+
+    if (requestStoreSteamKeyboard(element, description)) {
+      return true;
+    }
+
+    const label = description;
+    const currentValue = element.value || "";
+    const rect = element.getBoundingClientRect();
+    let opened = false;
+
+    try {
+      if (typeof window.navigator?.virtualKeyboard?.show === "function") {
+        window.navigator.virtualKeyboard.show();
+        opened = true;
+      }
+    } catch {
+    }
+
+    const steamInput = window.SteamClient?.Input;
+    if (typeof steamInput?.ShowFloatingGamepadTextInput === "function") {
+      opened =
+        tryInvokeStoreKeyboardOpener(steamInput.ShowFloatingGamepadTextInput.bind(steamInput), [
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],
+          [0, Math.round(rect.left), Math.round(rect.top), Math.round(rect.right), Math.round(rect.bottom)],
+        ]) || opened;
+    }
+
+    if (typeof steamInput?.ShowGamepadTextInput === "function") {
+      opened =
+        tryInvokeStoreKeyboardOpener(steamInput.ShowGamepadTextInput.bind(steamInput), [
+          [0, 0, label, 256, currentValue],
+          [0, 0, label, 1024, currentValue],
+        ]) || opened;
+    }
+
+    return opened;
+  }
 
   function canHostPluginStoreOverlay() {
     return Boolean(
@@ -165,6 +324,10 @@
 
       .steamloader-plugin-store-root.is-open {
         display: block;
+      }
+
+      .steamloader-plugin-store-root.is-keyboard-open {
+        z-index: 10;
       }
 
       .steamloader-plugin-store-surface {
@@ -642,8 +805,8 @@
       }
 
       .steamloader-plugin-store-card-footer {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
+        display: flex;
+        justify-content: flex-start;
         gap: 10px;
         align-items: center;
         margin-top: 4px;
@@ -657,20 +820,6 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-      }
-
-      .steamloader-plugin-store-actions {
-        display: flex;
-        flex-wrap: nowrap;
-        justify-content: flex-end;
-        gap: 7px;
-      }
-
-      .steamloader-plugin-store-actions .steamloader-plugin-store-button {
-        min-height: 34px;
-        padding: 0 12px;
-        border-radius: 8px;
-        font-size: 12px;
       }
 
       .steamloader-plugin-store-empty {
@@ -785,20 +934,21 @@
       }
 
       .steamloader-plugin-store-main {
+        position: relative;
         grid-column: 1;
         min-width: 0;
         min-height: 0;
         display: grid;
-        grid-template-rows: auto auto minmax(0, 1fr) auto;
+        grid-template-rows: auto auto auto minmax(0, 1fr) auto;
         padding: 50px 34px 18px;
         background: #101720;
       }
 
       .steamloader-plugin-store-topbar {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-columns: minmax(0, 1fr) minmax(260px, 460px) auto;
         gap: 22px;
-        align-items: start;
+        align-items: center;
         padding: 0 0 18px;
       }
 
@@ -819,6 +969,38 @@
       .steamloader-plugin-store-topbar-actions {
         display: flex;
         gap: 12px;
+      }
+
+      .steamloader-plugin-store-search {
+        min-width: 0;
+      }
+
+      .steamloader-plugin-store-search-input {
+        appearance: none;
+        width: 100%;
+        min-height: 54px;
+        border: 0;
+        border-radius: 22px;
+        padding: 0 18px;
+        background: #252c35;
+        color: #eef3f8;
+        font: inherit;
+        font-size: 15px;
+        font-weight: 850;
+        outline: none;
+        box-shadow: inset 0 0 0 2px rgba(238, 243, 248, 0.04);
+      }
+
+      .steamloader-plugin-store-search-input::placeholder {
+        color: rgba(190, 201, 213, 0.62);
+      }
+
+      .steamloader-plugin-store-search-input:focus-visible,
+      .steamloader-plugin-store-search-input.is-controller-focus {
+        background: #343a42;
+        box-shadow:
+          inset 0 0 0 3px rgba(238, 243, 248, 0.2),
+          0 0 0 4px rgba(238, 243, 248, 0.08);
       }
 
       .steamloader-plugin-store-button {
@@ -901,15 +1083,34 @@
       }
 
       .steamloader-plugin-store-status-row {
-        display: none;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 34px;
+        padding: 0 0 14px;
+        overflow: hidden;
       }
 
       .steamloader-plugin-store-status,
       .steamloader-plugin-store-error {
         min-height: 32px;
         border-radius: 12px;
+        padding: 0 12px;
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
         background: rgba(255, 255, 255, 0.055);
         color: rgba(190, 201, 213, 0.76);
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .steamloader-plugin-store-error {
+        background: rgba(148, 69, 35, 0.62);
+        color: #ffd7b0;
       }
 
       .steamloader-plugin-store-content {
@@ -927,6 +1128,10 @@
 
       .steamloader-plugin-store-section-heading {
         margin: 0 0 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
       }
 
       .steamloader-plugin-store-section-title {
@@ -935,28 +1140,45 @@
         letter-spacing: 0;
       }
 
+      .steamloader-plugin-store-page-pill {
+        min-height: 30px;
+        padding: 0 12px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        background: #252c35;
+        color: rgba(238, 243, 248, 0.72);
+        font-size: 11px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
       .steamloader-plugin-store-gallery {
         height: 100%;
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        grid-template-rows: repeat(4, minmax(0, 1fr));
-        grid-auto-rows: minmax(0, 1fr);
-        gap: 12px;
-        overflow: auto;
-        padding: 0 0 8px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-rows: none;
+        grid-auto-rows: minmax(420px, 48vh);
+        gap: 42px 34px;
+        overflow-x: hidden;
+        overflow-y: auto;
+        padding: 4px 22px 26px 2px;
         align-content: start;
-        scrollbar-color: rgba(238, 243, 248, 0.28) transparent;
+        scrollbar-color: rgba(238, 243, 248, 0.46) rgba(255, 255, 255, 0.04);
+        scrollbar-width: auto;
       }
 
       .steamloader-plugin-store-card {
         position: relative;
         display: grid;
         grid-template-columns: minmax(0, 1fr);
-        grid-template-rows: auto minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr) minmax(180px, 50%);
         align-items: stretch;
-        gap: 8px;
+        gap: 14px;
+        height: 100%;
         min-height: 0;
-        padding: 12px;
+        padding: 16px;
         border-radius: 24px;
         background: #343a42;
         box-shadow: none;
@@ -977,9 +1199,7 @@
       .steamloader-plugin-store-card:focus-visible,
       .steamloader-plugin-store-card.is-controller-focus {
         background: #48515d;
-        box-shadow:
-          0 10px 26px rgba(0, 0, 0, 0.18),
-          0 0 0 4px rgba(238, 243, 248, 0.1);
+        box-shadow: inset 0 0 0 2px rgba(238, 243, 248, 0.12);
         transform: none;
       }
 
@@ -987,9 +1207,7 @@
       .steamloader-plugin-store-card:focus-visible::after,
       .steamloader-plugin-store-card.is-controller-focus::after {
         border-color: rgba(238, 243, 248, 0.96);
-        box-shadow:
-          inset 0 0 0 2px rgba(255, 255, 255, 0.12),
-          0 0 0 2px rgba(238, 243, 248, 0.16);
+        box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.12);
       }
 
       .steamloader-plugin-store-card.is-selected {
@@ -1001,11 +1219,23 @@
         border-color: rgba(238, 243, 248, 0.34);
       }
 
+      .steamloader-plugin-store-card.is-context-open {
+        background: #4a535f;
+        box-shadow:
+          inset 0 0 0 2px rgba(238, 243, 248, 0.18),
+          inset 0 -18px 42px rgba(238, 243, 248, 0.035);
+      }
+
+      .steamloader-plugin-store-card.is-context-open::after {
+        border-color: rgba(238, 243, 248, 0.82);
+      }
+
       .steamloader-plugin-store-card-main {
         display: flex;
         flex-direction: column;
         gap: 6px;
         min-height: 0;
+        overflow: hidden;
       }
 
       .steamloader-plugin-store-card-title {
@@ -1060,7 +1290,8 @@
 
       .steamloader-plugin-store-card-preview {
         width: 100%;
-        height: clamp(74px, 10vh, 116px);
+        height: 100%;
+        min-height: 170px;
         border-radius: 20px;
         background: transparent;
         box-shadow: none;
@@ -1089,11 +1320,210 @@
         color: rgba(190, 201, 213, 0.62);
       }
 
-      .steamloader-plugin-store-actions .steamloader-plugin-store-button {
-        min-height: 24px;
+      .steamloader-plugin-store-context-scrim {
+        position: absolute;
+        inset: 0;
+        z-index: 7;
+        background:
+          radial-gradient(circle at center, rgba(238, 243, 248, 0.035), transparent 46%),
+          rgba(0, 0, 0, 0.2);
+      }
+
+      .steamloader-plugin-store-context-menu {
+        position: absolute;
+        z-index: 8;
+        top: 50%;
+        left: 50%;
+        width: min(380px, calc(100vw - 72px));
+        transform: translate(-50%, -50%);
+        padding: 12px;
+        border-radius: 24px;
+        background: rgba(37, 44, 53, 0.98);
+        box-shadow:
+          0 28px 90px rgba(0, 0, 0, 0.48),
+          inset 0 0 0 1px rgba(238, 243, 248, 0.1);
+        backdrop-filter: blur(18px);
+      }
+
+      .steamloader-plugin-store-context-header {
+        padding: 8px 10px 12px;
+        border-bottom: 1px solid rgba(238, 243, 248, 0.08);
+      }
+
+      .steamloader-plugin-store-context-kicker {
+        margin-bottom: 5px;
+        color: rgba(190, 201, 213, 0.72);
+        font-size: 10px;
+        font-weight: 950;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+      }
+
+      .steamloader-plugin-store-context-title {
+        color: #eef3f8;
+        font-size: 22px;
+        font-weight: 950;
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+      }
+
+      .steamloader-plugin-store-context-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding-top: 10px;
+      }
+
+      .steamloader-plugin-store-context-action {
+        width: 100%;
+        min-height: 60px;
+        border: 0;
+        border-radius: 16px;
+        padding: 10px 12px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        text-align: left;
+        background: transparent;
+        color: rgba(238, 243, 248, 0.88);
+        font: inherit;
+        outline: none;
+      }
+
+      .steamloader-plugin-store-context-action:disabled,
+      .steamloader-plugin-store-context-action.is-disabled {
+        opacity: 0.48;
+      }
+
+      .steamloader-plugin-store-context-action:not(:disabled):hover,
+      .steamloader-plugin-store-context-action:not(:disabled):focus-visible,
+      .steamloader-plugin-store-context-action:not(:disabled).is-controller-focus {
+        background: #eef3f8;
+        color: #17212c;
+        box-shadow: 0 0 0 4px rgba(238, 243, 248, 0.12);
+      }
+
+      .steamloader-plugin-store-context-action.is-danger:not(:disabled):hover,
+      .steamloader-plugin-store-context-action.is-danger:not(:disabled):focus-visible,
+      .steamloader-plugin-store-context-action.is-danger:not(:disabled).is-controller-focus {
+        background: #dfe6ee;
+      }
+
+      .steamloader-plugin-store-context-action-text {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .steamloader-plugin-store-context-action-label {
+        font-size: 17px;
+        font-weight: 950;
+        letter-spacing: -0.02em;
+      }
+
+      .steamloader-plugin-store-context-action-copy {
+        color: rgba(190, 201, 213, 0.72);
+        font-size: 11px;
+        font-weight: 750;
+      }
+
+      .steamloader-plugin-store-context-action:not(:disabled):hover .steamloader-plugin-store-context-action-copy,
+      .steamloader-plugin-store-context-action:not(:disabled):focus-visible .steamloader-plugin-store-context-action-copy,
+      .steamloader-plugin-store-context-action:not(:disabled).is-controller-focus .steamloader-plugin-store-context-action-copy {
+        color: rgba(23, 33, 44, 0.68);
+      }
+
+      .steamloader-plugin-store-context-action-icon {
+        min-width: 32px;
+        height: 32px;
         border-radius: 999px;
-        padding: 0 9px;
-        font-size: 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(238, 243, 248, 0.1);
+        color: inherit;
+        font-size: 15px;
+        font-weight: 950;
+      }
+
+      .steamloader-plugin-store-search-keyboard {
+        position: absolute;
+        left: 50%;
+        bottom: 78px;
+        z-index: 6;
+        width: min(1040px, calc(100vw - 96px));
+        transform: translateX(-50%);
+        padding: 18px;
+        border-radius: 28px;
+        background: rgba(24, 31, 40, 0.98);
+        box-shadow:
+          0 28px 80px rgba(0, 0, 0, 0.45),
+          inset 0 0 0 2px rgba(238, 243, 248, 0.08);
+      }
+
+      .steamloader-plugin-store-search-keyboard-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin: 0 0 14px;
+      }
+
+      .steamloader-plugin-store-search-keyboard-title {
+        color: rgba(238, 243, 248, 0.92);
+        font-size: 18px;
+        font-weight: 950;
+      }
+
+      .steamloader-plugin-store-search-keyboard-value {
+        min-width: 260px;
+        min-height: 42px;
+        padding: 0 14px;
+        border-radius: 16px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-start;
+        background: #101720;
+        color: rgba(238, 243, 248, 0.86);
+        font-size: 16px;
+        font-weight: 800;
+      }
+
+      .steamloader-plugin-store-search-keyboard-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .steamloader-plugin-store-search-keyboard-row {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+      }
+
+      .steamloader-plugin-store-search-key {
+        min-width: 60px;
+        min-height: 44px;
+        border: 0;
+        border-radius: 14px;
+        background: #343a42;
+        color: #eef3f8;
+        font-size: 15px;
+        font-weight: 950;
+      }
+
+      .steamloader-plugin-store-search-key.is-wide {
+        min-width: 126px;
+      }
+
+      .steamloader-plugin-store-search-key:focus-visible,
+      .steamloader-plugin-store-search-key.is-controller-focus {
+        outline: none;
+        background: #eef3f8;
+        color: #17212c;
+        box-shadow: 0 0 0 4px rgba(238, 243, 248, 0.14);
       }
 
       .steamloader-plugin-store-controller-bar {
@@ -1142,7 +1572,9 @@
 
         .steamloader-plugin-store-gallery {
           grid-template-columns: repeat(3, minmax(0, 1fr));
-          grid-template-rows: repeat(4, minmax(0, 1fr));
+          grid-template-rows: none;
+          grid-auto-rows: minmax(380px, 46vh);
+          gap: 36px 28px;
         }
 
         .steamloader-plugin-store-card {
@@ -1152,7 +1584,8 @@
         }
 
         .steamloader-plugin-store-card-preview {
-          height: clamp(72px, 9vh, 104px);
+          height: 100%;
+          min-height: 150px;
         }
 
         .steamloader-plugin-store-card-title {
@@ -1184,7 +1617,8 @@
         .steamloader-plugin-store-gallery {
           grid-template-columns: repeat(2, minmax(0, 1fr));
           grid-template-rows: none;
-          grid-auto-rows: minmax(220px, auto);
+          grid-auto-rows: minmax(300px, auto);
+          gap: 22px;
         }
 
         .steamloader-plugin-store-controller-bar {
@@ -1431,6 +1865,10 @@
       .filter((element) => !element.disabled && element.offsetParent !== null);
   }
 
+  function isStoreSearchInput(element) {
+    return element instanceof HTMLInputElement && element.dataset.storeFocusKey === "top:search";
+  }
+
   function applyStoreFocus(shouldFocus = true) {
     for (const item of state.focusItems) {
       item.classList.remove("is-controller-focus");
@@ -1448,7 +1886,10 @@
     if (shouldFocus) {
       item.focus({ preventScroll: true });
     }
-    item.scrollIntoView({ block: "nearest", inline: "nearest" });
+
+    if (item.closest(".steamloader-plugin-store-gallery")) {
+      item.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
   }
 
   function syncSelectedStoreCard() {
@@ -1548,32 +1989,218 @@
   }
 
   function getStoreItemZone(item) {
-    return item?.closest?.(".steamloader-plugin-store-gallery") ? "assets" : "side";
+    if (item?.closest?.(".steamloader-plugin-store-search-keyboard")) {
+      return "keyboard";
+    }
+
+    if (item?.closest?.(".steamloader-plugin-store-context-menu")) {
+      return "context-menu";
+    }
+
+    if (isStoreSearchInput(item)) {
+      return "search";
+    }
+
+    if (item?.closest?.(".steamloader-plugin-store-topbar-actions")) {
+      return "top";
+    }
+
+    if (item?.closest?.(".steamloader-plugin-store-nav")) {
+      return "nav";
+    }
+
+    return item?.closest?.(".steamloader-plugin-store-gallery") ? "assets" : "nav";
   }
 
-  function getStoreZoneItems(zone = getStoreItemZone(state.focusItems[state.focusIndex]) || "side") {
+  function getStoreZoneItems(zone = getStoreItemZone(state.focusItems[state.focusIndex]) || "nav") {
     return state.focusItems.filter((item) => getStoreItemZone(item) === zone);
   }
 
-  function getFirstStoreZoneWithItems(preferredZone = getStoreItemZone(state.focusItems[state.focusIndex]) || "side") {
-    if (getStoreZoneItems(preferredZone).length) {
-      return preferredZone;
-    }
-
-    return getStoreZoneItems("assets").length ? "assets" : "side";
+  function getStoreGridStep() {
+    return window.matchMedia?.("(max-width: 900px)")?.matches ? 2 : storeGridColumns;
   }
 
-  function getStoreGridStep() {
-    const current = state.focusItems[state.focusIndex];
-    if (!current?.closest?.(".steamloader-plugin-store-gallery")) {
-      return 1;
+  function getStoreKeyboardStep() {
+    return 10;
+  }
+
+  function focusStoreElement(element) {
+    const index = state.focusItems.indexOf(element);
+    if (index < 0) {
+      return false;
     }
 
-    const grid = current.closest(".steamloader-plugin-store-gallery");
-    const firstCard = grid?.querySelector(".steamloader-plugin-store-card");
-    const gridWidth = grid?.getBoundingClientRect().width || 0;
-    const itemWidth = firstCard?.getBoundingClientRect().width || 0;
-    return Math.max(1, Math.floor(gridWidth / Math.max(1, itemWidth + 8)));
+    state.focusIndex = index;
+    applyStoreFocus();
+    return true;
+  }
+
+  function focusStoreZone(zone, index = 0) {
+    const items = getStoreZoneItems(zone);
+    if (!items.length) {
+      return false;
+    }
+
+    const nextIndex = Math.max(0, Math.min(items.length - 1, index));
+    return focusStoreElement(items[nextIndex]);
+  }
+
+  function focusSelectedStoreCard() {
+    const cards = getStoreZoneItems("assets");
+    if (!cards.length) {
+      return false;
+    }
+
+    const selectedKey = state.selectedPluginId ? `card:${state.selectedPluginId}` : "";
+    const selected = selectedKey
+      ? cards.find((item) => item.dataset.storeFocusKey === selectedKey)
+      : null;
+    return focusStoreElement(selected || cards[0]);
+  }
+
+  function getStorePluginById(pluginId) {
+    const id = String(pluginId || "");
+    return getAllPlugins().find((plugin) => plugin?.id === id) || null;
+  }
+
+  function getStoreContextActions(plugin) {
+    if (!plugin) {
+      return [];
+    }
+
+    const actions = [];
+    if (plugin.isBuiltIn) {
+      if (plugin.canToggleVisibility) {
+        actions.push({
+          id: "visibility",
+          label: plugin.isEnabled ? "Hide from Home" : "Show in Home",
+          copy: plugin.isEnabled
+            ? "Keep it installed, but remove it from the TFS home list."
+            : "Show this built-in plugin again on the TFS home list.",
+          icon: plugin.isEnabled ? "H" : "S",
+          kind: "primary",
+          run: () => toggleBuiltInPlugin(plugin),
+        });
+      } else {
+        actions.push({
+          id: "core",
+          label: "Core plugin",
+          copy: "This built-in plugin is required and cannot be hidden.",
+          icon: "i",
+          disabled: true,
+        });
+      }
+    } else {
+      if (plugin.hasUpdate && plugin.canInstall) {
+        actions.push({
+          id: "update",
+          label: "Update",
+          copy: "Download and install the newest available package.",
+          icon: "U",
+          kind: "primary",
+          run: () => runCommunityAction("api/plugin-store/plugins/update", plugin.id),
+        });
+      } else if (!plugin.isInstalled && plugin.canInstall) {
+        actions.push({
+          id: "download",
+          label: "Download",
+          copy: "Install this community plugin from the catalog.",
+          icon: "D",
+          kind: "primary",
+          run: () => runCommunityAction("api/plugin-store/plugins/install", plugin.id),
+        });
+      } else if (plugin.isInstalled) {
+        actions.push({
+          id: "installed",
+          label: "Installed",
+          copy: "This community plugin is already available on this device.",
+          icon: "I",
+          disabled: true,
+        });
+      }
+
+      if (plugin.canUninstall) {
+        actions.push({
+          id: "uninstall",
+          label: "Uninstall",
+          copy: "Remove this community plugin from the local install folder.",
+          icon: "!",
+          kind: "danger",
+          run: () => runCommunityAction("api/plugin-store/plugins/uninstall", plugin.id),
+        });
+      }
+    }
+
+    if (!actions.length) {
+      actions.push({
+        id: "none",
+        label: "No actions available",
+        copy: "This plugin does not expose a store action right now.",
+        icon: "i",
+        disabled: true,
+      });
+    }
+
+    actions.push({
+      id: "cancel",
+      label: "Cancel",
+      copy: "Close this menu and return to the plugin grid.",
+      icon: "B",
+      run: () => {
+        closeStoreContextMenu();
+        return true;
+      },
+    });
+
+    return actions;
+  }
+
+  async function runStoreContextAction(action, plugin) {
+    if (!action || action.disabled || state.busy) {
+      return false;
+    }
+
+    if (action.id === "cancel") {
+      closeStoreContextMenu();
+      return true;
+    }
+
+    const pluginId = plugin?.id || state.contextMenuPluginId || state.selectedPluginId;
+    state.contextMenuPluginId = "";
+    requestStoreFocus(pluginId ? `card:${pluginId}` : "");
+    render();
+
+    const result = await action.run?.();
+    requestStoreFocus(pluginId ? `card:${pluginId}` : "");
+    return Boolean(result);
+  }
+
+  function openStoreContextMenu(pluginId) {
+    const nextPluginId = String(pluginId || "");
+    if (!nextPluginId) {
+      return false;
+    }
+
+    const plugin = getStorePluginById(nextPluginId);
+    if (!plugin) {
+      return false;
+    }
+
+    state.selectedPluginId = nextPluginId;
+    state.contextMenuPluginId = nextPluginId;
+    state.searchPadOpen = false;
+    setStoreKeyboardLayer(false);
+    const firstEnabledActionIndex = getStoreContextActions(plugin).findIndex((action) => !action.disabled);
+    requestStoreFocus(`context:${nextPluginId}:${Math.max(0, firstEnabledActionIndex)}`);
+    render();
+    return true;
+  }
+
+  function closeStoreContextMenu() {
+    const pluginId = state.contextMenuPluginId || state.selectedPluginId;
+    state.contextMenuPluginId = "";
+    requestStoreFocus(pluginId ? `card:${pluginId}` : "");
+    render();
   }
 
   function moveStoreFocus(direction) {
@@ -1583,36 +2210,133 @@
     }
 
     const current = state.focusItems[state.focusIndex];
-    const zone = getFirstStoreZoneWithItems(getStoreItemZone(current));
+    const zone = getStoreItemZone(current);
     const zoneItems = getStoreZoneItems(zone);
     if (!zoneItems.length) {
       return;
     }
 
     const zoneIndex = Math.max(0, zoneItems.indexOf(current));
-    const step =
-      zone === "side"
-        ? direction === "up" || direction === "left"
-          ? -1
-          : 1
-        : direction === "up"
-          ? -getStoreGridStep()
-          : direction === "down"
-            ? getStoreGridStep()
-            : direction === "left"
-              ? -1
-              : 1;
-    const nextZoneIndex = (zoneIndex + step + zoneItems.length) % zoneItems.length;
-    state.focusIndex = state.focusItems.indexOf(zoneItems[nextZoneIndex]);
-    applyStoreFocus();
+
+    if (zone === "context-menu") {
+      if (direction === "up" || direction === "down") {
+        focusStoreZone("context-menu", zoneIndex + (direction === "up" ? -1 : 1));
+      }
+      return;
+    }
+
+    if (zone === "keyboard") {
+      if (direction === "up" && zoneIndex < getStoreKeyboardStep()) {
+        focusStoreZone("search", 0);
+        return;
+      }
+
+      if (direction === "down" || direction === "up") {
+        focusStoreZone("keyboard", zoneIndex + (direction === "up" ? -getStoreKeyboardStep() : getStoreKeyboardStep()));
+        return;
+      }
+
+      focusStoreZone("keyboard", zoneIndex + (direction === "left" ? -1 : 1));
+      return;
+    }
+
+    if (zone === "search") {
+      if (direction === "right") {
+        focusStoreZone("top", 0);
+      } else if (direction === "down") {
+        if (state.searchPadOpen) {
+          focusStoreZone("keyboard", 0);
+        } else {
+          focusSelectedStoreCard() || focusStoreZone("nav", 0);
+        }
+      }
+      return;
+    }
+
+    if (zone === "top") {
+      if (direction === "left" && zoneIndex === 0) {
+        focusStoreZone("search", 0);
+        return;
+      }
+
+      if (direction === "left" || direction === "right") {
+        focusStoreZone("top", zoneIndex + (direction === "left" ? -1 : 1));
+        return;
+      }
+
+      if (direction === "down") {
+        focusSelectedStoreCard() || focusStoreZone("nav", 0);
+      }
+      return;
+    }
+
+    if (zone === "nav") {
+      if (direction === "up") {
+        focusStoreZone("search", 0) || focusStoreZone("top", 0);
+        return;
+      }
+
+      if (direction === "down") {
+        focusSelectedStoreCard();
+        return;
+      }
+
+      if (direction === "left" || direction === "right") {
+        focusStoreZone("nav", zoneIndex + (direction === "left" ? -1 : 1));
+      }
+      return;
+    }
+
+    const columns = getStoreGridStep();
+    const visiblePlugins = getVisiblePlugins();
+    const absoluteIndex = Number(current?.dataset?.storeCardIndex || 0);
+    if (direction === "up") {
+      if (zoneIndex < columns) {
+        focusStoreZone("search", 0) || focusStoreZone("nav", 0);
+      } else {
+        focusStoreZone("assets", zoneIndex - columns);
+      }
+      return;
+    }
+
+    if (direction === "down") {
+      const nextIndex = zoneIndex + columns;
+      if (nextIndex < zoneItems.length) {
+        focusStoreZone("assets", nextIndex);
+      } else if (absoluteIndex + columns < visiblePlugins.length) {
+        selectStorePluginByVisibleIndex(absoluteIndex + columns);
+      }
+      return;
+    }
+
+    if (direction === "left" && zoneIndex === 0) {
+      selectStorePluginByVisibleIndex(absoluteIndex - 1);
+      return;
+    }
+
+    if (direction === "right" && zoneIndex === zoneItems.length - 1) {
+      selectStorePluginByVisibleIndex(absoluteIndex + 1);
+      return;
+    }
+
+    focusStoreZone("assets", zoneIndex + (direction === "left" ? -1 : 1));
   }
 
   function activateStoreFocus() {
     refreshStoreFocus();
     const item = state.focusItems[state.focusIndex];
-    if (item) {
-      item.click();
+    if (!item) {
+      return;
     }
+
+    if (isStoreSearchInput(item)) {
+      state.searchPadOpen = true;
+      requestStoreFocus("keyboard:Q");
+      render();
+      return;
+    }
+
+    item.click();
   }
 
   function cycleStoreSection(direction) {
@@ -1620,6 +2344,10 @@
     const currentIndex = Math.max(0, sectionIds.indexOf(state.activeSection));
     const nextIndex = (currentIndex + direction + sectionIds.length) % sectionIds.length;
     state.activeSection = sectionIds[nextIndex];
+    state.storePageIndex = 0;
+    state.searchPadOpen = false;
+    state.contextMenuPluginId = "";
+    state.selectedPluginId = "";
     ensureSelection();
     requestStoreFocus(state.selectedPluginId ? `card:${state.selectedPluginId}` : `section:${state.activeSection}`);
     render();
@@ -1636,16 +2364,41 @@
     }
 
     if (action === "b") {
+      if (state.searchPadOpen) {
+        state.searchPadOpen = false;
+        requestStoreFocus("top:search");
+        render();
+        return;
+      }
+
+      if (state.contextMenuPluginId) {
+        closeStoreContextMenu();
+        return;
+      }
+
       void closeOverlay();
       return;
     }
 
+    if (action === "search-back") {
+      if (state.searchPadOpen) {
+        handleStoreSearchKey("Back");
+      }
+      return;
+    }
+
     if (action === "previous-section") {
+      if (state.contextMenuPluginId) {
+        return;
+      }
       cycleStoreSection(-1);
       return;
     }
 
     if (action === "next-section") {
+      if (state.contextMenuPluginId) {
+        return;
+      }
       cycleStoreSection(1);
       return;
     }
@@ -1670,12 +2423,18 @@
       return;
     }
 
+    const isMoveAction = action === "up" || action === "down" || action === "left" || action === "right";
+    const isSectionAction = action === "previous-section" || action === "next-section";
     const repeatDelay =
-      action === "up" || action === "down" || action === "left" || action === "right"
+      isMoveAction
         ? state.lastGamepadInput === action
           ? 170
           : 250
-        : 320;
+        : isSectionAction
+          ? 210
+          : action === "search-back"
+            ? 170
+            : 280;
     if (state.lastGamepadInput === action && now - state.lastGamepadInputAt < repeatDelay) {
       return;
     }
@@ -1705,6 +2464,9 @@
     if (/\b(B|BACK|CANCEL)\b/.test(namedButton)) {
       return "b";
     }
+    if (/\b(X|BUTTON_X|GAMEPADX|XBUTTON)\b/.test(namedButton)) {
+      return "search-back";
+    }
     if (/(LEFT|L).*(BUMPER|SHOULDER|TRIGGER)|\b(LB|L1)\b/.test(namedButton)) {
       return "previous-section";
     }
@@ -1717,6 +2479,8 @@
         return "a";
       case 2:
         return "b";
+      case 3:
+        return "search-back";
       case 5:
       case 7:
         return "previous-section";
@@ -1740,7 +2504,11 @@
     const now = Date.now();
     const repeatMs = action === "up" || action === "down" || action === "left" || action === "right"
       ? 230
-      : 340;
+      : action === "previous-section" || action === "next-section"
+        ? 220
+        : action === "search-back"
+          ? 170
+          : 340;
     const lastMs = state.catchAllButtonState[button] || 0;
     if (now - lastMs < repeatMs) {
       return false;
@@ -1837,6 +2605,7 @@
     const buttonMap = [
       [0, "a"],
       [1, "b"],
+      [2, "search-back"],
       [4, "previous-section"],
       [5, "next-section"],
       [12, "up"],
@@ -1867,6 +2636,7 @@
       const buttonMap = [
         [0, "a"],
         [1, "b"],
+        [2, "search-back"],
         [4, "previous-section"],
         [5, "next-section"],
         [12, "up"],
@@ -1883,7 +2653,8 @@
             action === "up" ||
             action === "down" ||
             action === "left" ||
-            action === "right"
+            action === "right" ||
+            action === "search-back"
           ) {
             maybeRepeatGamepadAction(action, "browser-gamepad");
           }
@@ -1964,8 +2735,34 @@
       key === "Escape" ||
       key === "GamepadA" ||
       key === "GamepadB" ||
+      key === "GamepadX" ||
       isPreviousSectionKey ||
       isNextSectionKey;
+
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (
+      isStoreSearchInput(activeElement) &&
+      !isPreviousSectionKey &&
+      !isNextSectionKey &&
+      key !== "ArrowUp" &&
+      key !== "ArrowDown" &&
+      key !== "ArrowLeft" &&
+      key !== "ArrowRight" &&
+      key !== "GamepadUp" &&
+      key !== "GamepadDown" &&
+      key !== "GamepadLeft" &&
+      key !== "GamepadRight" &&
+      key !== "GamepadDPadUp" &&
+      key !== "GamepadDPadDown" &&
+      key !== "GamepadDPadLeft" &&
+      key !== "GamepadDPadRight" &&
+      key !== "Escape" &&
+      key !== "GamepadA" &&
+      key !== "GamepadB" &&
+      key !== "GamepadX"
+    ) {
+      return;
+    }
 
     if (!handled) {
       return;
@@ -1986,6 +2783,8 @@
       maybeRepeatGamepadAction("right", source);
     } else if (key === "Escape" || key === "GamepadB") {
       maybeRepeatGamepadAction("b", source);
+    } else if (key === "GamepadX") {
+      maybeRepeatGamepadAction("search-back", source);
     } else if (isPreviousSectionKey) {
       maybeRepeatGamepadAction("previous-section", source);
     } else if (isNextSectionKey) {
@@ -1997,6 +2796,10 @@
 
   function swallowStoreInput(event) {
     if (!state.open) {
+      return;
+    }
+
+    if (isStoreSearchInput(document.activeElement)) {
       return;
     }
 
@@ -2090,38 +2893,106 @@
     });
   }
 
+  function filterStorePluginsForSearch(plugins) {
+    const query = String(state.searchQuery || "").trim().toLowerCase();
+    if (!query) {
+      return plugins;
+    }
+
+    const terms = query.split(/\s+/).filter(Boolean);
+    return plugins.filter((plugin) => {
+      const searchableText = [
+        plugin?.title,
+        plugin?.name,
+        plugin?.description,
+        plugin?.author,
+        plugin?.source,
+        plugin?.category,
+        Array.isArray(plugin?.tags) ? plugin.tags.join(" ") : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return terms.every((term) => searchableText.includes(term));
+    });
+  }
+
   function getVisiblePlugins() {
     const snapshot = getSnapshot();
     const all = getAllPlugins();
     if (state.activeSection === "built-in") {
-      return sortStorePlugins(Array.isArray(snapshot?.builtInPlugins) ? snapshot.builtInPlugins : []);
+      return filterStorePluginsForSearch(sortStorePlugins(Array.isArray(snapshot?.builtInPlugins) ? snapshot.builtInPlugins : []));
     }
 
     if (state.activeSection === "community") {
-      return sortStorePlugins(Array.isArray(snapshot?.communityPlugins) ? snapshot.communityPlugins : []);
+      return filterStorePluginsForSearch(sortStorePlugins(Array.isArray(snapshot?.communityPlugins) ? snapshot.communityPlugins : []));
     }
 
     if (state.activeSection === "installed") {
-      return sortStorePlugins(all.filter((plugin) => Boolean(plugin?.isInstalled)));
+      return filterStorePluginsForSearch(sortStorePlugins(all.filter((plugin) => Boolean(plugin?.isInstalled))));
     }
 
     if (state.activeSection === "updates") {
-      return sortStorePlugins(all.filter((plugin) => Boolean(plugin?.hasUpdate)));
+      return filterStorePluginsForSearch(sortStorePlugins(all.filter((plugin) => Boolean(plugin?.hasUpdate))));
     }
 
-    return sortStorePlugins(all);
+    return filterStorePluginsForSearch(sortStorePlugins(all));
+  }
+
+  function getStorePageCount(plugins = getVisiblePlugins()) {
+    return Math.max(1, Math.ceil((plugins?.length || 0) / storePageSize));
+  }
+
+  function normalizeStorePageIndex(plugins = getVisiblePlugins()) {
+    const pageCount = getStorePageCount(plugins);
+    const selectedIndex = plugins.findIndex((plugin) => plugin?.id === state.selectedPluginId);
+    if (selectedIndex >= 0) {
+      state.storePageIndex = Math.floor(selectedIndex / storePageSize);
+    }
+
+    const pageIndex = Math.max(0, Math.min(pageCount - 1, Number(state.storePageIndex) || 0));
+    state.storePageIndex = pageIndex;
+    return pageIndex;
+  }
+
+  function getPagedStorePlugins(plugins = getVisiblePlugins()) {
+    const pageIndex = normalizeStorePageIndex(plugins);
+    return plugins.slice(pageIndex * storePageSize, pageIndex * storePageSize + storePageSize);
+  }
+
+  function selectStorePluginByVisibleIndex(index, preferredFocusKey = "") {
+    const visiblePlugins = getVisiblePlugins();
+    if (index < 0 || index >= visiblePlugins.length) {
+      return false;
+    }
+
+    const targetIndex = index;
+    const target = visiblePlugins[targetIndex];
+    if (!target?.id) {
+      return false;
+    }
+
+    state.selectedPluginId = target.id;
+    state.storePageIndex = Math.floor(targetIndex / storePageSize);
+    requestStoreFocus(preferredFocusKey || `card:${target.id}`);
+    render();
+    return true;
   }
 
   function ensureSelection() {
     const visiblePlugins = getVisiblePlugins();
     if (!visiblePlugins.length) {
       state.selectedPluginId = "";
+      state.storePageIndex = 0;
       return;
     }
 
     if (!visiblePlugins.some((plugin) => plugin?.id === state.selectedPluginId)) {
       state.selectedPluginId = visiblePlugins[0]?.id || "";
     }
+
+    normalizeStorePageIndex(visiblePlugins);
   }
 
   function getSelectedPlugin() {
@@ -2291,36 +3162,7 @@
       : `${base}${value}`;
   }
 
-  async function runPluginPrimaryAction(plugin) {
-    if (!plugin?.id || state.busy) {
-      return false;
-    }
-
-    state.selectedPluginId = plugin.id;
-    requestStoreFocus(`card:${plugin.id}`);
-
-    if (plugin.isBuiltIn) {
-      if (plugin.canToggleVisibility) {
-        return await toggleBuiltInPlugin(plugin);
-      }
-
-      render();
-      return false;
-    }
-
-    if (plugin.hasUpdate) {
-      return await runCommunityAction("api/plugin-store/plugins/update", plugin.id);
-    }
-
-    if (!plugin.isInstalled && plugin.canInstall) {
-      return await runCommunityAction("api/plugin-store/plugins/install", plugin.id);
-    }
-
-    render();
-    return false;
-  }
-
-  function buildPreview(plugin, previewClassName, imageAltFallback) {
+  function buildPreview(plugin, previewClassName, imageAltFallback, preferEager = false) {
     const preview = createNode("div", previewClassName);
     const placeholder = createNode("div", previewClassName === "steamloader-plugin-store-preview"
       ? "steamloader-plugin-store-preview-copy"
@@ -2347,11 +3189,22 @@
 
     const imageUrl = normalizeStoreImageUrl(Array.isArray(plugin?.images) ? plugin.images[0]?.url : "");
     if (imageUrl) {
+      if (!(state.imageReadyUrls instanceof Set)) {
+        state.imageReadyUrls = new Set();
+      }
+
+      if (state.imageReadyUrls.has(imageUrl)) {
+        placeholder.style.display = "none";
+      }
+
       const image = document.createElement("img");
       image.src = imageUrl;
       image.alt = imageAltFallback;
-      image.loading = "lazy";
+      image.decoding = "async";
+      image.loading = preferEager ? "eager" : "lazy";
+      image.fetchPriority = preferEager ? "high" : "low";
       image.addEventListener("load", () => {
+        state.imageReadyUrls.add(imageUrl);
         placeholder.style.display = "none";
       });
       image.addEventListener("error", () => {
@@ -2373,79 +3226,10 @@
     parent.append(metric);
   }
 
-  function buildDetailActions(plugin) {
-    const actions = createNode("div", "steamloader-plugin-store-actions");
-    if (!plugin) {
-      return actions;
-    }
-
-    if (plugin.isBuiltIn) {
-      const toggle = createNode(
-        "button",
-        `steamloader-plugin-store-button${plugin.canToggleVisibility ? " is-primary" : " is-disabled"}`,
-        plugin.canToggleVisibility
-          ? plugin.isEnabled
-            ? "Visible"
-            : "Hidden"
-          : "Core Plugin",
-      );
-      toggle.type = "button";
-      toggle.tabIndex = -1;
-      toggle.disabled = state.busy || !plugin.canToggleVisibility;
-      toggle.title = plugin.canToggleVisibility
-        ? plugin.isEnabled
-          ? "Press A on the card to hide it from Home."
-          : "Press A on the card to show it in Home."
-        : "This core plugin is always visible.";
-      toggle.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void toggleBuiltInPlugin(plugin);
-      });
-      actions.append(toggle);
-      return actions;
-    }
-
-    const installText = plugin.hasUpdate
-      ? "Update"
-      : plugin.isInstalled
-        ? "Installed"
-        : "Install";
-    const install = createNode(
-      "button",
-      `steamloader-plugin-store-button${!plugin.isInstalled || plugin.hasUpdate ? " is-primary" : " is-disabled"}`,
-      installText,
-    );
-    install.type = "button";
-    install.tabIndex = -1;
-    install.disabled = state.busy || !plugin.canInstall || (plugin.isInstalled && !plugin.hasUpdate);
-    install.addEventListener("click", (event) => {
-      event.stopPropagation();
-      void runCommunityAction(
-        plugin.hasUpdate ? "api/plugin-store/plugins/update" : "api/plugin-store/plugins/install",
-        plugin.id,
-      );
-    });
-    actions.append(install);
-
-    if (plugin.canUninstall) {
-      const uninstall = createNode("button", "steamloader-plugin-store-button is-danger", "Uninstall");
-      uninstall.type = "button";
-      uninstall.tabIndex = -1;
-      uninstall.disabled = state.busy;
-      uninstall.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void runCommunityAction("api/plugin-store/plugins/uninstall", plugin.id);
-      });
-      actions.append(uninstall);
-    }
-
-    return actions;
-  }
-
   function buildCard(plugin, index) {
     const card = createNode(
       "div",
-      `steamloader-plugin-store-card${plugin?.id === state.selectedPluginId ? " is-selected" : ""}`,
+      `steamloader-plugin-store-card${plugin?.id === state.selectedPluginId ? " is-selected" : ""}${plugin?.id === state.contextMenuPluginId ? " is-context-open" : ""}`,
     );
     card.setAttribute("role", "button");
     card.setAttribute("aria-label", plugin?.title || "Plugin");
@@ -2454,7 +3238,7 @@
     card.addEventListener("click", () => {
       selectStorePlugin(plugin?.id || "");
       requestStoreFocus(`card:${plugin?.id || ""}`);
-      void runPluginPrimaryAction(plugin);
+      openStoreContextMenu(plugin?.id || "");
     });
     decorateFocusable(card, `card:${plugin?.id || ""}`, () => {
       if (plugin?.id && plugin.id !== state.selectedPluginId) {
@@ -2493,20 +3277,178 @@
       (plugin?.isInstalled ? "Installed" : "Not installed");
     const footer = createNode("div", "steamloader-plugin-store-card-footer");
     footer.append(
-      buildDetailActions(plugin),
       createNode("div", "steamloader-plugin-store-card-status", statusText),
     );
     main.append(badges, footer);
 
     card.append(
       main,
-      buildPreview(plugin, "steamloader-plugin-store-card-preview", `${plugin?.title || "Plugin"} preview`),
+      buildPreview(plugin, "steamloader-plugin-store-card-preview", `${plugin?.title || "Plugin"} preview`, index < 12),
     );
     return card;
   }
 
+  function updateStoreSearchQuery(value, focusKey = "") {
+    state.searchQuery = String(value || "");
+    state.storePageIndex = 0;
+    state.contextMenuPluginId = "";
+    state.selectedPluginId = "";
+    ensureSelection();
+    requestStoreFocus(focusKey || "keyboard:Q");
+    render();
+  }
+
+  function handleStoreSearchKey(key) {
+    const value = String(key || "");
+    if (value === "Done") {
+      state.searchPadOpen = false;
+      requestStoreFocus("top:search");
+      render();
+      return;
+    }
+
+    if (value === "Back") {
+      updateStoreSearchQuery(String(state.searchQuery || "").slice(0, -1), "keyboard:Back");
+      return;
+    }
+
+    if (value === "Clear") {
+      updateStoreSearchQuery("", "keyboard:Clear");
+      return;
+    }
+
+    updateStoreSearchQuery(`${state.searchQuery || ""}${value === "Space" ? " " : value.toLowerCase()}`, `keyboard:${value}`);
+  }
+
+  function buildStoreSearchKeyboard() {
+    const panel = createNode("div", "steamloader-plugin-store-search-keyboard");
+    const header = createNode("div", "steamloader-plugin-store-search-keyboard-header");
+    header.append(
+      createNode("div", "steamloader-plugin-store-search-keyboard-title", "Search plugins"),
+      createNode("div", "steamloader-plugin-store-search-keyboard-value", state.searchQuery || "A Type - X Back"),
+    );
+
+    const grid = createNode("div", "steamloader-plugin-store-search-keyboard-grid");
+    for (const row of searchKeyboardRows) {
+      const rowNode = createNode("div", "steamloader-plugin-store-search-keyboard-row");
+      for (const key of row) {
+        const button = createNode(
+          "button",
+          `steamloader-plugin-store-search-key${key.length > 1 ? " is-wide" : ""}`,
+          key,
+        );
+        button.type = "button";
+        button.addEventListener("click", () => {
+          handleStoreSearchKey(key);
+        });
+        decorateFocusable(button, `keyboard:${key}`);
+        rowNode.append(button);
+      }
+      grid.append(rowNode);
+    }
+
+    panel.append(header, grid);
+    return panel;
+  }
+
+  function positionStoreContextMenu() {
+    const root = getStoreRoot();
+    const menu = root?.querySelector?.(".steamloader-plugin-store-context-menu");
+    if (!(root instanceof HTMLElement) || !(menu instanceof HTMLElement)) {
+      return;
+    }
+
+    const cards = [...root.querySelectorAll(".steamloader-plugin-store-card")]
+      .filter((card) => card instanceof HTMLElement);
+    const card = cards.find((candidate) => candidate.dataset.storeCardId === state.contextMenuPluginId);
+    if (!(card instanceof HTMLElement)) {
+      menu.style.left = "50%";
+      menu.style.top = "50%";
+      menu.style.transform = "translate(-50%, -50%)";
+      return;
+    }
+
+    const rootRect = root.getBoundingClientRect();
+    const cardRect = card.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const padding = 30;
+    const controllerReserve = 92;
+    const preferredRight = cardRect.right - rootRect.left + 14;
+    const preferredLeft = cardRect.left - rootRect.left + cardRect.width - menuRect.width - 14;
+    const hasRightRoom = preferredRight + menuRect.width + padding <= rootRect.width;
+    const rawLeft = hasRightRoom ? preferredRight : preferredLeft;
+    const rawTop = cardRect.top - rootRect.top + Math.min(56, Math.max(18, cardRect.height * 0.18));
+    const maxLeft = Math.max(padding, rootRect.width - menuRect.width - padding);
+    const maxTop = Math.max(padding, rootRect.height - menuRect.height - controllerReserve);
+
+    menu.style.left = `${Math.max(padding, Math.min(maxLeft, rawLeft))}px`;
+    menu.style.top = `${Math.max(padding, Math.min(maxTop, rawTop))}px`;
+    menu.style.transform = "none";
+  }
+
+  function buildStoreContextMenu() {
+    const plugin = getStorePluginById(state.contextMenuPluginId);
+    if (!plugin) {
+      return null;
+    }
+
+    const fragment = document.createDocumentFragment();
+    const scrim = createNode("div", "steamloader-plugin-store-context-scrim");
+    scrim.addEventListener("click", () => {
+      closeStoreContextMenu();
+    });
+
+    const menu = createNode("div", "steamloader-plugin-store-context-menu");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", `${plugin.title || "Plugin"} actions`);
+
+    const header = createNode("div", "steamloader-plugin-store-context-header");
+    header.append(
+      createNode("div", "steamloader-plugin-store-context-kicker", plugin.isBuiltIn ? "Built-In Plugin" : "Community Plugin"),
+      createNode("div", "steamloader-plugin-store-context-title", plugin.title || "Plugin"),
+    );
+
+    const list = createNode("div", "steamloader-plugin-store-context-list");
+    getStoreContextActions(plugin).forEach((action, index) => {
+      const button = createNode(
+        "button",
+        `steamloader-plugin-store-context-action${action.kind === "danger" ? " is-danger" : ""}${action.disabled ? " is-disabled" : ""}`,
+      );
+      button.type = "button";
+      button.disabled = Boolean(action.disabled) || state.busy;
+      button.setAttribute("role", "menuitem");
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void runStoreContextAction(action, plugin);
+      });
+
+      const text = createNode("span", "steamloader-plugin-store-context-action-text");
+      text.append(
+        createNode("span", "steamloader-plugin-store-context-action-label", action.label),
+        createNode("span", "steamloader-plugin-store-context-action-copy", action.copy || ""),
+      );
+      button.append(
+        text,
+        createNode("span", "steamloader-plugin-store-context-action-icon", action.icon || ""),
+      );
+
+      if (!button.disabled) {
+        decorateFocusable(button, `context:${plugin.id}:${index}`);
+      }
+      list.append(button);
+    });
+
+    menu.append(header, list);
+    fragment.append(scrim, menu);
+    window.requestAnimationFrame(positionStoreContextMenu);
+    return fragment;
+  }
+
   async function closeOverlay() {
     state.open = false;
+    state.searchPadOpen = false;
+    state.contextMenuPluginId = "";
+    setStoreKeyboardLayer(false);
     setRemoteStoreOverlayActive(false);
     state.ignoreOverlayInputUntil = Date.now() + 280;
     render();
@@ -2565,9 +3507,16 @@
     const root = ensureRoot();
     state.root = root;
     root.classList.toggle("is-open", state.open);
+    root.classList.toggle(
+      "is-keyboard-open",
+      state.open &&
+        Date.now() < (state.searchKeyboardActiveUntil || 0) &&
+        isStoreSearchInput(document.activeElement),
+    );
     root.replaceChildren();
 
     if (!state.open) {
+      setStoreKeyboardLayer(false);
       syncStoreInputCapture();
       return;
     }
@@ -2587,6 +3536,37 @@
         snapshot?.catalogDescription || "Built-in plugins live here permanently. Community entries can add installs, updates, previews, and downloads later.",
       ),
     );
+
+    const search = createNode("div", "steamloader-plugin-store-search");
+    const searchInput = document.createElement("input");
+    searchInput.type = "search";
+    searchInput.className = "steamloader-plugin-store-search-input";
+    searchInput.placeholder = "Search plugins";
+    searchInput.value = state.searchQuery || "";
+    searchInput.autocomplete = "off";
+    searchInput.spellcheck = false;
+    searchInput.readOnly = true;
+    searchInput.setAttribute("enterkeyhint", "search");
+    searchInput.setAttribute("aria-label", "Search plugins");
+    searchInput.addEventListener("click", () => {
+      requestStoreFocus("top:search");
+    });
+    searchInput.addEventListener("input", () => {
+      state.searchQuery = searchInput.value;
+      ensureSelection();
+      requestStoreFocus("top:search");
+
+      if (state.searchRenderTimer) {
+        window.clearTimeout(state.searchRenderTimer);
+      }
+
+      state.searchRenderTimer = window.setTimeout(() => {
+        state.searchRenderTimer = 0;
+        render();
+      }, 120);
+    });
+    decorateFocusable(searchInput, "top:search");
+    search.append(searchInput);
 
     const actions = createNode("div", "steamloader-plugin-store-topbar-actions");
     actions.append(
@@ -2614,7 +3594,7 @@
     });
     decorateFocusable(closeButton, "top:close");
     actions.append(refreshButton, closeButton);
-    topbar.append(brand, actions);
+    topbar.append(brand, search, actions);
     main.append(topbar);
 
     const tabsRow = createNode("div", "steamloader-plugin-store-tabs-row");
@@ -2632,6 +3612,10 @@
       button.dataset.storeSectionId = sectionId;
       button.addEventListener("click", () => {
         state.activeSection = sectionId;
+        state.storePageIndex = 0;
+        state.searchPadOpen = false;
+        state.contextMenuPluginId = "";
+        state.selectedPluginId = "";
         ensureSelection();
         requestStoreFocus(state.selectedPluginId ? `card:${state.selectedPluginId}` : `section:${sectionId}`);
         render();
@@ -2649,9 +3633,26 @@
     tabsRow.append(previousHint, nav, nextHint);
     main.append(tabsRow);
 
+    const statusRow = createNode("div", "steamloader-plugin-store-status-row");
+    const statusText = state.busy
+      ? "Working on the selected plugin..."
+      : state.loading
+        ? "Refreshing the community catalog..."
+        : snapshot?.communityCatalogStatusText || snapshot?.statusText || "";
+    if (statusText) {
+      statusRow.append(createNode("div", "steamloader-plugin-store-status", statusText));
+    }
+
+    if (state.error) {
+      statusRow.append(createNode("div", "steamloader-plugin-store-error", state.error));
+    }
+
+    main.append(statusRow);
+
     const content = createNode("div", "steamloader-plugin-store-content");
     const browser = createNode("div", "steamloader-plugin-store-browser");
     const sectionHeading = createNode("div", "steamloader-plugin-store-section-heading");
+    const visiblePlugins = getVisiblePlugins();
     sectionHeading.append(
       createNode("div", "steamloader-plugin-store-section-title", getStoreSectionTitle(state.activeSection)),
       createNode("div", "steamloader-plugin-store-section-copy", getStoreSectionCopy(state.activeSection)),
@@ -2659,7 +3660,6 @@
     browser.append(sectionHeading);
 
     const gallery = createNode("div", "steamloader-plugin-store-gallery");
-    const visiblePlugins = getVisiblePlugins();
     if (visiblePlugins.length) {
       visiblePlugins.forEach((plugin, index) => {
         gallery.append(buildCard(plugin, index));
@@ -2671,7 +3671,9 @@
           "steamloader-plugin-store-empty",
           state.loading
             ? "Loading plugin catalog..."
-            : "This section is still empty. Built-ins remain available, and community downloads can appear here as soon as your registry feed is connected.",
+            : String(state.searchQuery || "").trim()
+              ? "No plugins match your search."
+              : "This section is still empty. Built-ins remain available, and community downloads can appear here as soon as your registry feed is connected.",
         ),
       );
     }
@@ -2685,15 +3687,24 @@
     const openHint = createNode("div", "steamloader-plugin-store-controller-hint");
     openHint.append(
       createNode("span", "steamloader-plugin-store-controller-key", "A"),
-      createNode("span", "steamloader-plugin-store-controller-label", "Open"),
+      createNode("span", "steamloader-plugin-store-controller-label", state.contextMenuPluginId ? "Select" : "Open"),
     );
     const closeHint = createNode("div", "steamloader-plugin-store-controller-hint");
     closeHint.append(
       createNode("span", "steamloader-plugin-store-controller-key", "B"),
-      createNode("span", "steamloader-plugin-store-controller-label", "Close"),
+      createNode("span", "steamloader-plugin-store-controller-label", state.contextMenuPluginId ? "Back" : "Close"),
     );
     controllerBar.append(openHint, closeHint);
     main.append(controllerBar);
+
+    if (state.searchPadOpen) {
+      main.append(buildStoreSearchKeyboard());
+    }
+
+    const contextMenu = buildStoreContextMenu();
+    if (contextMenu) {
+      main.append(contextMenu);
+    }
 
     surface.append(main);
     root.append(surface);

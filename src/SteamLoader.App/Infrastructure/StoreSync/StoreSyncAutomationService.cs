@@ -43,6 +43,11 @@ public sealed class StoreSyncAutomationService
 
                 if (now >= _nextPollAtUtc)
                 {
+                    if (_isPluginEnabled())
+                    {
+                        _storeSyncService.TryRunAutomaticUnifySteamRefresh();
+                    }
+
                     TryRunAutomaticSync("poll");
                     _nextPollAtUtc = now.Add(PollInterval);
                 }

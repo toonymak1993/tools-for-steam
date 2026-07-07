@@ -168,7 +168,8 @@ public sealed class PluginStoreServiceTests
                 "sample-plugin",
                 "Sample Plugin",
                 "1.2.3",
-                "./packages/broken-plugin.zip");
+                "./packages/broken-plugin.zip",
+                ComputeSha256(zipPath));
 
             var service = CreatePluginStoreService(root);
 
@@ -222,6 +223,78 @@ public sealed class PluginStoreServiceTests
             var snapshot = await service.GetSnapshotAsync(CancellationToken.None);
 
             Assert.Empty(snapshot.CommunityPlugins);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task InstallCommunityPlugin_WithoutChecksum_IsRejectedAndNotInstallable()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+
+            var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
+            CreateSamplePluginZip(zipPath);
+            WriteCatalog(
+                storeRoot,
+                "sample-plugin",
+                "Sample Plugin",
+                "1.2.3",
+                "./packages/sample-plugin.zip");
+
+            var service = CreatePluginStoreService(root);
+
+            var snapshot = await service.GetSnapshotAsync(CancellationToken.None);
+            var plugin = Assert.Single(snapshot.CommunityPlugins);
+            Assert.False(plugin.CanInstall);
+            Assert.Contains("checksum", plugin.StatusText, StringComparison.OrdinalIgnoreCase);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None));
+            Assert.Contains("checksum", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(Directory.Exists(Path.Combine(storeRoot, "community", "sample-plugin")));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task InstallCommunityPlugin_WithUnsupportedPermission_IsRejected()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+
+            var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
+            CreateSamplePluginZip(zipPath, permissions: ["frontend", "filesystem"]);
+            WriteCatalog(
+                storeRoot,
+                "sample-plugin",
+                "Sample Plugin",
+                "1.2.3",
+                "./packages/sample-plugin.zip",
+                ComputeSha256(zipPath));
+
+            var service = CreatePluginStoreService(root);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None));
+            Assert.Contains("unsupported permission", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(Directory.Exists(Path.Combine(storeRoot, "community", "sample-plugin")));
         }
         finally
         {
@@ -423,14 +496,14 @@ public sealed class PluginStoreServiceTests
 
             var first = service.AddOverlayInput("down", "test");
             var second = service.AddOverlayInput("a", "test");
+            var third = service.AddOverlayInput("search-back", "test");
 
             var allInputs = service.GetOverlayInputs(0);
-            Assert.Equal(second.Nonce, allInputs.LatestNonce);
-            Assert.Equal(new[] { "down", "a" }, allInputs.Inputs.Select(input => input.Action));
+            Assert.Equal(third.Nonce, allInputs.LatestNonce);
+            Assert.Equal(new[] { "down", "a", "search-back" }, allInputs.Inputs.Select(input => input.Action));
 
             var inputsAfterFirst = service.GetOverlayInputs(first.Nonce);
-            Assert.Single(inputsAfterFirst.Inputs);
-            Assert.Equal(second, inputsAfterFirst.Inputs[0]);
+            Assert.Equal(new[] { second, third }, inputsAfterFirst.Inputs);
 
             service.SetOverlayOpen(false);
             Assert.Empty(service.GetOverlayInputs(0).Inputs);
