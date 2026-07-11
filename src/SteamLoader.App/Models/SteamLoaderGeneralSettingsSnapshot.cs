@@ -11,6 +11,10 @@ public sealed record SteamLoaderGeneralSettingsSnapshot(
     string ProductVersion,
     string InstallPath,
     bool DeveloperDebugEnabled,
+    bool XboxModeSupported,
+    string XboxModeSupportReason,
+    bool HandheldPerformanceAvailable,
+    string HandheldPerformanceTitle,
     IReadOnlyList<SteamLoaderPluginSettingsState> Plugins);
 
 public sealed record SteamLoaderPluginSettingsState(

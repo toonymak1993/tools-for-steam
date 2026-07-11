@@ -1,4 +1,5 @@
 using SteamLoader.App;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 using System.Reflection;
@@ -13,9 +14,11 @@ public sealed class SteamLoaderSettingsService
         WriteIndented = true
     };
     private const int MaximumWindowsShellStartDelaySeconds = 30;
+    private const string StartupModeMutexName = @"Local\ToolsForSteam.StartupMode";
 
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
+    private readonly IXboxModeService _xboxModeService;
     private readonly string _executablePath;
     private readonly string _shellLaunchArguments;
     private readonly string _settingsPath;
@@ -27,9 +30,27 @@ public sealed class SteamLoaderSettingsService
         string executablePath,
         string shellLaunchArguments,
         string settingsPath)
+        : this(
+            autostartService,
+            shellService,
+            NoOpXboxModeService.Instance,
+            executablePath,
+            shellLaunchArguments,
+            settingsPath)
+    {
+    }
+
+    public SteamLoaderSettingsService(
+        WindowsAutostartService autostartService,
+        WindowsShellService shellService,
+        IXboxModeService xboxModeService,
+        string executablePath,
+        string shellLaunchArguments,
+        string settingsPath)
     {
         _autostartService = autostartService;
         _shellService = shellService;
+        _xboxModeService = xboxModeService;
         _executablePath = executablePath;
         _shellLaunchArguments = shellLaunchArguments;
         _settingsPath = settingsPath;
@@ -37,103 +58,213 @@ public sealed class SteamLoaderSettingsService
 
     public SteamLoaderGeneralSettingsSnapshot GetSnapshot()
     {
-        var settings = LoadSettings();
-        var startupMode = ResolveStartupMode(settings);
-        return new SteamLoaderGeneralSettingsSnapshot(
-            RunOnWindowsSignIn: true,
-            StartupMode: startupMode,
-            HideWindowsShellInConsoleMode: settings.HideWindowsShellInConsoleMode ?? true,
-            FirstRunCompleted: settings.FirstRunCompleted == true,
-            ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
-            SplashScreen: BuildSplashScreenSettings(settings),
-            WindowsShellStartDelaySeconds: GetWindowsShellStartDelaySeconds(settings),
-            ProductVersion: GetProductVersion(),
-            InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
-            DeveloperDebugEnabled: settings.DeveloperDebugEnabled == true,
-            Plugins: BuildPluginStates(settings));
+        lock (_gate)
+        {
+            return CreateSnapshot(LoadSettings());
+        }
     }
 
     public SteamLoaderGeneralSettingsSnapshot EnsureDefaultConsoleModeEnabled()
     {
-        var settings = LoadSettings();
-        if (settings.ConsoleModeDefaultApplied == true || settings.RunOnWindowsSignInUserConfigured == true)
+        lock (_gate)
         {
-            return GetSnapshot();
+            var settings = LoadSettings();
+            if (settings.ConsoleModeDefaultApplied == true || settings.RunOnWindowsSignInUserConfigured == true)
+            {
+                if (ResolveStartupMode(settings) == SteamLoaderRuntime.StartupModeXbox &&
+                    !_xboxModeService.GetSupportStatus().IsSupported)
+                {
+                    ApplyStartupMode(SteamLoaderRuntime.StartupModeTray);
+                    settings = settings with
+                    {
+                        StartupMode = SteamLoaderRuntime.StartupModeTray,
+                        HideWindowsShellInConsoleMode = false,
+                        ConsoleModeDefaultApplied = true,
+                        RunOnWindowsSignInUserConfigured = true
+                    };
+                    SaveSettings(settings);
+                }
+
+                return CreateSnapshot(settings);
+            }
+
+            ApplyStartupMode(SteamLoaderRuntime.StartupModeShell);
+            settings = settings with
+            {
+                StartupMode = SteamLoaderRuntime.StartupModeShell,
+                ConsoleModeDefaultApplied = true,
+                HideWindowsShellInConsoleMode = true
+            };
+            SaveSettings(settings);
+
+            return CreateSnapshot(settings);
         }
-
-        ApplyStartupMode(SteamLoaderRuntime.StartupModeShell);
-        SaveSettings(settings with
-        {
-            StartupMode = SteamLoaderRuntime.StartupModeShell,
-            ConsoleModeDefaultApplied = true,
-            HideWindowsShellInConsoleMode = settings.HideWindowsShellInConsoleMode ?? true
-        });
-
-        return GetSnapshot();
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetRunOnWindowsSignIn(bool enabled)
     {
-        var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeTray;
-        ApplyStartupMode(mode);
-
-        var settings = LoadSettings();
-        SaveSettings(settings with
+        lock (_gate)
         {
-            StartupMode = mode,
-            ConsoleModeDefaultApplied = true,
-            RunOnWindowsSignInUserConfigured = true
-        });
+            var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeTray;
+            ApplyStartupMode(mode);
 
-        return GetSnapshot();
+            var settings = LoadSettings() with
+            {
+                StartupMode = mode,
+                HideWindowsShellInConsoleMode = NormalizeStartupMode(mode) == SteamLoaderRuntime.StartupModeShell
+                    ? LoadSettings().HideWindowsShellInConsoleMode ?? true
+                    : false,
+                ConsoleModeDefaultApplied = true,
+                RunOnWindowsSignInUserConfigured = true
+            };
+
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetStartupMode(string mode)
     {
-        var normalizedMode = NormalizeStartupMode(mode);
-        ApplyStartupMode(normalizedMode);
-
-        var settings = LoadSettings();
-        SaveSettings(settings with
+        lock (_gate)
         {
-            StartupMode = normalizedMode,
-            ConsoleModeDefaultApplied = true,
-            RunOnWindowsSignInUserConfigured = true
-        });
+            var normalizedMode = NormalizeStartupMode(mode);
+            var existingSettings = LoadSettings();
+            var previousMode = ResolveStartupMode(existingSettings);
+            try
+            {
+                ApplyStartupMode(normalizedMode);
+            }
+            catch
+            {
+                try
+                {
+                    ApplyStartupMode(previousMode);
+                }
+                catch
+                {
+                }
 
-        return GetSnapshot();
+                throw;
+            }
+
+            var settings = existingSettings with
+            {
+                StartupMode = normalizedMode,
+                HideWindowsShellInConsoleMode = normalizedMode == SteamLoaderRuntime.StartupModeShell
+                    ? existingSettings.HideWindowsShellInConsoleMode ?? true
+                    : false,
+                ConsoleModeDefaultApplied = true,
+                RunOnWindowsSignInUserConfigured = true
+            };
+
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
     }
 
     private void ApplyStartupMode(string mode)
     {
-        _autostartService.DisableSteamAutostartEntries();
-
-        switch (NormalizeStartupMode(mode))
+        var normalizedMode = NormalizeStartupMode(mode);
+        if (normalizedMode == SteamLoaderRuntime.StartupModeXbox)
         {
-            case SteamLoaderRuntime.StartupModeShell:
-                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
-                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
-                break;
-            case SteamLoaderRuntime.StartupModeTray:
-                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, false);
-                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, true);
-                break;
-            default:
-                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
-                _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
-                break;
+            var support = _xboxModeService.GetSupportStatus();
+            if (!support.IsSupported)
+            {
+                throw new InvalidOperationException(support.Reason);
+            }
+        }
+
+        using var modeMutex = new Mutex(false, StartupModeMutexName);
+        var lockTaken = false;
+        try
+        {
+            try
+            {
+                lockTaken = modeMutex.WaitOne(TimeSpan.FromSeconds(10));
+            }
+            catch (AbandonedMutexException)
+            {
+                lockTaken = true;
+            }
+
+            if (!lockTaken)
+            {
+                throw new TimeoutException("Another Tools for Steam process is already changing the startup mode.");
+            }
+
+            _autostartService.DisableSteamAutostartEntries();
+            _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
+
+            switch (normalizedMode)
+            {
+                case SteamLoaderRuntime.StartupModeShell:
+                    _xboxModeService.SetStartupEnabled(false);
+                    _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
+                    break;
+                case SteamLoaderRuntime.StartupModeTray:
+                    _xboxModeService.SetStartupEnabled(false);
+                    _shellService.SetExplorerShell();
+                    _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, true);
+                    break;
+                case SteamLoaderRuntime.StartupModeXbox:
+                    _shellService.SetExplorerShell();
+                    _xboxModeService.SetStartupEnabled(true);
+                    break;
+                default:
+                    _xboxModeService.SetStartupEnabled(false);
+                    _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
+                    break;
+            }
+
+            VerifyStartupMode(normalizedMode);
+        }
+        finally
+        {
+            if (lockTaken)
+            {
+                modeMutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private void VerifyStartupMode(string mode)
+    {
+        var shellEnabled = _shellService.IsEnabled(_executablePath, _shellLaunchArguments);
+        var explorerEnabled = string.Equals(_shellService.GetShellCommand(), "explorer.exe", StringComparison.OrdinalIgnoreCase);
+        var trayEnabled = _autostartService.IsEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments);
+        var valid = mode switch
+        {
+            SteamLoaderRuntime.StartupModeShell => shellEnabled && !trayEnabled && _xboxModeService.VerifyStartupEnabled(false),
+            SteamLoaderRuntime.StartupModeTray => explorerEnabled && trayEnabled && _xboxModeService.VerifyStartupEnabled(false),
+            SteamLoaderRuntime.StartupModeXbox => explorerEnabled && !trayEnabled && _xboxModeService.VerifyStartupEnabled(true),
+            _ => false
+        };
+
+        if (!valid)
+        {
+            throw new InvalidOperationException($"Windows did not confirm a clean transition to {mode} startup mode.");
         }
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetHideWindowsShellInConsoleMode(bool enabled)
     {
-        var settings = LoadSettings() with
+        lock (_gate)
         {
-            HideWindowsShellInConsoleMode = enabled
-        };
+            var settings = LoadSettings();
+            var startupMode = ResolveStartupMode(settings);
+            var allowHideWindowsShell = string.Equals(
+                startupMode,
+                SteamLoaderRuntime.StartupModeShell,
+                StringComparison.OrdinalIgnoreCase);
 
-        SaveSettings(settings);
-        return GetSnapshot();
+            settings = settings with
+            {
+                HideWindowsShellInConsoleMode = allowHideWindowsShell && enabled
+            };
+
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetDeveloperDebugEnabled(bool enabled)
@@ -275,7 +406,7 @@ public sealed class SteamLoaderSettingsService
         var definition = SteamLoaderPluginCatalog.Find(pluginId);
         if (definition is null)
         {
-            return true;
+            return false;
         }
 
         if (!definition.CanDisable)
@@ -302,7 +433,11 @@ public sealed class SteamLoaderSettingsService
 
     public bool ShouldHideWindowsShellInConsoleMode()
     {
-        return LoadSettings().HideWindowsShellInConsoleMode ?? true;
+        lock (_gate)
+        {
+            var settings = LoadSettings();
+            return ShouldHideWindowsShellInConsoleMode(ResolveStartupMode(settings), settings);
+        }
     }
 
     public bool ShouldShowSplashScreen()
@@ -407,6 +542,35 @@ public sealed class SteamLoaderSettingsService
             ?? 0);
     }
 
+    private static bool ShouldHideWindowsShellInConsoleMode(string startupMode, SteamLoaderSettingsData settings)
+    {
+        return string.Equals(startupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase)
+            && settings.HideWindowsShellInConsoleMode != false;
+    }
+
+    private SteamLoaderGeneralSettingsSnapshot CreateSnapshot(SteamLoaderSettingsData settings)
+    {
+        var startupMode = ResolveStartupMode(settings);
+        var xboxModeSupport = _xboxModeService.GetSupportStatus();
+        var handheld = HandheldDeviceCatalog.Detect();
+        return new SteamLoaderGeneralSettingsSnapshot(
+            RunOnWindowsSignIn: true,
+            StartupMode: startupMode,
+            HideWindowsShellInConsoleMode: ShouldHideWindowsShellInConsoleMode(startupMode, settings),
+            FirstRunCompleted: settings.FirstRunCompleted == true,
+            ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
+            SplashScreen: BuildSplashScreenSettings(settings),
+            WindowsShellStartDelaySeconds: GetWindowsShellStartDelaySeconds(settings),
+            ProductVersion: GetProductVersion(),
+            InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
+            DeveloperDebugEnabled: settings.DeveloperDebugEnabled == true,
+            XboxModeSupported: xboxModeSupport.IsSupported,
+            XboxModeSupportReason: xboxModeSupport.Reason,
+            HandheldPerformanceAvailable: HandheldDeviceCatalog.IsSupported(handheld),
+            HandheldPerformanceTitle: handheld.DisplayName,
+            Plugins: BuildPluginStates(settings));
+    }
+
     private static string NormalizeOptionalPath(string? path)
     {
         return (path ?? string.Empty).Trim().Trim('"');
@@ -433,6 +597,8 @@ public sealed class SteamLoaderSettingsService
         {
             SteamLoaderRuntime.StartupModeShell => SteamLoaderRuntime.StartupModeShell,
             SteamLoaderRuntime.StartupModeTray => SteamLoaderRuntime.StartupModeTray,
+            SteamLoaderRuntime.StartupModeXbox => SteamLoaderRuntime.StartupModeXbox,
+            "external" => SteamLoaderRuntime.StartupModeXbox,
             _ => SteamLoaderRuntime.StartupModeShell
         };
     }
@@ -507,14 +673,6 @@ public sealed class SteamLoaderSettingsService
                     normalized.Add(canonicalId);
                 }
             }
-        }
-
-        if (!seen.Contains("unifystore") && seen.Contains("store-sync"))
-        {
-            var storeSyncIndex = normalized.FindIndex(id =>
-                string.Equals(id, "store-sync", StringComparison.OrdinalIgnoreCase));
-            normalized.Insert(storeSyncIndex + 1, "unifystore");
-            seen.Add("unifystore");
         }
 
         foreach (var plugin in SteamLoaderPluginCatalog.Definitions)

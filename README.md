@@ -22,11 +22,11 @@ Tools for Steam can change the current user's Windows shell so TFS launches firs
 
 ![Tools for Steam startup flow](docs/screenshots/startup-flow.svg)
 
-This shell behavior is intentional and can be disabled again from `Tools for Steam > Settings`. If something goes wrong, the `Power` plugin and desktop manager both provide recovery actions to start Windows Explorer manually.
+This shell behavior is intentional and can be disabled again from `Tools for Steam > Settings`. If something goes wrong, the `Power` plugin and the tray app both provide recovery actions to start Windows Explorer manually.
 
 ## Built-In Plugins
 
-- `Settings`: Global TFS startup behavior, desktop manager access, and plugin enable/disable controls.
+- `Settings`: Global TFS startup behavior plus plugin enable/disable controls.
 - `Processes`: See visible app windows and bring one to the foreground from the controller.
 - `App Start`: Add installed Windows apps from the Start Menu and launch them later from the controller.
 - `Store Sync`: Import supported launcher games and custom folders into Steam as non-Steam games, with SteamGridDB artwork support.
@@ -67,7 +67,7 @@ The installer:
 - shows the license before installation
 - closes running TFS processes automatically during setup
 - creates Start Menu entries
-- starts the TFS console startup flow after installation
+- starts the TFS background host after installation when Shell or Tray mode is selected
 
 ## Updates
 
@@ -85,7 +85,7 @@ Because TFS can take over the current user's shell, it is important to know how 
 
 - Open `Tools for Steam > Settings` to disable console startup.
 - Use `Tools for Steam > Power > Start Windows Desktop` to bring Explorer back.
-- Start the desktop manager from the tray icon or Start Menu if you need a normal Windows window.
+- Use the tray app if you need desktop-side recovery actions outside Steam.
 - Uninstall from Windows Apps settings or the Start Menu uninstall entry.
 
 TFS only changes the current user's shell configuration. It does not replace Windows system files.

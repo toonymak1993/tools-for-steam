@@ -12,7 +12,6 @@
   const patchIntervalMs = 1200;
 
   const targetCollections = [
-    { id: "unifysteam", title: "Storefront", names: ["Storefront", "UnifySteam"] },
     { id: "epic-games", title: "Epic", names: ["Epic Games", "Epic"] },
     { id: "gog-galaxy", title: "GOG", names: ["GOG Galaxy", "GOG"] },
     { id: "xbox-game-pass", title: "Xbox", names: ["Xbox / Game Pass", "Xbox", "Game Pass"] },

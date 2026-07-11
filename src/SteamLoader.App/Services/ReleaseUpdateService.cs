@@ -648,7 +648,8 @@ public sealed class ReleaseUpdateService
 
     private static string BuildInstallerArguments(string installDirectory)
     {
-        return $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=\"{installDirectory}\"";
+        var logPath = Path.Combine(installDirectory, "data", "installer-update.log");
+        return $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TFSUPDATE=1 /DIR=\"{installDirectory}\" /LOG=\"{logPath}\"";
     }
 
     private static string BuildUpdateScript(
@@ -682,9 +683,20 @@ foreach ($processId in $processIds) {
 }
 
 if ($packageKind -eq "installer") {
-    $installer = Start-Process -FilePath $packagePath -ArgumentList $installerArguments -PassThru -Wait
-    if ($installer.ExitCode -ne 0) {
-        throw "The installer exited with code $($installer.ExitCode)."
+    try {
+        $installer = Start-Process -FilePath $packagePath -ArgumentList $installerArguments -PassThru -Wait
+        if ($installer.ExitCode -ne 0) {
+            throw "The installer exited with code $($installer.ExitCode)."
+        }
+    } catch {
+        $failureLog = Join-Path $installDirectory "data\update-handoff.log"
+        New-Item -ItemType Directory -Path (Split-Path $failureLog) -Force | Out-Null
+        Add-Content -LiteralPath $failureLog -Value "$(Get-Date -Format o) $($_.Exception.Message)"
+        $existingExe = Join-Path $installDirectory $executableName
+        if (Test-Path $existingExe) {
+            Start-Process -FilePath $existingExe -ArgumentList "--tray"
+        }
+        throw
     }
 
     Start-Sleep -Seconds 2

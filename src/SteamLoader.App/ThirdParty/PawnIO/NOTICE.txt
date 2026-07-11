@@ -1,0 +1,18 @@
+PawnIO RyzenSMU module
+
+Project: PawnIO.Modules
+Source: https://github.com/namazso/PawnIO.Modules
+Release: 0.2.9
+Binary: RyzenSMU.bin
+SHA-256: DAD38B36A08E2DA982D4397619AEE7264E32BE088EA6BCB781B066ADFB00EFC0
+License: GNU Lesser General Public License v2.1
+
+Tools for Steam uses the official signed release binary without modification.
+The corresponding module source is available from the project URL above.
+
+PawnIO_setup.exe
+Source: https://github.com/namazso/PawnIO.Setup/releases/tag/2.2.0
+Version: 2.2.0.0
+SHA-256: 1F519A22E47187F70A1379A48CA604981C4FCF694F4E65B734AAA74A9FBA3032
+The setup executable is distributed without modification and is only launched
+after hash verification when PawnIO is missing or outdated.

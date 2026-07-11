@@ -1,5 +1,6 @@
 using System.Text.Json;
 using SteamLoader.App.Infrastructure.Audio;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.SmartHome;
 using SteamLoader.App.Infrastructure.StoreSync;
@@ -15,6 +16,7 @@ public sealed class QuickAccessLiveStatePublisher
     private static readonly TimeSpan AudioInterval = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan StoreSyncInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan SmartHomeInterval = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan HandheldPerformanceInterval = TimeSpan.FromSeconds(2);
 
     private readonly QuickAccessLiveUpdateHub _liveUpdateHub;
     private readonly IAudioOutputDeviceService _audioOutputDeviceService;
@@ -22,11 +24,13 @@ public sealed class QuickAccessLiveStatePublisher
     private readonly StoreSyncService _storeSyncService;
     private readonly SmartHomeService _smartHomeService;
     private readonly Func<bool> _isSmartHomeEnabled;
+    private readonly HandheldPerformanceService _handheldPerformanceService;
 
     private string _lastProcessesFingerprint = string.Empty;
     private string _lastAudioDashboardFingerprint = string.Empty;
     private string _lastStoreSyncFingerprint = string.Empty;
     private string _lastSmartHomeFingerprint = string.Empty;
+    private string _lastHandheldPerformanceFingerprint = string.Empty;
 
     public QuickAccessLiveStatePublisher(
         QuickAccessLiveUpdateHub liveUpdateHub,
@@ -34,6 +38,7 @@ public sealed class QuickAccessLiveStatePublisher
         ProcessWindowService processWindowService,
         StoreSyncService storeSyncService,
         SmartHomeService smartHomeService,
+        HandheldPerformanceService handheldPerformanceService,
         Func<bool> isSmartHomeEnabled)
     {
         _liveUpdateHub = liveUpdateHub;
@@ -41,6 +46,7 @@ public sealed class QuickAccessLiveStatePublisher
         _processWindowService = processWindowService;
         _storeSyncService = storeSyncService;
         _smartHomeService = smartHomeService;
+        _handheldPerformanceService = handheldPerformanceService;
         _isSmartHomeEnabled = isSmartHomeEnabled;
     }
 
@@ -50,6 +56,7 @@ public sealed class QuickAccessLiveStatePublisher
         var nextAudioAtUtc = DateTimeOffset.UtcNow;
         var nextStoreSyncAtUtc = DateTimeOffset.UtcNow;
         var nextSmartHomeAtUtc = DateTimeOffset.UtcNow;
+        var nextHandheldPerformanceAtUtc = DateTimeOffset.UtcNow;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -79,7 +86,34 @@ public sealed class QuickAccessLiveStatePublisher
                 nextSmartHomeAtUtc = now.Add(SmartHomeInterval);
             }
 
+            if (now >= nextHandheldPerformanceAtUtc)
+            {
+                PublishHandheldPerformanceStateIfChanged();
+                nextHandheldPerformanceAtUtc = now.Add(HandheldPerformanceInterval);
+            }
+
             await Task.Delay(LoopInterval, cancellationToken);
+        }
+    }
+
+    private void PublishHandheldPerformanceStateIfChanged()
+    {
+        try
+        {
+            var snapshot = _handheldPerformanceService.GetSnapshot();
+            if (!snapshot.Supported)
+            {
+                return;
+            }
+
+            PublishIfChanged(
+                "handheld-performance.state",
+                snapshot,
+                snapshot,
+                ref _lastHandheldPerformanceFingerprint);
+        }
+        catch
+        {
         }
     }
 

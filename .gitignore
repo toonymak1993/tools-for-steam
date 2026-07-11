@@ -7,3 +7,13 @@ sdk/catalog.local.json
 sdk/catalog.online.json
 sdk/images/
 sdk/packages/
+
+# Local diagnostics, build verification, and reverse-engineering scratch data.
+.codex/
+.reset-backups/
+.tmp/
+artifacts/
+scratch/
+/pmui-init-log-*.txt
+/resources.pri
+/restart-tfs.bat

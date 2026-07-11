@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 103;
+  const stateVersion = 104;
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
   const smartHomeSliderCommitSettleDelayMs = 1000;
@@ -11,6 +11,7 @@
   const pluginStoreInputStorageKey = "ToolsForSteamPluginStoreInput";
   const pluginStoreOverlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
   const pluginStoreChannelName = "ToolsForSteamPluginStoreChannel";
+  const storefrontEnabled = false;
 
   window.__steamLoaderApiBase = apiBase;
 
@@ -177,6 +178,19 @@
             suppressNextLivePanelRerender: false,
             settingCommitTimersByKey: {},
             pendingSliderAutoFocus: false,
+          },
+          handheldPerformance: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            tdpCommitTimer: 0,
+            tdpMutationSequence: 0,
+            globalTdpCommitTimers: {},
+            globalTdpMutationSequences: {},
+            profileTdpCommitTimers: {},
+            profileTdpMutationSequences: {},
+            editingProfileKey: "",
           },
           power: {
             actioning: false,
@@ -1240,7 +1254,7 @@
     },
     {
       id: "performance",
-      title: "Performance",
+      title: "FPS Overlay",
       description: "Built-in TFS FPS meter and Steam-style overlay controls",
       pages: [
         {
@@ -1323,7 +1337,7 @@
         },
       ],
     },
-  ];
+  ].filter((plugin) => storefrontEnabled || plugin.id !== "unifystore");
 
   function getPluginSettings() {
     const entries = state.generalSettings.snapshot?.plugins;
@@ -1332,6 +1346,14 @@
 
   function getPluginSettingsEntry(pluginId) {
     return getPluginSettings().find((entry) => entry.id === pluginId) || null;
+  }
+
+  function isPluginAvailable(pluginId) {
+    if (pluginId === "handheld-performance") {
+      return Boolean(state.generalSettings.snapshot?.handheldPerformanceAvailable);
+    }
+
+    return true;
   }
 
   function getCommunityRuntimePlugins() {
@@ -1384,6 +1406,16 @@
   }
 
   function getPluginDefinition(pluginId) {
+    if (pluginId === "handheld-performance" && isPluginAvailable(pluginId)) {
+      return {
+        id: "handheld-performance",
+        title: state.generalSettings.snapshot?.handheldPerformanceTitle || "Handheld Performance",
+        description: "Automatic per-game TDP profiles and device power controls",
+        pages: [],
+        isSystemCategory: true,
+      };
+    }
+
     return plugins.find((plugin) => plugin.id === pluginId) || getCommunityPluginDefinition(pluginId);
   }
 
@@ -1407,7 +1439,7 @@
 
   function getDefaultPluginOrderIds() {
     return plugins
-      .filter((plugin) => plugin.id !== "settings")
+      .filter((plugin) => plugin.id !== "settings" && isPluginAvailable(plugin.id))
       .map((plugin) => plugin.id);
   }
 
@@ -1466,7 +1498,9 @@
   }
 
   function getVisiblePlugins() {
-    const builtInEntries = sortPluginsBySavedOrder(plugins.filter((plugin) => isPluginEnabled(plugin.id)));
+    const builtInEntries = sortPluginsBySavedOrder(
+      plugins.filter((plugin) => isPluginAvailable(plugin.id) && isPluginEnabled(plugin.id)),
+    );
     const communityEntries = getCommunityPluginDefinitions()
       .filter((plugin) => isPluginEnabled(plugin.id))
       .sort((left, right) => left.title.localeCompare(right.title));
@@ -1474,7 +1508,9 @@
   }
 
   function getHomePlugins() {
-    return getVisiblePlugins().filter((plugin) => plugin.id !== "settings");
+    const entries = getVisiblePlugins().filter((plugin) => plugin.id !== "settings");
+    const handheldPerformance = getPluginDefinition("handheld-performance");
+    return handheldPerformance ? [handheldPerformance, ...entries] : entries;
   }
 
   function getVisiblePluginIndex(pluginId) {
@@ -5437,6 +5473,7 @@
       case "display":
         return DisplayPluginIcon;
       case "performance":
+      case "handheld-performance":
         return PerformancePluginIcon;
       case "power":
         return PowerPluginIcon;
@@ -6510,7 +6547,10 @@
           createElement("div", {
             className: "steamloader-card-line",
             key: `card-line-${index}-${lineIndex}`,
-            children: line,
+            ...(line && typeof line === "object" && line.liveKey
+              ? { "data-live-value": line.liveKey }
+              : {}),
+            children: line && typeof line === "object" ? line.text : line,
           }),
         ),
         card.swatchHex
@@ -11173,6 +11213,16 @@
     if (state.generalSettings.snapshot && options.syncDrafts !== false) {
       syncSplashDraftsFromSnapshot(options.forceDraftSync === true);
     }
+
+    if (
+      state.generalSettings.snapshot &&
+      state.route.pluginId === "handheld-performance" &&
+      !state.generalSettings.snapshot.handheldPerformanceAvailable
+    ) {
+      state.handheldPerformance.snapshot = null;
+      requestFocusForRoute(parseRoute("root"), 0);
+      state.route = parseRoute("root");
+    }
   }
 
   function setUpdateSnapshot(snapshot, options = {}) {
@@ -13497,6 +13547,306 @@
     }
   }
 
+  async function loadHandheldPerformanceState() {
+    state.handheldPerformance.loading = true;
+    state.handheldPerformance.error = "";
+    if (isCurrentPluginRoute("handheld-performance")) {
+      renderPanelDataRefresh();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/handheld-performance/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Handheld performance could not be loaded (${response.status}).`);
+      }
+      state.handheldPerformance.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.handheldPerformance.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.handheldPerformance.loading = false;
+      if (isCurrentPluginRoute("handheld-performance")) {
+        renderPanelDataRefresh();
+      }
+    }
+  }
+
+  async function sendHandheldPerformanceRequest(path, body, options = {}) {
+    if (state.handheldPerformance.saving) {
+      return;
+    }
+    state.handheldPerformance.saving = true;
+    state.handheldPerformance.error = "";
+    if (options.silent !== true && isCurrentPluginRoute("handheld-performance")) {
+      renderPanelDataRefresh();
+    }
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The TDP request failed (${response.status}).`);
+      }
+      state.handheldPerformance.snapshot = payload;
+    } catch (error) {
+      state.handheldPerformance.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.handheldPerformance.saving = false;
+      if (options.silent === true && isCurrentPluginRoute("handheld-performance")) {
+        syncVisibleSlotSliderUi();
+      } else if (isCurrentPluginRoute("handheld-performance")) {
+        renderPanelDataRefresh();
+      }
+    }
+  }
+
+  function previewHandheldTdp(watts) {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot) {
+      return false;
+    }
+
+    const modes = Array.isArray(snapshot.modes) ? snapshot.modes : [];
+    const matchingMode = modes.find((mode) => Number(mode.watts) === watts);
+    state.handheldPerformance.snapshot = {
+      ...snapshot,
+      selectedTdpWatts: watts,
+      selectedModeId: matchingMode?.id || "custom",
+    };
+    return true;
+  }
+
+  function queueHandheldTdpCommit(watts) {
+    if (state.handheldPerformance.tdpCommitTimer) {
+      window.clearTimeout(state.handheldPerformance.tdpCommitTimer);
+    }
+
+    const sequence = ++state.handheldPerformance.tdpMutationSequence;
+    const commit = async () => {
+      state.handheldPerformance.tdpCommitTimer = 0;
+      if (state.handheldPerformance.saving) {
+        state.handheldPerformance.tdpCommitTimer = window.setTimeout(commit, 100);
+        return;
+      }
+      await sendHandheldPerformanceRequest(
+        "api/handheld-performance/tdp",
+        { watts },
+        { silent: true },
+      );
+      if (sequence !== state.handheldPerformance.tdpMutationSequence) {
+        return;
+      }
+      syncVisibleSlotSliderUi();
+    };
+    state.handheldPerformance.tdpCommitTimer = window.setTimeout(commit, 250);
+  }
+
+  function stepHandheldTdp(direction) {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot || !direction) {
+      return;
+    }
+
+    const minimumWatts = Number(snapshot.minimumTdpWatts || 0);
+    const maximumWatts = Number(snapshot.maximumTdpWatts || 0);
+    const currentWatts = Number(snapshot.selectedTdpWatts || minimumWatts);
+    const nextWatts = Math.max(minimumWatts, Math.min(maximumWatts, currentWatts + direction));
+    if (nextWatts === currentWatts) {
+      return;
+    }
+
+    playSliderMoveSound(direction);
+    if (previewHandheldTdp(nextWatts)) {
+      syncVisibleSlotSliderUi();
+    }
+    queueHandheldTdpCommit(nextWatts);
+  }
+
+  function previewHandheldGlobalTdp(powerSource, watts) {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot) {
+      return false;
+    }
+
+    const sourceField = powerSource === "battery" ? "globalBatteryTdpWatts" : "globalAcTdpWatts";
+    const isCurrentSource = snapshot.powerSource === powerSource;
+    state.handheldPerformance.snapshot = {
+      ...snapshot,
+      [sourceField]: watts,
+      ...(isCurrentSource ? { globalTdpWatts: watts } : {}),
+      ...(isCurrentSource && !snapshot.currentGame ? { selectedTdpWatts: watts } : {}),
+    };
+    return true;
+  }
+
+  function queueHandheldGlobalTdpCommit(powerSource, watts) {
+    const timers = state.handheldPerformance.globalTdpCommitTimers;
+    const sequences = state.handheldPerformance.globalTdpMutationSequences;
+    if (timers[powerSource]) {
+      window.clearTimeout(timers[powerSource]);
+    }
+
+    const sequence = (sequences[powerSource] || 0) + 1;
+    sequences[powerSource] = sequence;
+    const commit = async () => {
+      timers[powerSource] = 0;
+      if (state.handheldPerformance.saving) {
+        timers[powerSource] = window.setTimeout(commit, 100);
+        return;
+      }
+      await sendHandheldPerformanceRequest(
+        "api/handheld-performance/profiles/global",
+        { watts, powerSource },
+        { silent: true },
+      );
+      if (sequence !== sequences[powerSource]) {
+        return;
+      }
+      syncVisibleSlotSliderUi();
+    };
+    timers[powerSource] = window.setTimeout(commit, 250);
+  }
+
+  function stepHandheldGlobalTdp(powerSource, direction) {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot || !direction) {
+      return;
+    }
+
+    const minimumWatts = Number(snapshot.minimumTdpWatts || 0);
+    const maximumWatts = Number(snapshot.maximumTdpWatts || 0);
+    const sourceField = powerSource === "battery" ? "globalBatteryTdpWatts" : "globalAcTdpWatts";
+    const currentWatts = Number(snapshot[sourceField] || snapshot.globalTdpWatts || minimumWatts);
+    const nextWatts = Math.max(minimumWatts, Math.min(maximumWatts, currentWatts + direction));
+    if (nextWatts === currentWatts) {
+      return;
+    }
+
+    playSliderMoveSound(direction);
+    if (previewHandheldGlobalTdp(powerSource, nextWatts)) {
+      syncVisibleSlotSliderUi();
+    }
+    queueHandheldGlobalTdpCommit(powerSource, nextWatts);
+  }
+
+  function getHandheldProfileTdp(profile, powerSource) {
+    if (!profile) {
+      return 0;
+    }
+    const sourceValue = powerSource === "battery" ? profile.batteryTdpWatts : profile.acTdpWatts;
+    return Number(sourceValue ?? profile.tdpWatts ?? 0);
+  }
+
+  function previewHandheldGameProfileTdp(key, powerSource, watts) {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot) {
+      return false;
+    }
+
+    const updateProfile = (profile) => ({
+      ...profile,
+      tdpWatts: watts,
+      acTdpWatts: powerSource === "ac" ? watts : getHandheldProfileTdp(profile, "ac"),
+      batteryTdpWatts: powerSource === "battery" ? watts : getHandheldProfileTdp(profile, "battery"),
+    });
+    const profiles = (Array.isArray(snapshot.profiles) ? snapshot.profiles : []).map((profile) =>
+      profile.key === key ? updateProfile(profile) : profile,
+    );
+    const activeProfile = snapshot.activeProfile?.key === key
+      ? updateProfile(snapshot.activeProfile)
+      : snapshot.activeProfile;
+    const isActiveSource = snapshot.currentGame?.key === key && snapshot.powerSource === powerSource;
+    state.handheldPerformance.snapshot = {
+      ...snapshot,
+      profiles,
+      activeProfile,
+      ...(isActiveSource ? { selectedTdpWatts: watts } : {}),
+    };
+    return true;
+  }
+
+  function queueHandheldGameProfileTdpCommit(key, powerSource, watts) {
+    const timerKey = `${key}:${powerSource}`;
+    const timers = state.handheldPerformance.profileTdpCommitTimers;
+    const sequences = state.handheldPerformance.profileTdpMutationSequences;
+    if (timers[timerKey]) {
+      window.clearTimeout(timers[timerKey]);
+    }
+
+    const sequence = (sequences[timerKey] || 0) + 1;
+    sequences[timerKey] = sequence;
+    const commit = async () => {
+      timers[timerKey] = 0;
+      if (state.handheldPerformance.saving) {
+        timers[timerKey] = window.setTimeout(commit, 100);
+        return;
+      }
+      await sendHandheldPerformanceRequest(
+        "api/handheld-performance/profiles/game",
+        { key, watts, powerSource },
+        { silent: true },
+      );
+      if (sequence === sequences[timerKey]) {
+        syncVisibleSlotSliderUi();
+      }
+    };
+    timers[timerKey] = window.setTimeout(commit, 250);
+  }
+
+  function stepHandheldGameProfileTdp(key, powerSource, direction) {
+    const snapshot = state.handheldPerformance.snapshot;
+    const profile = snapshot?.profiles?.find((candidate) => candidate.key === key);
+    if (!snapshot || !profile || !direction) {
+      return;
+    }
+
+    const minimumWatts = Number(snapshot.minimumTdpWatts || 0);
+    const maximumWatts = Number(snapshot.maximumTdpWatts || 0);
+    const currentWatts = getHandheldProfileTdp(profile, powerSource);
+    const nextWatts = Math.max(minimumWatts, Math.min(maximumWatts, currentWatts + direction));
+    if (nextWatts === currentWatts) {
+      return;
+    }
+
+    playSliderMoveSound(direction);
+    if (previewHandheldGameProfileTdp(key, powerSource, nextWatts)) {
+      syncVisibleSlotSliderUi();
+    }
+    queueHandheldGameProfileTdpCommit(key, powerSource, nextWatts);
+  }
+
+  function refreshHandheldPerformanceLiveUi() {
+    const snapshot = state.handheldPerformance.snapshot;
+    if (!snapshot || !isCurrentPluginRoute("handheld-performance")) {
+      return false;
+    }
+
+    const telemetry = snapshot.telemetry || {};
+    const liveValues = {
+      "handheld-power-source": snapshot.powerSource === "battery" ? "Battery power" : "Plugged in",
+      "handheld-battery-level": Number(telemetry.batteryPercent) >= 0
+        ? `${telemetry.batteryPercent}% battery${Number(telemetry.estimatedMinutesRemaining) > 0
+          ? ` - about ${Math.floor(telemetry.estimatedMinutesRemaining / 60)}h ${telemetry.estimatedMinutesRemaining % 60}m left`
+          : ""}`
+        : "Battery level unavailable",
+      "handheld-applied-tdp": telemetry.appliedTdpConfirmed
+        ? `${telemetry.appliedTdpWatts} W applied`
+        : `${snapshot.selectedTdpWatts} W requested`,
+    };
+
+    Object.entries(liveValues).forEach(([key, value]) => {
+      const node = document.querySelector(`[data-live-value="${key}"]`);
+      if (node && node.textContent !== value) {
+        node.textContent = value;
+      }
+    });
+    syncVisibleSlotSliderUi();
+    return true;
+  }
+
   async function loadHltbState() {
     state.hltb.loading = true;
     state.hltb.error = "";
@@ -14439,12 +14789,16 @@
   }
 
   async function setStartupMode(mode) {
-    const normalizedMode = ["shell", "tray"].includes(mode) ? mode : "shell";
+    const normalizedMode = ["shell", "tray", "xbox"].includes(mode) ? mode : "shell";
     const snapshot = getGeneralSettingsSnapshot();
     if (snapshot) {
       state.generalSettings.snapshot = {
         ...snapshot,
         startupMode: normalizedMode,
+        hideWindowsShellInConsoleMode:
+          normalizedMode === "shell"
+            ? snapshot.hideWindowsShellInConsoleMode !== false
+            : false,
         runOnWindowsSignIn: true,
       };
       rerenderGeneralSettingsPanel();
@@ -16093,6 +16447,292 @@
       };
     }
 
+    if (state.route.screen === "plugin" && state.route.pluginId === "handheld-performance") {
+      const snapshot = state.handheldPerformance.snapshot;
+      const busy = state.handheldPerformance.loading || state.handheldPerformance.saving;
+      const supported = Boolean(snapshot?.supported);
+      const pawnIoInstalled = Boolean(snapshot?.pawnIoInstalled);
+      const modes = Array.isArray(snapshot?.modes) ? snapshot.modes : [];
+      const selectedWatts = Number(snapshot?.selectedTdpWatts || 0);
+      const globalWatts = Number(snapshot?.globalTdpWatts || selectedWatts);
+      const globalAcWatts = Number(snapshot?.globalAcTdpWatts || globalWatts);
+      const globalBatteryWatts = Number(snapshot?.globalBatteryTdpWatts || globalWatts);
+      const minimumWatts = Number(snapshot?.minimumTdpWatts || 0);
+      const maximumWatts = Number(snapshot?.maximumTdpWatts || 0);
+      const powerSource = snapshot?.powerSource === "battery" ? "battery" : "ac";
+      const telemetry = snapshot?.telemetry || null;
+      const currentGame = snapshot?.currentGame || null;
+      const activeProfile = snapshot?.activeProfile || null;
+      const profiles = Array.isArray(snapshot?.profiles) ? snapshot.profiles : [];
+      const editingProfile = profiles.find((profile) => profile.key === state.handheldPerformance.editingProfileKey) || null;
+      const modeSlots = modes.map((mode) =>
+        makeCommandSlot(
+          mode.title,
+          `${mode.watts} W${snapshot?.selectedModeId === mode.id ? " - selected" : ""}`,
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/mode", { modeId: mode.id }),
+          {
+            slotKey: `handheld-mode-${mode.id}`,
+            disabled: busy || !supported,
+            leadingIcon: PerformancePluginIcon,
+          },
+        ),
+      );
+      const tdpSlider = createPerformanceValueSliderSlot({
+        title: `${currentGame?.title || "Game"} TDP`,
+        copy: supported ? "Saved automatically for the active game" : "No supported device detected",
+        hint: "Left / Right changes TDP by 1 watt.",
+        slotKey: "handheld-tdp-slider",
+        min: minimumWatts,
+        max: maximumWatts,
+        step: 1,
+        disabled: busy || !supported,
+        getValue: () => selectedWatts,
+        displayValue: (value) => `${value} W`,
+        onAdjust: (direction) => stepHandheldTdp(direction),
+      });
+      const createGlobalTdpSlider = (source, title, watts) => createPerformanceValueSliderSlot({
+        title,
+        copy: supported
+          ? `${minimumWatts}-${maximumWatts} W fallback for games without their own ${source} profile`
+          : "No supported device detected",
+        hint: "Left / Right changes this persistent profile by 1 watt.",
+        slotKey: `handheld-global-${source}-tdp-slider`,
+        min: minimumWatts,
+        max: maximumWatts,
+        step: 1,
+        disabled: busy || !supported,
+        getValue: () => watts,
+        displayValue: (value) => `${value} W`,
+        onAdjust: (direction) => stepHandheldGlobalTdp(source, direction),
+      });
+      const globalTdpSliders = [
+        createGlobalTdpSlider("ac", "Plugged In Profile", globalAcWatts),
+        createGlobalTdpSlider("battery", "Battery Profile", globalBatteryWatts),
+      ];
+      const profileSlots = profiles.map((profile) =>
+        makeCommandSlot(
+          profile.title || profile.appId || "Saved game",
+          `${getHandheldProfileTdp(profile, "ac")} W plugged in / ${getHandheldProfileTdp(profile, "battery")} W battery`,
+          () => {
+            state.handheldPerformance.editingProfileKey =
+              state.handheldPerformance.editingProfileKey === profile.key ? "" : profile.key;
+            renderPanelDataRefresh();
+          },
+          {
+            slotKey: `handheld-profile-${profile.key}`,
+            disabled: busy,
+            leadingIcon: PerformancePluginIcon,
+            selected: editingProfile?.key === profile.key,
+            badge: editingProfile?.key === profile.key ? "Editing" : "",
+          },
+        ),
+      );
+      const profileEditorSlots = editingProfile
+        ? [
+            createPerformanceValueSliderSlot({
+              title: `${editingProfile.title} - Plugged In`,
+              copy: "Saved TDP while the charger is connected.",
+              hint: "Left / Right changes the game profile by 1 watt.",
+              slotKey: `handheld-profile-editor-${editingProfile.key}-ac`,
+              min: minimumWatts,
+              max: maximumWatts,
+              step: 1,
+              disabled: busy || !supported,
+              getValue: () => getHandheldProfileTdp(editingProfile, "ac"),
+              displayValue: (value) => `${value} W`,
+              onAdjust: (direction) => stepHandheldGameProfileTdp(editingProfile.key, "ac", direction),
+            }),
+            createPerformanceValueSliderSlot({
+              title: `${editingProfile.title} - Battery`,
+              copy: "Saved TDP while running from the internal battery.",
+              hint: "Left / Right changes the game profile by 1 watt.",
+              slotKey: `handheld-profile-editor-${editingProfile.key}-battery`,
+              min: minimumWatts,
+              max: maximumWatts,
+              step: 1,
+              disabled: busy || !supported,
+              getValue: () => getHandheldProfileTdp(editingProfile, "battery"),
+              displayValue: (value) => `${value} W`,
+              onAdjust: (direction) => stepHandheldGameProfileTdp(editingProfile.key, "battery", direction),
+            }),
+            makeCommandSlot(
+              "Delete Game Profile",
+              `Remove the automatic TDP values saved for ${editingProfile.title}.`,
+              () => {
+                const key = editingProfile.key;
+                state.handheldPerformance.editingProfileKey = "";
+                void sendHandheldPerformanceRequest(
+                  "api/handheld-performance/profiles/delete",
+                  { key },
+                );
+              },
+              {
+                slotKey: `handheld-profile-delete-${editingProfile.key}`,
+                disabled: busy,
+                leadingIcon: RefreshActionIcon,
+              },
+            ),
+          ]
+        : [];
+      const activeGameSlots = currentGame ? [tdpSlider] : [];
+      const globalProfileStartIndex = 2;
+      const activeGameStartIndex = globalProfileStartIndex + globalTdpSliders.length;
+      const modeStartIndex = activeGameStartIndex + activeGameSlots.length;
+      const profileStartIndex = modeStartIndex + modeSlots.length;
+      const profileEditorStartIndex = profileStartIndex + profileSlots.length;
+      const maintenanceStartIndex = profileEditorStartIndex + profileEditorSlots.length;
+      return {
+        ...defaultModel,
+        title: snapshot?.pluginTitle || "Handheld Performance",
+        subtitle: snapshot?.productCode || "Device detection",
+        status: snapshot?.statusText || "Loading handheld state...",
+        error: state.handheldPerformance.error || snapshot?.errorText || "",
+        note: supported
+          ? currentGame
+            ? `Changes are saved automatically for ${currentGame.title}. The saved TDP will be restored on its next launch.`
+            : "No game is running. TDP changes now update the global default profile."
+          : "TDP writes remain disabled until a supported handheld is detected.",
+        cards: [
+          {
+            title: "Live Power",
+            lines: [
+              {
+                liveKey: "handheld-power-source",
+                text: powerSource === "battery" ? "Battery power" : "Plugged in",
+              },
+              {
+                liveKey: "handheld-battery-level",
+                text: Number(telemetry?.batteryPercent) >= 0
+                  ? `${telemetry.batteryPercent}% battery`
+                  : "Battery level unavailable",
+              },
+              {
+                liveKey: "handheld-applied-tdp",
+                text: telemetry?.appliedTdpConfirmed
+                  ? `${telemetry.appliedTdpWatts} W applied`
+                  : `${selectedWatts} W requested`,
+              },
+            ],
+          },
+          {
+            title: currentGame ? "Active Game" : "Automatic Profiles",
+            lines: currentGame
+              ? [
+                  currentGame.title,
+                  activeProfile
+                    ? `${getHandheldProfileTdp(activeProfile, powerSource)} W ${powerSource} profile`
+                    : `${globalWatts} W global fallback; moving the slider creates a game profile`,
+                ]
+              : [
+                  `${globalAcWatts} W plugged in / ${globalBatteryWatts} W battery`,
+                  `${profiles.length} saved game profile${profiles.length === 1 ? "" : "s"}`,
+                ],
+          },
+        ],
+        autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
+        sectionHeaders: [
+          createSectionHeader(0, "Automatic Profiles", "Detect Steam games and restore their saved TDP.", {
+            icon: PerformancePluginIcon,
+          }),
+          createSectionHeader(globalProfileStartIndex, "Global Profiles", "Separate persistent defaults for plugged-in and battery use.", {
+            icon: PerformancePluginIcon,
+          }),
+          ...(currentGame
+            ? [createSectionHeader(activeGameStartIndex, "Active Game Profile", `Saved automatically for ${currentGame.title}.`, {
+                icon: PerformancePluginIcon,
+              })]
+            : []),
+          createSectionHeader(modeStartIndex, "TDP Modes", "Apply device-specific presets.", {
+            icon: PerformancePluginIcon,
+          }),
+          ...(profileSlots.length
+            ? [createSectionHeader(profileStartIndex, "Saved Game Profiles", "Open a profile to edit both power states.", {
+                icon: PerformancePluginIcon,
+              })]
+            : []),
+          ...(profileEditorSlots.length
+            ? [createSectionHeader(profileEditorStartIndex, `Edit ${editingProfile.title}`, "Fine-tune and maintain this game profile.", {
+                icon: PerformancePluginIcon,
+              })]
+            : []),
+          createSectionHeader(maintenanceStartIndex, "Maintenance", "Install PawnIO or reload helper status.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        dividerAfterIndices: [
+          1,
+          activeGameStartIndex - 1,
+          ...(currentGame ? [modeStartIndex - 1] : []),
+          profileStartIndex - 1,
+          ...(profileSlots.length ? [profileEditorStartIndex - 1] : []),
+          ...(profileEditorSlots.length ? [maintenanceStartIndex - 1] : []),
+        ],
+        slots: [
+          makeSettingToggleSlot(
+            "handheld-performance",
+            "automatic-profiles",
+            "Automatic Game Profiles",
+            "Apply a saved TDP when a Steam game starts and return to the global profile when it closes.",
+            snapshot?.autoProfilesEnabled !== false,
+            () => void sendHandheldPerformanceRequest(
+              "api/handheld-performance/profiles/auto-enabled",
+              { value: snapshot?.autoProfilesEnabled === false },
+            ),
+            { disabled: busy || !supported },
+          ),
+          makeSettingToggleSlot(
+            "handheld-performance",
+            "profile-notifications",
+            "Windows Profile Notifications",
+            "Show one Windows notification when TFS automatically applies a profile.",
+            snapshot?.profileNotificationsEnabled !== false,
+            () => void sendHandheldPerformanceRequest(
+              "api/handheld-performance/profiles/notifications-enabled",
+              { value: snapshot?.profileNotificationsEnabled === false },
+            ),
+            { disabled: busy || !supported },
+          ),
+          ...globalTdpSliders,
+          ...activeGameSlots,
+          ...modeSlots,
+          ...profileSlots,
+          ...profileEditorSlots,
+          makeCommandSlot(
+            "Test Profile Notification",
+            "Show the same TFS profile banner used for automatic game and global profile changes.",
+            () => void sendHandheldPerformanceRequest(
+              "api/handheld-performance/profiles/notifications/test",
+              {},
+            ),
+            {
+              slotKey: "handheld-notification-test",
+              disabled: busy || !supported,
+              leadingIcon: PerformancePluginIcon,
+            },
+          ),
+          makeCommandSlot(
+            pawnIoInstalled ? "Repair PawnIO" : "Install PawnIO",
+            pawnIoInstalled
+              ? "Run the bundled verified PawnIO 2.2.0 setup again."
+              : "Install the verified PawnIO 2.2.0 driver required for TDP control.",
+            () => void sendHandheldPerformanceRequest("api/handheld-performance/pawnio/install", {}),
+            {
+              slotKey: "handheld-pawnio-install",
+              disabled: busy || !supported,
+              leadingIcon: SaveActionIcon,
+            },
+          ),
+          makeCommandSlot("Refresh Status", "Read the latest result from the elevated helper.", () => {
+            void loadHandheldPerformanceState();
+          }, {
+            slotKey: "handheld-refresh",
+            disabled: busy,
+            leadingIcon: RefreshActionIcon,
+          }),
+        ],
+      };
+    }
+
     if (
       state.route.screen === "page" &&
       state.route.pluginId === "display" &&
@@ -17704,6 +18344,12 @@
       const settings = getGeneralSettingsSnapshot();
       const pluginSettings = getGeneralPluginSettings();
       const startupMode = settings?.startupMode || "shell";
+      const shellHideAvailable = startupMode === "shell";
+      const xboxModeSupported = settings?.xboxModeSupported === true;
+      const startupModeSlotCount = xboxModeSupported ? 3 : 2;
+      const xboxModeSupportNote = xboxModeSupported
+        ? ""
+        : ` Xbox Mode is hidden: ${settings?.xboxModeSupportReason || "Windows Gaming FSE support was not detected."}`;
 
       return {
         ...defaultModel,
@@ -17711,19 +18357,19 @@
         subtitle: "General",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Choose between Shell and Tray startup, then manage the global behavior and plugin list below. Developer debug stays hidden unless you turn it on here.",
+        note: `Choose a supported startup mode, then manage global behavior and plugins below. Startup modes always replace each other.${xboxModeSupportNote}`,
         sectionHeaders: [
           createSectionHeader(0, "Startup Mode", "Choose how TFS enters Windows and Steam on sign-in.", {
             icon: SettingsPluginIcon,
           }),
-          createSectionHeader(2, "Behavior", "Fine-tune shell hiding and debug visibility.", {
+          createSectionHeader(startupModeSlotCount, "Behavior", "Fine-tune shell hiding and debug visibility.", {
             icon: DesktopActionIcon,
           }),
-          createSectionHeader(4, "Built-In Plugins", "Show or hide modules and block their background routes.", {
+          createSectionHeader(startupModeSlotCount + 2, "Built-In Plugins", "Show or hide modules and block their background routes.", {
             icon: SteamLoaderIcon,
           }),
         ],
-        dividerAfterIndex: 3,
+        dividerAfterIndex: startupModeSlotCount + 1,
         slots: [
           makeChoiceSlot(
             "Shell Takeover",
@@ -17738,7 +18384,7 @@
             },
           ),
           makeChoiceSlot(
-            "Tray App",
+            "eTray",
             "Windows starts normally. Tools for Steam runs from the tray, syncs launchers, and starts Steam without taking over the shell.",
             () => setStartupMode("tray"),
             {
@@ -17749,15 +18395,31 @@
               leadingIcon: SteamLoaderIcon,
             },
           ),
+          ...(xboxModeSupported
+            ? [
+                makeChoiceSlot(
+                  "Xbox Mode",
+                  "Windows launches TFS as the Xbox Mode Home app. Shell takeover and eTray startup are disabled.",
+                  () => setStartupMode("xbox"),
+                  {
+                    disabled: isGeneralSettingsBusy() || startupMode === "xbox",
+                    selected: startupMode === "xbox",
+                    badge: startupMode === "xbox" ? "Current" : "",
+                    trailing: startupMode === "xbox" ? "none" : "chevron",
+                    leadingIcon: SettingsPluginIcon,
+                  },
+                ),
+              ]
+            : []),
           makeSettingToggleSlot(
             "tfs",
             "hide-windows-shell",
             "Hide Windows Shell in Console Mode",
-            "Hide the taskbar and desktop icons while Steam Big Picture is active. This only applies in Shell Takeover mode and never in Tray App mode.",
-            settings?.hideWindowsShellInConsoleMode !== false,
+            "Hide the taskbar and desktop icons while Steam Big Picture is active. This only applies in Shell Takeover mode and never in Xbox Mode or eTray.",
+            shellHideAvailable && settings?.hideWindowsShellInConsoleMode !== false,
             () => toggleHideWindowsShellInConsoleMode(),
             {
-              disabled: isGeneralSettingsBusy(),
+              disabled: isGeneralSettingsBusy() || !shellHideAvailable,
             },
           ),
           makeSettingToggleSlot(
@@ -17806,7 +18468,7 @@
         subtitle: "Splashscreen Themes",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Use full local image paths. Missing files are kept in settings, but the splash falls back safely until the path exists. In Shell Takeover mode the splash stays on until Big Picture is visible, then Windows starts later in the background after the hand-off delay.",
+        note: "Use full local image paths. Missing files fall back safely. The enabled startup splash appears for 10 seconds in Shell Takeover, Xbox Mode, and eTray.",
         sectionHeaders: [
           createSectionHeader(0, "Preview", "Open the splash briefly without running the full startup flow.", {
             icon: EyeActionIcon,
@@ -17825,9 +18487,7 @@
           {
             title: "Current Splash",
             lines: [
-              shellTakeoverMode
-                ? "Splashscreen: Always shown until Big Picture is visible"
-                : "Splashscreen: Used when Shell Takeover startup is active",
+              "Splashscreen: Shown for 10 seconds in every startup mode",
               `Text: ${splash?.showText === false ? "Hidden" : "Shown"}`,
               wallpaperPath
                 ? `Wallpaper: ${splash?.wallpaperExists ? wallpaperPath : `Missing - ${wallpaperPath}`}`
@@ -17869,7 +18529,7 @@
             "tfs-splash",
             "show-text",
             "Show Splash Text",
-            "Show startup status text on top of the splash artwork while Shell Takeover is running.",
+            "Show startup status text on top of the splash artwork in every startup mode.",
             splash?.showText !== false,
             () => toggleSplashScreenSetting("show-text"),
             {
@@ -19947,7 +20607,7 @@
       };
     }
 
-    if (state.route.screen === "plugin" && state.route.pluginId === "unifystore") {
+    if (storefrontEnabled && state.route.screen === "plugin" && state.route.pluginId === "unifystore") {
       const stores = getUnifySteamStores();
       const installedCount = stores.reduce((total, store) => total + (Number(store.installedCount) || 0), 0);
       const libraryCount = stores.reduce((total, store) => total + (Number(store.availableCount) || 0), 0);
@@ -20450,6 +21110,16 @@
       !state.performance.error
     ) {
       void loadPerformanceState();
+    }
+
+    if (
+      route.pluginId === "handheld-performance" &&
+      state.generalSettings.snapshot?.handheldPerformanceAvailable === true &&
+      !state.handheldPerformance.loading &&
+      !state.handheldPerformance.snapshot &&
+      !state.handheldPerformance.error
+    ) {
+      void loadHandheldPerformanceState();
     }
 
     if (
@@ -21362,6 +22032,37 @@
     }
 
     switch (topic) {
+      case "handheld-performance.state": {
+        const previous = state.handheldPerformance.snapshot;
+        const hasPendingSliderCommit = Boolean(
+          state.handheldPerformance.tdpCommitTimer ||
+          Object.values(state.handheldPerformance.globalTdpCommitTimers).some(Boolean) ||
+          Object.values(state.handheldPerformance.profileTdpCommitTimers).some(Boolean),
+        );
+        const gameChanged = previous?.currentGame?.key !== payload?.currentGame?.key;
+        const powerSourceChanged = previous?.powerSource !== payload?.powerSource;
+        const profileKeysChanged = (previous?.profiles || []).map((profile) => profile.key).join("|") !==
+          (payload?.profiles || []).map((profile) => profile.key).join("|");
+
+        state.handheldPerformance.snapshot = hasPendingSliderCommit && previous
+          ? {
+              ...previous,
+              telemetry: payload.telemetry,
+              powerSource: payload.powerSource,
+              statusText: payload.statusText,
+              errorText: payload.errorText,
+            }
+          : payload;
+
+        if (state.panelVisible && state.route?.pluginId === "handheld-performance") {
+          if (gameChanged || powerSourceChanged || profileKeysChanged) {
+            renderPanelDataRefresh();
+          } else {
+            refreshHandheldPerformanceLiveUi();
+          }
+        }
+        return true;
+      }
       case "audio.dashboard":
       case "audio.mixer":
       applyAudioDashboardSnapshotIfCurrent(payload);
@@ -21475,6 +22176,7 @@
       case "app-start.state":
       case "smart-home.state":
       case "plugin-store.state":
+      case "handheld-performance.state":
         refreshCurrentLiveRouteState();
         return;
       default:

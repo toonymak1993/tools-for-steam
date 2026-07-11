@@ -26,9 +26,17 @@
   <ItemGroup>
     <PackageReference Include="AudioSwitcher.AudioApi.CoreAudio" Version="3.0.3" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.4" />
-    <!-- MSI WMI/EC access for the handheld plugin (MSI_ACPI). If restore complains
-         about the version, use the latest System.Management 9.x/10.x available. -->
     <PackageReference Include="System.Management" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ToolsForSteam.Splash\ToolsForSteam.Splash.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="ThirdParty\PawnIO\RyzenSMU.bin" />
+    <None Include="ThirdParty\PawnIO\COPYING" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ThirdParty\PawnIO\NOTICE.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

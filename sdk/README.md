@@ -9,6 +9,7 @@ Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins shoul
 ## Store Contract
 
 - The store refreshes the default GitHub catalog from `https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json`.
+- On a fresh install, TFS tries to download that catalog automatically on first Store use.
 - The downloaded catalog is cached as `data/plugin-store/catalog.json`.
 - Advanced users can override the feed by creating `data/plugin-store/catalog-source.json` with `{ "catalogUrl": "https://example.com/catalog.json" }`.
 - Each catalog entry points to a zip package through `packagePath` or `packageUrl`.
@@ -17,7 +18,7 @@ Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins shoul
 - Installed community plugins live under `data/plugin-store/community/<plugin-id>`.
 - SDK data lives under `data/plugin-store/sdk-data/<plugin-id>`.
 - Built-in plugins remain part of the app and can only be hidden from Home.
-- Community catalog entries must include at least one image. Entries without images are not listed.
+- Community catalog images are recommended. If an entry has no image, the Store shows a fallback preview card instead of hiding the plugin.
 
 ## Runtime
 
@@ -117,7 +118,7 @@ my-plugin.zip
     preview.png
 ```
 
-The preview image is required for store listings. Use PNG, JPG, WEBP, GIF, or SVG.
+The preview image is optional but recommended for store listings. Use PNG, JPG, WEBP, GIF, or SVG when you provide one.
 
 ## Manifest
 
@@ -179,7 +180,7 @@ See these files for the store-side registry format:
 
 The catalog is display and delivery metadata. The manifest inside the package is the runtime contract.
 
-Community catalog entries must include at least one image. Entries without images are not listed by the local store because the store UI is designed around visual plugin cards.
+Community catalog images are recommended but not required. Entries without images still appear in the local store and use the built-in fallback preview card.
 
 For local development, run:
 
@@ -216,9 +217,9 @@ Recommended flow:
 
 1. Fork `tfs-plugin-template` or copy `sdk/plugin-template/` into your own plugin repository.
 2. Build a zip with `tfs-plugin.json` at the package root.
-3. Add a required preview image.
+3. Add a preview image if you want a custom store card.
 4. Publish the zip somewhere stable, or add it to `tfs-plugin-database/packages/` for official catalog inclusion.
-5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, and at least one image URL.
+5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, and optionally one or more image URLs.
 6. Open a pull request against `tfs-plugin-database` and document what permissions the plugin needs.
 
 Use the smallest permission set possible. If your plugin only renders UI, use `frontend`. Add `storage`, `secrets`, or `network` only when the plugin truly needs them.

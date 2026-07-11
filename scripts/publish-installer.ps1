@@ -2,15 +2,27 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $projectPath = Join-Path $projectRoot "src\SteamLoader.App\SteamLoader.App.csproj"
-$innoPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+$innoCandidates = @(
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+)
+$innoPath = $innoCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 $issPath = Join-Path $projectRoot "installer\ToolsForSteam.iss"
 $installerOutput = Join-Path $projectRoot "dist\installer\ToolsForSteamSetup.exe"
 $projectVersion = ([xml](Get-Content $projectPath)).Project.PropertyGroup.Version | Select-Object -First 1
 $versionSuffix = if ([string]::IsNullOrWhiteSpace($projectVersion)) { "0.0.0-dev" } else { $projectVersion.Trim() }
 $versionedInstallerOutput = Join-Path $projectRoot ("dist\installer\ToolsForSteamSetup-{0}.exe" -f $versionSuffix)
+$versionParts = $versionSuffix.Split('.')
+$packageMajor = if ($versionParts.Length -ge 1) { [int]$versionParts[0] } else { 0 }
+$packageMinor = if ($versionParts.Length -ge 2) { [int]$versionParts[1] } else { 0 }
+$packageBuildTime = [DateTimeOffset]::UtcNow
+$packageEpoch = [DateTimeOffset]::new(2020, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+$packageDay = [int][Math]::Floor(($packageBuildTime - $packageEpoch).TotalDays)
+$packageTimeSlot = [int][Math]::Floor($packageBuildTime.TimeOfDay.TotalSeconds / 2)
+$xboxHostPackageVersion = "$packageMajor.$packageMinor.$packageDay.$packageTimeSlot"
 
-if (-not (Test-Path $innoPath)) {
-    throw "Inno Setup compiler was not found at $innoPath."
+if (-not $innoPath) {
+    throw "Inno Setup 6 compiler was not found."
 }
 
 if (-not (Test-Path $issPath)) {
@@ -20,6 +32,31 @@ if (-not (Test-Path $issPath)) {
 & (Join-Path $PSScriptRoot "publish-portable.ps1")
 if ($LASTEXITCODE -ne 0) {
     throw "Installer payload publish failed."
+}
+
+$xboxHostPfxPath = if ($env:TFS_XBOX_HOST_PFX) {
+    $env:TFS_XBOX_HOST_PFX
+} else {
+    Join-Path $projectRoot "dist\signing\ToolsForSteam.XboxHost.pfx"
+}
+$xboxHostPassword = if ($env:TFS_XBOX_HOST_PFX_PASSWORD) {
+    $env:TFS_XBOX_HOST_PFX_PASSWORD
+} else {
+    $passwordFile = Join-Path $projectRoot "dist\signing\ToolsForSteam.XboxHost.password"
+    if (Test-Path -LiteralPath $passwordFile) {
+        (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+    }
+}
+if (-not (Test-Path -LiteralPath $xboxHostPfxPath) -or [string]::IsNullOrWhiteSpace($xboxHostPassword)) {
+    throw "Xbox host signing requires TFS_XBOX_HOST_PFX and TFS_XBOX_HOST_PFX_PASSWORD."
+}
+
+& (Join-Path $projectRoot "tools\Build-XboxHost.ps1") `
+    -PfxPath $xboxHostPfxPath `
+    -PfxPassword $xboxHostPassword `
+    -PackageVersion $xboxHostPackageVersion
+if ($LASTEXITCODE -ne 0) {
+    throw "Xbox Mode host package build failed."
 }
 
 $installerDirectory = Split-Path -Parent $installerOutput
@@ -36,7 +73,7 @@ Remove-Item -LiteralPath (Join-Path $projectRoot "dist\uninstall-toolsforsteam.p
 
 New-Item -ItemType Directory -Path $installerDirectory -Force | Out-Null
 
-& $innoPath $issPath
+& $innoPath "/DXboxHostBuildVersion=$xboxHostPackageVersion" $issPath
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup build failed."
 }

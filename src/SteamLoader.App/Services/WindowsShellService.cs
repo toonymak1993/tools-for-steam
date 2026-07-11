@@ -5,11 +5,28 @@ namespace SteamLoader.App.Services;
 
 public sealed class WindowsShellService
 {
-    private const string WinlogonKeyPath = @"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
+    private const string DefaultWinlogonKeyPath = @"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
     private const string ShellValueName = "Shell";
-    private const string AppStateKeyPath = @"Software\GCM\SteamTools";
+    private const string DefaultAppStateKeyPath = @"Software\GCM\SteamTools";
     private const string PreviousShellValueName = "PreviousShell";
     private const string DefaultShellCommand = "explorer.exe";
+    private readonly string _winlogonKeyPath;
+    private readonly string _appStateKeyPath;
+
+    public WindowsShellService()
+        : this(DefaultWinlogonKeyPath, DefaultAppStateKeyPath)
+    {
+    }
+
+    public WindowsShellService(string winlogonKeyPath, string appStateKeyPath)
+    {
+        _winlogonKeyPath = string.IsNullOrWhiteSpace(winlogonKeyPath)
+            ? DefaultWinlogonKeyPath
+            : winlogonKeyPath;
+        _appStateKeyPath = string.IsNullOrWhiteSpace(appStateKeyPath)
+            ? DefaultAppStateKeyPath
+            : appStateKeyPath;
+    }
 
     public bool IsEnabled(string executablePath, string arguments)
     {
@@ -27,7 +44,7 @@ public sealed class WindowsShellService
             if (!string.IsNullOrWhiteSpace(currentShell) &&
                 !string.Equals(currentShell, desiredCommand, StringComparison.OrdinalIgnoreCase))
             {
-                using var stateKey = Registry.CurrentUser.CreateSubKey(AppStateKeyPath);
+                using var stateKey = Registry.CurrentUser.CreateSubKey(_appStateKeyPath);
                 stateKey?.SetValue(PreviousShellValueName, currentShell, RegistryValueKind.String);
             }
 
@@ -36,6 +53,11 @@ public sealed class WindowsShellService
         }
 
         SetShellCommand(GetFallbackShellCommand());
+    }
+
+    public void SetExplorerShell()
+    {
+        SetShellCommand(DefaultShellCommand);
     }
 
     public void PrepareCurrentSession(string executablePath, string arguments)
@@ -73,13 +95,13 @@ public sealed class WindowsShellService
 
     public string GetShellCommand()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(WinlogonKeyPath, writable: false);
+        using var key = Registry.CurrentUser.OpenSubKey(_winlogonKeyPath, writable: false);
         return key?.GetValue(ShellValueName) as string ?? DefaultShellCommand;
     }
 
     private string GetFallbackShellCommand()
     {
-        using var stateKey = Registry.CurrentUser.OpenSubKey(AppStateKeyPath, writable: false);
+        using var stateKey = Registry.CurrentUser.OpenSubKey(_appStateKeyPath, writable: false);
         var previousShell = stateKey?.GetValue(PreviousShellValueName) as string;
         return string.IsNullOrWhiteSpace(previousShell)
             ? DefaultShellCommand
@@ -88,7 +110,7 @@ public sealed class WindowsShellService
 
     private void SetShellCommand(string command)
     {
-        using var key = Registry.CurrentUser.CreateSubKey(WinlogonKeyPath);
+        using var key = Registry.CurrentUser.CreateSubKey(_winlogonKeyPath);
         key?.SetValue(ShellValueName, string.IsNullOrWhiteSpace(command) ? DefaultShellCommand : command, RegistryValueKind.String);
     }
 

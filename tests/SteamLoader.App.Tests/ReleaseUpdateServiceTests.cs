@@ -7,6 +7,46 @@ namespace SteamLoader.App.Tests;
 public sealed class ReleaseUpdateServiceTests
 {
     [Fact]
+    public void BuildInstallerArguments_MarksUpdateAndPersistsInstallerLog()
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod(
+            "BuildInstallerArguments",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var arguments = Assert.IsType<string>(method!.Invoke(null, [@"C:\Program Files\ToolsForSteam"]));
+
+        Assert.Contains("/VERYSILENT", arguments, StringComparison.Ordinal);
+        Assert.Contains("/TFSUPDATE=1", arguments, StringComparison.Ordinal);
+        Assert.Contains("/DIR=\"C:\\Program Files\\ToolsForSteam\"", arguments, StringComparison.Ordinal);
+        Assert.Contains("/LOG=\"C:\\Program Files\\ToolsForSteam\\data\\installer-update.log\"", arguments, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildUpdateScript_LogsInstallerFailureAndRestartsExistingVersion()
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod(
+            "BuildUpdateScript",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var script = Assert.IsType<string>(method!.Invoke(
+            null,
+            [
+                @"C:\Temp\TfsUpdate",
+                @"C:\Temp\TfsUpdate\ToolsForSteamSetup.exe",
+                @"C:\Program Files\ToolsForSteam",
+                "ToolsForSteam.exe",
+                new[] { 10, 20 },
+                true
+            ]));
+
+        Assert.Contains("data\\update-handoff.log", script, StringComparison.Ordinal);
+        Assert.Contains("Start-Process -FilePath $existingExe -ArgumentList \"--tray\"", script, StringComparison.Ordinal);
+        Assert.Contains("$installer.ExitCode", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateInstallerPackage_AcceptsMinimalMzExecutable()
     {
         var root = CreateTempRoot();

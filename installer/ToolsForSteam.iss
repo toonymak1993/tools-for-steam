@@ -17,6 +17,9 @@
 #ifndef VariantFpsHelperPrep
   #define VariantFpsHelperPrep "1"
 #endif
+#ifndef XboxHostBuildVersion
+  #define XboxHostBuildVersion "0.3.8.2"
+#endif
 
 [Setup]
 AppId={#MyAppId}
@@ -54,8 +57,17 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#PayloadDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.msix"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
+Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.cer"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
+Source: "XboxModePackage.ps1"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
+Source: "XboxModeSession.ps1"; Flags: dontcopy
+Source: "XboxModeDiagnostics.ps1"; Flags: dontcopy
+Source: "Assets\ControllerGuide.png"; Flags: dontcopy
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\COPYING"; DestDir: "{app}\ThirdParty\PawnIO"; DestName: "COPYING-LGPL-2.1.txt"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\NOTICE.txt"; DestDir: "{app}\ThirdParty\PawnIO"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\PawnIO_setup.exe"; DestDir: "{app}\ThirdParty\PawnIO"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\SteamLoader.exe"
@@ -67,23 +79,32 @@ Type: files; Name: "{app}\install-toolsforsteam.ps1"
 Type: files; Name: "{app}\uninstall-toolsforsteam.ps1"
 
 [Icons]
-Name: "{group}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--manager"; WorkingDir: "{app}"
+Name: "{group}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; WorkingDir: "{app}"
 Name: "{group}\Start Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; WorkingDir: "{app}"
 Name: "{group}\Uninstall Tools for Steam"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--manager"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; WorkingDir: "{app}"; Tasks: desktopicon
 
-[Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-startup-mode=shell"; Flags: runhidden waituntilterminated runasoriginaluser skipifdoesntexist; Check: IsShellMode
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-startup-mode=tray"; Flags: runhidden waituntilterminated runasoriginaluser skipifdoesntexist; Check: IsTrayMode
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; Flags: nowait runasoriginaluser skipifnotsilent skipifdoesntexist; Check: IsShellMode
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; Flags: nowait runasoriginaluser skipifnotsilent skipifdoesntexist; Check: IsTrayMode
+[Registry]
+Root: HKCU; Subkey: "Software\GCM\SteamTools"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletevalue uninsdeletekeyifempty
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM ToolsForSteam.exe /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseToolsForSteam"
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM SteamLoader.exe /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseLegacySteamLoader"
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-xbox-mode"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreXboxModeSettings"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Get-AppxPackage -Name 'GCM.ToolsForSteam.XboxHost' | Remove-AppxPackage"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModePackage"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Start-Process -FilePath '{sys}\certutil.exe' -ArgumentList '-delstore','TrustedPeople','B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251' -Verb RunAs -WindowStyle Hidden -Wait"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModeCertificate"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\GamepadHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveGamepadHelperTask"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\FpsHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveFpsHelperTask"
 
 [Code]
+const
+  XboxHostPackageName = 'GCM.ToolsForSteam.XboxHost';
+  XboxHostPackageFamilyName = 'GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j';
+  XboxHostPackageVersion = '{#XboxHostBuildVersion}';
+  XboxHostPublisher = 'CN=GCM Gaming Console Mode';
+  XboxHostCertificateThumbprint = 'B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251';
+  PawnIOSetupSha256 = '1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032';
+
 var
   SystemCheckPage: TWizardPage;
   StartupModePage: TWizardPage;
@@ -99,14 +120,28 @@ var
   ShellModeDescriptionLabel: TNewStaticText;
   TrayModeRadio: TNewRadioButton;
   TrayModeDescriptionLabel: TNewStaticText;
-  GuideSummaryLabel: TNewStaticText;
-  GuideShellLabel: TNewStaticText;
-  GuideSelectedModeLabel: TNewStaticText;
+  ExternalModeRadio: TNewRadioButton;
+  ExternalModeDescriptionLabel: TNewStaticText;
+  GuideControllerImage: TBitmapImage;
   LaunchSettingsAfterSetup: Boolean;
   PostInstallSettingsArguments: string;
   ExistingInstallPath: string;
   SteamInstallPath: string;
   CreatedBackupPath: string;
+  XboxModeSupportReady: Boolean;
+  XboxCertificateInstalledThisRun: Boolean;
+  XboxPackageExistedBeforeInstall: Boolean;
+  InstallFinalizationReady: Boolean;
+  XboxNativeApiChecked: Boolean;
+  XboxNativeApiSupported: Boolean;
+  XboxModeSuspendedForInstall: Boolean;
+  XboxModeSessionStatePath: string;
+  UpdateInstallRequested: Boolean;
+  UpdateStartupModeToRestore: string;
+  StartupModeFinalized: Boolean;
+  FinalizedStartupMode: string;
+  XboxModeFailureReason: string;
+  DiagnosticFailureReason: string;
 
 function GetRegistryStringValue(RootKey: Integer; SubKey: string; ValueName: string): string;
 begin
@@ -122,6 +157,63 @@ begin
   StringChangeEx(Result, '''', '''''', True);
 end;
 
+function DiagnosticBool(Value: Boolean): string;
+begin
+  if Value then
+  begin
+    Result := 'true';
+  end
+  else
+  begin
+    Result := 'false';
+  end;
+end;
+
+procedure RecordDiagnosticFailure(Message: string);
+begin
+  if DiagnosticFailureReason = '' then
+  begin
+    DiagnosticFailureReason := Message;
+  end
+  else
+  begin
+    DiagnosticFailureReason := DiagnosticFailureReason + ' | ' + Message;
+  end;
+  Log('Diagnostic failure recorded: ' + Message);
+end;
+
+procedure RecordXboxModeFailure(Message: string);
+begin
+  XboxModeFailureReason := Message;
+  RecordDiagnosticFailure(Message);
+end;
+
+function SelectedStartupMode: string;
+forward;
+
+function IsXboxModePlatformSupported: Boolean;
+forward;
+
+function DescribeStartupMode(Mode: string): string;
+begin
+  if Mode = 'shell' then
+  begin
+    Result := 'Shell';
+  end
+  else if Mode = 'tray' then
+  begin
+    Result := 'Tray';
+  end
+  else if (Mode = 'xbox') or (Mode = 'external') then
+  begin
+    Result := 'Xbox Mode';
+  end
+  else
+  begin
+    Result := Mode;
+  end;
+end;
+
 procedure AppendLine(var Value: string; Line: string);
 begin
   Value := Value + Line + #13#10;
@@ -135,6 +227,198 @@ begin
     WizardForm.StatusLabel.Caption := Message;
     WizardForm.Repaint;
   end;
+end;
+
+function RunXboxPackageTool(Mode: string; CertificatePath: string; PackagePath: string): Boolean;
+var
+  ScriptPath: string;
+  LogPath: string;
+  Arguments: string;
+  ResultCode: Integer;
+begin
+  ScriptPath := ExpandConstant('{app}\XboxMode\XboxModePackage.ps1');
+  LogPath := ExpandConstant('{app}\data\xbox-mode-installer.log');
+  if not FileExists(ScriptPath) then
+  begin
+    Log('Xbox Mode package verification tool is missing.');
+    Result := False;
+    Exit;
+  end;
+
+  Arguments :=
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
+    ' -Mode "' + Mode + '"' +
+    ' -CertificatePath "' + CertificatePath + '"' +
+    ' -PackagePath "' + PackagePath + '"' +
+    ' -ExpectedThumbprint "' + XboxHostCertificateThumbprint + '"' +
+    ' -ExpectedPackageName "' + XboxHostPackageName + '"' +
+    ' -ExpectedPackageFamilyName "' + XboxHostPackageFamilyName + '"' +
+    ' -ExpectedPublisher "' + XboxHostPublisher + '"' +
+    ' -ExpectedVersion "' + XboxHostPackageVersion + '"' +
+    ' -LogPath "' + LogPath + '"';
+
+  Result := Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Arguments,
+    ExpandConstant('{app}\XboxMode'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode) and (ResultCode = 0);
+  if not Result then
+  begin
+    Log('Xbox Mode package tool failed in ' + Mode + ' mode with code ' + IntToStr(ResultCode) + '.');
+  end;
+end;
+
+procedure RollBackXboxCertificateInstalledThisRun;
+var
+  ResultCode: Integer;
+begin
+  if not XboxCertificateInstalledThisRun then
+  begin
+    Exit;
+  end;
+
+  UpdateSetupStatus('Rolling back the Xbox Mode certificate...');
+  if ShellExec(
+      'runas',
+      ExpandConstant('{sys}\certutil.exe'),
+      '-delstore TrustedPeople "' + XboxHostCertificateThumbprint + '"',
+      ExpandConstant('{app}\XboxMode'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and (ResultCode = 0) then
+  begin
+    XboxCertificateInstalledThisRun := False;
+    Log('Xbox Mode certificate installed by this setup run was rolled back.');
+  end
+  else
+  begin
+    Log('Xbox Mode certificate rollback failed or was cancelled.');
+  end;
+end;
+
+function IsXboxPackageInstalled: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "if (Get-AppxPackage -Name ''' + XboxHostPackageName + ''') { exit 0 } else { exit 1 }"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode) and (ResultCode = 0);
+end;
+
+procedure RollBackXboxPackageInstalledThisRun;
+var
+  ResultCode: Integer;
+begin
+  if XboxPackageExistedBeforeInstall then
+  begin
+    Exit;
+  end;
+
+  UpdateSetupStatus('Rolling back the Xbox Mode package...');
+  Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-AppxPackage -Name ''' + XboxHostPackageName + ''' | Remove-AppxPackage -ErrorAction SilentlyContinue"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode);
+  Log('Xbox Mode package installed by this setup run was rolled back.');
+end;
+
+procedure InstallXboxModeSupport;
+var
+  CertificatePath: string;
+  PackagePath: string;
+  CertificateKeyPath: string;
+  ResultCode: Integer;
+begin
+  XboxModeSupportReady := False;
+  XboxModeFailureReason := '';
+  XboxCertificateInstalledThisRun := False;
+  XboxPackageExistedBeforeInstall := IsXboxPackageInstalled;
+
+  if not IsXboxModePlatformSupported then
+  begin
+    RecordXboxModeFailure('The Windows build or Gaming FSE API is not supported.');
+    Log('Xbox Mode package installation skipped because this Windows build is unsupported.');
+    Exit;
+  end;
+
+  CertificatePath := ExpandConstant('{app}\XboxMode\ToolsForSteam.XboxHost.cer');
+  PackagePath := ExpandConstant('{app}\XboxMode\ToolsForSteam.XboxHost.msix');
+  CertificateKeyPath :=
+    'SOFTWARE\Microsoft\SystemCertificates\TrustedPeople\Certificates\' +
+    XboxHostCertificateThumbprint;
+
+  if not FileExists(CertificatePath) or not FileExists(PackagePath) then
+  begin
+    RecordXboxModeFailure('The Xbox Mode certificate or MSIX payload is missing after file installation.');
+    Log('Xbox Mode support files are missing from the installed payload.');
+    Exit;
+  end;
+
+  UpdateSetupStatus('Verifying the signed Xbox Mode package...');
+  if not RunXboxPackageTool('VerifyPayload', CertificatePath, PackagePath) then
+  begin
+    RecordXboxModeFailure('The signed Xbox Mode payload failed verification.');
+    Log('Xbox Mode payload verification failed before certificate installation.');
+    Exit;
+  end;
+
+  if not RegKeyExists(HKLM64, CertificateKeyPath) then
+  begin
+    UpdateSetupStatus('Installing the Tools for Steam Xbox Mode certificate...');
+    if not ShellExec(
+        'runas',
+        ExpandConstant('{sys}\certutil.exe'),
+        '-f -addstore TrustedPeople "' + CertificatePath + '"',
+        ExpandConstant('{app}\XboxMode'),
+        SW_HIDE,
+        ewWaitUntilTerminated,
+        ResultCode) or (ResultCode <> 0) then
+    begin
+      RecordXboxModeFailure('The Xbox Mode certificate could not be installed into LocalMachine TrustedPeople. Result code: ' + IntToStr(ResultCode) + '.');
+      Log('Xbox Mode certificate installation failed or was cancelled.');
+      Exit;
+    end;
+    XboxCertificateInstalledThisRun := True;
+  end;
+
+  UpdateSetupStatus('Registering Tools for Steam as the Windows Xbox Mode Home app...');
+  if not RunXboxPackageTool('InstallAndVerify', CertificatePath, PackagePath) then
+  begin
+    RecordXboxModeFailure('Windows failed to register or verify the Xbox Mode MSIX package and its windows.gamingApp extension.');
+    Log('Xbox Mode package registration or extension verification failed.');
+    RollBackXboxPackageInstalledThisRun;
+    RollBackXboxCertificateInstalledThisRun;
+    Exit;
+  end;
+
+  UpdateSetupStatus('Checking Windows Gaming FSE compatibility...');
+  if not Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--check-xbox-mode-support',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) or (ResultCode <> 0) then
+  begin
+    RecordXboxModeFailure('The installed TFS runtime did not confirm Windows Gaming FSE compatibility. Result code: ' + IntToStr(ResultCode) + '.');
+    Log('The installed TFS runtime did not confirm Xbox Mode compatibility.');
+    RollBackXboxPackageInstalledThisRun;
+    RollBackXboxCertificateInstalledThisRun;
+    Exit;
+  end;
+
+  XboxModeSupportReady := True;
+  XboxModeFailureReason := '';
+  Log('Tools for Steam Xbox Mode support is installed and ready.');
 end;
 
 function GetExistingInstallLocation: string;
@@ -256,6 +540,69 @@ begin
   end;
 end;
 
+function IsXboxNativeApiAvailable: Boolean;
+var
+  ScriptPath: string;
+  Script: string;
+  ResultCode: Integer;
+begin
+  if XboxNativeApiChecked then
+  begin
+    Result := XboxNativeApiSupported;
+    Exit;
+  end;
+
+  XboxNativeApiChecked := True;
+  ScriptPath := ExpandConstant('{tmp}\tfs-check-xbox-fse-api.ps1');
+  Script :=
+    '$source = @''' + #13#10 +
+    'using System;' + #13#10 +
+    'using System.Runtime.InteropServices;' + #13#10 +
+    'public static class TfsXboxApiCheck {' + #13#10 +
+    '  [DllImport("kernel32.dll", EntryPoint = "LoadLibraryW", CharSet = CharSet.Unicode, SetLastError = true)]' + #13#10 +
+    '  private static extern IntPtr LoadLibrary(string name);' + #13#10 +
+    '  [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]' + #13#10 +
+    '  private static extern IntPtr GetProcAddress(IntPtr module, string name);' + #13#10 +
+    '  [DllImport("kernel32.dll")] private static extern bool FreeLibrary(IntPtr module);' + #13#10 +
+    '  public static bool Available() {' + #13#10 +
+    '    var module = LoadLibrary("api-ms-win-gaming-experience-l1-1-0.dll");' + #13#10 +
+    '    if (module == IntPtr.Zero) return false;' + #13#10 +
+    '    try {' + #13#10 +
+    '      return GetProcAddress(module, "IsGamingFullScreenExperienceActive") != IntPtr.Zero &&' + #13#10 +
+    '             GetProcAddress(module, "SetGamingFullScreenExperience") != IntPtr.Zero;' + #13#10 +
+    '    } finally { FreeLibrary(module); }' + #13#10 +
+    '  }' + #13#10 +
+    '}' + #13#10 +
+    '''@' + #13#10 +
+    'try { Add-Type -TypeDefinition $source -ErrorAction Stop; if ([TfsXboxApiCheck]::Available()) { exit 0 } } catch {}' + #13#10 +
+    'exit 1' + #13#10;
+
+  XboxNativeApiSupported :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+  Result := XboxNativeApiSupported;
+end;
+
+function IsXboxModePlatformSupported: Boolean;
+var
+  BuildNumber: Integer;
+  BuildRevision: Integer;
+begin
+  BuildNumber := GetWindowsBuildNumber;
+  BuildRevision := GetWindowsBuildRevision;
+  Result := (
+    (BuildNumber > 26100) or
+    ((BuildNumber = 26100) and (BuildRevision >= 7019))) and
+    IsXboxNativeApiAvailable;
+end;
+
 procedure CloseProcess(ImageName: string);
 var
   ResultCode: Integer;
@@ -276,7 +623,99 @@ begin
     ResultCode);
 end;
 
-procedure RequestSteamShutdown;
+procedure StopElevatedHelperTasksForInstall;
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/End /TN "\ToolsForSteam\GamepadHelper"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode);
+  Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/End /TN "\ToolsForSteam\FpsHelper"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode);
+end;
+
+function EnsureToolsForSteamRuntimeStopped: Boolean;
+var
+  ResultCode: Integer;
+  ScriptPath: string;
+  Script: string;
+begin
+  ScriptPath := ExpandConstant('{tmp}\tools-for-steam-stop-runtime.ps1');
+  Script :=
+    '$ErrorActionPreference = "SilentlyContinue"' + #13#10 +
+    '$names = @("ToolsForSteam", "SteamLoader", "ToolsForSteam.XboxHost")' + #13#10 +
+    '$deadline = (Get-Date).AddSeconds(12)' + #13#10 +
+    'do {' + #13#10 +
+    '  $processes = Get-Process -Name $names -ErrorAction SilentlyContinue' + #13#10 +
+    '  if (-not $processes) { exit 0 }' + #13#10 +
+    '  $processes | Stop-Process -Force -ErrorAction SilentlyContinue' + #13#10 +
+    '  Start-Sleep -Milliseconds 350' + #13#10 +
+    '} while ((Get-Date) -lt $deadline)' + #13#10 +
+    'if (Get-Process -Name $names -ErrorAction SilentlyContinue) { exit 1 }' + #13#10 +
+    'exit 0' + #13#10;
+
+  Result :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+end;
+
+function WaitForToolsForSteamExecutableRelease: Boolean;
+var
+  ExePath: string;
+  ScriptPath: string;
+  Script: string;
+  ResultCode: Integer;
+begin
+  ExePath := AddBackslash(ExpandConstant('{app}')) + '{#MyAppExeName}';
+  if not FileExists(ExePath) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  ScriptPath := ExpandConstant('{tmp}\tfs-wait-for-executable-release.ps1');
+  Script :=
+    '$path = ''' + EscapePowerShellSingleQuoted(ExePath) + '''' + #13#10 +
+    '$deadline = (Get-Date).AddSeconds(15)' + #13#10 +
+    'do {' + #13#10 +
+    '  try {' + #13#10 +
+    '    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)' + #13#10 +
+    '    $stream.Dispose()' + #13#10 +
+    '    exit 0' + #13#10 +
+    '  } catch {' + #13#10 +
+    '    Start-Sleep -Milliseconds 250' + #13#10 +
+    '  }' + #13#10 +
+    '} while ((Get-Date) -lt $deadline)' + #13#10 +
+    'exit 1' + #13#10;
+  Result :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+end;
+
+function RequestSteamShutdown: Boolean;
 var
   ResultCode: Integer;
   ScriptPath: string;
@@ -310,33 +749,72 @@ begin
     '$deadline = (Get-Date).AddSeconds(45)' + #13#10 +
     'do {' + #13#10 +
     '  Start-Sleep -Milliseconds 500' + #13#10 +
-    '  $processes = Get-Process steam,steamwebhelper -ErrorAction SilentlyContinue' + #13#10 +
-    '} while ($processes -and (Get-Date) -lt $deadline)' + #13#10;
+    '  $processes = Get-Process steam,steamwebhelper,GameOverlayUI,steamerrorreporter -ErrorAction SilentlyContinue' + #13#10 +
+    '} while ($processes -and (Get-Date) -lt $deadline)' + #13#10 +
+    'if ($processes) {' + #13#10 +
+    '  $processes | Stop-Process -Force -ErrorAction SilentlyContinue' + #13#10 +
+    '  Start-Sleep -Seconds 2' + #13#10 +
+    '}' + #13#10 +
+    'if (Get-Process steam,steamwebhelper,GameOverlayUI,steamerrorreporter -ErrorAction SilentlyContinue) { exit 1 }' + #13#10 +
+    'exit 0' + #13#10;
 
-  SaveStringToFile(ScriptPath, Script, False);
-  Exec(
-    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode);
+  Result :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
 end;
 
-procedure ShowFpsHelperInstallWarning(Message: string);
+procedure ShowElevatedHelperInstallWarning(Message: string);
 var
-  LogPath: string;
+  GamepadLogPath: string;
+  FpsLogPath: string;
 begin
   if not WizardSilent then
   begin
-    LogPath := ExpandConstant('{app}\data\fps-helper-task.log');
+    GamepadLogPath := ExpandConstant('{app}\data\gamepad-helper-task.log');
+    FpsLogPath := ExpandConstant('{app}\data\fps-helper-task.log');
     MsgBox(
       Message + #13#10#13#10 +
-      'You can still prepare it later in Performance > TFS FPS Overlay.' + #13#10#13#10 +
-      'Details were written to:' + #13#10 + LogPath,
+      'You can still repair the elevated helpers later after installation.' + #13#10#13#10 +
+      'Details were written to:' + #13#10 + GamepadLogPath + #13#10 + FpsLogPath,
       mbInformation,
       MB_OK);
   end;
+end;
+
+function IsGamepadHelperTaskInstalled: Boolean;
+var
+  InstallRoot: string;
+  ExePath: string;
+  ResultCode: Integer;
+begin
+  InstallRoot := GetResolvedInstallRootForChecks;
+  if InstallRoot = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  ExePath := AddBackslash(InstallRoot) + '{#MyAppExeName}';
+  if not FileExists(ExePath) then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  Result := Exec(
+    ExePath,
+    '--check-gamepad-helper-task',
+    InstallRoot,
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode) and (ResultCode = 0);
 end;
 
 function IsFpsHelperTaskInstalled: Boolean;
@@ -368,44 +846,189 @@ begin
     ResultCode) and (ResultCode = 0);
 end;
 
-procedure RegisterFpsHelperTaskSupport;
+procedure StartGamepadHelperAfterInstall;
+var
+  ResultCode: Integer;
+begin
+  if not IsGamepadHelperTaskInstalled then
+  begin
+    Log('The Gamepad Helper task is unavailable after installation; the runtime will keep using its local HID fallback.');
+    Exit;
+  end;
+
+  if Exec(
+      ExpandConstant('{sys}\schtasks.exe'),
+      '/Run /TN "\ToolsForSteam\GamepadHelper"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and (ResultCode = 0) then
+  begin
+    Log('The elevated Gamepad Helper task was started after installation.');
+  end
+  else
+  begin
+    Log('The post-install Gamepad Helper start returned code ' + IntToStr(ResultCode) + '; the runtime watchdog will retry it.');
+  end;
+end;
+
+procedure RegisterElevatedHelperTaskSupport;
 var
   ResultCode: Integer;
 begin
   if not FileExists(ExpandConstant('{app}\{#MyAppExeName}')) then
   begin
-    Log('TFS FPS helper task registration skipped because the executable is missing.');
+    Log('Elevated helper task registration skipped because the executable is missing.');
     Exit;
   end;
 
   ForceDirectories(ExpandConstant('{app}\data'));
 
-  if IsFpsHelperTaskInstalled then
+  if IsGamepadHelperTaskInstalled and IsFpsHelperTaskInstalled then
   begin
-    Log('TFS FPS helper task is already installed.');
-    Exit;
+    Log('Elevated helper tasks are already installed; refreshing them and sanitizing conflicting startup tasks.');
   end;
 
-  UpdateSetupStatus('Installing helper: TFS FPS Overlay elevated helper...');
+  UpdateSetupStatus('Installing helpers: elevated Xbox Mode and FPS helpers...');
 
   if not ShellExec(
     'runas',
     ExpandConstant('{app}\{#MyAppExeName}'),
-    '--register-fps-helper-task',
+    '--register-installed-helper-tasks',
     ExpandConstant('{app}'),
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode) then
   begin
-    Log('TFS FPS helper task registration was skipped or cancelled.');
-    ShowFpsHelperInstallWarning('The TFS FPS Overlay helper was not prepared during installation because the Windows admin prompt was cancelled or blocked.');
+    Log('Elevated helper task registration was skipped or cancelled.');
+    ShowElevatedHelperInstallWarning('The elevated TFS helper tasks were not prepared during installation because the Windows admin prompt was cancelled or blocked.');
     Exit;
   end;
 
-  if not IsFpsHelperTaskInstalled then
+  if not (IsGamepadHelperTaskInstalled and IsFpsHelperTaskInstalled) then
   begin
-    Log('TFS FPS helper task registration did not complete successfully.');
-    ShowFpsHelperInstallWarning('The TFS FPS Overlay helper could not be prepared during installation.');
+    Log('Elevated helper task registration did not complete successfully.');
+    ShowElevatedHelperInstallWarning('One or more elevated TFS helper tasks could not be prepared during installation.');
+  end;
+end;
+
+procedure SanitizeSteamAutostartSources;
+var
+  ResultCode: Integer;
+begin
+  if not FileExists(ExpandConstant('{app}\{#MyAppExeName}')) then
+  begin
+    Log('Steam autostart sanitation skipped because the executable is missing.');
+    Exit;
+  end;
+
+  ResultCode := -1;
+  if Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--sanitize-steam-autostart',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and (ResultCode = 0) then
+  begin
+    Log('Conflicting Steam and legacy TFS autostart sources were sanitized.');
+  end
+  else
+  begin
+    Log('Steam autostart sanitation returned code ' + IntToStr(ResultCode) + '.');
+  end;
+end;
+
+function IsPawnIOCurrent: Boolean;
+var
+  InstalledVersion: string;
+begin
+  InstalledVersion := '';
+  if not RegQueryStringValue(
+      HKLM,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO',
+      'DisplayVersion',
+      InstalledVersion) then
+  begin
+    RegQueryStringValue(
+      HKLM32,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO',
+      'DisplayVersion',
+      InstalledVersion);
+  end;
+
+  Result := (InstalledVersion <> '') and (CompareStr(InstalledVersion, '2.2.0.0') >= 0);
+end;
+
+function IsMsiClawA8: Boolean;
+var
+  Manufacturer: string;
+  ProductName: string;
+begin
+  Manufacturer := '';
+  ProductName := '';
+  RegQueryStringValue(HKLM, 'HARDWARE\DESCRIPTION\System\BIOS', 'BaseBoardManufacturer', Manufacturer);
+  RegQueryStringValue(HKLM, 'HARDWARE\DESCRIPTION\System\BIOS', 'BaseBoardProduct', ProductName);
+  Result :=
+    (CompareText(Manufacturer, 'MICRO-STAR INTERNATIONAL CO., LTD.') = 0) and
+    (CompareText(ProductName, 'MS-1T8K') = 0);
+end;
+
+procedure InstallPawnIOIfNeeded;
+var
+  SetupPath: string;
+  ActualHash: string;
+  ResultCode: Integer;
+begin
+  if not IsMsiClawA8 then
+  begin
+    Log('PawnIO installation skipped because this device is not an MSI Claw A8 (MS-1T8K).');
+    Exit;
+  end;
+
+  if IsPawnIOCurrent then
+  begin
+    Log('PawnIO 2.2.0 or newer is already installed.');
+    Exit;
+  end;
+
+  SetupPath := ExpandConstant('{app}\ThirdParty\PawnIO\PawnIO_setup.exe');
+  if not FileExists(SetupPath) then
+  begin
+    Log('PawnIO setup is missing from the installed payload.');
+    Exit;
+  end;
+
+  ActualHash := LowerCase(GetSHA256OfFile(SetupPath));
+  if ActualHash <> PawnIOSetupSha256 then
+  begin
+    Log('PawnIO setup hash verification failed.');
+    if not WizardSilent then
+      MsgBox('PawnIO was not installed because its setup file failed verification.', mbError, MB_OK);
+    Exit;
+  end;
+
+  UpdateSetupStatus('Installing PawnIO 2.2.0 for handheld TDP control...');
+  if not ShellExec(
+      'runas',
+      SetupPath,
+      '-install -silent',
+      ExpandConstant('{app}\ThirdParty\PawnIO'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) then
+  begin
+    Log('PawnIO installation was cancelled or could not be started.');
+    if not WizardSilent then
+      MsgBox('PawnIO installation was cancelled. You can install or repair it later from the handheld performance plugin.', mbInformation, MB_OK);
+    Exit;
+  end;
+
+  if (ResultCode <> 0) and (ResultCode <> 3010) then
+  begin
+    Log('PawnIO setup returned exit code ' + IntToStr(ResultCode) + '.');
+    if not WizardSilent then
+      MsgBox('PawnIO setup did not finish successfully. You can retry it later from the handheld performance plugin.', mbInformation, MB_OK);
   end;
 end;
 
@@ -438,7 +1061,15 @@ begin
     SettingsJsonLower := LowerCase(string(SettingsJson));
     if Pos('"startupmode"', SettingsJsonLower) > 0 then
     begin
-      if Pos('"tray"', SettingsJsonLower) > 0 then
+      if Pos('"xbox"', SettingsJsonLower) > 0 then
+      begin
+        Result := 'xbox';
+      end
+      else if Pos('"external"', SettingsJsonLower) > 0 then
+      begin
+        Result := 'xbox';
+      end
+      else if Pos('"tray"', SettingsJsonLower) > 0 then
       begin
         Result := 'tray';
       end
@@ -509,9 +1140,6 @@ begin
   Result := ReadStartupModeFromSettings;
 end;
 
-function SelectedStartupMode: string;
-forward;
-
 procedure UpdateSystemCheckPage;
 var
   CurrentMode: string;
@@ -523,12 +1151,21 @@ begin
   end;
 
   SystemCheckSummaryLabel.Caption :=
-    'The installer keeps Shell Mode in front, offers Tray Mode as the lightweight alternative, ' +
-    'and creates a rollback snapshot before it changes Windows startup hooks.';
+    'Choose Shell, Xbox Mode, or eTray, then let the installer keep a rollback snapshot ' +
+    'before it changes any Windows startup hooks.';
 
-  SystemCheckWindowsLabel.Caption :=
-    'Windows build: ' + IntToStr(GetWindowsBuildNumber()) + '.' + IntToStr(GetWindowsBuildRevision()) +
-    ' - ready for TFS.';
+  if IsXboxModePlatformSupported then
+  begin
+    SystemCheckWindowsLabel.Caption :=
+      'Windows build: ' + IntToStr(GetWindowsBuildNumber()) + '.' + IntToStr(GetWindowsBuildRevision()) +
+      ' - ready for TFS and Xbox Mode.';
+  end
+  else
+  begin
+    SystemCheckWindowsLabel.Caption :=
+      'Windows build: ' + IntToStr(GetWindowsBuildNumber()) + '.' + IntToStr(GetWindowsBuildRevision()) +
+      ' - Xbox Mode requires Windows 26100.7019 or newer and will not be installed or shown.';
+  end;
 
   if SteamInstallPath <> '' then
   begin
@@ -541,7 +1178,7 @@ begin
 
   if ExistingInstallPath <> '' then
   begin
-    SystemCheckInstallLabel.Caption := 'Existing TFS install: found at ' + ExistingInstallPath + ' (' + CurrentMode + ' mode).';
+    SystemCheckInstallLabel.Caption := 'Existing TFS install: found at ' + ExistingInstallPath + ' (' + DescribeStartupMode(CurrentMode) + ' mode).';
   end
   else
   begin
@@ -549,31 +1186,27 @@ begin
   end;
 
   SystemCheckHelperLabel.Caption :=
-    'Helper: the installer can prepare the elevated TFS FPS helper after files are copied. ' +
+    'Helper: the installer can prepare the elevated Xbox Mode and FPS helpers after files are copied. ' +
     'This check is deferred so the setup window always opens cleanly on fresh Windows installs.';
 
   SystemCheckRollbackLabel.Caption := 'Rollback: a snapshot and rollback script will be written before startup settings are changed.';
-end;
-
-procedure UpdateGuidePage;
-begin
-  GuideSummaryLabel.Caption :=
-    'Controller shortcuts stay simple now. Keep this page in mind so the first launch feels right right away.';
-  GuideShellLabel.Caption := 'Shell and Tray Mode: press Guide Button + A to open the TFS side panel.';
-  GuideSelectedModeLabel.Caption :=
-    'You selected ' + SelectedStartupMode + ' mode. Guide Button + A is the main open-panel shortcut after install.';
 end;
 
 procedure UpdateStartupModePageState;
 begin
   TrayModeRadio.Visible := True;
   TrayModeDescriptionLabel.Visible := True;
+  ExternalModeRadio.Visible := IsXboxModePlatformSupported;
+  ExternalModeDescriptionLabel.Visible := IsXboxModePlatformSupported;
+  if not IsXboxModePlatformSupported and ExternalModeRadio.Checked then
+  begin
+    ShellModeRadio.Checked := True;
+  end;
 end;
 
 procedure StartupModeSelectionChanged(Sender: TObject);
 begin
   UpdateStartupModePageState;
-  UpdateGuidePage;
 end;
 
 function SelectedStartupMode: string;
@@ -583,11 +1216,26 @@ begin
 #else
   if WizardSilent then
   begin
-    Result := ExistingStartupMode;
+    if UpdateInstallRequested and (UpdateStartupModeToRestore <> '') then
+    begin
+      Result := UpdateStartupModeToRestore;
+    end
+    else
+    begin
+      Result := ExistingStartupMode;
+    end;
     if Result = '' then
     begin
       Result := 'shell';
     end;
+    if (Result = 'xbox') and not IsXboxModePlatformSupported then
+    begin
+      Result := 'tray';
+    end;
+  end
+  else if ExternalModeRadio.Checked then
+  begin
+    Result := 'xbox';
   end
   else if TrayModeRadio.Checked then
   begin
@@ -605,13 +1253,16 @@ var
   CurrentMode: string;
   ControlTop: Integer;
 begin
+  UpdateInstallRequested := CompareText(ExpandConstant('{param:TFSUPDATE|0}'), '1') = 0;
 #if VariantCustomPages == "0"
   ExistingInstallPath := GetExistingInstallLocation;
   SteamInstallPath := GetSteamInstallLocation;
+  UpdateStartupModeToRestore := ExistingStartupMode;
 #else
   CurrentMode := ExistingStartupMode;
   ExistingInstallPath := GetExistingInstallLocation;
   SteamInstallPath := GetSteamInstallLocation;
+  UpdateStartupModeToRestore := CurrentMode;
 
   SystemCheckPage := CreateCustomPage(
     wpWelcome,
@@ -685,24 +1336,32 @@ begin
   StartupModePage := CreateCustomPage(
     SystemCheckPage.ID,
     'Choose startup mode',
-    'Shell Mode stays front-and-center. Open the other paths only if you really want them.');
+    'Pick the startup style you want now. You can still switch later inside TFS.');
 
   StartupModeSummaryLabel := TNewStaticText.Create(WizardForm);
   StartupModeSummaryLabel.Parent := StartupModePage.Surface;
   StartupModeSummaryLabel.Left := 0;
   StartupModeSummaryLabel.Top := ScaleY(4);
   StartupModeSummaryLabel.Width := StartupModePage.SurfaceWidth;
-  StartupModeSummaryLabel.Height := ScaleY(54);
+  StartupModeSummaryLabel.Height := ScaleY(42);
   StartupModeSummaryLabel.AutoSize := False;
   StartupModeSummaryLabel.WordWrap := True;
-  StartupModeSummaryLabel.Caption :=
-    'Shell Mode (Recommended) gives the cleanest couch setup, so it is preselected. ' +
-    'Tray Mode stays available right below it if you want the lighter Windows-first path instead.';
+  if IsXboxModePlatformSupported then
+  begin
+    StartupModeSummaryLabel.Caption :=
+      'Shell Mode (Recommended) gives the cleanest couch setup, so it is preselected. ' +
+      'Xbox Mode and eTray stay available below it and all three modes cleanly replace each other.';
+  end
+  else
+  begin
+    StartupModeSummaryLabel.Caption :=
+      'Shell Mode (Recommended) and eTray are available. Xbox Mode is hidden because this Windows build does not provide the required Gaming FSE support.';
+  end;
 
   ShellModeRadio := TNewRadioButton.Create(WizardForm);
   ShellModeRadio.Parent := StartupModePage.Surface;
   ShellModeRadio.Left := 0;
-  ShellModeRadio.Top := ScaleY(78);
+  ShellModeRadio.Top := ScaleY(60);
   ShellModeRadio.Width := StartupModePage.SurfaceWidth;
   ShellModeRadio.Caption := 'Shell Mode (Recommended)';
   ShellModeRadio.Checked := (CurrentMode = '') or (CurrentMode = 'shell');
@@ -711,9 +1370,9 @@ begin
   ShellModeDescriptionLabel := TNewStaticText.Create(WizardForm);
   ShellModeDescriptionLabel.Parent := StartupModePage.Surface;
   ShellModeDescriptionLabel.Left := ScaleX(20);
-  ShellModeDescriptionLabel.Top := ScaleY(104);
+  ShellModeDescriptionLabel.Top := ScaleY(84);
   ShellModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
-  ShellModeDescriptionLabel.Height := ScaleY(44);
+  ShellModeDescriptionLabel.Height := ScaleY(34);
   ShellModeDescriptionLabel.AutoSize := False;
   ShellModeDescriptionLabel.WordWrap := True;
   ShellModeDescriptionLabel.Caption :=
@@ -722,16 +1381,16 @@ begin
   TrayModeRadio := TNewRadioButton.Create(WizardForm);
   TrayModeRadio.Parent := StartupModePage.Surface;
   TrayModeRadio.Left := 0;
-  TrayModeRadio.Top := ScaleY(172);
+  TrayModeRadio.Top := ScaleY(128);
   TrayModeRadio.Width := StartupModePage.SurfaceWidth;
-  TrayModeRadio.Caption := 'Tray app mode';
+  TrayModeRadio.Caption := 'eTray mode';
   TrayModeRadio.Checked := CurrentMode = 'tray';
   TrayModeRadio.OnClick := @StartupModeSelectionChanged;
 
   TrayModeDescriptionLabel := TNewStaticText.Create(WizardForm);
   TrayModeDescriptionLabel.Parent := StartupModePage.Surface;
   TrayModeDescriptionLabel.Left := ScaleX(20);
-  TrayModeDescriptionLabel.Top := ScaleY(198);
+  TrayModeDescriptionLabel.Top := ScaleY(152);
   TrayModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
   TrayModeDescriptionLabel.Height := ScaleY(36);
   TrayModeDescriptionLabel.AutoSize := False;
@@ -739,47 +1398,174 @@ begin
   TrayModeDescriptionLabel.Caption :=
     'Keep the normal Windows shell and start TFS quietly with Windows as a tray-style launcher service.';
 
+  ExternalModeRadio := TNewRadioButton.Create(WizardForm);
+  ExternalModeRadio.Parent := StartupModePage.Surface;
+  ExternalModeRadio.Left := 0;
+  ExternalModeRadio.Top := ScaleY(194);
+  ExternalModeRadio.Width := StartupModePage.SurfaceWidth;
+  ExternalModeRadio.Caption := 'Xbox Mode';
+  ExternalModeRadio.Checked := (CurrentMode = 'xbox') or (CurrentMode = 'external');
+  ExternalModeRadio.OnClick := @StartupModeSelectionChanged;
+
+  ExternalModeDescriptionLabel := TNewStaticText.Create(WizardForm);
+  ExternalModeDescriptionLabel.Parent := StartupModePage.Surface;
+  ExternalModeDescriptionLabel.Left := ScaleX(20);
+  ExternalModeDescriptionLabel.Top := ScaleY(218);
+  ExternalModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
+  ExternalModeDescriptionLabel.Height := ScaleY(48);
+  ExternalModeDescriptionLabel.AutoSize := False;
+  ExternalModeDescriptionLabel.WordWrap := True;
+  ExternalModeDescriptionLabel.Caption :=
+    'Use the signed TFS Gaming Home package. Explorer remains the Windows shell and eTray startup is disabled.';
+
   GuidePage := CreateCustomPage(
-    StartupModePage.ID,
+    wpSelectDir,
     'Controller guide',
-    'One quick page so the first launch already feels natural.');
+    'Steam and in-game controller shortcuts at a glance.');
 
-  GuideSummaryLabel := TNewStaticText.Create(WizardForm);
-  GuideSummaryLabel.Parent := GuidePage.Surface;
-  GuideSummaryLabel.Left := 0;
-  GuideSummaryLabel.Top := ScaleY(4);
-  GuideSummaryLabel.Width := GuidePage.SurfaceWidth;
-  GuideSummaryLabel.Height := ScaleY(56);
-  GuideSummaryLabel.AutoSize := False;
-  GuideSummaryLabel.WordWrap := True;
+  ExtractTemporaryFile('ControllerGuide.png');
+  GuideControllerImage := TBitmapImage.Create(WizardForm);
+  GuideControllerImage.Parent := GuidePage.Surface;
+  GuideControllerImage.Left := 0;
+  GuideControllerImage.Width := GuidePage.SurfaceWidth;
+  GuideControllerImage.Height := (GuideControllerImage.Width * 9) div 16;
+  GuideControllerImage.Top := (GuidePage.SurfaceHeight - GuideControllerImage.Height) div 2;
+  GuideControllerImage.Stretch := True;
+  GuideControllerImage.Center := True;
+  GuideControllerImage.BackColor := clNone;
+  GuideControllerImage.PngImage.LoadFromFile(ExpandConstant('{tmp}\ControllerGuide.png'));
 
-  GuideShellLabel := TNewStaticText.Create(WizardForm);
-  GuideShellLabel.Parent := GuidePage.Surface;
-  GuideShellLabel.Left := 0;
-  GuideShellLabel.Top := ScaleY(82);
-  GuideShellLabel.Width := GuidePage.SurfaceWidth;
-  GuideShellLabel.Height := ScaleY(40);
-  GuideShellLabel.AutoSize := False;
-  GuideShellLabel.WordWrap := True;
-
-  GuideSelectedModeLabel := TNewStaticText.Create(WizardForm);
-  GuideSelectedModeLabel.Parent := GuidePage.Surface;
-  GuideSelectedModeLabel.Left := 0;
-  GuideSelectedModeLabel.Top := ScaleY(150);
-  GuideSelectedModeLabel.Width := GuidePage.SurfaceWidth;
-  GuideSelectedModeLabel.Height := ScaleY(44);
-  GuideSelectedModeLabel.AutoSize := False;
-  GuideSelectedModeLabel.WordWrap := True;
-
-  if not (ShellModeRadio.Checked or TrayModeRadio.Checked) then
+  if not (ShellModeRadio.Checked or TrayModeRadio.Checked or ExternalModeRadio.Checked) then
   begin
     ShellModeRadio.Checked := True;
   end;
 
   UpdateSystemCheckPage;
   UpdateStartupModePageState;
-  UpdateGuidePage;
 #endif
+end;
+
+function ShouldSuspendXboxModeForInstall: Boolean;
+var
+  GamingHomeApp: string;
+begin
+  if GetExistingInstallLocation = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  GamingHomeApp := GetRegistryStringValue(
+    HKCU,
+    'Software\Microsoft\Windows\CurrentVersion\GamingConfiguration',
+    'GamingHomeApp');
+  Result :=
+    (CompareText(GamingHomeApp, XboxHostPackageFamilyName + '!App') = 0) or
+    (CompareText(UpdateStartupModeToRestore, 'xbox') = 0);
+end;
+
+function RunXboxModeSessionTool(Mode: string): Boolean;
+var
+  ScriptPath: string;
+  LogPath: string;
+  ResultCode: Integer;
+begin
+  ExtractTemporaryFile('XboxModeSession.ps1');
+  ScriptPath := ExpandConstant('{tmp}\XboxModeSession.ps1');
+  LogPath := AddBackslash(ExpandConstant('{app}')) + 'data\xbox-mode-installer.log';
+  Result := Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
+    ' -Mode "' + Mode + '"' +
+    ' -StatePath "' + XboxModeSessionStatePath + '"' +
+    ' -LogPath "' + LogPath + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode) and (ResultCode = 0);
+  if not Result then
+  begin
+    Log('Xbox Mode session tool failed in ' + Mode + ' mode with code ' + IntToStr(ResultCode) + '.');
+  end;
+end;
+
+function SuspendXboxModeForInstall: Boolean;
+begin
+  Result := True;
+  if not ShouldSuspendXboxModeForInstall then
+  begin
+    Exit;
+  end;
+
+  XboxModeSessionStatePath := ExpandConstant('{tmp}\tfs-xbox-mode-install-state.json');
+  DeleteFile(XboxModeSessionStatePath);
+  UpdateSetupStatus('Leaving Xbox Mode safely before updating files and the Gaming Home package...');
+  Result := RunXboxModeSessionTool('Suspend');
+  XboxModeSuspendedForInstall := Result;
+end;
+
+procedure RestoreSuspendedXboxModeAfterFailure;
+begin
+  if not XboxModeSuspendedForInstall then
+  begin
+    Exit;
+  end;
+
+  UpdateSetupStatus('Restoring the Xbox Mode state from before the failed install...');
+  if RunXboxModeSessionTool('Restore') then
+  begin
+    XboxModeSuspendedForInstall := False;
+    DeleteFile(XboxModeSessionStatePath);
+  end;
+end;
+
+function ApplyInstalledStartupMode(Mode: string): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result :=
+    FileExists(ExpandConstant('{app}\{#MyAppExeName}')) and
+    Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--set-startup-mode=' + Mode,
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+  if not Result then
+  begin
+    Log('The installed TFS runtime did not confirm startup mode ' + Mode + '.');
+  end;
+end;
+
+function FinalizeInstalledStartupMode(AllowTrayFallback: Boolean): Boolean;
+var
+  TargetMode: string;
+begin
+  TargetMode := SelectedStartupMode;
+  if (TargetMode = 'xbox') and not XboxModeSupportReady then
+  begin
+    if UpdateInstallRequested and IsXboxModePlatformSupported then
+    begin
+      Result := False;
+      Exit;
+    end;
+    TargetMode := 'tray';
+  end;
+
+  Result := ApplyInstalledStartupMode(TargetMode);
+  if not Result and AllowTrayFallback and (TargetMode <> 'tray') then
+  begin
+    TargetMode := 'tray';
+    Result := ApplyInstalledStartupMode(TargetMode);
+  end;
+
+  if Result then
+  begin
+    FinalizedStartupMode := TargetMode;
+    StartupModeFinalized := True;
+  end;
 end;
 
 function IsShellMode: Boolean;
@@ -792,9 +1578,14 @@ begin
   Result := SelectedStartupMode = 'tray';
 end;
 
-function BuildPostInstallSettingsArguments: string;
+function IsExternalMode: Boolean;
 begin
-  Result := '--manager';
+  Result := (SelectedStartupMode = 'xbox') and XboxModeSupportReady;
+end;
+
+function IsXboxModeFallback: Boolean;
+begin
+  Result := (SelectedStartupMode = 'xbox') and not XboxModeSupportReady;
 end;
 
 procedure CreateInstallerBackupSnapshot;
@@ -900,33 +1691,118 @@ begin
     UpdateStartupModePageState;
   end;
 
-  if CurPageID = GuidePage.ID then
-  begin
-    UpdateGuidePage;
-  end;
 #endif
 
-  if (CurPageID = wpFinished) and (not WizardSilent) then
-  begin
-    LaunchSettingsAfterSetup := True;
-    PostInstallSettingsArguments := BuildPostInstallSettingsArguments;
-  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    InstallXboxModeSupport;
+    InstallPawnIOIfNeeded;
 #if VariantFpsHelperPrep == "1"
-    RegisterFpsHelperTaskSupport;
+    RegisterElevatedHelperTaskSupport;
 #endif
+    SanitizeSteamAutostartSources;
+    { Startup mode finalization is deliberately deferred until setup teardown.
+      Xbox Mode must not relaunch TFS or Steam while package and helper work is active. }
+    InstallFinalizationReady := True;
   end;
 end;
 
-procedure DeinitializeSetup;
+procedure RunXboxModeDiagnostics;
+var
+  ScriptPath: string;
+  ReportPath: string;
+  InstallerState: string;
+  ResultCode: Integer;
+begin
+  ReportPath := AddBackslash(ExpandConstant('{src}')) + 'ToolsForSteam-XboxMode-Diagnostics.log';
+  InstallerState :=
+    'UpdateRequested=' + DiagnosticBool(UpdateInstallRequested) +
+    '; InstallFinalizationReady=' + DiagnosticBool(InstallFinalizationReady) +
+    '; StartupModeFinalized=' + DiagnosticBool(StartupModeFinalized) +
+    '; XboxModeSupportReady=' + DiagnosticBool(XboxModeSupportReady) +
+    '; XboxModeSuspended=' + DiagnosticBool(XboxModeSuspendedForInstall);
+
+  try
+    ExtractTemporaryFile('XboxModeDiagnostics.ps1');
+    ScriptPath := ExpandConstant('{tmp}\XboxModeDiagnostics.ps1');
+    ResultCode := -1;
+    if Exec(
+        ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+        '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + ScriptPath + '"' +
+        ' -RequestedOutputPath "' + ReportPath + '"' +
+        ' -InstallerLogPath "' + ExpandConstant('{log}') + '"' +
+        ' -InstallRoot "' + ExpandConstant('{app}') + '"' +
+        ' -SetupPath "' + ExpandConstant('{srcexe}') + '"' +
+        ' -SelectedMode "' + SelectedStartupMode + '"' +
+        ' -FinalizedMode "' + FinalizedStartupMode + '"' +
+        ' -FailureReason "' + DiagnosticFailureReason + '"' +
+        ' -InstallerState "' + InstallerState + '"' +
+        ' -ExpectedPackageName "' + XboxHostPackageName + '"' +
+        ' -ExpectedPackageFamilyName "' + XboxHostPackageFamilyName + '"' +
+        ' -ExpectedThumbprint "' + XboxHostCertificateThumbprint + '"',
+        '',
+        SW_HIDE,
+        ewWaitUntilTerminated,
+        ResultCode) and (ResultCode = 0) then
+    begin
+      Log('Xbox Mode diagnostics written next to the setup executable: ' + ReportPath);
+    end
+    else
+    begin
+      Log('Xbox Mode diagnostics collector returned code ' + IntToStr(ResultCode) + '. Check the Desktop or the installation data directory for its fallback report.');
+    end;
+  except
+    Log('Xbox Mode diagnostics collector failed to start: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure DeinitializeSetupCore;
 var
   ResultCode: Integer;
 begin
+  if not InstallFinalizationReady then
+  begin
+    RestoreSuspendedXboxModeAfterFailure;
+    Exit;
+  end;
+
+  if not StartupModeFinalized then
+  begin
+    if not FinalizeInstalledStartupMode(True) then
+    begin
+      RecordDiagnosticFailure('Windows did not confirm a safe startup mode during installer finalization.');
+      RestoreSuspendedXboxModeAfterFailure;
+      if not WizardSilent then
+      begin
+        MsgBox(
+          'Windows did not confirm a safe Tools for Steam startup mode. The state from before installation was restored. Details are in data\xbox-mode-installer.log.',
+          mbError,
+          MB_OK);
+      end;
+      Exit;
+    end;
+  end;
+
+  XboxModeSuspendedForInstall := False;
+  DeleteFile(XboxModeSessionStatePath);
+  StartGamepadHelperAfterInstall;
+
+  if WizardSilent and (FinalizedStartupMode <> 'xbox') and
+     FileExists(ExpandConstant('{app}\{#MyAppExeName}')) then
+  begin
+    Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--tray',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewNoWait,
+      ResultCode);
+  end;
+
   if not LaunchSettingsAfterSetup then
   begin
     Exit;
@@ -946,21 +1822,93 @@ begin
     ResultCode);
 end;
 
+procedure DeinitializeSetup;
+begin
+  try
+    DeinitializeSetupCore;
+  finally
+    RunXboxModeDiagnostics;
+    if (XboxModeFailureReason <> '') and not WizardSilent then
+    begin
+      MsgBox(
+        'Tools for Steam could not enable Xbox Mode:' + #13#10 +
+        XboxModeFailureReason + #13#10#13#10 +
+        'A complete diagnostic report was created as ToolsForSteam-XboxMode-Diagnostics.log next to this setup EXE. If that folder is read-only, the report is on your Desktop.',
+        mbError,
+        MB_OK);
+    end;
+  end;
+end;
+
 function NeedRestart: Boolean;
 begin
   Result := False;
 end;
 
+function IsUpdateOrUpgradeInstall: Boolean;
+begin
+  Result := UpdateInstallRequested or (GetExistingInstallLocation <> '');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   CreateInstallerBackupSnapshot;
-  UpdateSetupStatus('Closing running Tools for Steam and Steam sessions before install...');
+  if not SuspendXboxModeForInstall then
+  begin
+    RecordDiagnosticFailure('The installer could not leave the active Xbox Mode session safely before replacing files.');
+    Result := 'Tools for Steam could not leave Xbox Mode safely. Installation was stopped before any files were replaced. See data\xbox-mode-installer.log.';
+    Exit;
+  end;
+
+  UpdateSetupStatus('Stopping every Tools for Steam, helper, Xbox Host, and Steam process before install...');
+  StopElevatedHelperTasksForInstall;
   RequestToolsForSteamShutdown;
   Sleep(2000);
   RestoreWindowsShellChrome;
   CloseProcess('ToolsForSteam.exe');
   CloseProcess('SteamLoader.exe');
-  RequestSteamShutdown;
+  CloseProcess('ToolsForSteam.XboxHost.exe');
+  if not EnsureToolsForSteamRuntimeStopped then
+  begin
+    RecordDiagnosticFailure('A Tools for Steam, elevated helper, or Xbox Host process remained active after forced shutdown.');
+    RestoreSuspendedXboxModeAfterFailure;
+    Result := 'A Tools for Steam or helper process is still running. Installation was stopped before replacing files.';
+    Exit;
+  end;
+  if not WaitForToolsForSteamExecutableRelease then
+  begin
+    RecordDiagnosticFailure('ToolsForSteam.exe remained locked after the coordinated shutdown.');
+    RestoreSuspendedXboxModeAfterFailure;
+    Result := 'ToolsForSteam.exe is still in use after the coordinated shutdown. Installation was stopped before replacing files.';
+    Exit;
+  end;
+  if (not IsUpdateOrUpgradeInstall) or (SelectedStartupMode = 'xbox') then
+  begin
+    if IsUpdateOrUpgradeInstall then
+    begin
+      UpdateSetupStatus('Preparing a clean Steam hand-off for the updated Xbox Mode...');
+    end;
+
+    if not RequestSteamShutdown then
+    begin
+      RecordDiagnosticFailure('Steam could not be stopped completely before the Xbox Mode hand-off.');
+      RestoreSuspendedXboxModeAfterFailure;
+      Result := 'Steam could not be stopped safely before entering the updated Xbox Mode. Close Steam and retry the update.';
+      Exit;
+    end;
+
+    { Nothing may recreate Steam between shutdown and file replacement. }
+    StopElevatedHelperTasksForInstall;
+    CloseProcess('ToolsForSteam.exe');
+    CloseProcess('ToolsForSteam.XboxHost.exe');
+    if not EnsureToolsForSteamRuntimeStopped then
+    begin
+      RecordDiagnosticFailure('Tools for Steam restarted after Steam shutdown and before Xbox Mode update.');
+      RestoreSuspendedXboxModeAfterFailure;
+      Result := 'Tools for Steam restarted unexpectedly during the clean Xbox Mode hand-off. Retry the update.';
+      Exit;
+    end;
+  end;
   RestoreWindowsShellChrome;
   Result := '';
 end;

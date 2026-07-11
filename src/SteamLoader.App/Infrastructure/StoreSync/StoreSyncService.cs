@@ -565,6 +565,11 @@ public sealed class StoreSyncService
         lock (_gate)
         {
             var configuration = _settingsStore.Load();
+            if (!StorefrontFeatureFlags.Enabled)
+            {
+                return BuildSnapshot(configuration);
+            }
+
             var storeConfiguration = GetUnifySteamStoreConfiguration(configuration, storeId);
             storeConfiguration.Enabled = enabled;
             _settingsStore.Save(configuration);
@@ -577,6 +582,11 @@ public sealed class StoreSyncService
         lock (_gate)
         {
             var configuration = _settingsStore.Load();
+            if (!StorefrontFeatureFlags.Enabled)
+            {
+                return BuildSnapshot(configuration);
+            }
+
             _unifySteamService.RefreshLibraries(configuration, storeId);
             _settingsStore.Save(configuration);
             return BuildSnapshot(configuration);
@@ -588,6 +598,11 @@ public sealed class StoreSyncService
         lock (_gate)
         {
             var configuration = _settingsStore.Load();
+            if (!StorefrontFeatureFlags.Enabled)
+            {
+                return BuildSnapshot(configuration);
+            }
+
             _unifySteamService.StartLogin(configuration, storeId);
             _settingsStore.Save(configuration);
             return BuildSnapshot(configuration);
@@ -599,6 +614,11 @@ public sealed class StoreSyncService
         lock (_gate)
         {
             var configuration = _settingsStore.Load();
+            if (!StorefrontFeatureFlags.Enabled)
+            {
+                return BuildSnapshot(configuration);
+            }
+
             _unifySteamService.CompleteManualCodeAuth(configuration, storeId, value);
             // Load the library right away so a successful paste needs no extra refresh click.
             _unifySteamService.RefreshLibraries(configuration, storeId);
@@ -940,7 +960,9 @@ public sealed class StoreSyncService
                     DetectedTitles: []);
             })
             .ToList();
-        var unifySteam = _unifySteamService.BuildSnapshot(configuration, stores);
+        var unifySteam = StorefrontFeatureFlags.Enabled
+            ? _unifySteamService.BuildSnapshot(configuration, stores)
+            : StorefrontFeatureFlags.BuildDisabledSnapshot();
 
         return new StoreSyncSnapshot(
             profile,
@@ -994,7 +1016,9 @@ public sealed class StoreSyncService
                     .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
                     .ToArray()))
             .ToList();
-        var unifySteam = _unifySteamService.BuildSnapshot(configuration, stores);
+        var unifySteam = StorefrontFeatureFlags.Enabled
+            ? _unifySteamService.BuildSnapshot(configuration, stores)
+            : StorefrontFeatureFlags.BuildDisabledSnapshot();
 
         return new StoreSyncSnapshot(
             profile,
@@ -1027,9 +1051,13 @@ public sealed class StoreSyncService
             })
             .ToList();
 
-        // Virtual store: not-yet-installed games from the connected launcher accounts
-        // become Steam shortcuts that download + start the game on first launch.
-        snapshots.Add(BuildUnifySteamStoreSnapshot(configuration, snapshots));
+        if (StorefrontFeatureFlags.Enabled)
+        {
+            // Virtual store: not-yet-installed games from the connected launcher accounts
+            // become Steam shortcuts that download + start the game on first launch.
+            snapshots.Add(BuildUnifySteamStoreSnapshot(configuration, snapshots));
+        }
+
         return snapshots;
     }
 
@@ -1187,6 +1215,11 @@ public sealed class StoreSyncService
     /// </summary>
     public void TryRunAutomaticUnifySteamRefresh()
     {
+        if (!StorefrontFeatureFlags.Enabled)
+        {
+            return;
+        }
+
         lock (_gate)
         {
             if (_activeUnifyRefreshTask is { IsCompleted: false })

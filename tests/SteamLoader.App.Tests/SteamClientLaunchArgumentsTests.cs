@@ -55,4 +55,24 @@ public sealed class SteamClientLaunchArgumentsTests
             }
         }
     }
+
+    [Theory]
+    [InlineData("C:\\Steam\\steam.exe -gamepadui -dev -cef-enable-debugging")]
+    [InlineData("\"C:\\Program Files (x86)\\Steam\\steam.exe\" -CEF-ENABLE-DEBUGGING -DEV -GAMEPADUI")]
+    public void HasRequiredConsoleLaunchArguments_AllRequiredFlags_ReturnsTrue(string commandLine)
+    {
+        Assert.True(SteamClientLaunchService.HasRequiredConsoleLaunchArguments(commandLine));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("steam.exe")]
+    [InlineData("steam.exe -dev -cef-enable-debugging")]
+    [InlineData("steam.exe -gamepadui -cef-enable-debugging")]
+    [InlineData("steam.exe -gamepadui -dev")]
+    public void HasRequiredConsoleLaunchArguments_MissingFlag_ReturnsFalse(string? commandLine)
+    {
+        Assert.False(SteamClientLaunchService.HasRequiredConsoleLaunchArguments(commandLine));
+    }
 }

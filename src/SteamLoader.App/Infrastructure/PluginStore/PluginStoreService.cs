@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -14,11 +15,15 @@ public sealed class PluginStoreService
     private const string PermissionStorage = "storage";
     private const string PermissionSecrets = "secrets";
     private const string PermissionNetwork = "network";
+    private const string PermissionFiles = "files";
     private const int SupportedSdkMajorVersion = 1;
     private const int MaxPluginSettingsBytes = 256 * 1024;
     private const int MaxPluginSecretLength = 16 * 1024;
     private const int MaxPluginNetworkRequestBytes = 512 * 1024;
     private const int MaxPluginNetworkResponseBytes = 1024 * 1024;
+    private const int MaxPluginFileBytes = 8 * 1024 * 1024;
+    private const long MaxPluginFilesBytes = 32L * 1024 * 1024;
+    private const int MaxPluginFileEntries = 1024;
     private const int MaxCommunityCatalogBytes = 1024 * 1024;
     private const long MaxCommunityPackageBytes = 64L * 1024 * 1024;
     private const long MaxCommunityPackageExtractedBytes = 128L * 1024 * 1024;
@@ -32,29 +37,25 @@ public sealed class PluginStoreService
         PermissionStorage,
         PermissionSecrets,
         PermissionNetwork,
+        PermissionFiles,
         "frontend"
     };
 
-    private static readonly string ShopPictureDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-        "tfs version",
-        "shop_picture");
-
-    private static readonly IReadOnlyDictionary<string, string> BuiltInImageFiles =
+    private static readonly IReadOnlyDictionary<string, string> BuiltInImageAccents =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            ["app-start"] = "appstart.png",
-            ["artwork"] = "steamgriddb.png",
-            ["audio"] = "audio.png",
-            ["auto-sisr"] = "autosisr.png",
-            ["display"] = "display.png",
-            ["hltb"] = "how long to beat .png",
-            ["performance"] = "performance.png",
-            ["power"] = "power.png",
-            ["processes"] = "prozesse.png",
-            ["smart-home"] = "homey.png",
-            ["store-sync"] = "storesync.png",
-            ["themes"] = "cssloader.png"
+            ["app-start"] = "#3FA7FF",
+            ["artwork"] = "#F97316",
+            ["audio"] = "#10B981",
+            ["auto-sisr"] = "#F43F5E",
+            ["display"] = "#EAB308",
+            ["hltb"] = "#8B5CF6",
+            ["performance"] = "#22C55E",
+            ["power"] = "#FB7185",
+            ["processes"] = "#14B8A6",
+            ["smart-home"] = "#06B6D4",
+            ["store-sync"] = "#60A5FA",
+            ["themes"] = "#A855F7"
         };
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -71,15 +72,23 @@ public sealed class PluginStoreService
     private readonly string _communityRootPath;
     private readonly string _sdkDataRootPath;
     private readonly string _catalogImagesRootPath;
+    private readonly string _builtInImagesRootPath;
+    private readonly bool _enableCommunityCatalogBootstrap;
     private readonly object _gate = new();
+    private readonly object _sdkFileGate = new();
     private readonly List<PluginStoreInputState> _inputQueue = [];
+    private readonly SemaphoreSlim _catalogSyncSemaphore = new(1, 1);
+    private readonly object _catalogBootstrapGate = new();
     private bool _overlayOpen;
     private long _inputNonce;
+    private Task? _communityCatalogBootstrapTask;
+    private string _communityCatalogBootstrapError = string.Empty;
 
     public PluginStoreService(
         HttpClient httpClient,
         SteamLoaderSettingsService settingsService,
-        string rootPath)
+        string rootPath,
+        bool enableCommunityCatalogBootstrap = true)
     {
         _httpClient = httpClient;
         _settingsService = settingsService;
@@ -90,10 +99,19 @@ public sealed class PluginStoreService
         _communityRootPath = Path.Combine(rootPath, "community");
         _sdkDataRootPath = Path.Combine(rootPath, "sdk-data");
         _catalogImagesRootPath = Path.Combine(rootPath, "images");
+        _builtInImagesRootPath = Path.Combine(_catalogImagesRootPath, "built-in");
+        _enableCommunityCatalogBootstrap = enableCommunityCatalogBootstrap;
+
+        EnsureBuiltInImageCache();
     }
 
     public async Task<PluginStoreSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
     {
+        if (_enableCommunityCatalogBootstrap)
+        {
+            await EnsureCommunityCatalogAvailableAsync(cancellationToken);
+        }
+
         var settingsSnapshot = _settingsService.GetSnapshot();
         var builtInById = settingsSnapshot.Plugins.ToDictionary(plugin => plugin.Id, StringComparer.OrdinalIgnoreCase);
         var builtInPlugins = SteamLoaderPluginCatalog.Definitions
@@ -169,17 +187,7 @@ public sealed class PluginStoreService
         imagePath = string.Empty;
         contentType = string.Empty;
 
-        var normalizedPluginId = NormalizePluginId(pluginId);
-        if (normalizedPluginId.Length == 0 ||
-            !BuiltInImageFiles.TryGetValue(normalizedPluginId, out var fileName))
-        {
-            return false;
-        }
-
-        var candidatePath = Path.GetFullPath(Path.Combine(ShopPictureDirectory, fileName));
-        var directoryPath = Path.GetFullPath(ShopPictureDirectory);
-        if (!candidatePath.StartsWith(directoryPath, StringComparison.OrdinalIgnoreCase) ||
-            !File.Exists(candidatePath))
+        if (!TryResolveBuiltInImagePath(pluginId, out var candidatePath))
         {
             return false;
         }
@@ -593,6 +601,266 @@ public sealed class PluginStoreService
             networkResponse.Content.Headers.ContentType?.ToString() ?? string.Empty,
             responseBody,
             headers);
+    }
+
+    public PluginSdkFileListState ListPluginSdkFiles(
+        string pluginId,
+        PluginSdkFileListRequest? request)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var normalizedPath = NormalizePluginFilePath(request?.Path, allowEmpty: true);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            if (!Directory.Exists(targetPath))
+            {
+                if (File.Exists(targetPath))
+                {
+                    throw new InvalidOperationException("The requested plugin file path is not a directory.");
+                }
+
+                return new PluginSdkFileListState(
+                    normalizedPath,
+                    [],
+                    GetPluginFilesUsage(rootPath),
+                    MaxPluginFilesBytes);
+            }
+
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            var entries = EnumeratePluginFileEntries(rootPath, targetPath, request?.Recursive ?? false);
+            return new PluginSdkFileListState(
+                normalizedPath,
+                entries,
+                GetPluginFilesUsage(rootPath),
+                MaxPluginFilesBytes);
+        }
+    }
+
+    public PluginSdkFileMutationState GetPluginSdkFileInfo(string pluginId, PluginSdkFilePathRequest? request)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var normalizedPath = NormalizePluginFilePath(request?.Path, allowEmpty: true);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            return BuildPluginFileMutationState(rootPath, targetPath, normalizedPath);
+        }
+    }
+
+    public PluginSdkFileContentState ReadPluginSdkFile(string pluginId, PluginSdkFileReadRequest? request)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var normalizedPath = NormalizePluginFilePath(request?.Path, allowEmpty: false);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            if (!File.Exists(targetPath))
+            {
+                throw new FileNotFoundException("The requested plugin file does not exist.", normalizedPath);
+            }
+
+            var fileInfo = new FileInfo(targetPath);
+            if (fileInfo.Length > MaxPluginFileBytes)
+            {
+                throw new InvalidOperationException("The requested plugin file is too large to read through the SDK.");
+            }
+
+            var encoding = NormalizePluginFileEncoding(request?.Encoding);
+            var bytes = File.ReadAllBytes(targetPath);
+            var content = encoding == "base64"
+                ? Convert.ToBase64String(bytes)
+                : new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(bytes);
+            return new PluginSdkFileContentState(
+                normalizedPath,
+                content,
+                encoding,
+                bytes.LongLength,
+                fileInfo.LastWriteTimeUtc);
+        }
+    }
+
+    public PluginSdkFileMutationState WritePluginSdkFile(string pluginId, PluginSdkFileWriteRequest? request)
+    {
+        if (request is null)
+        {
+            throw new InvalidOperationException("A plugin file write payload is required.");
+        }
+
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            Directory.CreateDirectory(rootPath);
+            var normalizedPath = NormalizePluginFilePath(request.Path, allowEmpty: false);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            if (Directory.Exists(targetPath))
+            {
+                throw new InvalidOperationException("The requested plugin file path is a directory.");
+            }
+
+            var bytes = DecodePluginFileContent(request.Content, request.Encoding);
+            var existingLength = File.Exists(targetPath) ? new FileInfo(targetPath).Length : 0;
+            var resultingLength = request.Append ? existingLength + bytes.LongLength : bytes.LongLength;
+            if (resultingLength > MaxPluginFileBytes)
+            {
+                throw new InvalidOperationException("A single plugin file cannot exceed 8 MB.");
+            }
+
+            if (File.Exists(targetPath) && !request.Append && !request.Overwrite)
+            {
+                throw new InvalidOperationException("The plugin file already exists and overwrite was not enabled.");
+            }
+
+            var usedBytes = GetPluginFilesUsage(rootPath);
+            var projectedUsage = request.Append
+                ? usedBytes + bytes.LongLength
+                : usedBytes - existingLength + bytes.LongLength;
+            if (projectedUsage > MaxPluginFilesBytes)
+            {
+                throw new InvalidOperationException("The plugin file storage quota of 32 MB would be exceeded.");
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath) ?? rootPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            if (request.Append)
+            {
+                using var stream = new FileStream(targetPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                stream.Write(bytes);
+            }
+            else
+            {
+                File.WriteAllBytes(targetPath, bytes);
+            }
+
+            return BuildPluginFileMutationState(rootPath, targetPath, normalizedPath);
+        }
+    }
+
+    public PluginSdkFileMutationState CreatePluginSdkDirectory(string pluginId, PluginSdkFilePathRequest? request)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            Directory.CreateDirectory(rootPath);
+            var normalizedPath = NormalizePluginFilePath(request?.Path, allowEmpty: true);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            Directory.CreateDirectory(targetPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            return BuildPluginFileMutationState(rootPath, targetPath, normalizedPath);
+        }
+    }
+
+    public PluginSdkFileMutationState DeletePluginSdkFile(string pluginId, PluginSdkFilePathRequest? request)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var normalizedPath = NormalizePluginFilePath(request?.Path, allowEmpty: false);
+            var targetPath = ResolvePluginFilesPath(rootPath, normalizedPath);
+            EnsurePluginFilesTreeSafe(rootPath, targetPath);
+            if (File.Exists(targetPath))
+            {
+                File.Delete(targetPath);
+            }
+            else if (Directory.Exists(targetPath))
+            {
+                Directory.Delete(targetPath, request?.Recursive ?? false);
+            }
+
+            return BuildPluginFileMutationState(rootPath, targetPath, normalizedPath);
+        }
+    }
+
+    public PluginSdkFileMutationState MovePluginSdkFile(string pluginId, PluginSdkFileTransferRequest? request)
+    {
+        if (request is null)
+        {
+            throw new InvalidOperationException("A plugin file move payload is required.");
+        }
+
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var sourceRelativePath = NormalizePluginFilePath(request.SourcePath, allowEmpty: false);
+            var destinationRelativePath = NormalizePluginFilePath(request.DestinationPath, allowEmpty: false);
+            var sourcePath = ResolvePluginFilesPath(rootPath, sourceRelativePath);
+            var destinationPath = ResolvePluginFilesPath(rootPath, destinationRelativePath);
+            EnsurePluginFilesTreeSafe(rootPath, sourcePath);
+            EnsurePluginFilesTreeSafe(rootPath, destinationPath);
+
+            if (File.Exists(sourcePath))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? rootPath);
+                File.Move(sourcePath, destinationPath, request.Overwrite);
+            }
+            else if (Directory.Exists(sourcePath))
+            {
+                if (File.Exists(destinationPath) || Directory.Exists(destinationPath))
+                {
+                    throw new InvalidOperationException("The destination plugin path already exists.");
+                }
+
+                var sourcePrefix = sourcePath.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                if (destinationPath.StartsWith(sourcePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("A plugin directory cannot be moved inside itself.");
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? rootPath);
+                Directory.Move(sourcePath, destinationPath);
+            }
+            else
+            {
+                throw new FileNotFoundException("The source plugin path does not exist.", sourceRelativePath);
+            }
+
+            return BuildPluginFileMutationState(rootPath, destinationPath, destinationRelativePath);
+        }
+    }
+
+    public PluginSdkFileMutationState CopyPluginSdkFile(string pluginId, PluginSdkFileTransferRequest? request)
+    {
+        if (request is null)
+        {
+            throw new InvalidOperationException("A plugin file copy payload is required.");
+        }
+
+        var context = EnsurePluginPermission(pluginId, PermissionFiles);
+        lock (_sdkFileGate)
+        {
+            var rootPath = GetPluginFilesDirectory(context.PluginId);
+            var sourceRelativePath = NormalizePluginFilePath(request.SourcePath, allowEmpty: false);
+            var destinationRelativePath = NormalizePluginFilePath(request.DestinationPath, allowEmpty: false);
+            var sourcePath = ResolvePluginFilesPath(rootPath, sourceRelativePath);
+            var destinationPath = ResolvePluginFilesPath(rootPath, destinationRelativePath);
+            EnsurePluginFilesTreeSafe(rootPath, sourcePath);
+            EnsurePluginFilesTreeSafe(rootPath, destinationPath);
+            if (!File.Exists(sourcePath))
+            {
+                throw new FileNotFoundException("The source plugin file does not exist.", sourceRelativePath);
+            }
+
+            var sourceLength = new FileInfo(sourcePath).Length;
+            var destinationLength = File.Exists(destinationPath) ? new FileInfo(destinationPath).Length : 0;
+            if (GetPluginFilesUsage(rootPath) - destinationLength + sourceLength > MaxPluginFilesBytes)
+            {
+                throw new InvalidOperationException("The plugin file storage quota of 32 MB would be exceeded.");
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? rootPath);
+            File.Copy(sourcePath, destinationPath, request.Overwrite);
+            return BuildPluginFileMutationState(rootPath, destinationPath, destinationRelativePath);
+        }
     }
 
     private PluginStoreCommunityRuntimePluginState? BuildCommunityRuntimePluginState(
@@ -1026,10 +1294,9 @@ public sealed class PluginStoreService
                 .ToArray());
     }
 
-    private static IReadOnlyList<PluginStoreImageState> BuildBuiltInImages(string pluginId, string title)
+    private IReadOnlyList<PluginStoreImageState> BuildBuiltInImages(string pluginId, string title)
     {
-        return BuiltInImageFiles.ContainsKey(pluginId) &&
-            File.Exists(Path.Combine(ShopPictureDirectory, BuiltInImageFiles[pluginId]))
+        return TryResolveBuiltInImagePath(pluginId, out _)
             ? [new PluginStoreImageState($"api/plugin-store/images/built-in/{Uri.EscapeDataString(pluginId)}", $"{title} preview")]
             : [];
     }
@@ -1069,11 +1336,17 @@ public sealed class PluginStoreService
     {
         if (!File.Exists(_catalogPath))
         {
+            var statusText = !_enableCommunityCatalogBootstrap
+                ? "No community catalog has been cached yet. Press Refresh to download the default GitHub catalog."
+                : string.IsNullOrWhiteSpace(_communityCatalogBootstrapError)
+                    ? "The default GitHub catalog is not cached yet. TFS will download it automatically on first use, or you can press Refresh to retry."
+                    : $"The community catalog could not be downloaded automatically ({_communityCatalogBootstrapError}). Press Refresh to retry.";
+
             return new CommunityCatalogSnapshot(
                 Available: false,
                 Title: "TFS Store",
-                Description: "Built-in plugins are always available here. Refresh the community catalog to discover installs and updates.",
-                StatusText: "No community catalog has been cached yet. Press Refresh to download the default GitHub catalog.",
+                Description: "Built-in plugins are always available here. Community plugins are loaded from the connected catalog when it becomes available.",
+                StatusText: statusText,
                 CatalogDirectory: Path.GetDirectoryName(_catalogPath) ?? _rootPath,
                 Plugins: []);
         }
@@ -1088,7 +1361,7 @@ public sealed class PluginStoreService
                 .Select(plugin => TryNormalizeCommunityPlugin(plugin, out var normalizedPlugin) ? normalizedPlugin : null)
                 .Where(plugin => plugin is not null)
                 .Cast<CommunityCatalogPluginData>()
-                .Where(plugin => !string.IsNullOrWhiteSpace(plugin.Id) && plugin.Images.Length > 0)
+                .Where(plugin => !string.IsNullOrWhiteSpace(plugin.Id))
                 .GroupBy(plugin => plugin.Id, StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
                 .ToArray();
@@ -1222,32 +1495,165 @@ public sealed class PluginStoreService
 
     private async Task SyncCommunityCatalogAsync(CancellationToken cancellationToken)
     {
-        var catalogUrl = GetCommunityCatalogUrl();
-        using var request = new HttpRequestMessage(HttpMethod.Get, catalogUrl);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
-        using var response = await _httpClient.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        if (response.Content.Headers.ContentLength > MaxCommunityCatalogBytes)
+        await _catalogSyncSemaphore.WaitAsync(cancellationToken);
+        try
         {
-            throw new InvalidOperationException("The community catalog is too large.");
+            var catalogUrl = GetCommunityCatalogUrl();
+            using var request = new HttpRequestMessage(HttpMethod.Get, catalogUrl);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+            using var response = await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            if (response.Content.Headers.ContentLength > MaxCommunityCatalogBytes)
+            {
+                throw new InvalidOperationException("The community catalog is too large.");
+            }
+
+            var catalogBytes = StripUtf8Bom(await response.Content.ReadAsByteArrayAsync(cancellationToken));
+            if (catalogBytes.Length > MaxCommunityCatalogBytes)
+            {
+                throw new InvalidOperationException("The community catalog is too large.");
+            }
+
+            _ = JsonSerializer.Deserialize<CommunityCatalogFileData>(catalogBytes, JsonOptions)
+                ?? throw new InvalidOperationException("The community catalog is empty.");
+
+            Directory.CreateDirectory(_rootPath);
+            await File.WriteAllBytesAsync(_catalogPath, catalogBytes, cancellationToken);
+            _communityCatalogBootstrapError = string.Empty;
+        }
+        finally
+        {
+            _catalogSyncSemaphore.Release();
+        }
+    }
+
+    private async Task EnsureCommunityCatalogAvailableAsync(CancellationToken cancellationToken)
+    {
+        if (File.Exists(_catalogPath))
+        {
+            return;
         }
 
-        var catalogBytes = StripUtf8Bom(await response.Content.ReadAsByteArrayAsync(cancellationToken));
-        if (catalogBytes.Length > MaxCommunityCatalogBytes)
+        Task bootstrapTask;
+        lock (_catalogBootstrapGate)
         {
-            throw new InvalidOperationException("The community catalog is too large.");
+            _communityCatalogBootstrapTask ??= BootstrapCommunityCatalogAsync();
+            bootstrapTask = _communityCatalogBootstrapTask;
         }
 
-        _ = JsonSerializer.Deserialize<CommunityCatalogFileData>(catalogBytes, JsonOptions)
-            ?? throw new InvalidOperationException("The community catalog is empty.");
+        await bootstrapTask.WaitAsync(cancellationToken);
+    }
 
-        Directory.CreateDirectory(_rootPath);
-        await File.WriteAllBytesAsync(_catalogPath, catalogBytes, cancellationToken);
+    private async Task BootstrapCommunityCatalogAsync()
+    {
+        try
+        {
+            await SyncCommunityCatalogAsync(CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            _communityCatalogBootstrapError = exception.Message;
+        }
+    }
+
+    private void EnsureBuiltInImageCache()
+    {
+        Directory.CreateDirectory(_builtInImagesRootPath);
+
+        foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
+        {
+            var normalizedPluginId = NormalizePluginId(plugin.Id);
+            if (normalizedPluginId.Length == 0)
+            {
+                continue;
+            }
+
+            var imagePath = Path.Combine(_builtInImagesRootPath, $"{normalizedPluginId}.svg");
+            if (File.Exists(imagePath))
+            {
+                continue;
+            }
+
+            File.WriteAllText(
+                imagePath,
+                BuildBuiltInPreviewSvg(normalizedPluginId, plugin.Title, plugin.Description),
+                Encoding.UTF8);
+        }
+    }
+
+    private bool TryResolveBuiltInImagePath(string pluginId, out string imagePath)
+    {
+        imagePath = string.Empty;
+
+        var normalizedPluginId = NormalizePluginId(pluginId);
+        if (normalizedPluginId.Length == 0)
+        {
+            return false;
+        }
+
+        var candidatePath = Path.GetFullPath(Path.Combine(_builtInImagesRootPath, $"{normalizedPluginId}.svg"));
+        EnsureWithinPathRoot(candidatePath, _builtInImagesRootPath);
+        if (!File.Exists(candidatePath))
+        {
+            return false;
+        }
+
+        imagePath = candidatePath;
+        return true;
+    }
+
+    private static string BuildBuiltInPreviewSvg(string pluginId, string title, string description)
+    {
+        var accent = BuiltInImageAccents.TryGetValue(pluginId, out var configuredAccent)
+            ? configuredAccent
+            : "#60A5FA";
+        var escapedTitle = EscapeSvgText(title);
+        var escapedDescription = EscapeSvgText(TruncateForSvg(description, 88));
+        var escapedLabel = EscapeSvgText(pluginId.Replace('-', ' ').ToUpperInvariant());
+
+        return $$"""
+                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" role="img" aria-label="{{escapedTitle}}">
+                   <defs>
+                     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+                       <stop offset="0%" stop-color="#0B1120" />
+                       <stop offset="100%" stop-color="#172554" />
+                     </linearGradient>
+                     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+                       <stop offset="0%" stop-color="{{accent}}" stop-opacity="1" />
+                       <stop offset="100%" stop-color="{{accent}}" stop-opacity="0.18" />
+                     </linearGradient>
+                   </defs>
+                   <rect width="1280" height="720" rx="36" fill="url(#bg)" />
+                   <circle cx="1100" cy="120" r="210" fill="url(#accent)" />
+                   <circle cx="1190" cy="610" r="180" fill="{{accent}}" fill-opacity="0.14" />
+                   <rect x="74" y="74" width="1132" height="572" rx="32" fill="#07101D" fill-opacity="0.56" stroke="{{accent}}" stroke-opacity="0.28" />
+                   <text x="116" y="176" fill="{{accent}}" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="700" letter-spacing="5">{{escapedLabel}}</text>
+                   <text x="116" y="306" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="86" font-weight="700">{{escapedTitle}}</text>
+                   <text x="116" y="386" fill="#CBD5E1" font-family="Segoe UI, Arial, sans-serif" font-size="34">{{escapedDescription}}</text>
+                   <text x="116" y="560" fill="#E2E8F0" font-family="Segoe UI, Arial, sans-serif" font-size="28">Built-in plugin preview</text>
+                 </svg>
+                 """;
+    }
+
+    private static string EscapeSvgText(string value)
+    {
+        return WebUtility.HtmlEncode(value ?? string.Empty);
+    }
+
+    private static string TruncateForSvg(string value, int maxLength)
+    {
+        var normalized = (value ?? string.Empty).Trim();
+        if (normalized.Length <= maxLength)
+        {
+            return normalized;
+        }
+
+        return $"{normalized[..Math.Max(0, maxLength - 1)].TrimEnd()}...";
     }
 
     private static byte[] StripUtf8Bom(byte[] bytes)

@@ -229,6 +229,111 @@ public sealed class SteamDevToolsClient
         }
     }
 
+    public Task<bool> TryOpenSteamMenuAsync(CancellationToken cancellationToken)
+    {
+        return TryInvokeSteamSurfaceActionAsync(
+            BuildMenuActionExpression(
+                openMethodNames:
+                [
+                    "OpenMainMenu",
+                    "ShowMainMenu",
+                    "OpenSteamMenu",
+                    "ShowSteamMenu",
+                    "OpenMenu",
+                    "ShowMenu",
+                    "OpenSideMenus",
+                    "OpenSideMenu",
+                    "ShowSideMenus",
+                    "ShowSideMenu"
+                ],
+                setVisibleMethodNames:
+                [
+                    "SetMainMenuVisible",
+                    "SetSteamMenuVisible",
+                    "SetMenuVisible",
+                    "SetMainMenuOpen",
+                    "SetMenuOpen",
+                    "SetSideMenuVisible",
+                    "SetSideMenuOpen"
+                ],
+                openArgs:
+                [
+                    [],
+                    ["menu"],
+                    ["Menu"],
+                    ["mainmenu"],
+                    ["MainMenu"],
+                    ["main-menu"],
+                    ["mainMenu"],
+                    ["steam"],
+                    ["Steam"],
+                    ["steammenu"],
+                    ["SteamMenu"],
+                    ["left"],
+                    ["Left"]
+                ],
+                setVisibleArgs:
+                [
+                    [true],
+                    ["menu", true],
+                    ["Menu", true],
+                    ["mainmenu", true],
+                    ["MainMenu", true],
+                    ["main-menu", true],
+                    ["mainMenu", true],
+                    ["steam", true],
+                    ["Steam", true],
+                    ["steammenu", true],
+                    ["SteamMenu", true],
+                    ["left", true],
+                    ["Left", true]
+                ]),
+            cancellationToken);
+    }
+
+    public Task<bool> TryOpenQuickAccessMenuAsync(CancellationToken cancellationToken)
+    {
+        return TryInvokeSteamSurfaceActionAsync(
+            BuildMenuActionExpression(
+                openMethodNames:
+                [
+                    "OpenQuickAccessMenu",
+                    "ShowQuickAccessMenu",
+                    "OpenSideMenus",
+                    "OpenSideMenu",
+                    "ShowSideMenus",
+                    "ShowSideMenu"
+                ],
+                setVisibleMethodNames:
+                [
+                    "SetQuickAccessMenuVisible",
+                    "SetQuickAccessVisible",
+                    "SetSideMenuVisible",
+                    "SetSideMenuOpen"
+                ],
+                openArgs:
+                [
+                    [],
+                    ["quickaccess"],
+                    ["QuickAccess"],
+                    ["quick-access"],
+                    ["quickAccess"],
+                    ["right"],
+                    ["Right"]
+                ],
+                setVisibleArgs:
+                [
+                    [true],
+                    ["quickaccess", true],
+                    ["QuickAccess", true],
+                    ["quick-access", true],
+                    ["quickAccess", true],
+                    ["right", true],
+                    ["Right", true]
+                ]),
+            cancellationToken);
+    }
+
     private async Task<int> SendKeyEventAsync(
         ClientWebSocket webSocket,
         string type,
@@ -341,6 +446,174 @@ public sealed class SteamDevToolsClient
         {
             return null;
         }
+    }
+
+    private async Task<bool> TryInvokeSteamSurfaceActionAsync(
+        string expression,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(3));
+        var operationToken = timeoutCts.Token;
+
+        try
+        {
+            var targets = await GetTargetsAsync(operationToken);
+            var candidateTargets = targets
+                .Where(IsSteamSurfaceActionTarget)
+                .Where(target => !string.IsNullOrWhiteSpace(target.WebSocketDebuggerUrl))
+                .OrderBy(GetSteamSurfaceActionPriority)
+                .GroupBy(target => target.WebSocketDebuggerUrl, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToArray();
+
+            foreach (var target in candidateTargets)
+            {
+                var result = await EvaluateAsync(target.WebSocketDebuggerUrl, expression, operationToken);
+                if (result.Success && TryReadBoolean(result.Value, out var handled) && handled)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private static bool IsSteamSurfaceActionTarget(SteamDevToolsTarget target)
+    {
+        return string.Equals(target.Type, "page", StringComparison.OrdinalIgnoreCase) &&
+            (string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase) ||
+             IsBigPictureSurfaceTarget(target) ||
+             IsSteamMenuSurfaceTarget(target));
+    }
+
+    private static int GetSteamSurfaceActionPriority(SteamDevToolsTarget target)
+    {
+        if (string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        if (IsBigPictureMainTarget(target))
+        {
+            return 1;
+        }
+
+        if (target.Title.StartsWith("MainMenu", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        if (target.Title.Equals("Menu", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        if (IsQuickAccessTarget(target))
+        {
+            return 4;
+        }
+
+        return 5;
+    }
+
+    private static bool TryReadBoolean(object? value, out bool boolean)
+    {
+        switch (value)
+        {
+            case bool typedBoolean:
+                boolean = typedBoolean;
+                return true;
+            case JsonElement { ValueKind: JsonValueKind.True }:
+                boolean = true;
+                return true;
+            case JsonElement { ValueKind: JsonValueKind.False }:
+                boolean = false;
+                return true;
+            case JsonElement { ValueKind: JsonValueKind.String } element
+                when bool.TryParse(element.GetString(), out var parsedBoolean):
+                boolean = parsedBoolean;
+                return true;
+            case string text when bool.TryParse(text, out var parsedBoolean):
+                boolean = parsedBoolean;
+                return true;
+            default:
+                boolean = false;
+                return false;
+        }
+    }
+
+    private static string BuildMenuActionExpression(
+        IReadOnlyCollection<string> openMethodNames,
+        IReadOnlyCollection<string> setVisibleMethodNames,
+        IReadOnlyCollection<object?[]> openArgs,
+        IReadOnlyCollection<object?[]> setVisibleArgs)
+    {
+        var openMethodsJson = JsonSerializer.Serialize(openMethodNames, JsonOptions);
+        var setVisibleMethodsJson = JsonSerializer.Serialize(setVisibleMethodNames, JsonOptions);
+        var openArgsJson = JsonSerializer.Serialize(openArgs, JsonOptions);
+        var setVisibleArgsJson = JsonSerializer.Serialize(setVisibleArgs, JsonOptions);
+
+        return $$"""
+(() => {
+  const tryInvoke = (target, methodNames, argsList) => {
+    if (!target || (typeof target !== "object" && typeof target !== "function")) {
+      return false;
+    }
+
+    for (const name of methodNames) {
+      const method = target?.[name];
+      if (typeof method !== "function") {
+        continue;
+      }
+
+      for (const args of argsList) {
+        try {
+          method.apply(target, Array.isArray(args) ? args : []);
+          return true;
+        } catch {
+        }
+      }
+    }
+
+    return false;
+  };
+
+  const openMethodNames = {{openMethodsJson}};
+  const setVisibleMethodNames = {{setVisibleMethodsJson}};
+  const openArgs = {{openArgsJson}};
+  const setVisibleArgs = {{setVisibleArgsJson}};
+  const candidates = [
+    window.GamepadUI,
+    window.GamepadUI?.Router,
+    window.GamepadUI?.NavigationManager,
+    window.SteamUIStore,
+    window.SteamUIStore?.MenuStore,
+    window.SteamUIStore?.SideMenuStore,
+    window.SteamClient?.UI,
+    window.SteamClient?.Overlay,
+    window.SteamClient?.Input,
+    window.SteamClient?.System,
+    window.SteamClient,
+  ];
+
+  for (const candidate of candidates) {
+    if (tryInvoke(candidate, openMethodNames, openArgs) || tryInvoke(candidate, setVisibleMethodNames, setVisibleArgs)) {
+      return true;
+    }
+  }
+
+  return false;
+})()
+""";
     }
 
     private sealed record DevToolsCommand(int Id, string Method, DevToolsCommandParameters Params);

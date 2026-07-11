@@ -25,14 +25,67 @@ public sealed class PluginStoreServiceTests
 
         try
         {
-            var service = CreatePluginStoreService(root);
+            var service = CreatePluginStoreService(root, enableCommunityCatalogBootstrap: false);
 
             var snapshot = await service.GetSnapshotAsync(CancellationToken.None);
 
             Assert.False(snapshot.CommunityCatalogAvailable);
             Assert.NotEmpty(snapshot.BuiltInPlugins);
-            Assert.Contains(snapshot.BuiltInPlugins, plugin => plugin.Id == "smart-home");
+            var smartHome = Assert.Single(snapshot.BuiltInPlugins, plugin => plugin.Id == "smart-home");
+            Assert.NotEmpty(smartHome.Images);
             Assert.Empty(snapshot.CommunityPlugins);
+            Assert.True(service.TryGetBuiltInImage("smart-home", out var imagePath, out var contentType));
+            Assert.True(File.Exists(imagePath));
+            Assert.Equal("image/svg+xml", contentType);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_WithoutCatalog_AutoDownloadsCommunityCatalogWhenEnabled()
+    {
+        var root = CreateTempRoot();
+        var catalogJson = JsonSerializer.Serialize(
+            new
+            {
+                title = "TFS Community",
+                description = "Remote test catalog",
+                plugins = new[]
+                {
+                    new
+                    {
+                        id = "sample-plugin",
+                        title = "Sample Plugin",
+                        description = "Community sample",
+                        author = "Test Suite",
+                        category = "Utility",
+                        version = "1.2.3",
+                        packageUrl = "https://example.test/packages/sample-plugin.zip",
+                        packageSha256 = new string('0', 64),
+                        images = new[] { "https://example.test/images/sample-plugin.png" },
+                        tags = new[] { "sample" }
+                    }
+                }
+            },
+            JsonOptions);
+        var handler = new CapturingHandler(() => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(catalogJson, Encoding.UTF8, "application/json")
+        });
+
+        try
+        {
+            var service = CreatePluginStoreService(root, new HttpClient(handler), enableCommunityCatalogBootstrap: true);
+
+            var snapshot = await service.GetSnapshotAsync(CancellationToken.None);
+
+            Assert.True(snapshot.CommunityCatalogAvailable);
+            Assert.Single(snapshot.CommunityPlugins);
+            Assert.Contains("tfs-plugin-database/main/catalog.json", handler.RequestUri?.ToString());
+            Assert.True(File.Exists(Path.Combine(root, "plugin-store", "catalog.json")));
         }
         finally
         {
@@ -185,7 +238,7 @@ public sealed class PluginStoreServiceTests
     }
 
     [Fact]
-    public async Task GetSnapshotAsync_CommunityPluginsWithoutImages_AreNotListed()
+    public async Task GetSnapshotAsync_CommunityPluginsWithoutImages_AreStillListed()
     {
         var root = CreateTempRoot();
 
@@ -222,7 +275,9 @@ public sealed class PluginStoreServiceTests
 
             var snapshot = await service.GetSnapshotAsync(CancellationToken.None);
 
-            Assert.Empty(snapshot.CommunityPlugins);
+            var plugin = Assert.Single(snapshot.CommunityPlugins);
+            Assert.Equal("sample-plugin", plugin.Id);
+            Assert.Empty(plugin.Images);
         }
         finally
         {
@@ -514,12 +569,16 @@ public sealed class PluginStoreServiceTests
         }
     }
 
-    private static PluginStoreService CreatePluginStoreService(string root, HttpClient? httpClient = null)
+    private static PluginStoreService CreatePluginStoreService(
+        string root,
+        HttpClient? httpClient = null,
+        bool enableCommunityCatalogBootstrap = false)
     {
         return new PluginStoreService(
             httpClient ?? new HttpClient(),
             CreateSettingsService(Path.Combine(root, "settings.json")),
-            Path.Combine(root, "plugin-store"));
+            Path.Combine(root, "plugin-store"),
+            enableCommunityCatalogBootstrap);
     }
 
     private static async Task<PluginStoreService> CreateInstalledSamplePluginStoreAsync(

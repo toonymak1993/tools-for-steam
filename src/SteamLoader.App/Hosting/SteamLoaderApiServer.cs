@@ -8,6 +8,7 @@ using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Processes;
@@ -36,6 +37,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
     private readonly TfsPerformanceService _performanceService;
+    private readonly HandheldPerformanceService _handheldPerformanceService;
     private readonly SteamLoaderSettingsService _steamLoaderSettingsService;
     private readonly PluginStoreService _pluginStoreService;
     private readonly PowerActionService _powerActionService;
@@ -71,6 +73,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         StoreSyncService storeSyncService,
         ThemesService themesService,
         TfsPerformanceService performanceService,
+        HandheldPerformanceService handheldPerformanceService,
         SteamLoaderSettingsService steamLoaderSettingsService,
         PluginStoreService pluginStoreService,
         PowerActionService powerActionService,
@@ -93,6 +96,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _storeSyncService = storeSyncService;
         _themesService = themesService;
         _performanceService = performanceService;
+        _handheldPerformanceService = handheldPerformanceService;
         _steamLoaderSettingsService = steamLoaderSettingsService;
         _pluginStoreService = pluginStoreService;
         _powerActionService = powerActionService;
@@ -178,6 +182,16 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
         try
         {
+            if (StorefrontFeatureFlags.IsDisabledRequestPath(request.Url?.AbsolutePath))
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.NotFound,
+                    new { message = "Storefront is disabled in this build." },
+                    cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/health")
             {
@@ -220,6 +234,30 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     cancellationToken);
 
                 _requestShutdown();
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath is "/api/control/steam-menu" or "/api/control/quick-access")
+            {
+                var quickAccess = request.Url.AbsolutePath.EndsWith(
+                    "/quick-access",
+                    StringComparison.OrdinalIgnoreCase);
+                var openedDirectly = quickAccess
+                    ? await _devToolsClient.TryOpenQuickAccessMenuAsync(cancellationToken)
+                    : await _devToolsClient.TryOpenSteamMenuAsync(cancellationToken);
+                if (!openedDirectly)
+                {
+                    await _devToolsClient.SendControlDigitShortcutAsync(
+                        quickAccess ? 2 : 1,
+                        cancellationToken);
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new { handled = true, openedDirectly },
+                    cancellationToken);
                 return;
             }
 
@@ -2366,6 +2404,118 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/state")
+            {
+                await WriteJsonAsync(response, HttpStatusCode.OK, _handheldPerformanceService.GetSnapshot(), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/tdp")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldTdpRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetTdp(payload?.Watts ?? 0);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/mode")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldModeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetMode(payload?.ModeId ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/global")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldPowerTdpRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetGlobalTdp(
+                    payload?.Watts ?? 0,
+                    payload?.PowerSource ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/game")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldGameProfileRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetGameProfileTdp(
+                    payload?.Key ?? string.Empty,
+                    payload?.Watts ?? 0,
+                    payload?.PowerSource ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/auto-enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetAutoProfilesEnabled(payload?.Value ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/notifications-enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.SetProfileNotificationsEnabled(payload?.Value ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/notifications/test")
+            {
+                var snapshot = _handheldPerformanceService.ShowTestNotification();
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/profiles/delete")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<DeleteHandheldProfileRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _handheldPerformanceService.DeleteProfile(payload?.Key ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/pawnio/install")
+            {
+                var snapshot = _handheldPerformanceService.InstallOrRepairPawnIo();
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/themes/state")
             {
                 await WriteJsonAsync(
@@ -3913,7 +4063,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/hltb"] = "hltb",
             ["/api/smart-home"] = "smart-home",
             ["/api/store-sync"] = "store-sync",
-            ["/api/unifystore"] = "unifystore",
             ["/api/themes"] = "themes",
             ["/api/power"] = "power"
         };
@@ -4248,6 +4397,16 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetPerformanceVendorOverlayRequest(string VendorId);
 
     private sealed record SetPerformanceIntegerSettingRequest(string Key, int Value);
+
+    private sealed record SetHandheldTdpRequest(int Watts);
+
+    private sealed record SetHandheldPowerTdpRequest(int Watts, string PowerSource);
+
+    private sealed record SetHandheldGameProfileRequest(string Key, int Watts, string PowerSource);
+
+    private sealed record SetHandheldModeRequest(string ModeId);
+
+    private sealed record DeleteHandheldProfileRequest(string Key);
 
     private sealed record SetBooleanValueRequest(bool Value);
 

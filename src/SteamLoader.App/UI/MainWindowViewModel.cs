@@ -8,6 +8,7 @@ using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
+using ToolsForSteam.Splash;
 
 namespace SteamLoader.App.UI;
 
@@ -47,7 +48,7 @@ public sealed class MainWindowViewModel : BindableBase
     private int _stableBigPictureVisiblePollCount;
     private int _stableSteamSignalPollCount;
     private string _serviceStateText = "Checking background host...";
-    private string _serviceDetailText = "The manager is reading the current runtime status.";
+    private string _serviceDetailText = "Tools for Steam is reading the current runtime status.";
     private string _steamStateText = "Waiting for status...";
     private string _apiStateText = "Waiting for status...";
     private string _autostartStateText = "Checking startup registration...";
@@ -118,7 +119,7 @@ public sealed class MainWindowViewModel : BindableBase
 
     public string WindowTitle => "Tools for Steam";
 
-    public string Subtitle => "Installed console shell and control panel for the Windows Quick Access toolkit.";
+    public string Subtitle => "Installed console runtime and Quick Access bridge for Windows.";
 
     public string ServiceStateText
     {
@@ -325,7 +326,8 @@ public sealed class MainWindowViewModel : BindableBase
     public string AutostartMenuText => StartupMode switch
     {
         SteamLoaderRuntime.StartupModeShell => "Startup Mode: Shell takeover",
-        SteamLoaderRuntime.StartupModeTray => "Startup Mode: Tray app",
+        SteamLoaderRuntime.StartupModeTray => "Startup Mode: eTray",
+        SteamLoaderRuntime.StartupModeXbox => "Startup Mode: Xbox Mode",
         _ => "Startup Mode: Shell takeover"
     };
 
@@ -745,7 +747,7 @@ public sealed class MainWindowViewModel : BindableBase
     {
         if (status is null)
         {
-            return "Host offline - Tools for Steam can start it from this manager.";
+            return "Host offline - Tools for Steam can start it from the tray app.";
         }
 
         if (status.QuickAccessAttached)
@@ -1059,7 +1061,9 @@ public sealed class MainWindowViewModel : BindableBase
             SteamLoaderRuntime.StartupModeShell =>
                 "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer.",
             SteamLoaderRuntime.StartupModeTray =>
-                "Tray app mode is active. Windows starts normally, then Tools for Steam runs from the tray, syncs launchers, and starts Steam in dev mode.",
+                "eTray mode is active. Windows starts normally, then Tools for Steam runs from the tray, syncs launchers, and starts Steam in dev mode.",
+            SteamLoaderRuntime.StartupModeXbox =>
+                "Xbox Mode is active. Windows launches Tools for Steam as the gaming Home app, then TFS starts Steam and injects the Quick Access panel.",
             _ => "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
         };
     }
@@ -1067,160 +1071,13 @@ public sealed class MainWindowViewModel : BindableBase
     private async Task LoadSplashGameCoversAsync()
     {
         var steamRoot = _steamInstallationService.ResolveSteamRootPath();
-
-        // Step 1: collect paths (fast I/O scan)
-        var (paths, debugText) = await Task.Run(() => CollectSteamGameCoverPaths(steamRoot)).ConfigureAwait(false);
-
-        // Step 2: decode thumbnails at 160 px width on the background thread.
-        // BitmapImage with OnLoad + Freeze() is safe to create outside the UI thread.
-        var thumbnails = await Task.Run(() => CreateThumbnails(paths)).ConfigureAwait(false);
+        var thumbnails = await StartupSplashCoverService.LoadAsync(steamRoot).ConfigureAwait(false);
 
         await _dispatcher.InvokeAsync(() =>
         {
             SplashGameCovers = thumbnails;
-            SplashDebugText = $"{debugText} | loaded: {thumbnails.Count}";
+            SplashDebugText = $"loaded: {thumbnails.Count}";
         });
-    }
-
-    // Decode each image once at the exact cell size (1920/12 = 160 px) so WPF
-    // receives frozen BitmapSources instead of loading full-res JPEGs on the UI thread.
-    private static IReadOnlyList<BitmapSource> CreateThumbnails(IReadOnlyList<string> paths)
-    {
-        const int cellWidth = 160; // 1920 px ÷ 12 columns
-        var results = new List<BitmapSource>(paths.Count);
-        foreach (var path in paths)
-        {
-            try
-            {
-                var bmp = new BitmapImage();
-                bmp.BeginInit();
-                bmp.UriSource = new Uri(path, UriKind.Absolute);
-                bmp.DecodePixelWidth = cellWidth;
-                bmp.CacheOption = BitmapCacheOption.OnLoad;   // load fully before EndInit returns
-                bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-                bmp.EndInit();
-                bmp.Freeze(); // makes it cross-thread safe for WPF binding
-                results.Add(bmp);
-            }
-            catch
-            {
-                // skip unreadable files silently
-            }
-        }
-        return results;
-    }
-
-    private static (IReadOnlyList<string> Paths, string Debug) CollectSteamGameCoverPaths(string? steamRoot)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(steamRoot))
-                return ([], "No Steam path found");
-
-            // Primary source: userdata/<steamid>/config/grid
-            // Portrait covers end with 'p' before the extension: e.g. 730p.jpg
-            var gridDir = FindSteamGridDir(steamRoot);
-            List<string> covers = [];
-            string debugInfo;
-
-            if (gridDir != null)
-            {
-                var portraitCovers = Directory.EnumerateFiles(gridDir, "*p.jpg")
-                    .Concat(Directory.EnumerateFiles(gridDir, "*p.png"))
-                    .Where(f =>
-                    {
-                        var name = Path.GetFileNameWithoutExtension(f);
-                        // Must end with 'p' and have only digits before it: e.g. "730p"
-                        return name.Length >= 2 && name[^1] == 'p' &&
-                               name[..^1].All(char.IsDigit);
-                    })
-                    .ToList();
-
-                if (portraitCovers.Count >= 5)
-                {
-                    covers = portraitCovers;
-                    debugInfo = $"grid: {gridDir} | portrait: {portraitCovers.Count}";
-                }
-                else
-                {
-                    // Not enough portrait covers — use all non-logo, non-hero images from grid
-                    var allGrid = Directory.EnumerateFiles(gridDir, "*.jpg")
-                        .Concat(Directory.EnumerateFiles(gridDir, "*.png"))
-                        .Where(f =>
-                        {
-                            var name = Path.GetFileNameWithoutExtension(f);
-                            return !name.EndsWith("_hero", StringComparison.OrdinalIgnoreCase) &&
-                                   !name.EndsWith("_logo", StringComparison.OrdinalIgnoreCase) &&
-                                   !name.EndsWith("_icon", StringComparison.OrdinalIgnoreCase);
-                        })
-                        .ToList();
-                    covers = allGrid;
-                    debugInfo = $"grid: {gridDir} | portrait: {portraitCovers.Count} | all: {allGrid.Count}";
-                }
-            }
-            else
-            {
-                // Fallback: appcache/librarycache (old Steam client behaviour)
-                var cacheDir = Path.Combine(steamRoot, "appcache", "librarycache");
-                if (Directory.Exists(cacheDir))
-                {
-                    covers = Directory.EnumerateFiles(cacheDir, "*_library_600x900.jpg")
-                        .Concat(Directory.EnumerateFiles(cacheDir, "*_library_600x900.png"))
-                        .ToList();
-
-                    if (covers.Count < 5)
-                    {
-                        covers = Directory.EnumerateFiles(cacheDir, "*.jpg")
-                            .Concat(Directory.EnumerateFiles(cacheDir, "*.png"))
-                            .Where(f => !f.EndsWith("_logo.png", StringComparison.OrdinalIgnoreCase))
-                            .ToList();
-                    }
-                }
-
-                debugInfo = $"librarycache: {covers.Count} files (no grid dir found)";
-            }
-
-            if (covers.Count == 0)
-                return ([], debugInfo);
-
-            // Shuffle so each launch shows a different arrangement.
-            var rng = new Random();
-            covers = [.. covers.OrderBy(_ => rng.Next())];
-
-            // Fill a 12×7 UniformGrid — tile if fewer than 84 images.
-            const int targetCount = 84;
-            if (covers.Count < targetCount)
-            {
-                var repeated = new List<string>(targetCount);
-                while (repeated.Count < targetCount)
-                    repeated.AddRange(covers);
-                covers = repeated;
-            }
-
-            return (covers.Take(targetCount).ToList(), debugInfo);
-        }
-        catch (Exception ex)
-        {
-            return ([], $"Error: {ex.Message}");
-        }
-    }
-
-    private static string? FindSteamGridDir(string steamRoot)
-    {
-        var userdataDir = Path.Combine(steamRoot, "userdata");
-        if (!Directory.Exists(userdataDir))
-            return null;
-
-        // Find grid folder across all Steam user IDs; prefer the one with most files
-        return Directory.EnumerateDirectories(userdataDir)
-            .Select(d => Path.Combine(d, "config", "grid"))
-            .Where(Directory.Exists)
-            .OrderByDescending(d =>
-            {
-                try { return Directory.EnumerateFiles(d).Count(); }
-                catch { return 0; }
-            })
-            .FirstOrDefault();
     }
 
     private void ApplyGeneralSettingsSnapshot(SteamLoaderGeneralSettingsSnapshot settings)

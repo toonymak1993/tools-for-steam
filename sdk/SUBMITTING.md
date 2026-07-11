@@ -8,7 +8,7 @@ Tools for Steam community plugins are normal zip packages plus a catalog entry. 
 2. Build your plugin in that fork or in your own repository.
 3. Create `tfs-plugin.json` at the package root.
 4. Build your frontend entry point, normally `dist/index.js`.
-5. Add a required store image, normally `assets/preview.png`.
+5. Add a store image, normally `assets/preview.png`, if you want a custom preview card.
 6. Zip the package with `tfs-plugin.json` at the zip root.
 7. Compute the SHA-256 hash of the zip.
 8. Add or update a catalog entry in `https://github.com/toonymak1993/tfs-plugin-database/blob/main/catalog.json`.
@@ -86,7 +86,7 @@ my-plugin.zip
 }
 ```
 
-`images` is required. Plugins without an image are not listed in the store.
+`images` is optional. Plugins without an image still appear in the store and use the fallback preview card.
 `packageSha256` is required. Plugins without a checksum are shown as blocked and cannot be installed.
 
 ## Permission Review
@@ -120,7 +120,7 @@ For the official Home Assistant example:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-community-plugin-store.ps1 -ImagePath "$env:USERPROFILE\Downloads\hassio.png"
 ```
 
-Then open the TFS Store, refresh the catalog, install the plugin, and verify that the plugin appears on the Home screen without restarting Tools for Steam.
+Then open the TFS Store, let the catalog auto-load or press Refresh, install the plugin, and verify that the plugin appears on the Home screen without restarting Tools for Steam.
 
 To update the live official catalog, clone `tfs-plugin-database` and pass its path:
 

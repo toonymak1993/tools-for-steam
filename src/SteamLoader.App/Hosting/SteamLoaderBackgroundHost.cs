@@ -4,8 +4,9 @@ using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
-using SteamLoader.App.Infrastructure.Handheld;
+using SteamLoader.App.Infrastructure.Helpers;
 using SteamLoader.App.Infrastructure.Hltb;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Processes;
@@ -75,9 +76,18 @@ public sealed class SteamLoaderBackgroundHost
             new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json")),
             new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json")));
         performanceService.RestoreOverlayOnStartup();
+        var handheldProfileNotificationService = new WindowsProfileNotificationService(dataDirectory);
+        var handheldPerformanceService = new HandheldPerformanceService(
+            dataDirectory,
+            handheldProfileNotificationService);
+        var handheldProfileCoordinator = new HandheldPerformanceProfileCoordinator(
+            handheldPerformanceService,
+            steamInstallationService.ResolveSteamRootPath(),
+            handheldProfileNotificationService);
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
+            new XboxModeService(),
             Environment.ProcessPath
                 ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path."),
             SteamLoaderRuntime.ShellLaunchArguments,
@@ -99,17 +109,22 @@ public sealed class SteamLoaderBackgroundHost
         var executablePath =
             Environment.ProcessPath
             ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
-        var handheldDevice = new HandheldDeviceDetection().Detect();
         var steamClientLaunchService = new SteamClientLaunchService(
             httpClient,
             DebugEndpoint,
             steamInstallationService,
-            isHandheld: handheldDevice.IsHandheld);
+            isHandheld: HandheldDeviceCatalog.IsSupported(HandheldDeviceCatalog.Detect()));
         var powerActionService = new PowerActionService(
             steamClientLaunchService,
             shellService,
             executablePath,
             SteamLoaderRuntime.BackgroundArgument);
+        var gamepadHelperTaskService = new GamepadHelperScheduledTaskService(
+            executablePath,
+            AppContext.BaseDirectory);
+        var gamepadHelperSupervisor = new GamepadHelperSupervisor(
+            gamepadHelperTaskService,
+            Path.Combine(dataDirectory, "gamepad-helper-watchdog.log"));
         var releaseUpdateService = new ReleaseUpdateService();
         var liveUpdateHub = new QuickAccessLiveUpdateHub();
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
@@ -141,10 +156,23 @@ public sealed class SteamLoaderBackgroundHost
             processWindowService,
             storeSyncService,
             smartHomeService,
+            handheldPerformanceService,
             () => steamLoaderSettingsService.IsPluginEnabled("smart-home"));
+        using var hidMenuButtonMonitor = new HidMenuButtonMonitor();
         var controllerShortcutService = new ControllerShortcutService(
-            isEnabled: () => true,
-            sendControlDigitAsync: digit => devToolsClient.SendControlDigitShortcutAsync(digit, cancellationToken));
+            isEnabled: () => !gamepadHelperSupervisor.IsHelperRunning,
+            isBigPictureForeground: SteamBigPictureForegroundDetector.IsBigPictureForeground,
+            isGameInForeground: () =>
+                !gamepadHelperSupervisor.IsHelperRunning &&
+                PerformanceForegroundTargetResolver.TryResolve() is not null,
+            isHidMenuButtonDown: () => hidMenuButtonMonitor.IsMenuDown,
+            openSteamMenuAsync: () => devToolsClient.TryOpenSteamMenuAsync(cancellationToken),
+            openQuickAccessMenuAsync: () => devToolsClient.TryOpenQuickAccessMenuAsync(cancellationToken),
+            sendControlDigitAsync: digit => devToolsClient.SendControlDigitShortcutAsync(digit, cancellationToken),
+            diagnosticLog: message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "controller-shortcuts.log"),
+                message),
+            isHidBackButtonDown: () => hidMenuButtonMonitor.IsBackDown);
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
@@ -157,6 +185,7 @@ public sealed class SteamLoaderBackgroundHost
             storeSyncService,
             themesService,
             performanceService,
+            handheldPerformanceService,
             steamLoaderSettingsService,
             pluginStoreService,
             powerActionService,
@@ -188,8 +217,12 @@ public sealed class SteamLoaderBackgroundHost
         var storeSyncAutomationTask = storeSyncAutomationService.RunAsync(storeSyncAutomationCts.Token);
         using var liveStatePublisherCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var liveStatePublisherTask = liveStatePublisher.RunAsync(liveStatePublisherCts.Token);
+        using var gamepadHelperSupervisorCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var gamepadHelperSupervisorTask = gamepadHelperSupervisor.RunAsync(gamepadHelperSupervisorCts.Token);
         using var controllerShortcutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var controllerShortcutTask = controllerShortcutService.RunAsync(controllerShortcutCts.Token);
+        using var handheldProfileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var handheldProfileTask = handheldProfileCoordinator.RunAsync(handheldProfileCts.Token);
 
         try
         {
@@ -197,10 +230,28 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await handheldProfileCts.CancelAsync();
+            try
+            {
+                await handheldProfileTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             await liveStatePublisherCts.CancelAsync();
             try
             {
                 await liveStatePublisherTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await gamepadHelperSupervisorCts.CancelAsync();
+            try
+            {
+                await gamepadHelperSupervisorTask;
             }
             catch (OperationCanceledException)
             {
@@ -248,6 +299,20 @@ public sealed class SteamLoaderBackgroundHost
 
             _hostState.UpdateMessage("Background host stopped.");
             await apiServer.StopAsync();
+        }
+    }
+
+    private static void AppendDiagnosticLog(string path, string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.AppendAllText(
+                path,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
+        }
+        catch
+        {
         }
     }
 }

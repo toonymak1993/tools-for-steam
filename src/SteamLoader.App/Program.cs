@@ -1,5 +1,6 @@
 using System.Windows;
 using SteamLoader.App.Hosting;
+using SteamLoader.App.Infrastructure.Helpers;
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.Steam;
@@ -17,11 +18,27 @@ public static class Program
     {
         _installerMutex = new Mutex(false, SteamLoaderRuntime.InstallerMutexName);
 
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RestoreXboxModeArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RestoreXboxMode();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckXboxModeSupportArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return CheckXboxModeSupport();
+        }
+
         var unifyLaunchIndex = Array.FindIndex(args, argument =>
             string.Equals(argument, "--unifysteam-launch", StringComparison.OrdinalIgnoreCase));
         if (unifyLaunchIndex >= 0)
         {
             var unifyTarget = unifyLaunchIndex + 1 < args.Length ? args[unifyLaunchIndex + 1] : string.Empty;
+            if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
+            {
+                Console.Error.WriteLine("Storefront is disabled in this build.");
+                return 1;
+            }
+
             return Infrastructure.StoreSync.UnifySteamLauncher.Run(unifyTarget);
         }
 
@@ -30,9 +47,29 @@ public static class Program
             return RunBackgroundHostAsync().GetAwaiter().GetResult();
         }
 
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.HidDebugArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunHidDebugWindow();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.GamepadHelperArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunGamepadHelper();
+        }
+
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.FpsHelperArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return RunFpsHelper();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterInstalledHelperTasksArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RegisterInstalledHelperTasks();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterGamepadHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RegisterGamepadHelperTask();
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
@@ -40,9 +77,30 @@ public static class Program
             return RegisterFpsHelperTask();
         }
 
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckGamepadHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return CheckGamepadHelperTask();
+        }
+
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return CheckFpsHelperTask();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.SanitizeSteamAutostartArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return SanitizeSteamAutostart();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RequestSteamAttentionArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            TryRequestSteamAttention();
+            return 0;
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RepairSteamStartupArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RepairSteamStartup();
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PreviewSplashArgument, StringComparison.OrdinalIgnoreCase)))
@@ -57,8 +115,44 @@ public static class Program
             return ConfigureStartupMode(startupModeArgument[SteamLoaderRuntime.SetStartupModeArgumentPrefix.Length..]);
         }
 
-        var shellBootstrapMode = args.Any(argument =>
+        using var appMutex = new Mutex(true, SteamLoaderRuntime.AppMutexName, out var ownsAppMutex);
+        if (!ownsAppMutex)
+        {
+            TryRequestSteamAttention();
+            return 0;
+        }
+
+        var shellBootstrapRequested = args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.ShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+
+        var executablePath =
+            Environment.ProcessPath
+            ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+        var autostartService = new WindowsAutostartService(
+            SteamLoaderRuntime.AutostartValueName,
+            "SteamLoader",
+            "SteamTools");
+        var disabledStartupEntries = autostartService.DisableSteamAutostartEntries(SteamStartupDiagnostics.Write);
+        var shellService = new WindowsShellService();
+        var settingsService = new SteamLoaderSettingsService(
+            autostartService,
+            shellService,
+            new XboxModeService(),
+            executablePath,
+            SteamLoaderRuntime.ShellLaunchArguments,
+            Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
+        var settingsSnapshot = settingsService.EnsureDefaultConsoleModeEnabled();
+        var shellBootstrapMode = SteamLoaderRuntime.ShouldUseShellBootstrap(
+            shellBootstrapRequested,
+            settingsSnapshot.StartupMode);
+        var xboxBootstrapMode = args.Any(argument =>
+            string.Equals(argument, SteamLoaderRuntime.XboxBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+        var xboxHostedSplash = args.Any(argument =>
+            string.Equals(argument, SteamLoaderRuntime.XboxHostedSplashArgument, StringComparison.OrdinalIgnoreCase));
+        var consoleBootstrapMode = shellBootstrapMode || xboxBootstrapMode;
+        SteamStartupDiagnostics.Write(
+            $"main startup mode={settingsSnapshot.StartupMode} shellBootstrap={shellBootstrapMode} " +
+            $"xboxBootstrap={xboxBootstrapMode} disabledConflictingAutostarts={disabledStartupEntries}");
 
         // Resolve Steam early and, in console/shell startup, launch Big Picture as
         // the very first action - before shell setup, settings and the launcher
@@ -67,45 +161,27 @@ public static class Program
         var steamInstallationService = new SteamInstallationService(
             new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
-        if (shellBootstrapMode)
+        if (consoleBootstrapMode)
         {
-            SteamClientLaunchService.RequestSteamStartForTools(steamInstallationService);
+            var launchState = SteamClientLaunchService.PrepareConsoleStartup(steamInstallationService);
+            SteamStartupDiagnostics.Write($"console bootstrap result={launchState.Message}");
         }
 
         if (shellBootstrapMode)
         {
             var bootstrapShellService = new WindowsShellService();
-            var executablePath =
-                Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
             bootstrapShellService.PrepareCurrentSession(executablePath, SteamLoaderRuntime.ShellLaunchArguments);
         }
 
-        var showManager = args.Any(argument =>
-            string.Equals(argument, SteamLoaderRuntime.ManagerArgument, StringComparison.OrdinalIgnoreCase));
-        var runStartupSync = shellBootstrapMode || args.Any(argument =>
+        var runStartupSync = shellBootstrapMode || xboxBootstrapMode || args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleStartupMode = shellBootstrapMode;
+        var consoleStartupMode = settingsSnapshot.SplashScreen.Enabled && !xboxHostedSplash;
 
-        var startHiddenInTray = !showManager;
+        var startHiddenInTray = true;
 
         var processManager = new SteamLoaderProcessManager(
             new Uri("http://127.0.0.1:47652/"),
             SteamLoaderRuntime.BackgroundArgument);
-        var autostartService = new WindowsAutostartService(
-            SteamLoaderRuntime.AutostartValueName,
-            "SteamLoader",
-            "SteamTools");
-        var shellService = new WindowsShellService();
-        var settingsService = new SteamLoaderSettingsService(
-            autostartService,
-            shellService,
-            Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path."),
-            SteamLoaderRuntime.ShellLaunchArguments,
-            Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
-        var settingsSnapshot = settingsService.EnsureDefaultConsoleModeEnabled();
-
         if (shellBootstrapMode && !settingsSnapshot.FirstRunCompleted)
         {
             settingsService.CompleteFirstRunSetup();
@@ -154,7 +230,7 @@ public static class Program
 
         application.Startup += async (_, _) =>
         {
-            if (showManager || viewModel.ShowStartupSplash)
+            if (viewModel.ShowStartupSplash)
             {
                 // Wait for game covers to be ready before showing the window so
                 // the mosaic appears immediately without a pop-in effect.
@@ -237,6 +313,46 @@ public static class Program
         return application.Run();
     }
 
+    private static void TryRequestSteamAttention()
+    {
+        try
+        {
+            var steamInstallationService = new SteamInstallationService(
+                new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            SteamClientLaunchService.RequestSteamAttention(steamInstallationService);
+        }
+        catch
+        {
+            // Best effort only: duplicate launches should exit quietly even if
+            // Steam cannot be nudged into the foreground right now.
+        }
+    }
+
+    private static int RepairSteamStartup()
+    {
+        try
+        {
+            var steamInstallationService = new SteamInstallationService(
+                new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            var service = new SteamClientLaunchService(
+                httpClient,
+                new Uri("http://127.0.0.1:8080"),
+                steamInstallationService,
+                isHandheld: true);
+            var result = service.RestartSteamForSteamTools();
+            SteamStartupDiagnostics.Write($"external hard Steam startup repair result={result.Message}");
+            return result.Message.StartsWith("Steam is restarting", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"external hard Steam startup repair failed: {exception}");
+            return 1;
+        }
+    }
+
     private static int ParsePreviewDurationSeconds(string[] args)
     {
         var prefix = $"{SteamLoaderRuntime.PreviewSplashDurationArgument}=";
@@ -267,6 +383,7 @@ public static class Program
             var settingsService = new SteamLoaderSettingsService(
                 autostartService,
                 shellService,
+                new XboxModeService(),
                 executablePath,
                 SteamLoaderRuntime.ShellLaunchArguments,
                 Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
@@ -281,6 +398,27 @@ public static class Program
         }
     }
 
+    private static int RestoreXboxMode()
+    {
+        try
+        {
+            new XboxModeService().RestoreOnUninstall();
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
+    }
+
+    private static int CheckXboxModeSupport()
+    {
+        var support = new XboxModeService().GetSupportStatus();
+        Console.WriteLine(support.Reason);
+        return support.IsSupported ? 0 : 1;
+    }
+
     private static int RunFpsHelper()
     {
         try
@@ -290,6 +428,176 @@ public static class Program
             var statusStore = new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json"));
             var helperHost = new TfsFpsHelperHost(settingsStore, statusStore);
             return helperHost.Run();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception);
+            return 1;
+        }
+    }
+
+    private static int RunGamepadHelper()
+    {
+        try
+        {
+            var helperHost = new TfsGamepadHelperHost();
+            return helperHost.Run();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception);
+            return 1;
+        }
+    }
+
+    private static int RunHidDebugWindow()
+    {
+        var logPath = Path.Combine(AppContext.BaseDirectory, "data", "hid-debug.log");
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+            File.WriteAllText(logPath, string.Empty);
+
+            using var monitor = new HidMenuButtonMonitor();
+            var logLock = new object();
+
+            var instructionsText = new System.Windows.Controls.TextBlock
+            {
+                Margin = new Thickness(0, 0, 0, 12),
+                TextWrapping = TextWrapping.Wrap,
+                Text =
+                    "Press the controller button you want to inspect. " +
+                    $"Tools for Steam currently expects HID button usage {HidMenuButtonMonitor.ExpectedMenuButtonUsage} " +
+                    "for the Xbox Menu / Start button. This window logs the exact button usages reported by the device."
+            };
+
+            var stateText = new System.Windows.Controls.TextBlock
+            {
+                Margin = new Thickness(0, 0, 0, 12),
+                Text = $"Waiting for HID input... Log: {logPath}"
+            };
+
+            var outputText = new System.Windows.Controls.TextBox
+            {
+                IsReadOnly = true,
+                AcceptsReturn = true,
+                AcceptsTab = true,
+                TextWrapping = TextWrapping.NoWrap,
+                VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+                FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                MinHeight = 420
+            };
+
+            void AppendLine(string line)
+            {
+                lock (logLock)
+                {
+                    File.AppendAllText(logPath, line + Environment.NewLine);
+                }
+
+                if (outputText.Dispatcher.CheckAccess())
+                {
+                    outputText.AppendText(line + Environment.NewLine);
+                    outputText.ScrollToEnd();
+                    stateText.Text = $"Last update: {DateTime.Now:HH:mm:ss} | Log: {logPath}";
+                    return;
+                }
+
+                _ = outputText.Dispatcher.BeginInvoke(() =>
+                {
+                    outputText.AppendText(line + Environment.NewLine);
+                    outputText.ScrollToEnd();
+                    stateText.Text = $"Last update: {DateTime.Now:HH:mm:ss} | Log: {logPath}";
+                });
+            }
+
+            monitor.ReportObserved += report =>
+            {
+                var usagesText = report.ButtonUsages.Count == 0
+                    ? "-"
+                    : string.Join(", ", report.ButtonUsages);
+                var deviceHandleText = $"0x{unchecked((ulong)report.DeviceHandle.ToInt64()):X}";
+                var line =
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} " +
+                    $"device={deviceHandleText} reportLength={report.ReportLength} " +
+                    $"usages=[{usagesText}] expectedUsageDown={report.IsExpectedMenuUsagePressed}";
+                AppendLine(line);
+            };
+
+            var copyPathButton = new System.Windows.Controls.Button
+            {
+                Content = "Copy Log Path",
+                MinWidth = 120,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            copyPathButton.Click += (_, _) => System.Windows.Clipboard.SetText(logPath);
+
+            var clearButton = new System.Windows.Controls.Button
+            {
+                Content = "Clear",
+                MinWidth = 90,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            clearButton.Click += (_, _) =>
+            {
+                lock (logLock)
+                {
+                    File.WriteAllText(logPath, string.Empty);
+                }
+
+                outputText.Clear();
+                stateText.Text = $"Log cleared at {DateTime.Now:HH:mm:ss} | Log: {logPath}";
+            };
+
+            var closeButton = new System.Windows.Controls.Button
+            {
+                Content = "Close",
+                MinWidth = 90
+            };
+
+            var buttonBar = new System.Windows.Controls.StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                Margin = new Thickness(0, 0, 0, 12)
+            };
+            buttonBar.Children.Add(copyPathButton);
+            buttonBar.Children.Add(clearButton);
+            buttonBar.Children.Add(closeButton);
+
+            var contentPanel = new System.Windows.Controls.DockPanel
+            {
+                Margin = new Thickness(16)
+            };
+            System.Windows.Controls.DockPanel.SetDock(instructionsText, System.Windows.Controls.Dock.Top);
+            System.Windows.Controls.DockPanel.SetDock(stateText, System.Windows.Controls.Dock.Top);
+            System.Windows.Controls.DockPanel.SetDock(buttonBar, System.Windows.Controls.Dock.Top);
+            contentPanel.Children.Add(instructionsText);
+            contentPanel.Children.Add(stateText);
+            contentPanel.Children.Add(buttonBar);
+            contentPanel.Children.Add(outputText);
+
+            var window = new Window
+            {
+                Title = "Tools for Steam HID Debug",
+                Width = 980,
+                Height = 680,
+                WindowStartupLocation = WindowStartupLocation.CenterScreen,
+                Content = contentPanel
+            };
+
+            closeButton.Click += (_, _) => window.Close();
+
+            AppendLine(
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ready expectedMenuUsage={HidMenuButtonMonitor.ExpectedMenuButtonUsage}");
+
+            var application = new System.Windows.Application
+            {
+                ShutdownMode = ShutdownMode.OnMainWindowClose
+            };
+            application.MainWindow = window;
+            return application.Run(window);
         }
         catch (Exception exception)
         {
@@ -342,6 +650,105 @@ public static class Program
         }
     }
 
+    private static int RegisterGamepadHelperTask()
+    {
+        var logPath = Path.Combine(AppContext.BaseDirectory, "data", "gamepad-helper-task.log");
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+            if (File.Exists(logPath))
+            {
+                File.Delete(logPath);
+            }
+
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var taskService = new GamepadHelperScheduledTaskService(
+                executablePath,
+                AppContext.BaseDirectory);
+            taskService.EnsureRegistered();
+
+            if (File.Exists(logPath))
+            {
+                File.Delete(logPath);
+            }
+
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+                File.WriteAllText(logPath, exception.Message);
+            }
+            catch
+            {
+            }
+
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
+    }
+
+    private static int RegisterInstalledHelperTasks()
+    {
+        try
+        {
+            if (!FpsHelperScheduledTaskService.IsCurrentProcessElevated())
+            {
+                throw new InvalidOperationException("Admin rights are required to register the elevated TFS helper tasks.");
+            }
+
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var fpsTaskService = new FpsHelperScheduledTaskService(
+                executablePath,
+                SteamLoaderRuntime.FpsHelperArgument,
+                AppContext.BaseDirectory);
+            var gamepadTaskService = new GamepadHelperScheduledTaskService(
+                executablePath,
+                AppContext.BaseDirectory);
+
+            gamepadTaskService.EnsureRegistered();
+            fpsTaskService.EnsureRegistered();
+
+            var autostartService = new WindowsAutostartService(
+                SteamLoaderRuntime.AutostartValueName,
+                "SteamLoader",
+                "SteamTools");
+            var disabledCount = autostartService.DisableSteamAutostartEntries(SteamStartupDiagnostics.Write);
+            SteamStartupDiagnostics.Write($"elevated helper registration sanitized conflicting autostarts disabled={disabledCount}");
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
+    }
+
+    private static int CheckGamepadHelperTask()
+    {
+        try
+        {
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var taskService = new GamepadHelperScheduledTaskService(
+                executablePath,
+                AppContext.BaseDirectory);
+            return taskService.IsRegistered() ? 0 : 1;
+        }
+        catch
+        {
+            return 1;
+        }
+    }
+
     private static int CheckFpsHelperTask()
     {
         try
@@ -361,8 +768,33 @@ public static class Program
         }
     }
 
+    private static int SanitizeSteamAutostart()
+    {
+        try
+        {
+            var autostartService = new WindowsAutostartService(
+                SteamLoaderRuntime.AutostartValueName,
+                "SteamLoader",
+                "SteamTools");
+            var disabledCount = autostartService.DisableSteamAutostartEntries(SteamStartupDiagnostics.Write);
+            SteamStartupDiagnostics.Write($"installer autostart sanitation complete disabled={disabledCount}");
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"installer autostart sanitation failed: {exception}");
+            return 1;
+        }
+    }
+
     private static async Task<int> RunBackgroundHostAsync()
     {
+        using var backgroundHostMutex = new Mutex(true, SteamLoaderRuntime.BackgroundHostMutexName, out var ownsBackgroundHostMutex);
+        if (!ownsBackgroundHostMutex)
+        {
+            return 0;
+        }
+
         var cancellation = new CancellationTokenSource();
 
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>

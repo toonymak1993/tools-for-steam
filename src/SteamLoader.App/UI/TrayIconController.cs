@@ -21,7 +21,6 @@ public sealed class TrayIconController : IDisposable
     private readonly Forms.ToolStripMenuItem _startHostItem;
     private readonly Forms.ToolStripMenuItem _restartHostItem;
     private readonly Forms.ToolStripMenuItem _stopHostItem;
-    private readonly Forms.ToolStripMenuItem _autostartItem;
     private readonly Forms.ToolStripMenuItem _startDesktopItem;
     private readonly Forms.ToolStripMenuItem _openFolderItem;
     private readonly Forms.ToolStripMenuItem _checkUpdatesItem;
@@ -58,10 +57,6 @@ public sealed class TrayIconController : IDisposable
         _startHostItem = new Forms.ToolStripMenuItem("Start Background Host", null, (_, _) => _viewModel.StartCommand.Execute(null));
         _restartHostItem = new Forms.ToolStripMenuItem("Restart Background Host", null, (_, _) => _viewModel.RestartCommand.Execute(null));
         _stopHostItem = new Forms.ToolStripMenuItem("Stop Background Host", null, (_, _) => _viewModel.StopCommand.Execute(null));
-        _autostartItem = new Forms.ToolStripMenuItem("Startup Mode: Shell takeover", null, (_, _) => _viewModel.ToggleAutostartSetting())
-        {
-            CheckOnClick = false
-        };
         _startDesktopItem = new Forms.ToolStripMenuItem("Start Windows Desktop", null, (_, _) => _viewModel.StartWindowsDesktop());
         _openFolderItem = new Forms.ToolStripMenuItem("Open Install Folder", null, (_, _) => _viewModel.OpenInstallFolder());
         _checkUpdatesItem = new Forms.ToolStripMenuItem("Check for Updates", null, async (_, _) => await _viewModel.CheckForUpdatesAsync());
@@ -80,7 +75,6 @@ public sealed class TrayIconController : IDisposable
             _restartHostItem,
             _stopHostItem,
             new Forms.ToolStripSeparator(),
-            _autostartItem,
             _startDesktopItem,
             _openFolderItem,
             _checkUpdatesItem,
@@ -142,8 +136,6 @@ public sealed class TrayIconController : IDisposable
             case nameof(MainWindowViewModel.IsBusy):
             case nameof(MainWindowViewModel.IsRunning):
             case nameof(MainWindowViewModel.SteamStateText):
-            case nameof(MainWindowViewModel.AutostartEnabled):
-            case nameof(MainWindowViewModel.StartupMode):
             case nameof(MainWindowViewModel.ErrorText):
             case nameof(MainWindowViewModel.ServiceDetailText):
                 UpdateTrayState();
@@ -179,9 +171,6 @@ public sealed class TrayIconController : IDisposable
         _restartHostItem.Enabled = _viewModel.RestartCommand.CanExecute(null);
         _stopHostItem.Enabled = _viewModel.StopCommand.CanExecute(null);
         _refreshItem.Enabled = _viewModel.RefreshCommand.CanExecute(null);
-        _autostartItem.Enabled = _viewModel.ToggleAutostartCommand.CanExecute(null);
-        _autostartItem.Checked = _viewModel.AutostartEnabled;
-        _autostartItem.Text = _viewModel.AutostartMenuText;
         _startDesktopItem.Enabled = _viewModel.StartDesktopCommand.CanExecute(null);
         _checkUpdatesItem.Enabled = _viewModel.CheckForUpdatesCommand.CanExecute(null);
         _exportSupportBundleItem.Enabled = _viewModel.ExportSupportBundleCommand.CanExecute(null);

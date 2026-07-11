@@ -1,10 +1,14 @@
 using System.Diagnostics;
+using System.Management;
+using System.Runtime.InteropServices;
 using SteamLoader.App.Infrastructure.Steam;
 
 namespace SteamLoader.App.Services;
 
 public sealed class SteamClientLaunchService
 {
+    private const string BigPictureProtocolUri = "steam://open/bigpicture";
+    private const string SteamStartupMutexName = @"Local\ToolsForSteam.SteamStartup";
     private static readonly TimeSpan ActionCooldown = TimeSpan.FromSeconds(20);
 
     // How long Steam may take to expose its DevTools endpoint before we treat it
@@ -16,6 +20,7 @@ public sealed class SteamClientLaunchService
     private static readonly TimeSpan HandheldStartupGracePeriod = TimeSpan.FromSeconds(150);
     private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(18);
     private static readonly TimeSpan ForceKillTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan InvisibleUiGracePeriod = TimeSpan.FromSeconds(45);
 
     // How often we try to auto-recover a Steam client that starts but never
     // finishes building its UI (the "stuck at the splash screen" hang). The
@@ -24,6 +29,94 @@ public sealed class SteamClientLaunchService
     // we never hammer the machine in an endless kill/relaunch loop.
     private const int MaxRecoveryAttempts = 3;
 
+    public static SteamClientLaunchState PrepareConsoleStartup(
+        SteamInstallationService steamInstallationService)
+    {
+        var steamExePath = steamInstallationService.ResolveSteamExecutablePath();
+        if (steamExePath is null)
+        {
+            SteamStartupDiagnostics.Write("console bootstrap failed: steam.exe was not found");
+            return new SteamClientLaunchState(
+                false,
+                "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
+        }
+
+        using var startupMutex = new Mutex(false, SteamStartupMutexName);
+        var ownsMutex = false;
+        try
+        {
+            ownsMutex = startupMutex.WaitOne(TimeSpan.FromSeconds(15));
+            if (!ownsMutex)
+            {
+                SteamStartupDiagnostics.Write("console bootstrap skipped: another startup owner holds the mutex");
+                return new SteamClientLaunchState(false, "Another Tools for Steam startup owner is preparing Steam.");
+            }
+
+            return PrepareOwnedConsoleStartup(steamExePath);
+        }
+        catch (AbandonedMutexException)
+        {
+            ownsMutex = true;
+            SteamStartupDiagnostics.Write("console bootstrap recovered an abandoned startup mutex");
+            return PrepareOwnedConsoleStartup(steamExePath);
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"console bootstrap failed: {exception}");
+            return new SteamClientLaunchState(false, $"Steam could not be prepared: {exception.Message}");
+        }
+        finally
+        {
+            if (ownsMutex)
+            {
+                startupMutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private static SteamClientLaunchState PrepareOwnedConsoleStartup(string steamExePath)
+    {
+        var steamRunning = IsSteamRunning();
+        var commandLine = TryGetSteamMainProcessCommandLine();
+        SteamStartupDiagnostics.Write(
+            $"console bootstrap inspect running={steamRunning} commandLine={commandLine ?? "<missing>"}");
+
+        if (!steamRunning)
+        {
+            LaunchSteam(steamExePath);
+            SteamStartupDiagnostics.Write("console bootstrap launched one clean Steam process");
+            return new SteamClientLaunchState(false, "Starting Steam in Gamepad UI with DevTools enabled.");
+        }
+
+        if (HasRequiredConsoleLaunchArguments(commandLine))
+        {
+            SteamStartupDiagnostics.Write("console bootstrap kept the existing compatible Steam startup");
+            return new SteamClientLaunchState(false, "Steam is already starting with the required TFS arguments.");
+        }
+
+        SteamStartupDiagnostics.Write("console bootstrap found an incompatible or orphaned Steam startup; restarting once");
+        if (!RestartSteamForConsoleBootstrap(steamExePath))
+        {
+            SteamStartupDiagnostics.Write("console bootstrap could not stop the conflicting Steam process tree");
+            return new SteamClientLaunchState(false, "The conflicting Steam startup could not be stopped safely.");
+        }
+
+        SteamStartupDiagnostics.Write("console bootstrap replaced the conflicting startup with one clean Steam process");
+        return new SteamClientLaunchState(false, "Restarted Steam once with the required Gamepad UI and DevTools arguments.");
+    }
+
+    internal static bool HasRequiredConsoleLaunchArguments(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+        {
+            return false;
+        }
+
+        return commandLine.Contains("-gamepadui", StringComparison.OrdinalIgnoreCase) &&
+            commandLine.Contains("-dev", StringComparison.OrdinalIgnoreCase) &&
+            commandLine.Contains("-cef-enable-debugging", StringComparison.OrdinalIgnoreCase);
+    }
+
     private readonly HttpClient _httpClient;
     private readonly Uri _debugEndpoint;
     private readonly SteamInstallationService _steamInstallationService;
@@ -31,8 +124,10 @@ public sealed class SteamClientLaunchService
     private readonly object _recoverySync = new();
 
     private DateTimeOffset? _firstUnavailableAt;
+    private DateTimeOffset? _firstInvisibleUiAt;
     private DateTimeOffset _lastActionAt = DateTimeOffset.MinValue;
     private int _recoveryAttempts;
+    private bool _steamUiWasVisible;
 
     public SteamClientLaunchService(
         HttpClient httpClient,
@@ -60,6 +155,14 @@ public sealed class SteamClientLaunchService
 
         try
         {
+            if (IsSteamRunning())
+            {
+                RequestSteamGamepadUi();
+                return new SteamClientLaunchState(
+                    false,
+                    "Steam is already running. Requesting the Gamepad UI and waiting for the DevTools endpoint.");
+            }
+
             LaunchSteam(steamExePath);
             return new SteamClientLaunchState(
                 false,
@@ -73,18 +176,114 @@ public sealed class SteamClientLaunchService
         }
     }
 
-    public async Task<SteamClientLaunchState> EnsureDevToolsReadyAsync(CancellationToken cancellationToken)
+    public static SteamClientLaunchState RequestSteamAttention(SteamInstallationService steamInstallationService)
     {
-        if (await IsDebugEndpointAvailableAsync(cancellationToken))
+        var steamExePath = steamInstallationService.ResolveSteamExecutablePath();
+        if (steamExePath is null)
         {
-            // Steam finished loading and the DevTools endpoint answered: the
-            // client is healthy, so clear the hang bookkeeping.
-            _firstUnavailableAt = null;
-            _recoveryAttempts = 0;
-            return new SteamClientLaunchState(true, "Steam DevTools endpoint is ready.");
+            return new SteamClientLaunchState(
+                false,
+                "Tools for Steam could not find steam.exe. Install Steam or start it once manually.");
         }
 
+        try
+        {
+            if (!IsSteamRunning())
+            {
+                LaunchSteam(steamExePath);
+                return new SteamClientLaunchState(
+                    false,
+                    "Starting Steam in Gamepad UI with DevTools enabled.");
+            }
+
+            RequestSteamGamepadUi();
+            return new SteamClientLaunchState(
+                false,
+                "Requesting the Steam Gamepad UI.");
+        }
+        catch (Exception exception)
+        {
+            return new SteamClientLaunchState(
+                false,
+                $"Steam could not be activated: {exception.Message}");
+        }
+    }
+
+    public async Task<SteamClientLaunchState> EnsureDevToolsReadyAsync(CancellationToken cancellationToken)
+    {
         var now = DateTimeOffset.UtcNow;
+        var launchAttemptInFlight = _firstUnavailableAt.HasValue;
+        if (await IsDebugEndpointAvailableAsync(cancellationToken))
+        {
+            if (IsSteamUiVisible())
+            {
+                _steamUiWasVisible = true;
+                _firstInvisibleUiAt = null;
+                _firstUnavailableAt = null;
+                _recoveryAttempts = 0;
+                return new SteamClientLaunchState(true, "Steam DevTools endpoint and UI are ready.");
+            }
+
+            if (_steamUiWasVisible)
+            {
+                // Steam may hide its main window while a game is active. Once
+                // the UI was confirmed during this session, DevTools alone is
+                // enough and we must never restart Steam underneath a game.
+                _firstUnavailableAt = null;
+                return new SteamClientLaunchState(true, "Steam DevTools endpoint is ready.");
+            }
+
+            _firstUnavailableAt = null;
+            _firstInvisibleUiAt ??= now;
+            if (launchAttemptInFlight || now - _lastActionAt >= ActionCooldown)
+            {
+                RequestSteamGamepadUi();
+                _lastActionAt = now;
+                SteamStartupDiagnostics.Write("Steam DevTools is ready but no UI is visible; requested Gamepad UI attention");
+            }
+
+            if (now - _firstInvisibleUiAt.Value < InvisibleUiGracePeriod)
+            {
+                return new SteamClientLaunchState(
+                    true,
+                    "Steam is running, but its UI is still opening. Requesting Gamepad UI attention.");
+            }
+
+            if (_recoveryAttempts >= MaxRecoveryAttempts)
+            {
+                return new SteamClientLaunchState(
+                    false,
+                    "Steam DevTools responds, but the Steam UI remains invisible after several hard restarts.");
+            }
+
+            _recoveryAttempts++;
+            var repairSteamExePath = ResolveSteamExecutablePath();
+            if (repairSteamExePath is null)
+            {
+                return new SteamClientLaunchState(
+                    false,
+                    "Steam is running without a visible UI, but steam.exe could not be resolved for recovery.");
+            }
+
+            var uiRecovered = RecoverHungSteam(
+                repairSteamExePath,
+                forceKill: true,
+                clearWebCache: _recoveryAttempts > 1,
+                disableCefGpu: _recoveryAttempts >= MaxRecoveryAttempts);
+            _lastActionAt = now;
+            _firstUnavailableAt = now;
+            _firstInvisibleUiAt = null;
+            _steamUiWasVisible = false;
+            SteamStartupDiagnostics.Write(
+                $"Steam UI stayed invisible although DevTools responded; hard recovery attempt={_recoveryAttempts} result={uiRecovered}");
+            return new SteamClientLaunchState(
+                false,
+                uiRecovered
+                    ? "Steam was running without a visible UI. Its process tree was stopped and restarted cleanly."
+                    : "Steam UI is invisible and its stale process tree could not be stopped yet.");
+        }
+
+        _firstInvisibleUiAt = null;
         _firstUnavailableAt ??= now;
 
         if (now - _lastActionAt < ActionCooldown)
@@ -109,6 +308,7 @@ public sealed class SteamClientLaunchService
             LaunchSteam(steamExePath);
             _lastActionAt = now;
             _firstUnavailableAt = now;
+            _steamUiWasVisible = false;
             _recoveryAttempts = 0;
             return new SteamClientLaunchState(
                 false,
@@ -210,6 +410,8 @@ public sealed class SteamClientLaunchService
 
         _lastActionAt = DateTimeOffset.UtcNow;
         _firstUnavailableAt = _lastActionAt;
+        _firstInvisibleUiAt = null;
+        _steamUiWasVisible = false;
         _recoveryAttempts = restartRequested ? 1 : 0;
 
         return new SteamClientLaunchState(
@@ -239,22 +441,49 @@ public sealed class SteamClientLaunchService
         bool clearWebCache,
         bool disableCefGpu)
     {
-        // Serialize recovery so a background watchdog pass and a manual restart
-        // can never run overlapping kill/relaunch sequences at the same time.
-        lock (_recoverySync)
+        using var startupMutex = new Mutex(false, SteamStartupMutexName);
+        var ownsStartupMutex = false;
+        try
         {
-            if (!CloseSteam(forceIfUnresponsive: forceKill))
+            try
             {
+                ownsStartupMutex = startupMutex.WaitOne(TimeSpan.FromSeconds(15));
+            }
+            catch (AbandonedMutexException)
+            {
+                ownsStartupMutex = true;
+            }
+
+            if (!ownsStartupMutex)
+            {
+                SteamStartupDiagnostics.Write("Steam recovery skipped because another startup repair owns the mutex");
                 return false;
             }
 
-            if (clearWebCache)
+            // Serialize both threads and processes so the Xbox host watchdog,
+            // the background injector and a manual restart cannot overlap.
+            lock (_recoverySync)
             {
-                ClearSteamWebCache();
-            }
+                if (!CloseSteam(forceIfUnresponsive: forceKill))
+                {
+                    return false;
+                }
 
-            LaunchSteam(steamExePath, disableCefGpu);
-            return true;
+                if (clearWebCache)
+                {
+                    ClearSteamWebCache();
+                }
+
+                LaunchSteam(steamExePath, disableCefGpu);
+                return true;
+            }
+        }
+        finally
+        {
+            if (ownsStartupMutex)
+            {
+                startupMutex.ReleaseMutex();
+            }
         }
     }
 
@@ -268,6 +497,62 @@ public sealed class SteamClientLaunchService
             UseShellExecute = false,
             CreateNoWindow = true,
         })?.Dispose();
+    }
+
+    private static bool RestartSteamForConsoleBootstrap(string steamExePath)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = steamExePath,
+                Arguments = "-shutdown",
+                WorkingDirectory = Path.GetDirectoryName(steamExePath) ?? AppContext.BaseDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            })?.Dispose();
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"official Steam shutdown request failed: {exception.Message}");
+        }
+
+        if (!WaitForSteamToExit(TimeSpan.FromSeconds(20)))
+        {
+            SteamStartupDiagnostics.Write("official Steam shutdown timed out; terminating the stale boot process tree");
+            ForceKillSteamProcesses();
+            if (!WaitForSteamToExit(ForceKillTimeout))
+            {
+                return false;
+            }
+        }
+
+        LaunchSteam(steamExePath);
+        return true;
+    }
+
+    private static string? TryGetSteamMainProcessCommandLine()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'steam.exe'");
+            using var results = searcher.Get();
+            foreach (ManagementObject item in results)
+            {
+                var commandLine = Convert.ToString(item["CommandLine"])?.Trim();
+                if (!string.IsNullOrWhiteSpace(commandLine))
+                {
+                    return commandLine;
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"Steam command-line inspection failed: {exception.Message}");
+        }
+
+        return null;
     }
 
     private bool CloseSteam(bool forceIfUnresponsive)
@@ -413,7 +698,9 @@ public sealed class SteamClientLaunchService
                 {
                     return !process.HasExited &&
                         (string.Equals(process.ProcessName, "steam", StringComparison.OrdinalIgnoreCase) ||
-                         string.Equals(process.ProcessName, "steamwebhelper", StringComparison.OrdinalIgnoreCase));
+                         string.Equals(process.ProcessName, "steamwebhelper", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(process.ProcessName, "GameOverlayUI", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(process.ProcessName, "steamerrorreporter", StringComparison.OrdinalIgnoreCase));
                 }
                 catch
                 {
@@ -421,6 +708,157 @@ public sealed class SteamClientLaunchService
                 }
             });
     }
+
+    private static void RequestSteamGamepadUi()
+    {
+        if (IsSteamUiVisible())
+        {
+            return;
+        }
+
+        if (TryFocusSteamWindow())
+        {
+            return;
+        }
+
+        TryOpenBigPictureProtocol();
+    }
+
+    private static bool IsBigPictureWindowVisible()
+    {
+        var processes = Process.GetProcessesByName("steamwebhelper");
+        try
+        {
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (!process.HasExited &&
+                        process.MainWindowHandle != IntPtr.Zero &&
+                        IsBigPictureWindowTitle(process.MainWindowTitle))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private static bool IsSteamUiVisible() => FindSteamWindowHandle() != IntPtr.Zero;
+
+    private static bool IsBigPictureWindowTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        return title.Replace('-', ' ').Contains("Big Picture", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryFocusSteamWindow()
+    {
+        var handle = FindSteamWindowHandle();
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        ShowWindow(handle, ShowWindowRestore);
+        SetForegroundWindow(handle);
+        return true;
+    }
+
+    private static IntPtr FindSteamWindowHandle()
+    {
+        var preferredHandle = FindSteamWindowHandle("steamwebhelper", preferSteamTitle: true);
+        if (preferredHandle != IntPtr.Zero)
+        {
+            return preferredHandle;
+        }
+
+        var steamHandle = FindSteamWindowHandle("steam", preferSteamTitle: false);
+        if (steamHandle != IntPtr.Zero)
+        {
+            return steamHandle;
+        }
+
+        return FindSteamWindowHandle("steamwebhelper", preferSteamTitle: false);
+    }
+
+    private static IntPtr FindSteamWindowHandle(string processName, bool preferSteamTitle)
+    {
+        var processes = Process.GetProcessesByName(processName);
+        try
+        {
+            var fallbackHandle = IntPtr.Zero;
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (process.HasExited || process.MainWindowHandle == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    fallbackHandle = process.MainWindowHandle;
+                    if (!preferSteamTitle ||
+                        process.MainWindowTitle.Contains("Steam", StringComparison.OrdinalIgnoreCase) ||
+                        IsBigPictureWindowTitle(process.MainWindowTitle))
+                    {
+                        return process.MainWindowHandle;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return fallbackHandle;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private static void TryOpenBigPictureProtocol()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = BigPictureProtocolUri,
+                UseShellExecute = true
+            })?.Dispose();
+        }
+        catch
+        {
+        }
+    }
+
+    private const int ShowWindowRestore = 9;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
 
 public sealed record SteamClientLaunchState(
