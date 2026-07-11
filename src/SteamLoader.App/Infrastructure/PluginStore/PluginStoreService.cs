@@ -16,7 +16,20 @@ public sealed class PluginStoreService
     private const string PermissionSecrets = "secrets";
     private const string PermissionNetwork = "network";
     private const string PermissionFiles = "files";
-    private const int SupportedSdkMajorVersion = 1;
+    private const string PermissionNotifications = "notifications";
+    private const string PermissionLogging = "logging";
+    private const string PermissionNativeAudio = "native.audio";
+    private const string PermissionNativeProcesses = "native.processes";
+    private const string PermissionNativeDisplay = "native.display";
+    private const string PermissionNativeThemes = "native.themes";
+    private const string PermissionNativeArtwork = "native.artwork";
+    private const string PermissionNativeAppStart = "native.app-start";
+    private const string PermissionNativeStoreSync = "native.store-sync";
+    private const string PermissionNativeAutomation = "native.automation";
+    private const string PermissionNativePerformance = "native.performance";
+    private const string PermissionNativePower = "native.power";
+    private const string PermissionNativeFullTrust = "native.full-trust";
+    internal const string SupportedSdkVersion = "1.0.0";
     private const int MaxPluginSettingsBytes = 256 * 1024;
     private const int MaxPluginSecretLength = 16 * 1024;
     private const int MaxPluginNetworkRequestBytes = 512 * 1024;
@@ -24,11 +37,14 @@ public sealed class PluginStoreService
     private const int MaxPluginFileBytes = 8 * 1024 * 1024;
     private const long MaxPluginFilesBytes = 32L * 1024 * 1024;
     private const int MaxPluginFileEntries = 1024;
+    private const int MaxPluginLogMessageLength = 4096;
+    private const int MaxPluginLogEntryBytes = 16 * 1024;
+    private const long MaxPluginLogBytes = 1024 * 1024;
     private const int MaxCommunityCatalogBytes = 1024 * 1024;
-    private const long MaxCommunityPackageBytes = 64L * 1024 * 1024;
-    private const long MaxCommunityPackageExtractedBytes = 128L * 1024 * 1024;
-    private const long MaxCommunityPackageEntryBytes = 32L * 1024 * 1024;
-    private const int MaxCommunityPackageEntries = 512;
+    private const long MaxCommunityPackageBytes = 256L * 1024 * 1024;
+    private const long MaxCommunityPackageExtractedBytes = 512L * 1024 * 1024;
+    private const long MaxCommunityPackageEntryBytes = 256L * 1024 * 1024;
+    private const int MaxCommunityPackageEntries = 2048;
     private const string DefaultCommunityCatalogUrl =
         "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json";
 
@@ -38,6 +54,19 @@ public sealed class PluginStoreService
         PermissionSecrets,
         PermissionNetwork,
         PermissionFiles,
+        PermissionNotifications,
+        PermissionLogging,
+        PermissionNativeAudio,
+        PermissionNativeProcesses,
+        PermissionNativeDisplay,
+        PermissionNativeThemes,
+        PermissionNativeArtwork,
+        PermissionNativeAppStart,
+        PermissionNativeStoreSync,
+        PermissionNativeAutomation,
+        PermissionNativePerformance,
+        PermissionNativePower,
+        PermissionNativeFullTrust,
         "frontend"
     };
 
@@ -64,6 +93,7 @@ public sealed class PluginStoreService
     };
 
     private readonly HttpClient _httpClient;
+    private readonly HttpClient _pluginNetworkHttpClient;
     private readonly SteamLoaderSettingsService _settingsService;
     private readonly string _rootPath;
     private readonly string _catalogPath;
@@ -76,6 +106,8 @@ public sealed class PluginStoreService
     private readonly bool _enableCommunityCatalogBootstrap;
     private readonly object _gate = new();
     private readonly object _sdkFileGate = new();
+    private readonly Dictionary<string, Queue<DateTimeOffset>> _pluginNotificationTimes =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly List<PluginStoreInputState> _inputQueue = [];
     private readonly SemaphoreSlim _catalogSyncSemaphore = new(1, 1);
     private readonly object _catalogBootstrapGate = new();
@@ -88,9 +120,17 @@ public sealed class PluginStoreService
         HttpClient httpClient,
         SteamLoaderSettingsService settingsService,
         string rootPath,
-        bool enableCommunityCatalogBootstrap = true)
+        bool enableCommunityCatalogBootstrap = true,
+        HttpClient? pluginNetworkHttpClient = null)
     {
         _httpClient = httpClient;
+        _pluginNetworkHttpClient = pluginNetworkHttpClient ?? new HttpClient(new SocketsHttpHandler
+        {
+            AllowAutoRedirect = false
+        })
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
         _settingsService = settingsService;
         _rootPath = rootPath;
         _catalogPath = Path.Combine(rootPath, "catalog.json");
@@ -137,6 +177,12 @@ public sealed class PluginStoreService
                     SdkVersion: string.Empty,
                     EntryPoint: string.Empty,
                     Permissions: [],
+                    InstalledPermissions: [],
+                    NetworkHosts: [],
+                    InstalledNetworkHosts: [],
+                    HomepageUrl: string.Empty,
+                    RepositoryUrl: string.Empty,
+                    Changelog: string.Empty,
                     IsBuiltIn: true,
                     IsInstalled: true,
                     IsEnabled: enabled,
@@ -160,12 +206,18 @@ public sealed class PluginStoreService
 
         var installedCommunityCount = communityPlugins.Count(plugin => plugin.IsInstalled);
         var updateCount = communityPlugins.Count(plugin => plugin.HasUpdate);
+        var isCustomCatalog = IsCustomCatalogConfigured() ||
+            communityCatalog.Plugins.Any(plugin => !string.IsNullOrWhiteSpace(plugin.PackagePath));
 
         return new PluginStoreSnapshot(
             StatusText: $"{builtInPlugins.Length} built-in plugin{(builtInPlugins.Length == 1 ? string.Empty : "s")} ready - {communityPlugins.Length} community plugin{(communityPlugins.Length == 1 ? string.Empty : "s")} listed.",
             ErrorText: string.Empty,
             CatalogTitle: communityCatalog.Title,
             CatalogDescription: communityCatalog.Description,
+            IsCustomCatalog: isCustomCatalog,
+            CatalogTrustText: isCustomCatalog
+                ? "Developer catalog - these plugins are not reviewed by Tools for Steam and run with full plugin access."
+                : "Curated catalog - community plugins run with full plugin access and should only be installed from trusted publishers.",
             CommunityCatalogAvailable: communityCatalog.Available,
             CommunityCatalogStatusText: communityCatalog.StatusText,
             BuiltInCount: builtInPlugins.Length,
@@ -178,7 +230,10 @@ public sealed class PluginStoreService
 
     public async Task<PluginStoreSnapshot> RefreshAsync(CancellationToken cancellationToken)
     {
-        await SyncCommunityCatalogAsync(cancellationToken);
+        if (!IsLocalDeveloperCatalog())
+        {
+            await SyncCommunityCatalogAsync(cancellationToken);
+        }
         return await GetSnapshotAsync(cancellationToken);
     }
 
@@ -329,6 +384,7 @@ public sealed class PluginStoreService
                     SdkVersion = manifest.SdkVersion,
                     EntryPoint = manifest.EntryPoint,
                     Permissions = manifest.Permissions,
+                    NetworkHosts = manifest.NetworkHosts,
                     InstalledAtUtc = DateTimeOffset.UtcNow
                 };
 
@@ -441,8 +497,35 @@ public sealed class PluginStoreService
             context.Data.SdkVersion,
             context.Data.EntryPoint,
             context.Data.Permissions,
+            context.Data.NetworkHosts,
             LoadPluginSettingsElement(context.PluginId),
             LoadPluginSecretFlags(context.PluginId));
+    }
+
+    public void EnsurePluginSdkPermission(string pluginId, string permission)
+    {
+        EnsurePluginPermission(pluginId, permission);
+    }
+
+    public string GetPluginInstallationDirectory(string pluginId)
+    {
+        var context = EnsureInstalledCommunityPlugin(pluginId);
+        return GetCommunityPluginDirectory(context.PluginId);
+    }
+
+    public string GetPluginDataDirectory(string pluginId)
+    {
+        var context = EnsureInstalledCommunityPlugin(pluginId);
+        var path = GetPluginSdkDataDirectory(context.PluginId);
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    public string GetPluginSecretForFullTrust(string pluginId, string key)
+    {
+        var context = EnsurePluginPermission(pluginId, PermissionNativeFullTrust);
+        EnsurePluginPermission(pluginId, PermissionSecrets);
+        return LoadPluginSecretValue(context.PluginId, NormalizeSdkKey(key, "secret key"));
     }
 
     public PluginSdkSettingsState GetPluginSdkSettings(string pluginId)
@@ -521,6 +604,11 @@ public sealed class PluginStoreService
             throw new InvalidOperationException("Plugin network requests must use an absolute HTTP or HTTPS URL.");
         }
 
+        if (!IsNetworkHostAllowed(uri, context.Data.NetworkHosts))
+        {
+            throw new InvalidOperationException($"Plugin network access to {uri.Host} is not declared in networkHosts.");
+        }
+
         using var message = new HttpRequestMessage(new HttpMethod(method), uri);
         var contentType = string.Empty;
         var bodyText = BuildNetworkRequestBody(request.Body);
@@ -582,7 +670,7 @@ public sealed class PluginStoreService
             message.Headers.Authorization = new AuthenticationHeaderValue(scheme, secretValue);
         }
 
-        using var networkResponse = await _httpClient.SendAsync(
+        using var networkResponse = await _pluginNetworkHttpClient.SendAsync(
             message,
             HttpCompletionOption.ResponseHeadersRead,
             cancellationToken);
@@ -863,6 +951,119 @@ public sealed class PluginStoreService
         }
     }
 
+    public PluginSdkNotificationState CreatePluginSdkNotification(
+        string pluginId,
+        PluginSdkNotificationRequest? request)
+    {
+        if (request is null)
+        {
+            throw new InvalidOperationException("A plugin notification payload is required.");
+        }
+
+        var context = EnsurePluginPermission(pluginId, PermissionNotifications);
+        var title = (request.Title ?? string.Empty).Trim();
+        var message = (request.Message ?? string.Empty).Trim();
+        if (title.Length is < 1 or > 80 || message.Length is < 1 or > 320)
+        {
+            throw new InvalidOperationException("Plugin notifications require a title up to 80 characters and a message up to 320 characters.");
+        }
+
+        var level = (request.Level ?? "info").Trim().ToLowerInvariant();
+        if (level is not "info" and not "success" and not "warning" and not "error")
+        {
+            throw new InvalidOperationException("Plugin notification levels must be info, success, warning, or error.");
+        }
+
+        var durationMs = Math.Clamp(request.DurationMs <= 0 ? 4500 : request.DurationMs, 1500, 10000);
+        var now = DateTimeOffset.UtcNow;
+        lock (_gate)
+        {
+            if (!_pluginNotificationTimes.TryGetValue(context.PluginId, out var notificationTimes))
+            {
+                notificationTimes = new Queue<DateTimeOffset>();
+                _pluginNotificationTimes[context.PluginId] = notificationTimes;
+            }
+
+            while (notificationTimes.TryPeek(out var timestamp) && now - timestamp > TimeSpan.FromSeconds(30))
+            {
+                notificationTimes.Dequeue();
+            }
+
+            if (notificationTimes.Count >= 5)
+            {
+                throw new InvalidOperationException("Plugin notification rate limit exceeded. Try again in a moment.");
+            }
+
+            notificationTimes.Enqueue(now);
+        }
+
+        return new PluginSdkNotificationState(
+            Guid.NewGuid().ToString("N"),
+            context.PluginId,
+            title,
+            message,
+            level,
+            durationMs,
+            now);
+    }
+
+    public PluginSdkLogState WritePluginSdkLog(string pluginId, PluginSdkLogRequest? request)
+    {
+        if (request is null)
+        {
+            throw new InvalidOperationException("A plugin log payload is required.");
+        }
+
+        var context = EnsurePluginPermission(pluginId, PermissionLogging);
+        var level = (request.Level ?? "info").Trim().ToLowerInvariant();
+        if (level is not "debug" and not "info" and not "warning" and not "error")
+        {
+            throw new InvalidOperationException("Plugin log levels must be debug, info, warning, or error.");
+        }
+
+        var message = (request.Message ?? string.Empty).Trim();
+        if (message.Length is < 1 or > MaxPluginLogMessageLength)
+        {
+            throw new InvalidOperationException("Plugin log messages must contain between 1 and 4096 characters.");
+        }
+
+        var writtenAtUtc = DateTimeOffset.UtcNow;
+        var serializedEntry = JsonSerializer.Serialize(
+            new
+            {
+                timestamp = writtenAtUtc,
+                pluginId = context.PluginId,
+                level,
+                message,
+                data = request.Data
+            },
+            JsonOptions) + Environment.NewLine;
+        if (Encoding.UTF8.GetByteCount(serializedEntry) > MaxPluginLogEntryBytes)
+        {
+            throw new InvalidOperationException("The plugin log entry is too large.");
+        }
+
+        lock (_sdkFileGate)
+        {
+            var logDirectory = Path.Combine(GetPluginSdkDataDirectory(context.PluginId), "logs");
+            Directory.CreateDirectory(logDirectory);
+            var logPath = Path.Combine(logDirectory, "plugin.log");
+            if (File.Exists(logPath) && new FileInfo(logPath).Length >= MaxPluginLogBytes)
+            {
+                var previousLogPath = Path.Combine(logDirectory, "plugin.previous.log");
+                File.Delete(previousLogPath);
+                File.Move(logPath, previousLogPath);
+            }
+
+            File.AppendAllText(logPath, serializedEntry, Encoding.UTF8);
+            return new PluginSdkLogState(
+                context.PluginId,
+                level,
+                writtenAtUtc,
+                new FileInfo(logPath).Length);
+        }
+    }
+
     private PluginStoreCommunityRuntimePluginState? BuildCommunityRuntimePluginState(
         string pluginId,
         InstalledCommunityPluginData installedPlugin)
@@ -913,7 +1114,8 @@ public sealed class PluginStoreService
             runtimePlugin.SdkVersion,
             runtimePlugin.EntryPoint,
             $"api/plugin-store/community/{Uri.EscapeDataString(normalizedPluginId)}/files/{Uri.EscapeDataString(runtimePlugin.EntryPoint).Replace("%2F", "/", StringComparison.OrdinalIgnoreCase)}",
-            runtimePlugin.Permissions);
+            runtimePlugin.Permissions,
+            runtimePlugin.NetworkHosts);
     }
 
     private InstalledCommunityPluginContext EnsurePluginPermission(string pluginId, string permission)
@@ -986,13 +1188,24 @@ public sealed class PluginStoreService
             }
 
             var version = NormalizeVersion(manifest.Version);
+            var permissions = NormalizePermissions(manifest.Permissions);
+            if (!permissions.Contains("frontend", StringComparer.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            var networkHosts = NormalizeNetworkHosts(manifest.NetworkHosts);
+            if (permissions.Contains(PermissionNetwork, StringComparer.OrdinalIgnoreCase) && networkHosts.Length == 0)
+            {
+                return false;
+            }
             installedPlugin = new InstalledCommunityPluginData
             {
                 Version = version,
                 ManifestVersion = version,
                 SdkVersion = sdkVersion,
                 EntryPoint = entryPoint,
-                Permissions = NormalizePermissions(manifest.Permissions),
+                Permissions = permissions,
+                NetworkHosts = networkHosts,
                 InstalledAtUtc = DateTimeOffset.MinValue
             };
             return true;
@@ -1137,10 +1350,14 @@ public sealed class PluginStoreService
                 : throw new InvalidOperationException("A plugin file path is required.");
         }
 
+        var segments = normalized.Split('/');
         if (normalized.Length > 512 ||
             Path.IsPathRooted(normalized) ||
             normalized.IndexOfAny(Path.GetInvalidPathChars()) >= 0 ||
-            normalized.Split('/').Any(segment => segment is "" or "." or ".."))
+            segments.Any(segment =>
+                segment is "" or "." or ".." ||
+                segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                !string.Equals(segment, segment.TrimEnd(' ', '.'), StringComparison.Ordinal)))
         {
             throw new InvalidOperationException("The plugin file path must be a safe relative path.");
         }
@@ -1252,31 +1469,41 @@ public sealed class PluginStoreService
         string targetPath,
         bool recursive)
     {
-        var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var entries = new List<PluginSdkFileEntry>();
-        foreach (var entryPath in Directory.EnumerateFileSystemEntries(targetPath, "*", searchOption))
+        var directories = new Stack<string>();
+        directories.Push(targetPath);
+        while (directories.Count > 0)
         {
-            if (entries.Count >= MaxPluginFileEntries)
+            var directory = directories.Pop();
+            foreach (var entryPath in Directory.EnumerateFileSystemEntries(directory))
             {
-                throw new InvalidOperationException("A plugin file listing cannot contain more than 1024 entries.");
-            }
+                if (entries.Count >= MaxPluginFileEntries)
+                {
+                    throw new InvalidOperationException("A plugin file listing cannot contain more than 1024 entries.");
+                }
 
-            var attributes = File.GetAttributes(entryPath);
-            if (attributes.HasFlag(FileAttributes.ReparsePoint))
-            {
-                throw new InvalidOperationException("Plugin file storage cannot contain links or reparse points.");
-            }
+                var attributes = File.GetAttributes(entryPath);
+                if (attributes.HasFlag(FileAttributes.ReparsePoint))
+                {
+                    throw new InvalidOperationException("Plugin file storage cannot contain links or reparse points.");
+                }
 
-            var isDirectory = attributes.HasFlag(FileAttributes.Directory);
-            var relativePath = Path.GetRelativePath(rootPath, entryPath).Replace('\\', '/');
-            entries.Add(new PluginSdkFileEntry(
-                relativePath,
-                Path.GetFileName(entryPath),
-                isDirectory,
-                isDirectory ? 0 : new FileInfo(entryPath).Length,
-                isDirectory
-                    ? new DirectoryInfo(entryPath).LastWriteTimeUtc
-                    : new FileInfo(entryPath).LastWriteTimeUtc));
+                var isDirectory = attributes.HasFlag(FileAttributes.Directory);
+                var relativePath = Path.GetRelativePath(rootPath, entryPath).Replace('\\', '/');
+                entries.Add(new PluginSdkFileEntry(
+                    relativePath,
+                    Path.GetFileName(entryPath),
+                    isDirectory,
+                    isDirectory ? 0 : new FileInfo(entryPath).Length,
+                    isDirectory
+                        ? new DirectoryInfo(entryPath).LastWriteTimeUtc
+                        : new FileInfo(entryPath).LastWriteTimeUtc));
+
+                if (recursive && isDirectory)
+                {
+                    directories.Push(entryPath);
+                }
+            }
         }
 
         return entries
@@ -1423,9 +1650,14 @@ public sealed class PluginStoreService
                 NormalizeVersion(installedVersion),
                 NormalizeVersion(plugin.Version),
                 StringComparison.OrdinalIgnoreCase);
-        var sdkVersion = installedPlugin?.SdkVersion ?? string.Empty;
+        var sdkVersion = string.IsNullOrWhiteSpace(plugin.SdkVersion)
+            ? installedPlugin?.SdkVersion ?? string.Empty
+            : plugin.SdkVersion;
         var entryPoint = installedPlugin?.EntryPoint ?? string.Empty;
-        var permissions = installedPlugin?.Permissions ?? [];
+        var installedPermissions = installedPlugin?.Permissions ?? [];
+        var installedNetworkHosts = installedPlugin?.NetworkHosts ?? [];
+        var permissions = plugin.Permissions.Length > 0 ? plugin.Permissions : installedPermissions;
+        var networkHosts = plugin.NetworkHosts.Length > 0 ? plugin.NetworkHosts : installedNetworkHosts;
         var hasPackageSource = plugin.HasPackageSource;
         var hasPackageChecksum = !string.IsNullOrWhiteSpace(plugin.PackageSha256);
         var canInstall = hasPackageSource && hasPackageChecksum;
@@ -1469,6 +1701,12 @@ public sealed class PluginStoreService
             SdkVersion: sdkVersion,
             EntryPoint: entryPoint,
             Permissions: permissions,
+            InstalledPermissions: installedPermissions,
+            NetworkHosts: networkHosts,
+            InstalledNetworkHosts: installedNetworkHosts,
+            HomepageUrl: plugin.HomepageUrl,
+            RepositoryUrl: plugin.RepositoryUrl,
+            Changelog: plugin.Changelog,
             IsBuiltIn: false,
             IsInstalled: isInstalled,
             IsEnabled: isInstalled,
@@ -1564,7 +1802,9 @@ public sealed class PluginStoreService
                     : data.Description.Trim(),
                 StatusText: plugins.Length == 0
                     ? "The community catalog is connected, but it does not publish any plugins yet."
-                    : $"{plugins.Length} community plugin{(plugins.Length == 1 ? string.Empty : "s")} are available from the connected catalog.",
+                    : plugins.Length == 1
+                        ? "1 community plugin is available from the connected catalog."
+                        : $"{plugins.Length} community plugins are available from the connected catalog.",
                 CatalogDirectory: catalogDirectory,
                 Plugins: plugins);
         }
@@ -1606,6 +1846,9 @@ public sealed class PluginStoreService
             Author = string.IsNullOrWhiteSpace(plugin?.Author) ? "Community" : plugin!.Author.Trim(),
             Category = (plugin?.Category ?? string.Empty).Trim(),
             Version = string.IsNullOrWhiteSpace(plugin?.Version) ? "0.0.0" : plugin!.Version.Trim(),
+            SdkVersion = NormalizeVersion(plugin?.SdkVersion),
+            Permissions = NormalizePermissions(plugin?.Permissions),
+            NetworkHosts = NormalizeNetworkHosts(plugin?.NetworkHosts),
             Images = (plugin?.Images ?? [])
                 .Where(image => !string.IsNullOrWhiteSpace(image))
                 .Select(image => image.Trim())
@@ -1620,7 +1863,8 @@ public sealed class PluginStoreService
             PackageUrl = (plugin?.PackageUrl ?? string.Empty).Trim(),
             PackageSha256 = NormalizeSha256(plugin?.PackageSha256),
             HomepageUrl = (plugin?.HomepageUrl ?? string.Empty).Trim(),
-            RepositoryUrl = (plugin?.RepositoryUrl ?? string.Empty).Trim()
+            RepositoryUrl = (plugin?.RepositoryUrl ?? string.Empty).Trim(),
+            Changelog = (plugin?.Changelog ?? string.Empty).Trim()
         };
     }
 
@@ -1879,6 +2123,49 @@ public sealed class PluginStoreService
         return catalogUri.ToString();
     }
 
+    private bool IsCustomCatalogConfigured()
+    {
+        if (!File.Exists(_catalogSourcePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var source = JsonSerializer.Deserialize<CommunityCatalogSourceFileData>(
+                File.ReadAllText(_catalogSourcePath),
+                JsonOptions);
+            return !string.IsNullOrWhiteSpace(source?.CatalogUrl) &&
+                !string.Equals(
+                    source.CatalogUrl.Trim(),
+                    DefaultCommunityCatalogUrl,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private bool IsLocalDeveloperCatalog()
+    {
+        if (!File.Exists(_catalogSourcePath))
+        {
+            return false;
+        }
+        try
+        {
+            var source = JsonSerializer.Deserialize<CommunityCatalogSourceFileData>(
+                File.ReadAllText(_catalogSourcePath),
+                JsonOptions);
+            return source?.LocalDevelopment == true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static void EnsureZipFileName(string pathOrUrlPath)
     {
         if (!Path.GetExtension(pathOrUrlPath).Equals(".zip", StringComparison.OrdinalIgnoreCase))
@@ -1998,6 +2285,36 @@ public sealed class PluginStoreService
             throw new InvalidOperationException($"This plugin requires an unsupported TFS plugin SDK version ({sdkVersion}).");
         }
 
+        if (!string.IsNullOrWhiteSpace(catalogPlugin.SdkVersion) &&
+            !string.Equals(sdkVersion, NormalizeVersion(catalogPlugin.SdkVersion), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("The community plugin SDK version does not match the catalog entry.");
+        }
+
+        var manifestPermissions = NormalizePermissions(manifest.Permissions);
+        if (!manifestPermissions.Contains("frontend", StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Community plugins must declare the frontend permission.");
+        }
+        if (catalogPlugin.Permissions.Length > 0 &&
+            !new HashSet<string>(catalogPlugin.Permissions, StringComparer.OrdinalIgnoreCase)
+                .SetEquals(manifestPermissions))
+        {
+            throw new InvalidOperationException("The community plugin permissions do not match the catalog entry.");
+        }
+
+        var manifestNetworkHosts = NormalizeNetworkHosts(manifest.NetworkHosts);
+        var catalogNetworkHosts = NormalizeNetworkHosts(catalogPlugin.NetworkHosts);
+        if (manifestPermissions.Contains(PermissionNetwork, StringComparer.OrdinalIgnoreCase) && manifestNetworkHosts.Length == 0)
+        {
+            throw new InvalidOperationException("Plugins with network permission must declare at least one networkHosts entry.");
+        }
+
+        if (!new HashSet<string>(catalogNetworkHosts, StringComparer.OrdinalIgnoreCase).SetEquals(manifestNetworkHosts))
+        {
+            throw new InvalidOperationException("The community plugin networkHosts do not match the catalog entry.");
+        }
+
         var entryPoint = NormalizePackageRelativePath(manifest.EntryPoint, "dist/index.js");
         var entryPointPath = ResolvePackagePath(pluginRoot, entryPoint);
         if (!File.Exists(entryPointPath))
@@ -2013,6 +2330,40 @@ public sealed class PluginStoreService
             throw new InvalidOperationException("The community plugin entry point must be a JavaScript file.");
         }
 
+        PluginBackendManifestData? backend = null;
+        if (manifest.Backend is not null)
+        {
+            if (!manifestPermissions.Contains(PermissionNativeFullTrust, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Plugins with a native backend must declare native.full-trust.");
+            }
+            var backendEntryPoint = NormalizePackageRelativePath(manifest.Backend.EntryPoint, string.Empty);
+            if (string.IsNullOrWhiteSpace(backendEntryPoint))
+            {
+                throw new InvalidOperationException("Plugin backend.entryPoint is required.");
+            }
+            var backendPath = ResolvePackagePath(pluginRoot, backendEntryPoint);
+            if (!File.Exists(backendPath))
+            {
+                throw new InvalidOperationException("The declared plugin backend entry point could not be found.");
+            }
+            var backendRuntime = string.IsNullOrWhiteSpace(manifest.Backend.Runtime)
+                ? "executable"
+                : manifest.Backend.Runtime.Trim().ToLowerInvariant();
+            if (backendRuntime is not "executable" and not "powershell" and not "python" and not "node")
+            {
+                throw new InvalidOperationException("Plugin backend.runtime must be executable, powershell, python, or node.");
+            }
+            backend = manifest.Backend with
+            {
+                EntryPoint = backendEntryPoint,
+                Runtime = backendRuntime,
+                Arguments = manifest.Backend.Arguments ?? [],
+                Environment = manifest.Backend.Environment ?? new Dictionary<string, string>(),
+                SecretEnvironment = manifest.Backend.SecretEnvironment ?? new Dictionary<string, string>()
+            };
+        }
+
         return manifest with
         {
             Id = manifestId,
@@ -2020,19 +2371,25 @@ public sealed class PluginStoreService
             Version = manifestVersion,
             SdkVersion = sdkVersion,
             EntryPoint = entryPoint,
-            Permissions = NormalizePermissions(manifest.Permissions)
+            Permissions = manifestPermissions,
+            NetworkHosts = manifestNetworkHosts,
+            Backend = backend
         };
     }
 
-    private static bool IsSupportedSdkVersion(string sdkVersion)
+    internal static bool IsSupportedSdkVersion(string sdkVersion)
     {
-        if (string.IsNullOrWhiteSpace(sdkVersion))
+        var parts = sdkVersion.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length is < 1 or > 3 || parts.Any(part => !int.TryParse(part, out _)))
         {
             return false;
         }
 
-        var majorText = sdkVersion.Split('.', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        return int.TryParse(majorText, out var majorVersion) && majorVersion == SupportedSdkMajorVersion;
+        var normalized = string.Join('.', parts.Concat(Enumerable.Repeat("0", 3 - parts.Length)));
+        return Version.TryParse(normalized, out var requestedVersion) &&
+            Version.TryParse(SupportedSdkVersion, out var supportedVersion) &&
+            requestedVersion.Major == supportedVersion.Major &&
+            requestedVersion <= supportedVersion;
     }
 
     private static string[] NormalizePermissions(IEnumerable<string>? permissions)
@@ -2057,6 +2414,88 @@ public sealed class PluginStoreService
             })
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    private static string[] NormalizeNetworkHosts(IEnumerable<string>? hosts)
+    {
+        return (hosts ?? [])
+            .Select(host => (host ?? string.Empty).Trim().TrimEnd('.').ToLowerInvariant())
+            .Where(host => host.Length > 0)
+            .Select(host =>
+            {
+                if (host == "<local>")
+                {
+                    return host;
+                }
+
+                var candidate = host.StartsWith("*.", StringComparison.Ordinal) ? host[2..] : host;
+                if (candidate.Length == 0 ||
+                    host.Contains("//", StringComparison.Ordinal) ||
+                    host.Contains('/') ||
+                    host.Contains('\\') ||
+                    host.Contains(':') ||
+                    candidate.Contains('*') ||
+                    Uri.CheckHostName(candidate) == UriHostNameType.Unknown)
+                {
+                    throw new InvalidOperationException($"The community plugin manifest contains an invalid network host ({host}).");
+                }
+
+                return host;
+            })
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool IsNetworkHostAllowed(Uri uri, IReadOnlyList<string> declaredHosts)
+    {
+        var host = uri.IdnHost.TrimEnd('.').ToLowerInvariant();
+        foreach (var declaredHost in declaredHosts)
+        {
+            if (string.Equals(declaredHost, "<local>", StringComparison.OrdinalIgnoreCase) && IsLocalNetworkHost(host))
+            {
+                return true;
+            }
+
+            if (declaredHost.StartsWith("*.", StringComparison.Ordinal) &&
+                host.EndsWith(declaredHost[1..], StringComparison.OrdinalIgnoreCase) &&
+                host.Length > declaredHost.Length - 1)
+            {
+                return true;
+            }
+
+            if (string.Equals(host, declaredHost, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsLocalNetworkHost(string host)
+    {
+        if (host is "localhost" or "::1" || host.EndsWith(".local", StringComparison.OrdinalIgnoreCase) || !host.Contains('.'))
+        {
+            return true;
+        }
+
+        if (!IPAddress.TryParse(host, out var address))
+        {
+            return false;
+        }
+
+        if (IPAddress.IsLoopback(address) || address.IsIPv6LinkLocal || address.IsIPv6SiteLocal)
+        {
+            return true;
+        }
+
+        var bytes = address.GetAddressBytes();
+        return bytes.Length == 4 &&
+            (bytes[0] == 10 ||
+             bytes[0] == 127 ||
+             (bytes[0] == 169 && bytes[1] == 254) ||
+             (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) ||
+             (bytes[0] == 192 && bytes[1] == 168));
     }
 
     private static string NormalizePackageRelativePath(string? path, string fallback)
@@ -2397,6 +2836,8 @@ public sealed class PluginStoreService
     private sealed record CommunityCatalogSourceFileData
     {
         public string? CatalogUrl { get; init; }
+
+        public bool LocalDevelopment { get; init; }
     }
 
     private sealed record CommunityCatalogPluginData
@@ -2413,6 +2854,12 @@ public sealed class PluginStoreService
 
         public string Version { get; init; } = string.Empty;
 
+        public string SdkVersion { get; init; } = string.Empty;
+
+        public string[] Permissions { get; init; } = [];
+
+        public string[] NetworkHosts { get; init; } = [];
+
         public string[] Images { get; init; } = [];
 
         public string[] Tags { get; init; } = [];
@@ -2426,6 +2873,8 @@ public sealed class PluginStoreService
         public string HomepageUrl { get; init; } = string.Empty;
 
         public string RepositoryUrl { get; init; } = string.Empty;
+
+        public string Changelog { get; init; } = string.Empty;
 
         public bool HasPackageSource =>
             !string.IsNullOrWhiteSpace(PackagePath) || !string.IsNullOrWhiteSpace(PackageUrl);
@@ -2446,6 +2895,29 @@ public sealed class PluginStoreService
         public string EntryPoint { get; init; } = string.Empty;
 
         public string[] Permissions { get; init; } = [];
+
+        public string[] NetworkHosts { get; init; } = [];
+
+        public PluginBackendManifestData? Backend { get; init; }
+    }
+
+    private sealed record PluginBackendManifestData
+    {
+        public string EntryPoint { get; init; } = string.Empty;
+
+        public string Runtime { get; init; } = "executable";
+
+        public string RuntimeExecutable { get; init; } = string.Empty;
+
+        public string[] Arguments { get; init; } = [];
+
+        public Dictionary<string, string> Environment { get; init; } = [];
+
+        public Dictionary<string, string> SecretEnvironment { get; init; } = [];
+
+        public bool AutoStart { get; init; }
+
+        public bool CreateNoWindow { get; init; } = true;
     }
 
     private sealed record InstalledCommunityPluginsState
@@ -2470,6 +2942,8 @@ public sealed class PluginStoreService
         public string EntryPoint { get; init; } = string.Empty;
 
         public string[] Permissions { get; init; } = [];
+
+        public string[] NetworkHosts { get; init; } = [];
 
         public DateTimeOffset InstalledAtUtc { get; init; }
     }

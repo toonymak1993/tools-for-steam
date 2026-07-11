@@ -294,6 +294,7 @@
             scriptVersionsById: {},
             scriptPromisesById: {},
             scriptErrorsById: {},
+            sdkById: {},
           },
           homeReorder: {
             active: false,
@@ -2116,6 +2117,52 @@
 
       .steamloader-inline-stepper-arrow.is-disabled {
         opacity: 0.28;
+      }
+
+      .steamloader-progress-row {
+        width: 100%;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        text-align: left;
+      }
+
+      .steamloader-progress-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .steamloader-progress-title,
+      .steamloader-progress-label {
+        color: rgba(233, 239, 245, 0.94);
+        font-size: 14px;
+        line-height: 1.2;
+        font-weight: 800;
+      }
+
+      .steamloader-progress-copy {
+        color: rgba(173, 184, 195, 0.82);
+        font-size: 11px;
+        line-height: 1.3;
+        font-weight: 600;
+      }
+
+      .steamloader-progress-track {
+        position: relative;
+        height: 8px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.09);
+      }
+
+      .steamloader-progress-fill {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #4aa4dc, #78c8f4);
       }
 
       .steamloader-row-shell-global-back {
@@ -13320,12 +13367,18 @@
 
     const scriptId = `steamloader-community-plugin-script-${pluginId}`;
     document.getElementById(scriptId)?.remove();
+    state.communityPlugins.sdkById ??= {};
+    window.ToolsForSteamCommunityPlugins?.[pluginId]?.dispose?.();
+    state.communityPlugins.sdkById[pluginId]?.dispose?.();
+    delete state.communityPlugins.sdkById[pluginId];
     delete window.ToolsForSteamCommunityPlugins[pluginId];
 
     const promise = new Promise((resolve, reject) => {
       const script = document.createElement("script");
       script.id = scriptId;
-      script.src = scriptUrl;
+      script.src = typeof window.__steamLoaderApiUrl === "function"
+        ? window.__steamLoaderApiUrl(scriptUrl)
+        : scriptUrl;
       script.async = false;
       script.onload = () => {
         state.communityPlugins.scriptVersionsById[pluginId] = version;
@@ -13383,6 +13436,19 @@
       state.communityPlugins.snapshot = payload && typeof payload === "object"
         ? payload
         : { plugins: [] };
+      state.communityPlugins.sdkById ??= {};
+      const installedPluginIds = new Set(
+        state.communityPlugins.snapshot.plugins.map((plugin) => String(plugin?.id || "")).filter(Boolean),
+      );
+      for (const pluginId of Object.keys(state.communityPlugins.sdkById)) {
+        if (!installedPluginIds.has(pluginId)) {
+          window.ToolsForSteamCommunityPlugins?.[pluginId]?.dispose?.();
+          state.communityPlugins.sdkById[pluginId]?.dispose?.();
+          delete state.communityPlugins.sdkById[pluginId];
+          document.getElementById(`steamloader-community-plugin-script-${pluginId}`)?.remove();
+          delete window.ToolsForSteamCommunityPlugins?.[pluginId];
+        }
+      }
       await loadCommunityPluginScripts(state.communityPlugins.snapshot.plugins);
     } catch (error) {
       state.communityPlugins.error = error instanceof Error ? error.message : String(error);
@@ -13391,6 +13457,31 @@
       state.communityPlugins.loading = false;
       rerenderHomePanel();
     }
+  }
+
+  function getCommunityPluginSdk(plugin, registryEntry, runtime) {
+    const pluginId = String(plugin?.id || "").trim();
+    if (!pluginId) {
+      return null;
+    }
+
+    state.communityPlugins.sdkById ??= {};
+    const registeredSdk = registryEntry?.sdk;
+    if (registeredSdk && !registeredSdk.lifecycle?.disposed) {
+      state.communityPlugins.sdkById[pluginId] = registeredSdk;
+      return registeredSdk;
+    }
+
+    const existingSdk = state.communityPlugins.sdkById[pluginId];
+    if (existingSdk && !existingSdk.lifecycle?.disposed) {
+      return existingSdk;
+    }
+
+    const sdk = window.TfsPluginSdk?.create?.(registryEntry?.manifest || runtime || {}, { pluginId }) || null;
+    if (sdk) {
+      state.communityPlugins.sdkById[pluginId] = sdk;
+    }
+    return sdk;
   }
 
   async function loadUpdateState(options = {}) {
@@ -16269,7 +16360,7 @@
           plugin,
           runtime,
           refresh: () => renderPanelDataRefresh(),
-          sdk: window.TfsPluginSdk?.create?.(registryEntry.manifest || runtime, { pluginId: plugin.id }),
+          sdk: getCommunityPluginSdk(plugin, registryEntry, runtime),
         });
 
         if (!screenModel || typeof screenModel !== "object" || typeof screenModel.then === "function") {
@@ -22192,7 +22283,10 @@
     clearLiveUpdateRetryTimer();
 
     try {
-      const source = new EventSource(`${apiBase}api/events`);
+      const eventUrl = typeof window.__steamLoaderApiUrl === "function"
+        ? window.__steamLoaderApiUrl("api/events")
+        : `${apiBase}api/events`;
+      const source = new EventSource(eventUrl);
       state.liveUpdates.source = source;
       state.liveUpdates.connected = false;
 

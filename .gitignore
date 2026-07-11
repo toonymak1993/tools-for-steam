@@ -2,6 +2,12 @@ bin/
 obj/
 .vs/
 dist/
+!sdk/plugin-template/dist/
+!sdk/plugin-template/dist/index.js
+!sdk/official-plugins/home-assistant/dist/
+!sdk/official-plugins/home-assistant/dist/index.js
+!sdk/full-trust-plugin-template/dist/
+!sdk/full-trust-plugin-template/dist/index.js
 .codex_probe/
 sdk/catalog.local.json
 sdk/catalog.online.json

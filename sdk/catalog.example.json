@@ -9,6 +9,8 @@
       "author": "Community",
       "category": "Utility",
       "version": "1.0.0",
+      "sdkVersion": "1.0.0",
+      "permissions": ["frontend"],
       "packagePath": "./packages/example-plugin.zip",
       "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "images": [
@@ -19,7 +21,8 @@
         "sdk-v1"
       ],
       "homepageUrl": "https://example.com",
-      "repositoryUrl": "https://example.com/example-plugin"
+      "repositoryUrl": "https://example.com/example-plugin",
+      "changelog": "Initial controller-friendly release."
     },
     {
       "id": "home-assistant",
@@ -28,6 +31,9 @@
       "author": "Tools for Steam",
       "category": "Smart Home",
       "version": "0.1.0",
+      "sdkVersion": "1.0.0",
+      "permissions": ["frontend", "storage", "secrets", "network"],
+      "networkHosts": ["<local>"],
       "packagePath": "./packages/home-assistant.zip",
       "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "images": [
@@ -39,7 +45,8 @@
         "sdk-v1"
       ],
       "homepageUrl": "https://www.home-assistant.io/",
-      "repositoryUrl": "https://developers.home-assistant.io/docs/api/rest/"
+      "repositoryUrl": "https://developers.home-assistant.io/docs/api/rest/",
+      "changelog": "Initial Home Assistant light controls."
     }
   ]
 }

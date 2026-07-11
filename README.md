@@ -40,13 +40,28 @@ Plugins can be disabled from `Settings`. Disabled plugins are hidden from the TF
 
 ## Community Plugin SDK
 
-The first community plugin contract lives in `sdk/`. It defines the store catalog format, the required `tfs-plugin.json` manifest, SDK permissions, and templates that use the shared TFS frontend library.
+TFS ships a public Plugin SDK 1.0.0 for controller-first community apps. Start here:
 
-Community plugin packages are discovered through the TFS Store. The default Store Refresh action downloads `catalog.json` from the separate `tfs-plugin-database` repository, caches it as `data/plugin-store/catalog.json`, and installs selected packages into `data/plugin-store/community/<plugin-id>`. The installer validates the package manifest and SHA-256 checksum before replacing an installed plugin.
+- [Build and sideload your first plugin in about 10 minutes](sdk/QUICKSTART.md)
+- [Complete SDK and native API reference](sdk/DEVELOPER_GUIDE.md)
+- [Manifest and Store contract](sdk/README.md)
+- [Official catalog submission guide](sdk/SUBMITTING.md)
+- [TypeScript declarations](sdk/tfs-plugin-sdk.d.ts)
 
-The SDK currently exposes controller-friendly UI helpers plus core-owned storage, write-only secrets, a permission-gated HTTP/HTTPS network proxy, and a dynamic Quick Access loader for installed community entry points. `sdk/official-plugins/home-assistant/` is the first official community plugin and shows the intended pattern without giving the plugin special core access.
+Normal plugins can build native-feeling Steam screens and use settings, protected secrets, HTTP integrations, private files, notifications, logs, managed timers, audio, displays, processes, themes, artwork, App Start, Store Sync, performance, and confirmed power actions.
 
-SDK v1 is designed to grow additively. Future SDK v1 helpers should not break existing community plugins; incompatible runtime changes should become a future SDK v2.
+When a plugin needs something TFS Core does not already expose, `native.full-trust` provides the Decky-style escape hatch: bundle an executable, PowerShell, Python, or Node backend; call it through managed JSON RPC; run programs; access arbitrary files; request UAC; or extend selected Steam CEF surfaces. Full-trust permissions are shown prominently in the Store and should only be installed from trusted publishers.
+
+Create and sideload a plugin from this checkout:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tfs-plugin.ps1 new .\plugins\my-plugin -Id my-plugin -Name "My Plugin"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tfs-plugin.ps1 sideload .\plugins\my-plugin
+```
+
+Open the TFS Store, press `Refresh`, and install the plugin from `Community`. The CLI validates the manifest, packages the plugin, computes its SHA-256 checksum, copies its preview, and updates a persistent local developer catalog.
+
+Community packages are distributed through the TFS Store. The installer verifies package metadata, SDK compatibility, permissions, safe ZIP extraction, and SHA-256 before replacing an installed plugin. SDK v1 grows additively; incompatible runtime changes require a future SDK major version.
 
 ## Requirements
 

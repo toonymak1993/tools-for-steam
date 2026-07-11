@@ -45,10 +45,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SmartHomeService _smartHomeService;
+    private readonly PluginFullTrustRuntime _pluginFullTrustRuntime;
     private readonly SteamLoaderHostState _hostState;
     private readonly QuickAccessLiveUpdateHub _liveUpdateHub;
     private readonly HttpListener _listener;
     private readonly Action _requestShutdown;
+    private readonly string _apiSessionToken;
     private readonly object _artworkOpenRequestLock = new();
     private readonly object _unifyStoreOverlayLock = new();
     private ArtworkOpenRequest? _latestArtworkOpenRequest;
@@ -81,7 +83,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         SteamFrontendComponentService frontendComponentService,
         SteamDevToolsClient devToolsClient,
         SmartHomeService smartHomeService,
+        PluginFullTrustRuntime pluginFullTrustRuntime,
         Uri baseUri,
+        string apiSessionToken,
         SteamLoaderHostState hostState,
         QuickAccessLiveUpdateHub liveUpdateHub,
         Action requestShutdown)
@@ -104,6 +108,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _frontendComponentService = frontendComponentService;
         _devToolsClient = devToolsClient;
         _smartHomeService = smartHomeService;
+        _pluginFullTrustRuntime = pluginFullTrustRuntime;
+        _apiSessionToken = apiSessionToken;
         _hostState = hostState;
         _liveUpdateHub = liveUpdateHub;
         _requestShutdown = requestShutdown;
@@ -137,6 +143,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
+        await _pluginFullTrustRuntime.DisposeAsync();
         _listener.Close();
     }
 
@@ -168,15 +175,47 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         var request = context.Request;
         var response = context.Response;
 
-        response.Headers["Access-Control-Allow-Origin"] = "*";
-        response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-        response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
         response.Headers["Cache-Control"] = "no-store";
+
+        var origin = request.Headers["Origin"];
+        if (!LocalApiSession.IsTrustedOrigin(origin))
+        {
+            await WriteJsonAsync(
+                response,
+                HttpStatusCode.Forbidden,
+                new { message = "This origin is not allowed to access the local Tools for Steam API." },
+                cancellationToken);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(origin))
+        {
+            response.Headers["Access-Control-Allow-Origin"] = origin;
+            response.Headers["Vary"] = "Origin";
+            response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+            response.Headers["Access-Control-Allow-Headers"] = $"Content-Type, {LocalApiSession.HeaderName}";
+        }
 
         if (request.HttpMethod.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
         {
             response.StatusCode = (int)HttpStatusCode.NoContent;
             response.Close();
+            return;
+        }
+
+        var requestPath = request.Url?.AbsolutePath;
+        if (!LocalApiSession.IsPublicResourceRequest(request.HttpMethod, requestPath) &&
+            !LocalApiSession.IsAuthorized(
+                _apiSessionToken,
+                request.Headers[LocalApiSession.HeaderName],
+                request.QueryString[LocalApiSession.QueryName],
+                request.HttpMethod))
+        {
+            await WriteJsonAsync(
+                response,
+                HttpStatusCode.Unauthorized,
+                new { message = "A valid local Tools for Steam session is required." },
+                cancellationToken);
             return;
         }
 
@@ -1324,6 +1363,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     return;
                 }
 
+                _pluginFullTrustRuntime.StopAll(payload.PluginId);
                 var pluginStoreSnapshot = await _pluginStoreService.UninstallCommunityPluginAsync(payload.PluginId, cancellationToken);
                 await WriteJsonAndPublishAsync(
                     response,
@@ -1352,6 +1392,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     return;
                 }
 
+                _pluginFullTrustRuntime.StopAll(payload.PluginId);
                 var pluginStoreSnapshot = await _pluginStoreService.UpdateCommunityPluginAsync(payload.PluginId, cancellationToken);
                 await WriteJsonAndPublishAsync(
                     response,
@@ -1371,6 +1412,36 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         response,
                         HttpStatusCode.OK,
                         _pluginStoreService.GetPluginSdkState(sdkPluginId),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath.StartsWith("capabilities/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var capability = sdkPath["capabilities/".Length..].Trim('/');
+                    if (capability.Length == 0 || capability.Contains('/'))
+                    {
+                        await WriteJsonAsync(
+                            response,
+                            HttpStatusCode.BadRequest,
+                            new { message = "A valid SDK capability is required." },
+                            cancellationToken);
+                        return;
+                    }
+
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkCapabilityRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        await ExecutePluginSdkCapabilityAsync(
+                            sdkPluginId,
+                            capability,
+                            payload,
+                            cancellationToken),
                         cancellationToken);
                     return;
                 }
@@ -1586,6 +1657,36 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         response,
                         HttpStatusCode.OK,
                         _pluginStoreService.CopyPluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "notifications/show")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkNotificationRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.CreatePluginSdkNotification(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "logs/write")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkLogRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.WritePluginSdkLog(sdkPluginId, payload),
                         cancellationToken);
                     return;
                 }
@@ -4198,6 +4299,461 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         }
 
         return false;
+    }
+
+    private async Task<object> ExecutePluginSdkCapabilityAsync(
+        string pluginId,
+        string capability,
+        PluginSdkCapabilityRequest? request,
+        CancellationToken cancellationToken)
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.Operation))
+        {
+            throw new InvalidOperationException("An SDK capability operation is required.");
+        }
+
+        var normalizedCapability = capability.Trim().ToLowerInvariant();
+        var permission = normalizedCapability switch
+        {
+            "audio" => "native.audio",
+            "processes" => "native.processes",
+            "display" => "native.display",
+            "themes" => "native.themes",
+            "artwork" => "native.artwork",
+            "app-start" => "native.app-start",
+            "store-sync" => "native.store-sync",
+            "automation" => "native.automation",
+            "performance" => "native.performance",
+            "power" => "native.power",
+            "system" or "filesystem" or "steam" => "native.full-trust",
+            _ => throw new InvalidOperationException($"Unknown native SDK capability ({normalizedCapability}).")
+        };
+        _pluginStoreService.EnsurePluginSdkPermission(pluginId, permission);
+
+        var operation = request.Operation.Trim().ToLowerInvariant();
+        return normalizedCapability switch
+        {
+            "audio" => await ExecutePluginSdkAudioAsync(operation, request.Arguments, cancellationToken),
+            "processes" => ExecutePluginSdkProcesses(operation, request.Arguments),
+            "display" => ExecutePluginSdkDisplay(operation, request.Arguments),
+            "themes" => await ExecutePluginSdkThemesAsync(operation, request.Arguments),
+            "artwork" => await ExecutePluginSdkArtworkAsync(operation, request.Arguments, cancellationToken),
+            "app-start" => ExecutePluginSdkAppStart(operation, request.Arguments),
+            "store-sync" => await ExecutePluginSdkStoreSyncAsync(operation, request.Arguments, cancellationToken),
+            "automation" => ExecutePluginSdkAutomation(operation, request.Arguments),
+            "performance" => ExecutePluginSdkPerformance(operation, request.Arguments),
+            "power" => ExecutePluginSdkPower(operation, request.Arguments),
+            "system" => await _pluginFullTrustRuntime.ExecuteSystemAsync(pluginId, operation, request.Arguments, cancellationToken),
+            "filesystem" => await _pluginFullTrustRuntime.ExecuteFileSystemAsync(pluginId, operation, request.Arguments, cancellationToken),
+            "steam" => await _pluginFullTrustRuntime.ExecuteSteamAsync(pluginId, operation, request.Arguments, cancellationToken),
+            _ => throw new InvalidOperationException($"Unknown native SDK capability ({normalizedCapability}).")
+        };
+    }
+
+    private object ExecutePluginSdkPerformance(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => _performanceService.GetSnapshot(),
+            "setoverlaylevel" => _performanceService.SetOverlayLevel(GetCapabilityInt32(arguments, "level")),
+            "toggleautotarget" => _performanceService.ToggleAutoTarget(),
+            "setsettingvalue" => _performanceService.SetSettingValue(
+                GetCapabilityString(arguments, "key"),
+                GetCapabilityInt32(arguments, "value")),
+            "startoverlay" => _performanceService.StartOverlay(),
+            "stopoverlay" => _performanceService.StopOverlay(),
+            "prepareelevatedhelper" => _performanceService.PrepareElevatedHelper(),
+            _ => throw new InvalidOperationException($"Unknown native performance operation ({operation}).")
+        };
+    }
+
+    private object ExecutePluginSdkPower(string operation, JsonElement? arguments)
+    {
+        if (operation == "getstate")
+        {
+            return new
+            {
+                actions = new[]
+                {
+                    new { id = "startWindowsDesktop", title = "Start Windows Desktop", disruptive = false },
+                    new { id = "restartSteam", title = "Restart Steam", disruptive = true },
+                    new { id = "sleepWindows", title = "Sleep Windows", disruptive = true },
+                    new { id = "restartWindows", title = "Restart Windows", disruptive = true },
+                    new { id = "shutdownWindows", title = "Shut Down Windows", disruptive = true }
+                },
+                confirmationRequired = true
+            };
+        }
+
+        if (!GetCapabilityBoolean(arguments, "confirmed", false))
+        {
+            throw new InvalidOperationException("Native power actions require confirmed: true after an explicit user confirmation.");
+        }
+
+        return operation switch
+        {
+            "startwindowsdesktop" => _powerActionService.StartWindowsDesktop(),
+            "restartsteam" => _powerActionService.RestartSteam(),
+            "sleepwindows" => _powerActionService.SleepWindows(),
+            "restartwindows" => _powerActionService.RestartWindows(),
+            "shutdownwindows" => _powerActionService.ShutDownWindows(),
+            _ => throw new InvalidOperationException($"Unknown native power operation ({operation}).")
+        };
+    }
+
+    private async Task<object> ExecutePluginSdkAudioAsync(
+        string operation,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        if (operation == "getstate")
+        {
+            return await GetAudioDashboardSnapshotAsync(cancellationToken);
+        }
+
+        await StaThread.RunAsync(
+            () =>
+            {
+                switch (operation)
+                {
+                    case "setdefaultplayback":
+                        _audioOutputDeviceService.SetDefaultPlaybackDevice(GetCapabilityString(arguments, "deviceId"));
+                        break;
+                    case "setdefaultcapture":
+                        _audioOutputDeviceService.SetDefaultCaptureDevice(GetCapabilityString(arguments, "deviceId"));
+                        break;
+                    case "setplaybackvolume":
+                        _audioOutputDeviceService.SetDefaultPlaybackVolume(GetCapabilityDouble(arguments, "volume"));
+                        break;
+                    case "setcapturevolume":
+                        _audioOutputDeviceService.SetDefaultCaptureVolume(GetCapabilityDouble(arguments, "volume"));
+                        break;
+                    case "adjustplaybackvolume":
+                        _audioOutputDeviceService.AdjustDefaultPlaybackVolume(GetCapabilityDouble(arguments, "delta"));
+                        break;
+                    case "adjustcapturevolume":
+                        _audioOutputDeviceService.AdjustDefaultCaptureVolume(GetCapabilityDouble(arguments, "delta"));
+                        break;
+                    case "toggleplaybackmute":
+                        _audioOutputDeviceService.ToggleDefaultPlaybackMute();
+                        break;
+                    case "togglecapturemute":
+                        _audioOutputDeviceService.ToggleDefaultCaptureMute();
+                        break;
+                    case "setmixervolume":
+                        _audioOutputDeviceService.SetMixerSessionVolume(
+                            GetCapabilityString(arguments, "sessionId"),
+                            GetCapabilityDouble(arguments, "volume"));
+                        break;
+                    case "togglemixermute":
+                        _audioOutputDeviceService.ToggleMixerSessionMute(GetCapabilityString(arguments, "sessionId"));
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unknown native audio operation ({operation}).");
+                }
+
+                return true;
+            },
+            cancellationToken);
+
+        var snapshot = await GetAudioDashboardSnapshotAsync(cancellationToken);
+        _liveUpdateHub.Publish("audio.dashboard", snapshot);
+        return snapshot;
+    }
+
+    private object ExecutePluginSdkProcesses(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => _processWindowService.GetSnapshot(),
+            "activate" => _processWindowService.ActivateWindow(GetCapabilityString(arguments, "handle")),
+            _ => throw new InvalidOperationException($"Unknown native processes operation ({operation}).")
+        };
+    }
+
+    private object ExecutePluginSdkDisplay(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => _displaySwitchService.GetModeSnapshot(),
+            "switchinternal" => _displaySwitchService.SwitchToInternalDisplay(),
+            "switchexternal" => _displaySwitchService.SwitchToExternalDisplay(),
+            "setresolution" => _displaySwitchService.SetResolutionPreset(
+                GetCapabilityString(arguments, "presetId")),
+            "setrefreshrate" => _displaySwitchService.SetRefreshRatePreset(
+                GetCapabilityInt32(arguments, "refreshRate")),
+            _ => throw new InvalidOperationException($"Unknown native display operation ({operation}).")
+        };
+    }
+
+    private async Task<object> ExecutePluginSdkThemesAsync(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => await _themesService.GetSnapshotAsync(),
+            "refreshcatalog" => await _themesService.RefreshCatalogAsync(),
+            "getstorecatalog" => await _themesService.GetStoreCatalogAsync(
+                GetCapabilityOptionalString(arguments, "search"),
+                GetCapabilityOptionalString(arguments, "filter"),
+                GetCapabilityOptionalString(arguments, "order"),
+                GetCapabilityInt32(arguments, "page", 1),
+                GetCapabilityInt32(arguments, "perPage", 12)),
+            "getstoretheme" => await _themesService.GetStoreThemeAsync(
+                GetCapabilityString(arguments, "storeThemeId")),
+            "installstoretheme" => await _themesService.InstallStoreThemeAsync(
+                GetCapabilityString(arguments, "storeThemeId")),
+            "setenabled" => await _themesService.SetThemeEnabledAsync(
+                GetCapabilityString(arguments, "themeId"),
+                GetCapabilityBoolean(arguments, "enabled")),
+            "toggleoption" => await _themesService.ToggleThemeOptionAsync(
+                GetCapabilityString(arguments, "themeId"),
+                GetCapabilityString(arguments, "optionId")),
+            "setchoice" => await _themesService.SetThemeChoiceAsync(
+                GetCapabilityString(arguments, "themeId"),
+                GetCapabilityString(arguments, "optionId"),
+                GetCapabilityString(arguments, "choiceId")),
+            "adjustrange" => await _themesService.AdjustThemeRangeAsync(
+                GetCapabilityString(arguments, "themeId"),
+                GetCapabilityString(arguments, "optionId"),
+                GetCapabilityInt32(arguments, "delta")),
+            "resetrange" => await _themesService.ResetThemeRangeAsync(
+                GetCapabilityString(arguments, "themeId"),
+                GetCapabilityString(arguments, "optionId")),
+            "createprofile" => await _themesService.CreateProfileAsync(
+                GetCapabilityString(arguments, "title")),
+            "applyprofile" => await _themesService.ApplyProfileAsync(
+                GetCapabilityString(arguments, "profileId")),
+            "updateprofile" => await _themesService.UpdateProfileAsync(
+                GetCapabilityString(arguments, "profileId")),
+            "removeprofile" => await _themesService.RemoveProfileAsync(
+                GetCapabilityString(arguments, "profileId")),
+            "setwatchenabled" => await _themesService.SetWatchEnabledAsync(
+                GetCapabilityBoolean(arguments, "enabled")),
+            _ => throw new InvalidOperationException($"Unknown native themes operation ({operation}).")
+        };
+    }
+
+    private async Task<object> ExecutePluginSdkArtworkAsync(
+        string operation,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        return operation switch
+        {
+            "getstate" => _artworkService.GetSnapshot(),
+            "searchgames" => await _artworkService.SearchGamesAsync(
+                GetCapabilityString(arguments, "term"),
+                cancellationToken),
+            "searchassets" => await _artworkService.SearchAssetsAsync(
+                GetCapabilityInt32(arguments, "gameId"),
+                GetCapabilityString(arguments, "assetType"),
+                GetCapabilityInt32(arguments, "page", 0),
+                cancellationToken),
+            "apply" => await _artworkService.ApplyAssetAsync(
+                GetCapabilityInt64(arguments, "appId"),
+                GetCapabilityString(arguments, "assetType"),
+                GetCapabilityString(arguments, "assetUrl"),
+                cancellationToken),
+            "togglesetting" => _artworkService.ToggleSetting(
+                GetCapabilityString(arguments, "key")),
+            "setresultlimit" => _artworkService.SetResultLimit(
+                GetCapabilityInt32(arguments, "value")),
+            _ => throw new InvalidOperationException($"Unknown native artwork operation ({operation}).")
+        };
+    }
+
+    private object ExecutePluginSdkAppStart(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => _appStartService.GetSnapshot(),
+            "getcatalog" => _appStartService.GetCatalog(),
+            "add" => _appStartService.AddShortcut(GetCapabilityString(arguments, "appId")),
+            "remove" => _appStartService.RemoveShortcut(GetCapabilityString(arguments, "shortcutId")),
+            "launch" => _appStartService.LaunchShortcut(GetCapabilityString(arguments, "shortcutId")),
+            _ => throw new InvalidOperationException($"Unknown native app-start operation ({operation}).")
+        };
+    }
+
+    private async Task<object> ExecutePluginSdkStoreSyncAsync(
+        string operation,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        object result = operation switch
+        {
+            "getstate" => _storeSyncService.GetSnapshot(),
+            "gettitles" => string.IsNullOrWhiteSpace(GetCapabilityOptionalString(arguments, "storeId"))
+                ? _storeSyncService.GetDetectedTitles()
+                : _storeSyncService.GetDetectedTitlesByStore(GetCapabilityString(arguments, "storeId")),
+            "getartworkpreview" => await _storeSyncService.GetArtworkPreviewAsync(
+                GetCapabilityString(arguments, "titleId"),
+                cancellationToken),
+            "togglesetting" => _storeSyncService.ToggleSetting(GetCapabilityString(arguments, "key")),
+            "setstoreenabled" => _storeSyncService.SetStoreEnabled(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityBoolean(arguments, "enabled")),
+            "setstorepath" => _storeSyncService.SetStoreScanPath(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityString(arguments, "path")),
+            "clearstorepath" => _storeSyncService.ClearStoreScanPath(
+                GetCapabilityString(arguments, "storeId")),
+            "setadditionalpaths" => _storeSyncService.SetStoreAdditionalScanPaths(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityStringArray(arguments, "paths")),
+            "settitleoverride" => _storeSyncService.SetTitleOverride(
+                GetCapabilityString(arguments, "titleId"),
+                GetCapabilityOptionalString(arguments, "titleOverride") ?? string.Empty,
+                GetCapabilityOptionalString(arguments, "artworkTitleOverride") ?? string.Empty,
+                GetCapabilityBoolean(arguments, "excluded", false)),
+            "cleartitleoverride" => _storeSyncService.ClearTitleOverride(
+                GetCapabilityString(arguments, "titleId")),
+            "sync" => _storeSyncService.RunSync(),
+            "refreshstorefront" => _storeSyncService.RefreshUnifySteam(
+                GetCapabilityOptionalString(arguments, "storeId")),
+            "setstorefrontenabled" => _storeSyncService.SetUnifySteamStoreEnabled(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityBoolean(arguments, "enabled")),
+            "startstorefrontlogin" => _storeSyncService.StartUnifySteamLogin(
+                GetCapabilityString(arguments, "storeId")),
+            "completestorefrontauth" => _storeSyncService.CompleteUnifySteamManualAuth(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityString(arguments, "value")),
+            "launchstorefrontgame" => TryStartUnifyStoreLaunch(
+                GetCapabilityString(arguments, "storeId"),
+                GetCapabilityString(arguments, "gameId"),
+                out var launchMessage)
+                    ? new { success = true, message = launchMessage }
+                    : new { success = false, message = launchMessage },
+            _ => throw new InvalidOperationException($"Unknown native store-sync operation ({operation}).")
+        };
+
+        if (result is StoreSyncSnapshot snapshot && operation != "getstate")
+        {
+            _liveUpdateHub.Publish("store-sync.state", snapshot);
+        }
+        return result;
+    }
+
+    private object ExecutePluginSdkAutomation(string operation, JsonElement? arguments)
+    {
+        return operation switch
+        {
+            "getstate" => _autoSisirService.GetSnapshot(),
+            "togglesetting" => _autoSisirService.ToggleSetting(
+                GetCapabilityString(arguments, "key")),
+            "setexecutablepath" => _autoSisirService.SetExecutablePath(
+                GetCapabilityString(arguments, "path")),
+            "resetexecutablepath" => _autoSisirService.ResetExecutablePath(),
+            "togglewatchedtitle" => _autoSisirService.ToggleWatchedTitle(
+                GetCapabilityString(arguments, "titleId")),
+            _ => throw new InvalidOperationException($"Unknown native automation operation ({operation}).")
+        };
+    }
+
+    private static JsonElement GetCapabilityArguments(JsonElement? arguments)
+    {
+        if (arguments is null || arguments.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return default;
+        }
+        if (arguments.Value.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("SDK capability arguments must be a JSON object.");
+        }
+        return arguments.Value;
+    }
+
+    private static string GetCapabilityString(JsonElement? arguments, string name)
+    {
+        var value = GetCapabilityOptionalString(arguments, name);
+        return string.IsNullOrWhiteSpace(value)
+            ? throw new InvalidOperationException($"SDK capability argument '{name}' is required.")
+            : value;
+    }
+
+    private static string? GetCapabilityOptionalString(JsonElement? arguments, string name)
+    {
+        var value = GetCapabilityArguments(arguments);
+        return value.ValueKind == JsonValueKind.Object &&
+               value.TryGetProperty(name, out var property) &&
+               property.ValueKind == JsonValueKind.String
+            ? property.GetString()?.Trim()
+            : null;
+    }
+
+    private static double GetCapabilityDouble(JsonElement? arguments, string name)
+    {
+        var value = GetCapabilityArguments(arguments);
+        if (value.ValueKind != JsonValueKind.Object ||
+            !value.TryGetProperty(name, out var property) ||
+            !property.TryGetDouble(out var result) ||
+            double.IsNaN(result) ||
+            double.IsInfinity(result))
+        {
+            throw new InvalidOperationException($"SDK capability argument '{name}' must be a number.");
+        }
+        return result;
+    }
+
+    private static int GetCapabilityInt32(JsonElement? arguments, string name, int? defaultValue = null)
+    {
+        var value = GetCapabilityArguments(arguments);
+        if (value.ValueKind == JsonValueKind.Object &&
+            value.TryGetProperty(name, out var property) &&
+            property.TryGetInt32(out var result))
+        {
+            return result;
+        }
+        return defaultValue ?? throw new InvalidOperationException(
+            $"SDK capability argument '{name}' must be an integer.");
+    }
+
+    private static long GetCapabilityInt64(JsonElement? arguments, string name)
+    {
+        var value = GetCapabilityArguments(arguments);
+        if (value.ValueKind == JsonValueKind.Object &&
+            value.TryGetProperty(name, out var property) &&
+            property.TryGetInt64(out var result))
+        {
+            return result;
+        }
+        throw new InvalidOperationException($"SDK capability argument '{name}' must be an integer.");
+    }
+
+    private static bool GetCapabilityBoolean(JsonElement? arguments, string name, bool? defaultValue = null)
+    {
+        var value = GetCapabilityArguments(arguments);
+        if (value.ValueKind == JsonValueKind.Object && value.TryGetProperty(name, out var property))
+        {
+            if (property.ValueKind == JsonValueKind.True)
+            {
+                return true;
+            }
+            if (property.ValueKind == JsonValueKind.False)
+            {
+                return false;
+            }
+        }
+        return defaultValue ?? throw new InvalidOperationException(
+            $"SDK capability argument '{name}' must be a boolean.");
+    }
+
+    private static IReadOnlyList<string> GetCapabilityStringArray(JsonElement? arguments, string name)
+    {
+        var value = GetCapabilityArguments(arguments);
+        if (value.ValueKind != JsonValueKind.Object ||
+            !value.TryGetProperty(name, out var property) ||
+            property.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException($"SDK capability argument '{name}' must be an array of strings.");
+        }
+
+        return property.EnumerateArray()
+            .Where(entry => entry.ValueKind == JsonValueKind.String)
+            .Select(entry => entry.GetString()?.Trim() ?? string.Empty)
+            .Where(entry => entry.Length > 0)
+            .ToArray();
     }
 
     private static bool TryParsePluginSdkPath(string? path, out string pluginId, out string sdkPath)

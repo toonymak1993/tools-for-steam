@@ -1,6 +1,6 @@
 # Submitting A Tools for Steam Plugin
 
-Tools for Steam community plugins are normal zip packages plus a catalog entry. The app never gives a community plugin direct core access; plugins use the SDK surface declared by their manifest permissions.
+Tools for Steam community plugins are normal zip packages plus a catalog entry. They use a full-trust gaming-loader model inside Steam, so the official catalog reviews code and publishers. Manifest permissions describe and gate documented SDK bridges, but they do not make unknown JavaScript safe.
 
 ## Recommended Developer Flow
 
@@ -47,12 +47,10 @@ my-plugin.zip
     id: "my-plugin",
     name: "My Plugin",
     version: "1.0.0",
+    sdkVersion: "1.0.0",
+    permissions: ["frontend"],
   };
-  const sdk = window.TfsPluginSdk.create(manifest);
-
-  window.ToolsForSteamCommunityPlugins ??= {};
-  window.ToolsForSteamCommunityPlugins[manifest.id] = {
-    manifest,
+  window.TfsPluginSdk.register(manifest, (sdk) => ({
     createScreen(context) {
       return sdk.ui.createScreenModel({
         title: manifest.name,
@@ -64,7 +62,7 @@ my-plugin.zip
         ],
       });
     },
-  };
+  }));
 })();
 ```
 
@@ -78,16 +76,22 @@ my-plugin.zip
   "author": "Your Name",
   "category": "Utility",
   "version": "1.0.0",
+  "sdkVersion": "1.0.0",
+  "permissions": ["frontend", "files"],
   "packageUrl": "https://example.com/my-plugin.zip",
   "packageSha256": "64_HEX_CHARACTERS",
   "images": ["https://example.com/my-plugin.png"],
   "tags": ["sdk-v1"],
-  "repositoryUrl": "https://github.com/you/my-plugin"
+  "repositoryUrl": "https://github.com/you/my-plugin",
+  "changelog": "Initial release."
 }
 ```
 
 `images` is optional. Plugins without an image still appear in the store and use the fallback preview card.
 `packageSha256` is required. Plugins without a checksum are shown as blocked and cannot be installed.
+`sdkVersion` and `permissions` must match the package manifest exactly so the Store can show requested capabilities before installation.
+For this release, `sdkVersion` must be exactly `1.0.0`.
+When `network` is declared, `networkHosts` is required and must also match the package manifest exactly.
 
 ## Permission Review
 
@@ -96,24 +100,43 @@ Use the smallest permission set possible:
 - `frontend`: required for a visible Quick Access plugin.
 - `storage`: stores public per-plugin JSON settings.
 - `secrets`: stores write-only tokens or passwords through the core.
-- `network`: sends HTTP/HTTPS requests through the core network proxy.
+- `network`: sends HTTP/HTTPS requests through the core network proxy, restricted to `networkHosts`.
 - `files`: manages caches, exports, logs, indexes, and binary assets inside the plugin's private sandbox.
+- `notifications`: shows rate-limited notices inside Steam without leaving Xbox Mode.
+- `logging`: writes bounded structured diagnostic logs for support and troubleshooting.
+- `native.*`: grants one reviewed native bridge such as audio, display, themes, artwork, App Start, processes, Store Sync, performance, or power. Explain the exact user-facing need and every mutation the plugin can perform.
+- `native.full-trust`: runs bundled backends or programs and permits unrestricted filesystem, shell, and Steam-surface access. Official submissions require source code, reproducible backend build instructions, and a detailed justification.
 
-If a plugin declares `secrets`, `network`, or `files`, the pull request should explain why the permission is needed.
+Validate and package from the repository root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tfs-plugin.ps1 validate .\path\to\plugin
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tfs-plugin.ps1 pack .\path\to\plugin
+```
+
+If a plugin declares `secrets`, `network`, `files`, `notifications`, or `logging`, the pull request should explain why the permission is needed.
 Unknown permissions are rejected by the installer. Keep the permission list small and exact.
 
 ## Package Limits
 
 The store rejects packages that are too large or unsafe to extract:
 
-- 64 MB maximum zip size.
-- 128 MB maximum extracted size.
-- 512 files maximum.
-- 32 MB maximum per extracted file.
+- 256 MB maximum zip size.
+- 512 MB maximum extracted size.
+- 2,048 files maximum.
+- 256 MB maximum per extracted file.
 - No absolute paths or `..` segments inside the zip.
 - `packagePath` must be relative to the catalog file; use `packageUrl` for hosted packages.
 
 ## Local Test
+
+For any plugin, use the one-command developer sideload:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tfs-plugin.ps1 sideload .\path\to\plugin
+```
+
+Then open the Store, press Refresh, and install it from Community. The generated local catalog is marked as unreviewed and is not overwritten by an official-catalog refresh.
 
 For the official Home Assistant example:
 

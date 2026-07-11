@@ -10,5 +10,8 @@
     "storage",
     "secrets",
     "network"
+  ],
+  "networkHosts": [
+    "<local>"
   ]
 }
