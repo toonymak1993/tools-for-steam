@@ -940,7 +940,7 @@
         min-height: 0;
         display: grid;
         grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-        padding: 50px 34px 18px;
+        padding: clamp(28px, 4.6vh, 52px) clamp(24px, 4vw, 72px) 18px;
         background: #101720;
       }
 
@@ -1115,6 +1115,7 @@
 
       .steamloader-plugin-store-content {
         min-height: 0;
+        min-width: 0;
         padding: 0;
         overflow: hidden;
       }
@@ -1156,14 +1157,17 @@
 
       .steamloader-plugin-store-gallery {
         height: 100%;
+        min-width: 0;
+        min-height: 0;
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
         grid-template-rows: none;
-        grid-auto-rows: minmax(420px, 48vh);
-        gap: 42px 34px;
+        grid-auto-rows: minmax(380px, auto);
+        gap: clamp(20px, 2.2vw, 34px);
         overflow-x: hidden;
         overflow-y: auto;
-        padding: 4px 22px 26px 2px;
+        padding: 6px clamp(14px, 1.5vw, 26px) 32px 4px;
+        scroll-padding: 6px clamp(14px, 1.5vw, 26px) 32px 4px;
         align-content: start;
         scrollbar-color: rgba(238, 243, 248, 0.46) rgba(255, 255, 255, 0.04);
         scrollbar-width: auto;
@@ -1173,12 +1177,12 @@
         position: relative;
         display: grid;
         grid-template-columns: minmax(0, 1fr);
-        grid-template-rows: minmax(0, 1fr) minmax(180px, 50%);
+        grid-template-rows: auto minmax(160px, 1fr);
         align-items: stretch;
         gap: 14px;
-        height: 100%;
-        min-height: 0;
-        padding: 16px;
+        height: auto;
+        min-height: 380px;
+        padding: clamp(15px, 1.35vw, 20px);
         border-radius: 24px;
         background: #343a42;
         box-shadow: none;
@@ -1235,7 +1239,7 @@
         flex-direction: column;
         gap: 6px;
         min-height: 0;
-        overflow: hidden;
+        overflow: visible;
       }
 
       .steamloader-plugin-store-card-title {
@@ -1251,11 +1255,12 @@
 
       .steamloader-plugin-store-card-description {
         display: -webkit-box;
-        -webkit-line-clamp: 1;
+        -webkit-line-clamp: 3;
         -webkit-box-orient: vertical;
         overflow: hidden;
         color: rgba(190, 201, 213, 0.64);
-        font-size: 11px;
+        font-size: 12px;
+        line-height: 1.4;
       }
 
       .steamloader-plugin-store-badges {
@@ -1285,13 +1290,14 @@
         justify-content: flex-start;
         gap: 8px;
         flex-wrap: wrap;
-        margin-top: 2px;
+        margin-top: auto;
       }
 
       .steamloader-plugin-store-card-preview {
         width: 100%;
         height: 100%;
-        min-height: 170px;
+        min-height: 160px;
+        aspect-ratio: 16 / 9;
         border-radius: 20px;
         background: transparent;
         box-shadow: none;
@@ -1567,19 +1573,24 @@
 
       @media (max-width: 1280px) {
         .steamloader-plugin-store-main {
-          padding: 40px 22px 16px;
+          padding: 36px clamp(22px, 3.2vw, 42px) 16px;
+        }
+
+        .steamloader-plugin-store-topbar {
+          grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.15fr) auto;
+          gap: 16px;
         }
 
         .steamloader-plugin-store-gallery {
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
           grid-template-rows: none;
-          grid-auto-rows: minmax(380px, 46vh);
-          gap: 36px 28px;
+          grid-auto-rows: minmax(360px, auto);
+          gap: clamp(18px, 2.2vw, 28px);
         }
 
         .steamloader-plugin-store-card {
           grid-template-columns: minmax(0, 1fr);
-          min-height: 0;
+          min-height: 360px;
           border-radius: 24px;
         }
 
@@ -1593,6 +1604,36 @@
         }
       }
 
+      @media (max-width: 1050px) {
+        .steamloader-plugin-store-main {
+          padding-inline: clamp(18px, 3vw, 30px);
+        }
+
+        .steamloader-plugin-store-topbar {
+          grid-template-columns: minmax(0, 1fr) auto;
+          grid-template-areas:
+            "brand actions"
+            "search search";
+          gap: 12px 16px;
+        }
+
+        .steamloader-plugin-store-brand {
+          grid-area: brand;
+        }
+
+        .steamloader-plugin-store-search {
+          grid-area: search;
+        }
+
+        .steamloader-plugin-store-topbar-actions {
+          grid-area: actions;
+        }
+
+        .steamloader-plugin-store-gallery {
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+        }
+      }
+
       @media (max-width: 900px) {
         .steamloader-plugin-store-main {
           padding: 28px 14px 20px;
@@ -1600,6 +1641,10 @@
 
         .steamloader-plugin-store-topbar {
           grid-template-columns: 1fr;
+          grid-template-areas:
+            "brand"
+            "search"
+            "actions";
         }
 
         .steamloader-plugin-store-card {
@@ -1615,9 +1660,9 @@
         }
 
         .steamloader-plugin-store-gallery {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
           grid-template-rows: none;
-          grid-auto-rows: minmax(300px, auto);
+          grid-auto-rows: minmax(340px, auto);
           gap: 22px;
         }
 
