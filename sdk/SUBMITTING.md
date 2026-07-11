@@ -97,8 +97,9 @@ Use the smallest permission set possible:
 - `storage`: stores public per-plugin JSON settings.
 - `secrets`: stores write-only tokens or passwords through the core.
 - `network`: sends HTTP/HTTPS requests through the core network proxy.
+- `files`: manages caches, exports, logs, indexes, and binary assets inside the plugin's private sandbox.
 
-If a plugin declares `secrets` or `network`, the pull request should explain what service it connects to and why the permission is needed.
+If a plugin declares `secrets`, `network`, or `files`, the pull request should explain why the permission is needed.
 Unknown permissions are rejected by the installer. Keep the permission list small and exact.
 
 ## Package Limits

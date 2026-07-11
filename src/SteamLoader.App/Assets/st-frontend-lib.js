@@ -2309,6 +2309,16 @@
         const current = await storage.get();
         return storage.set({ ...current, ...partialSettings });
       },
+      async remove(...keys) {
+        const current = await storage.get();
+        for (const key of keys.flat()) {
+          delete current[String(key)];
+        }
+        return storage.set(current);
+      },
+      clear() {
+        return storage.set({});
+      },
     };
 
     const secrets = {
@@ -2333,8 +2343,8 @@
     };
 
     const network = {
-      request(networkRequest = {}) {
-        return pluginRequest("network/request", {
+      async request(networkRequest = {}) {
+        const response = await pluginRequest("network/request", {
           method: "POST",
           body: {
             method: networkRequest.method || "GET",
@@ -2345,6 +2355,11 @@
             authorizationScheme: networkRequest.authorizationScheme || "Bearer",
           },
         });
+        return {
+          ...response,
+          text: () => String(response?.bodyText || ""),
+          json: () => JSON.parse(String(response?.bodyText || "null")),
+        };
       },
       get(url, requestOptions = {}) {
         return network.request({ ...requestOptions, method: "GET", url });
@@ -2352,7 +2367,134 @@
       post(url, body = {}, requestOptions = {}) {
         return network.request({ ...requestOptions, method: "POST", url, body });
       },
+      put(url, body = {}, requestOptions = {}) {
+        return network.request({ ...requestOptions, method: "PUT", url, body });
+      },
+      patch(url, body = {}, requestOptions = {}) {
+        return network.request({ ...requestOptions, method: "PATCH", url, body });
+      },
+      delete(url, requestOptions = {}) {
+        return network.request({ ...requestOptions, method: "DELETE", url });
+      },
     };
+
+    function bytesToBase64(value) {
+      const bytes = value instanceof Uint8Array
+        ? value
+        : value instanceof ArrayBuffer
+          ? new Uint8Array(value)
+          : ArrayBuffer.isView(value)
+            ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+            : null;
+      if (!bytes) {
+        throw new TypeError("TFS files.writeBytes expects an ArrayBuffer or typed array.");
+      }
+
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    function base64ToBytes(value) {
+      const binary = atob(String(value || ""));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    }
+
+    const files = {
+      list(path = "", options = {}) {
+        return pluginRequest("files/list", {
+          method: "POST",
+          body: { path: String(path || ""), recursive: Boolean(options.recursive) },
+        });
+      },
+      stat(path = "") {
+        return pluginRequest("files/stat", {
+          method: "POST",
+          body: { path: String(path || ""), recursive: false },
+        });
+      },
+      read(path, options = {}) {
+        return pluginRequest("files/read", {
+          method: "POST",
+          body: { path: String(path || ""), encoding: options.encoding || "utf8" },
+        });
+      },
+      async readText(path) {
+        const result = await files.read(path, { encoding: "utf8" });
+        return result?.content || "";
+      },
+      async readBytes(path) {
+        const result = await files.read(path, { encoding: "base64" });
+        return base64ToBytes(result?.content || "");
+      },
+      write(path, content, options = {}) {
+        const isBinary = content instanceof ArrayBuffer || ArrayBuffer.isView(content);
+        return pluginRequest("files/write", {
+          method: "POST",
+          body: {
+            path: String(path || ""),
+            content: isBinary ? bytesToBase64(content) : String(content ?? ""),
+            encoding: isBinary ? "base64" : options.encoding || "utf8",
+            append: Boolean(options.append),
+            overwrite: options.overwrite !== false,
+          },
+        });
+      },
+      writeText(path, content, options = {}) {
+        return files.write(path, String(content ?? ""), { ...options, encoding: "utf8" });
+      },
+      appendText(path, content) {
+        return files.writeText(path, content, { append: true });
+      },
+      writeBytes(path, content, options = {}) {
+        return files.write(path, content, options);
+      },
+      mkdir(path = "") {
+        return pluginRequest("files/directory", {
+          method: "POST",
+          body: { path: String(path || ""), recursive: true },
+        });
+      },
+      remove(path, options = {}) {
+        return pluginRequest("files/delete", {
+          method: "POST",
+          body: { path: String(path || ""), recursive: Boolean(options.recursive) },
+        });
+      },
+      move(sourcePath, destinationPath, options = {}) {
+        return pluginRequest("files/move", {
+          method: "POST",
+          body: {
+            sourcePath: String(sourcePath || ""),
+            destinationPath: String(destinationPath || ""),
+            overwrite: Boolean(options.overwrite),
+          },
+        });
+      },
+      copy(sourcePath, destinationPath, options = {}) {
+        return pluginRequest("files/copy", {
+          method: "POST",
+          body: {
+            sourcePath: String(sourcePath || ""),
+            destinationPath: String(destinationPath || ""),
+            overwrite: Boolean(options.overwrite),
+          },
+        });
+      },
+    };
+
+    const declaredPermissions = new Set(
+      Array.isArray(manifest.permissions)
+        ? manifest.permissions.map((permission) => String(permission || "").trim().toLowerCase())
+        : [],
+    );
 
     return {
       version: 1,
@@ -2366,6 +2508,9 @@
       storage,
       secrets,
       network,
+      files,
+      permissions: Object.freeze([...declaredPermissions]),
+      hasPermission: (permission) => declaredPermissions.has(String(permission || "").trim().toLowerCase()),
       ui: {
         createSlot,
         createNavigationSlot,

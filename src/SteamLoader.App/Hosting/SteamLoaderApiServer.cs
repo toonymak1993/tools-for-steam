@@ -1469,6 +1469,126 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         cancellationToken);
                     return;
                 }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/list")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileListRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.ListPluginSdkFiles(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/stat")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.GetPluginSdkFileInfo(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/read")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileReadRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.ReadPluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/write")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileWriteRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.WritePluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/directory")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.CreatePluginSdkDirectory(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/delete")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.DeletePluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/move")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileTransferRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.MovePluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
+
+                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                    sdkPath == "files/copy")
+                {
+                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileTransferRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.OK,
+                        _pluginStoreService.CopyPluginSdkFile(sdkPluginId, payload),
+                        cancellationToken);
+                    return;
+                }
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&

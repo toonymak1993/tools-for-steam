@@ -335,7 +335,7 @@ public sealed class PluginStoreServiceTests
             Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
 
             var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
-            CreateSamplePluginZip(zipPath, permissions: ["frontend", "filesystem"]);
+            CreateSamplePluginZip(zipPath, permissions: ["frontend", "system"]);
             WriteCatalog(
                 storeRoot,
                 "sample-plugin",
@@ -438,6 +438,106 @@ public sealed class PluginStoreServiceTests
 
             var clearedSecrets = service.ClearPluginSdkSecret("sample-plugin", "accessToken");
             Assert.False(clearedSecrets.Secrets.ContainsKey("accesstoken"));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkFiles_RequireFilesPermission()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(root, ["frontend"]);
+
+            var exception = Assert.Throws<InvalidOperationException>(
+                () => service.ListPluginSdkFiles(
+                    "sample-plugin",
+                    new PluginSdkFileListRequest("", false)));
+
+            Assert.Contains("files", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkFiles_SupportSandboxedFileLifecycle()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(root, ["frontend", "files"]);
+
+            service.CreatePluginSdkDirectory(
+                "sample-plugin",
+                new PluginSdkFilePathRequest("cache/nested", true));
+            service.WritePluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFileWriteRequest("cache/nested/state.txt", "hello", "utf8", false, true));
+            service.WritePluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFileWriteRequest("cache/nested/state.txt", " world", "utf8", true, true));
+
+            var content = service.ReadPluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFileReadRequest("cache/nested/state.txt", "utf8"));
+            Assert.Equal("hello world", content.Content);
+            Assert.Equal(11, content.Size);
+
+            var listing = service.ListPluginSdkFiles(
+                "sample-plugin",
+                new PluginSdkFileListRequest("cache", true));
+            Assert.Contains(listing.Entries, entry => entry.Path == "cache/nested/state.txt" && !entry.IsDirectory);
+            Assert.Equal(11, listing.UsedBytes);
+
+            service.CopyPluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFileTransferRequest("cache/nested/state.txt", "copy.txt", false));
+            service.MovePluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFileTransferRequest("copy.txt", "moved.txt", false));
+            var moved = service.GetPluginSdkFileInfo(
+                "sample-plugin",
+                new PluginSdkFilePathRequest("moved.txt", false));
+            Assert.True(moved.Exists);
+            Assert.Equal(11, moved.Size);
+
+            var deleted = service.DeletePluginSdkFile(
+                "sample-plugin",
+                new PluginSdkFilePathRequest("cache", true));
+            Assert.False(deleted.Exists);
+            Assert.Equal(11, deleted.UsedBytes);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkFiles_RejectPathTraversal()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(root, ["frontend", "files"]);
+
+            var exception = Assert.Throws<InvalidOperationException>(
+                () => service.WritePluginSdkFile(
+                    "sample-plugin",
+                    new PluginSdkFileWriteRequest("../outside.txt", "blocked", "utf8", false, true)));
+
+            Assert.Contains("safe relative path", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(Path.Combine(root, "plugin-store", "sdk-data", "outside.txt")));
         }
         finally
         {

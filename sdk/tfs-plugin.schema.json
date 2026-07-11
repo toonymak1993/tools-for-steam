@@ -43,21 +43,23 @@
     },
     "permissions": {
       "type": "array",
-      "description": "Declared SDK capabilities. Known v1 permissions are frontend, storage, secrets, and network.",
+      "description": "Declared SDK capabilities. Known v1 permissions are frontend, storage, secrets, network, and files.",
       "items": {
         "type": "string",
         "enum": [
           "frontend",
           "storage",
           "secrets",
-          "network"
+          "network",
+          "files"
         ],
         "pattern": "^[a-z0-9][a-z0-9._-]*$",
         "examples": [
           "frontend",
           "storage",
           "secrets",
-          "network"
+          "network",
+          "files"
         ]
       },
       "uniqueItems": true

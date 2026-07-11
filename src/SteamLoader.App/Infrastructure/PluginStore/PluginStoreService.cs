@@ -1111,6 +1111,196 @@ public sealed class PluginStoreService
         return targetPath;
     }
 
+    private string GetPluginFilesDirectory(string pluginId)
+    {
+        return Path.Combine(GetPluginSdkDataDirectory(pluginId), "files");
+    }
+
+    private static string ResolvePluginFilesPath(string rootPath, string relativePath)
+    {
+        var targetPath = relativePath.Length == 0
+            ? Path.GetFullPath(rootPath)
+            : Path.GetFullPath(Path.Combine(
+                rootPath,
+                relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        EnsureWithinPathRoot(targetPath, rootPath);
+        return targetPath;
+    }
+
+    private static string NormalizePluginFilePath(string? path, bool allowEmpty)
+    {
+        var normalized = (path ?? string.Empty).Trim().Replace('\\', '/').Trim('/');
+        if (normalized.Length == 0)
+        {
+            return allowEmpty
+                ? string.Empty
+                : throw new InvalidOperationException("A plugin file path is required.");
+        }
+
+        if (normalized.Length > 512 ||
+            Path.IsPathRooted(normalized) ||
+            normalized.IndexOfAny(Path.GetInvalidPathChars()) >= 0 ||
+            normalized.Split('/').Any(segment => segment is "" or "." or ".."))
+        {
+            throw new InvalidOperationException("The plugin file path must be a safe relative path.");
+        }
+
+        return normalized;
+    }
+
+    private static string NormalizePluginFileEncoding(string? encoding)
+    {
+        var normalized = string.IsNullOrWhiteSpace(encoding)
+            ? "utf8"
+            : encoding.Trim().ToLowerInvariant().Replace("-", string.Empty);
+        return normalized switch
+        {
+            "utf8" => "utf8",
+            "base64" => "base64",
+            _ => throw new InvalidOperationException("Plugin files support utf8 and base64 encoding.")
+        };
+    }
+
+    private static byte[] DecodePluginFileContent(string? content, string? encoding)
+    {
+        var normalizedEncoding = NormalizePluginFileEncoding(encoding);
+        try
+        {
+            return normalizedEncoding == "base64"
+                ? Convert.FromBase64String(content ?? string.Empty)
+                : Encoding.UTF8.GetBytes(content ?? string.Empty);
+        }
+        catch (FormatException)
+        {
+            throw new InvalidOperationException("The plugin file content is not valid base64.");
+        }
+    }
+
+    private static void EnsurePluginFilesTreeSafe(string rootPath, string targetPath)
+    {
+        EnsureWithinPathRoot(targetPath, rootPath);
+        var currentPath = Path.GetFullPath(rootPath);
+        if (Path.Exists(currentPath) &&
+            File.GetAttributes(currentPath).HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException("Plugin file storage cannot traverse links or reparse points.");
+        }
+
+        var relativePath = Path.GetRelativePath(currentPath, targetPath);
+        if (relativePath == ".")
+        {
+            return;
+        }
+
+        foreach (var segment in relativePath.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries))
+        {
+            currentPath = Path.Combine(currentPath, segment);
+            if (Path.Exists(currentPath) &&
+                File.GetAttributes(currentPath).HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new InvalidOperationException("Plugin file storage cannot traverse links or reparse points.");
+            }
+        }
+    }
+
+    private static long GetPluginFilesUsage(string rootPath)
+    {
+        if (!Directory.Exists(rootPath))
+        {
+            return 0;
+        }
+
+        long usedBytes = 0;
+        var entryCount = 0;
+        var directories = new Stack<string>();
+        directories.Push(rootPath);
+        while (directories.Count > 0)
+        {
+            var directory = directories.Pop();
+            foreach (var entryPath in Directory.EnumerateFileSystemEntries(directory))
+            {
+                entryCount++;
+                if (entryCount > MaxPluginFileEntries)
+                {
+                    throw new InvalidOperationException("Plugin file storage cannot contain more than 1024 entries.");
+                }
+
+                var attributes = File.GetAttributes(entryPath);
+                if (attributes.HasFlag(FileAttributes.ReparsePoint))
+                {
+                    throw new InvalidOperationException("Plugin file storage cannot contain links or reparse points.");
+                }
+
+                if (attributes.HasFlag(FileAttributes.Directory))
+                {
+                    directories.Push(entryPath);
+                }
+                else
+                {
+                    usedBytes += new FileInfo(entryPath).Length;
+                }
+            }
+        }
+
+        return usedBytes;
+    }
+
+    private static IReadOnlyList<PluginSdkFileEntry> EnumeratePluginFileEntries(
+        string rootPath,
+        string targetPath,
+        bool recursive)
+    {
+        var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var entries = new List<PluginSdkFileEntry>();
+        foreach (var entryPath in Directory.EnumerateFileSystemEntries(targetPath, "*", searchOption))
+        {
+            if (entries.Count >= MaxPluginFileEntries)
+            {
+                throw new InvalidOperationException("A plugin file listing cannot contain more than 1024 entries.");
+            }
+
+            var attributes = File.GetAttributes(entryPath);
+            if (attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new InvalidOperationException("Plugin file storage cannot contain links or reparse points.");
+            }
+
+            var isDirectory = attributes.HasFlag(FileAttributes.Directory);
+            var relativePath = Path.GetRelativePath(rootPath, entryPath).Replace('\\', '/');
+            entries.Add(new PluginSdkFileEntry(
+                relativePath,
+                Path.GetFileName(entryPath),
+                isDirectory,
+                isDirectory ? 0 : new FileInfo(entryPath).Length,
+                isDirectory
+                    ? new DirectoryInfo(entryPath).LastWriteTimeUtc
+                    : new FileInfo(entryPath).LastWriteTimeUtc));
+        }
+
+        return entries
+            .OrderByDescending(entry => entry.IsDirectory)
+            .ThenBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static PluginSdkFileMutationState BuildPluginFileMutationState(
+        string rootPath,
+        string targetPath,
+        string relativePath)
+    {
+        var isDirectory = Directory.Exists(targetPath);
+        var exists = isDirectory || File.Exists(targetPath);
+        return new PluginSdkFileMutationState(
+            relativePath,
+            exists,
+            isDirectory,
+            exists && !isDirectory ? new FileInfo(targetPath).Length : 0,
+            GetPluginFilesUsage(rootPath),
+            MaxPluginFilesBytes);
+    }
+
     private string GetPluginSettingsPath(string pluginId)
     {
         return Path.Combine(GetPluginSdkDataDirectory(pluginId), "settings.json");

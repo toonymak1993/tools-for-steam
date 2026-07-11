@@ -13,7 +13,7 @@ assets/preview.png
 Store listings require a preview image. Keep it readable at controller distance and use PNG, JPG, WEBP, GIF, or SVG.
 Catalog entries also require a SHA-256 checksum for the final zip. Packages without a checksum are blocked by the Store.
 
-Use `window.TfsPluginSdk.create(manifest)` from `dist/index.js`. The SDK provides shared UI helpers plus optional `storage`, `secrets`, and `network` helpers when the manifest declares the matching permissions.
+Use `window.TfsPluginSdk.create(manifest)` from `dist/index.js`. The SDK provides shared UI helpers plus optional `storage`, `secrets`, `network`, and sandboxed `files` helpers when the manifest declares the matching permissions.
 
 Register synchronously:
 

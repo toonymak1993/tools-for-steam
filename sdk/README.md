@@ -2,7 +2,7 @@
 
 This folder documents the Tools for Steam community plugin contract.
 
-The current SDK is **v1 preview**. It is intentionally small and capability based: core owns installation, package validation, storage, secrets, and network access. Community plugins only receive the frontend SDK surface that Tools for Steam exposes to them.
+The current SDK is **v1 preview**. It is capability based and grows additively: core owns installation, package validation, storage, secrets, network access, and sandboxed files. Community plugins receive only the capabilities declared in their manifest.
 
 Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins should keep working as the SDK grows. If a future change needs to break the runtime contract, it should become SDK v2 while the app keeps a v1 loader for existing plugins.
 
@@ -35,11 +35,15 @@ Available helpers:
 - `sdk.state()` returns installed SDK metadata, declared permissions, public settings, and secret configured flags.
 - `sdk.storage.get()` and `sdk.storage.set(settings)` read and write a per-plugin JSON object.
 - `sdk.storage.patch(partialSettings)` merges a small settings update into the current settings object.
+- `sdk.storage.remove(...keys)` and `sdk.storage.clear()` remove public settings.
 - `sdk.secrets.status()` returns `{ key: true }` flags without exposing secret values.
 - `sdk.secrets.set(key, value)` stores a per-plugin secret through the core.
 - `sdk.secrets.clear(key)` removes a stored secret.
 - `sdk.network.request(options)` sends an HTTP or HTTPS request through the core network proxy.
 - `sdk.network.get(url, options)` and `sdk.network.post(url, body, options)` are small convenience wrappers.
+- `sdk.network.put()`, `sdk.network.patch()`, and `sdk.network.delete()` cover all supported HTTP methods. Responses expose `text()` and `json()` helpers.
+- `sdk.files` manages text or binary data inside an isolated per-plugin file area.
+- `sdk.hasPermission(name)` lets a plugin adapt to optional manifest capabilities.
 - `sdk.ui` exposes shared controller-friendly screen and slot factories.
 - `sdk.ui.createSecretEditor(options)` creates a password-style editor model for tokens or passwords. The entered value should be saved with `sdk.secrets.set()`.
 
@@ -81,6 +85,7 @@ Permissions are declared in `tfs-plugin.json` and enforced by the core SDK route
 - `storage`: The plugin may persist a public JSON settings object.
 - `secrets`: The plugin may store secrets and pass them to SDK network requests.
 - `network`: The plugin may send HTTP or HTTPS requests through the SDK proxy.
+- `files`: The plugin may manage its own sandboxed files. It cannot access another plugin's files or arbitrary user paths.
 
 Secrets are write-only from the plugin perspective. A plugin can check whether a key exists, but it cannot read the secret value back. To use a token in an HTTP request, pass `authorizationSecretKey`; the core injects the `Authorization` header server-side.
 
@@ -139,7 +144,7 @@ Rules enforced today:
 - `version` must match the catalog entry version.
 - `sdkVersion` must use major version `1`.
 - `entryPoint` must be a relative JavaScript path inside the package.
-- `permissions` must contain only SDK v1 permissions: `frontend`, `storage`, `secrets`, and `network`.
+- `permissions` must contain only SDK v1 permissions: `frontend`, `storage`, `secrets`, `network`, and `files`.
 
 ## Package Safety Rules
 
@@ -165,6 +170,25 @@ const response = await sdk.network.get(`${settings.baseUrl}/api/states`, {
 });
 
 const states = JSON.parse(response.bodyText);
+```
+
+## Sandboxed Files Example
+
+Declare `"files"` in the manifest before using this API. Each plugin receives a private file area under its SDK data directory, limited to 32 MB total and 8 MB per file. Paths are always relative; absolute paths, `..`, links, and reparse points are rejected.
+
+```js
+await sdk.files.mkdir("cache/images");
+await sdk.files.writeText("cache/state.json", JSON.stringify({ page: 2 }));
+await sdk.files.appendText("logs/plugin.log", "refreshed\n");
+
+const state = JSON.parse(await sdk.files.readText("cache/state.json"));
+const entries = await sdk.files.list("cache", { recursive: true });
+const bytes = await sdk.files.readBytes("cache/images/preview.png");
+
+await sdk.files.writeBytes("cache/images/copy.png", bytes);
+await sdk.files.copy("cache/state.json", "cache/state.backup.json");
+await sdk.files.move("cache/state.backup.json", "archive/state.json");
+await sdk.files.remove("archive", { recursive: true });
 ```
 
 Home Assistant's REST API is documented at https://developers.home-assistant.io/docs/api/rest/. It uses `/api/states` for entity states and `/api/services/<domain>/<service>` for service calls, authenticated with a Bearer token.
@@ -222,6 +246,6 @@ Recommended flow:
 5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, and optionally one or more image URLs.
 6. Open a pull request against `tfs-plugin-database` and document what permissions the plugin needs.
 
-Use the smallest permission set possible. If your plugin only renders UI, use `frontend`. Add `storage`, `secrets`, or `network` only when the plugin truly needs them.
+Use the smallest permission set possible. If your plugin only renders UI, use `frontend`. Add `storage`, `secrets`, `network`, or `files` only when the plugin truly needs them.
 
 See `SUBMITTING.md` for the full pull request checklist and minimal plugin example.
