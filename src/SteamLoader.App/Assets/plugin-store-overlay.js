@@ -3407,9 +3407,9 @@
       );
       state.snapshot = payload && typeof payload === "object" ? payload : null;
       ensureSelection();
-      if (state.open && state.selectedPluginId) {
-        requestStoreFocus(`card:${state.selectedPluginId}`);
-      }
+      // Keep selection and controller focus separate. A snapshot can finish while the
+      // user is navigating the search, tabs, or header actions; forcing the selected
+      // card here would unexpectedly move focus into the gallery.
       return true;
     } catch (error) {
       state.error = error instanceof Error ? error.message : String(error);
