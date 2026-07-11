@@ -30,7 +30,7 @@
       "description": "Control Home Assistant light entities from Tools for Steam.",
       "author": "Tools for Steam",
       "category": "Smart Home",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "sdkVersion": "1.0.0",
       "permissions": ["frontend", "storage", "secrets", "network"],
       "networkHosts": ["<local>"],
@@ -46,7 +46,7 @@
       ],
       "homepageUrl": "https://www.home-assistant.io/",
       "repositoryUrl": "https://developers.home-assistant.io/docs/api/rest/",
-      "changelog": "Initial Home Assistant light controls."
+      "changelog": "Updated for the public SDK 1.0 contract with explicit local-network permissions."
     }
   ]
 }

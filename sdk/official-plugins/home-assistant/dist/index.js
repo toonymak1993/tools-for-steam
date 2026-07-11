@@ -2,7 +2,7 @@
   const manifest = {
     id: "home-assistant",
     name: "Home Assistant",
-    version: "0.1.0",
+    version: "0.2.0",
     sdkVersion: "1.0.0",
     permissions: ["frontend", "storage", "secrets", "network"],
     networkHosts: ["<local>"],

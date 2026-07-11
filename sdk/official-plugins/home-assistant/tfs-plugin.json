@@ -2,7 +2,7 @@
   "id": "home-assistant",
   "name": "Home Assistant",
   "description": "Control Home Assistant light entities from Tools for Steam.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sdkVersion": "1.0.0",
   "entryPoint": "dist/index.js",
   "permissions": [
