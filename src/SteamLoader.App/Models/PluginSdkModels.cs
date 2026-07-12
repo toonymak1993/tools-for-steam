@@ -7,6 +7,7 @@ public sealed record PluginSdkState(
     string SdkVersion,
     string EntryPoint,
     IReadOnlyList<string> Permissions,
+    IReadOnlyList<string> NetworkHosts,
     JsonElement Settings,
     IReadOnlyDictionary<string, bool> Secrets);
 
@@ -82,3 +83,33 @@ public sealed record PluginSdkFileMutationState(
     long Size,
     long UsedBytes,
     long MaxBytes);
+
+public sealed record PluginSdkNotificationRequest(
+    string Title,
+    string Message,
+    string? Level,
+    int DurationMs);
+
+public sealed record PluginSdkNotificationState(
+    string Id,
+    string PluginId,
+    string Title,
+    string Message,
+    string Level,
+    int DurationMs,
+    DateTimeOffset CreatedAtUtc);
+
+public sealed record PluginSdkLogRequest(
+    string? Level,
+    string Message,
+    JsonElement? Data);
+
+public sealed record PluginSdkLogState(
+    string PluginId,
+    string Level,
+    DateTimeOffset WrittenAtUtc,
+    long LogSize);
+
+public sealed record PluginSdkCapabilityRequest(
+    string Operation,
+    JsonElement? Arguments);

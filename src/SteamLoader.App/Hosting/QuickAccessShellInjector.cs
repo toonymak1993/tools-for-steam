@@ -11,6 +11,7 @@ public sealed class QuickAccessShellInjector
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SteamLoaderHostState _hostState;
     private readonly Uri _apiBaseUri;
+    private readonly string _apiSessionToken;
     private readonly SteamClientLaunchService _steamClientLaunchService;
     private readonly string _sharedScriptTemplate;
     private readonly string _popupScriptTemplate;
@@ -28,6 +29,7 @@ public sealed class QuickAccessShellInjector
     public QuickAccessShellInjector(
         SteamDevToolsClient devToolsClient,
         Uri apiBaseUri,
+        string apiSessionToken,
         SteamClientLaunchService steamClientLaunchService,
         string sharedScriptTemplate,
         string popupScriptTemplate,
@@ -36,13 +38,14 @@ public sealed class QuickAccessShellInjector
     {
         _devToolsClient = devToolsClient;
         _apiBaseUri = apiBaseUri;
+        _apiSessionToken = apiSessionToken;
         _steamClientLaunchService = steamClientLaunchService;
         _sharedScriptTemplate = sharedScriptTemplate;
         _popupScriptTemplate = popupScriptTemplate;
         _themeSurfaceScriptTemplate = themeSurfaceScriptTemplate;
-        _sharedScriptVersion = ComputeScriptVersion(sharedScriptTemplate);
-        _popupScriptVersion = ComputeScriptVersion(popupScriptTemplate);
-        _themeSurfaceScriptVersion = ComputeScriptVersion(themeSurfaceScriptTemplate);
+        _sharedScriptVersion = ComputeScriptVersion($"{sharedScriptTemplate}\n{apiSessionToken}");
+        _popupScriptVersion = ComputeScriptVersion($"{popupScriptTemplate}\n{apiSessionToken}");
+        _themeSurfaceScriptVersion = ComputeScriptVersion($"{themeSurfaceScriptTemplate}\n{apiSessionToken}");
         _hostState = hostState;
     }
 
@@ -204,9 +207,36 @@ public sealed class QuickAccessShellInjector
         Action<string> setReadyState,
         CancellationToken cancellationToken)
     {
-        var scriptBody = scriptTemplate.Replace("__STEAMLOADER_API_BASE__", _apiBaseUri.ToString(), StringComparison.Ordinal);
+        var apiBase = _apiBaseUri.ToString();
+        var authenticatedFetchBootstrap = $$"""
+            (() => {
+              const apiBase = {{JsonSerializer.Serialize(apiBase)}};
+              const apiToken = {{JsonSerializer.Serialize(_apiSessionToken)}};
+              window.__steamLoaderApiBase = apiBase;
+              window.__steamLoaderApiToken = apiToken;
+              window.__steamLoaderApiUrl = (path) => {
+                const url = new URL(path, apiBase);
+                url.searchParams.set("{{LocalApiSession.QueryName}}", apiToken);
+                return url.toString();
+              };
+              if (window.__steamLoaderAuthenticatedFetchToken === apiToken) return;
+              const nativeFetch = window.__steamLoaderNativeFetch || window.fetch.bind(window);
+              window.__steamLoaderNativeFetch = nativeFetch;
+              window.fetch = (input, init = {}) => {
+                const requestUrl = typeof input === "string" || input instanceof URL ? String(input) : input?.url || "";
+                if (!requestUrl.startsWith(apiBase)) return nativeFetch(input, init);
+                const inheritedHeaders = input instanceof Request ? input.headers : undefined;
+                const headers = new Headers(init.headers || inheritedHeaders);
+                headers.set("{{LocalApiSession.HeaderName}}", apiToken);
+                return nativeFetch(input, { ...init, headers });
+              };
+              window.__steamLoaderAuthenticatedFetchToken = apiToken;
+            })();
+            """;
+        var scriptBody = scriptTemplate.Replace("__STEAMLOADER_API_BASE__", apiBase, StringComparison.Ordinal);
         var script = string.Join(
             Environment.NewLine,
+            authenticatedFetchBootstrap,
             scriptBody,
             $"window[{JsonSerializer.Serialize(scriptVersionProperty)}] = {JsonSerializer.Serialize(scriptVersion)};",
             "\"injected\";");

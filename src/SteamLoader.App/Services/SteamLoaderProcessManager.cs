@@ -22,6 +22,9 @@ public sealed class SteamLoaderProcessManager
             BaseAddress = apiBaseUri,
             Timeout = StatusTimeout
         };
+        _httpClient.DefaultRequestHeaders.Add(
+            LocalApiSession.HeaderName,
+            LocalApiSession.GetOrCreateDefault());
     }
 
     public Uri ApiBaseUri => _apiBaseUri;

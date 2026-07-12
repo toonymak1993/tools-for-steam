@@ -8,7 +8,8 @@ public sealed record PluginStoreCommunityRuntimePluginState(
     string SdkVersion,
     string EntryPoint,
     string ScriptUrl,
-    IReadOnlyList<string> Permissions);
+    IReadOnlyList<string> Permissions,
+    IReadOnlyList<string> NetworkHosts);
 
 public sealed record PluginStoreCommunityRuntimeState(
     IReadOnlyList<PluginStoreCommunityRuntimePluginState> Plugins);

@@ -1,0 +1,19 @@
+{
+  "id": "full-trust-example",
+  "name": "Full Trust Example",
+  "description": "Native backend and operating-system access example for TFS SDK 1.0.0.",
+  "version": "1.0.0",
+  "sdkVersion": "1.0.0",
+  "entryPoint": "dist/index.js",
+  "permissions": [
+    "frontend",
+    "native.full-trust"
+  ],
+  "backend": {
+    "entryPoint": "backend/plugin.ps1",
+    "runtime": "powershell",
+    "arguments": [],
+    "autoStart": true,
+    "createNoWindow": true
+  }
+}

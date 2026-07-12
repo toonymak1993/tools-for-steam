@@ -28,6 +28,8 @@
           "title",
           "description",
           "version",
+          "sdkVersion",
+          "permissions",
           "packageSha256"
         ],
         "oneOf": [
@@ -65,6 +67,45 @@
             "type": "string",
             "minLength": 1
           },
+          "sdkVersion": {
+            "type": "string",
+            "const": "1.0.0"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "frontend",
+                "storage",
+                "secrets",
+                "network",
+                "files",
+                "notifications",
+                "logging",
+                "native.audio",
+                "native.processes",
+                "native.display",
+                "native.themes",
+                "native.artwork",
+                "native.app-start",
+                "native.store-sync",
+                "native.automation",
+                "native.performance",
+                "native.power",
+                "native.full-trust"
+              ]
+            },
+            "uniqueItems": true
+          },
+          "networkHosts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(<local>|(\\*\\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)$"
+            },
+            "uniqueItems": true
+          },
           "packagePath": {
             "type": "string",
             "minLength": 1,
@@ -101,8 +142,29 @@
           "repositoryUrl": {
             "type": "string",
             "format": "uri"
+          },
+          "changelog": {
+            "type": "string",
+            "maxLength": 4000
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "permissions": {
+                  "contains": { "const": "network" }
+                }
+              }
+            },
+            "then": {
+              "required": ["networkHosts"],
+              "properties": {
+                "networkHosts": { "minItems": 1 }
+              }
+            }
+          }
+        ]
       },
       "uniqueItems": true
     }

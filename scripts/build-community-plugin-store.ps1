@@ -132,6 +132,7 @@ $storePackagePath = Join-Path $storePackagesRoot "$PluginId.zip"
 $storeImageFileName = "$PluginId$imageExtension"
 $storeImagePath = Join-Path $storeImagesRoot $storeImageFileName
 $catalogPath = Join-Path $storeRoot "catalog.json"
+$catalogSourcePath = Join-Path $storeRoot "catalog-source.json"
 $sdkCatalogPath = Join-Path $RepositoryRoot "sdk\catalog.local.json"
 
 New-Item -ItemType Directory -Force -Path $packageRoot, $sdkImagesRoot, $tmpRoot, $storePackagesRoot, $storeImagesRoot | Out-Null
@@ -158,7 +159,11 @@ $stagingAssetsRoot = Join-Path $stagingRoot "assets"
 New-Item -ItemType Directory -Force -Path $stagingAssetsRoot | Out-Null
 Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $stagingAssetsRoot "preview$imageExtension") -Force
 Copy-Item -LiteralPath $ImagePath -Destination $storeImagePath -Force
-Copy-Item -LiteralPath $ImagePath -Destination $sdkImagePath -Force
+if (-not [System.IO.Path]::GetFullPath($ImagePath).Equals(
+    [System.IO.Path]::GetFullPath($sdkImagePath),
+    [System.StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $ImagePath -Destination $sdkImagePath -Force
+}
 
 if (Test-Path -LiteralPath $packagePath) {
     Remove-Item -LiteralPath $packagePath -Force
@@ -185,18 +190,23 @@ $catalog = [ordered]@{
             author = "Tools for Steam"
             category = "Smart Home"
             version = $manifest.version
+            sdkVersion = $manifest.sdkVersion
+            permissions = @($manifest.permissions)
+            networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
             packagePath = "./packages/$PluginId.zip"
             packageSha256 = $sha256
             images = @("api/plugin-store/images/catalog/$storeImageFileName")
             tags = @("smart-home", "lights", "sdk-v1")
             homepageUrl = "https://www.home-assistant.io/"
             repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
+            changelog = "Initial Home Assistant light controls."
         }
     )
 }
 
 $catalogJson = $catalog | ConvertTo-Json -Depth 10
 Write-Utf8NoBom -Path $catalogPath -Value $catalogJson
+Write-Utf8NoBom -Path $catalogSourcePath -Value '{"localDevelopment":true}'
 Write-Utf8NoBom -Path $sdkCatalogPath -Value $catalogJson
 
 $pluginDatabaseCatalogPath = ""
@@ -221,12 +231,16 @@ if (-not [string]::IsNullOrWhiteSpace($PluginDatabaseRoot)) {
                 author = "Tools for Steam"
                 category = "Smart Home"
                 version = $manifest.version
+                sdkVersion = $manifest.sdkVersion
+                permissions = @($manifest.permissions)
+                networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
                 packageUrl = "$pluginDatabaseRawBaseUrl/packages/$PluginId.zip"
                 packageSha256 = $sha256
                 images = @("$pluginDatabaseRawBaseUrl/images/$sdkImageFileName")
                 tags = @("smart-home", "lights", "sdk-v1")
                 homepageUrl = "https://www.home-assistant.io/"
                 repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
+                changelog = "Initial Home Assistant light controls."
             }
         )
     }

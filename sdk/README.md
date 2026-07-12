@@ -1,8 +1,12 @@
 # Tools for Steam Plugin SDK
 
+New here? Follow [QUICKSTART.md](QUICKSTART.md) to create, run, and sideload a first plugin in about ten minutes. Use [full-trust-plugin-template/](full-trust-plugin-template/) when the plugin needs its own native backend.
+
+For the complete developer workflow, native capability reference, Xbox Mode rules, testing matrix, and release checklist, read [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
+
 This folder documents the Tools for Steam community plugin contract.
 
-The current SDK is **v1 preview**. It is capability based and grows additively: core owns installation, package validation, storage, secrets, network access, and sandboxed files. Community plugins receive only the capabilities declared in their manifest.
+The current public SDK is **v1.0.0**. It is designed for trusted gaming plugins in the same spirit as Decky-style loaders: installed plugin JavaScript runs inside Steam's frontend realm and can build deep integrations. The manifest capability list drives the supported SDK bridges, Store disclosure, and update review; it is not a hostile-code sandbox. Install plugins only from publishers you trust.
 
 Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins should keep working as the SDK grows. If a future change needs to break the runtime contract, it should become SDK v2 while the app keeps a v1 loader for existing plugins.
 
@@ -25,7 +29,9 @@ Compatibility rule: SDK v1 updates should be additive. Existing v1 plugins shoul
 Community plugins should use the same frontend foundation as built-in plugins:
 
 ```js
-const sdk = window.TfsPluginSdk.create(manifest);
+window.TfsPluginSdk.register(manifest, (sdk) => ({
+  createScreen: () => sdk.ui.createScreenModel({ title: manifest.name, slots: [] }),
+}));
 ```
 
 The SDK wraps the existing `STFrontendLib` helpers so plugin authors can create controller-friendly TFS screens without copying UI code.
@@ -39,13 +45,24 @@ Available helpers:
 - `sdk.secrets.status()` returns `{ key: true }` flags without exposing secret values.
 - `sdk.secrets.set(key, value)` stores a per-plugin secret through the core.
 - `sdk.secrets.clear(key)` removes a stored secret.
-- `sdk.network.request(options)` sends an HTTP or HTTPS request through the core network proxy.
+- `sdk.network.request(options)` sends an HTTP or HTTPS request through the core network proxy, limited to manifest `networkHosts`.
 - `sdk.network.get(url, options)` and `sdk.network.post(url, body, options)` are small convenience wrappers.
 - `sdk.network.put()`, `sdk.network.patch()`, and `sdk.network.delete()` cover all supported HTTP methods. Responses expose `text()` and `json()` helpers.
 - `sdk.files` manages text or binary data inside an isolated per-plugin file area.
+- `sdk.notifications` shows rate-limited, non-blocking notices inside the Steam UI, including Xbox Mode.
+- `sdk.log` writes bounded structured diagnostic logs without opening a console window.
+- `sdk.lifecycle` owns timers, cancellation, and cleanup when a plugin is reloaded or removed.
+- `sdk.events.watch()` observes audio, process, display, or performance snapshots with lifecycle-owned, change-only polling.
 - `sdk.hasPermission(name)` lets a plugin adapt to optional manifest capabilities.
 - `sdk.ui` exposes shared controller-friendly screen and slot factories.
+- `sdk.ui.createSliderSlot()` and `sdk.ui.createProgressSlot()` provide controller-native value and progress widgets.
 - `sdk.ui.createSecretEditor(options)` creates a password-style editor model for tokens or passwords. The entered value should be saved with `sdk.secrets.set()`.
+- `sdk.performance` exposes the managed TFS FPS/frametime service when `native.performance` is declared.
+- `sdk.power` exposes explicitly confirmed Steam and Windows power actions when `native.power` is declared.
+- `sdk.backend` starts a bundled executable, PowerShell, Python, or Node backend and provides lifecycle-managed JSON RPC.
+- `sdk.system` runs commands, manages long-lived processes, opens shell targets, injects protected secrets into backend environments, and exposes system paths/information.
+- `sdk.filesystem` reads and writes arbitrary Windows paths for explicitly full-trust plugins.
+- `sdk.steam` lists Steam CEF targets, evaluates/injects scripts on selected surfaces, and exposes the current Steam client realm.
 
 ## Dynamic Loader
 
@@ -56,15 +73,13 @@ The runtime flow is:
 - TFS reads installed plugin manifests from the store service.
 - Quick Access requests `/api/plugin-store/community/installed`.
 - Each plugin entry point is served from `/api/plugin-store/community/<plugin-id>/files/<entry-point>`.
-- The entry point registers itself in `window.ToolsForSteamCommunityPlugins`.
+- The entry point registers itself through `window.TfsPluginSdk.register()`.
 - Quick Access adds registered community plugins to the Home screen after the built-in plugins.
 
 Entry points should register synchronously:
 
 ```js
-window.ToolsForSteamCommunityPlugins ??= {};
-window.ToolsForSteamCommunityPlugins[manifest.id] = {
-  manifest,
+window.TfsPluginSdk.register(manifest, (sdk) => ({
   createScreen(context) {
     return sdk.ui.createScreenModel({
       title: manifest.name,
@@ -72,10 +87,10 @@ window.ToolsForSteamCommunityPlugins[manifest.id] = {
       slots: [],
     });
   },
-};
+}));
 ```
 
-`createScreen(context)` must return a screen model synchronously. Async work should run in command handlers or background promises and then call `context.refresh()` when the screen should re-render.
+`register()` creates one managed SDK instance for the plugin. `createScreen(context)` must return a screen model synchronously. Async work should run in command handlers or lifecycle-owned background tasks and then call `context.refresh()` when the screen should re-render.
 
 ## Permissions
 
@@ -84,8 +99,21 @@ Permissions are declared in `tfs-plugin.json` and enforced by the core SDK route
 - `frontend`: The plugin contains a frontend entry point.
 - `storage`: The plugin may persist a public JSON settings object.
 - `secrets`: The plugin may store secrets and pass them to SDK network requests.
-- `network`: The plugin may send HTTP or HTTPS requests through the SDK proxy.
+- `network`: The plugin may send HTTP or HTTPS requests through the SDK proxy, but only to declared `networkHosts`.
 - `files`: The plugin may manage its own sandboxed files. It cannot access another plugin's files or arbitrary user paths.
+- `notifications`: The plugin may show non-blocking TFS notifications. Notifications are limited to five per 30 seconds.
+- `logging`: The plugin may write structured diagnostics to its private rotating SDK log.
+- `native.audio`: The plugin may read and control Windows playback, capture, and mixer state.
+- `native.processes`: The plugin may list visible windows and activate a selected window.
+- `native.display`: The plugin may change supported display, resolution, and refresh-rate modes.
+- `native.themes`: The plugin may manage CSSLoader themes and profiles.
+- `native.artwork`: The plugin may search and apply Steam artwork.
+- `native.app-start`: The plugin may manage and launch curated App Start shortcuts.
+- `native.store-sync`: The plugin may manage launcher discovery and Steam shortcut synchronization.
+- `native.automation`: The plugin may configure reviewed TFS automation integrations such as Auto SISR.
+- `native.performance`: The plugin may read TFS FPS, frametime, process, CPU, and memory telemetry and control the TFS overlay.
+- `native.power`: The plugin may invoke confirmed Steam, sleep, restart, and shutdown actions.
+- `native.full-trust`: The plugin may run arbitrary trusted native code, access arbitrary files, open shell targets, and inject into Steam surfaces. This is a Store warning and not a sandbox.
 
 Secrets are write-only from the plugin perspective. A plugin can check whether a key exists, but it cannot read the secret value back. To use a token in an HTTP request, pass `authorizationSecretKey`; the core injects the `Authorization` header server-side.
 
@@ -134,7 +162,8 @@ The preview image is optional but recommended for store listings. Use PNG, JPG, 
   "version": "1.0.0",
   "sdkVersion": "1.0.0",
   "entryPoint": "dist/index.js",
-  "permissions": ["frontend", "storage", "secrets", "network"]
+  "permissions": ["frontend", "storage", "secrets", "network"],
+  "networkHosts": ["api.example.com"]
 }
 ```
 
@@ -142,9 +171,11 @@ Rules enforced today:
 
 - `id` must match the catalog entry id.
 - `version` must match the catalog entry version.
-- `sdkVersion` must use major version `1`.
+- `sdkVersion` must be `1.0.0` for this TFS release. A plugin that requests a newer v1 feature level is rejected until the runtime supports it.
 - `entryPoint` must be a relative JavaScript path inside the package.
-- `permissions` must contain only SDK v1 permissions: `frontend`, `storage`, `secrets`, `network`, and `files`.
+- `frontend` is required for every community plugin.
+- `permissions` must contain only permissions listed in this document and [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md). Native bridges use the `native.*` permission namespace.
+- `networkHosts` is mandatory when `network` is declared and must match the catalog entry exactly. Use exact hosts, a leading wildcard such as `*.example.com`, or `<local>` for reviewed LAN integrations.
 
 ## Package Safety Rules
 
@@ -154,7 +185,7 @@ The app rejects packages that do not fit the v1 store safety contract:
 - Package files must be `.zip`.
 - Remote `packageUrl` values must use HTTP or HTTPS.
 - Local `packagePath` values must be relative to the catalog file and stay inside that catalog folder.
-- Packages are limited to 64 MB compressed, 128 MB extracted, 512 files, and 32 MB per extracted file.
+- Packages are limited to 256 MB compressed, 512 MB extracted, 2,048 files, and 256 MB per extracted file so self-contained native backends can be bundled.
 - Zip entries may not escape the package root.
 - Unknown permissions are rejected instead of ignored.
 
@@ -183,12 +214,28 @@ await sdk.files.appendText("logs/plugin.log", "refreshed\n");
 
 const state = JSON.parse(await sdk.files.readText("cache/state.json"));
 const entries = await sdk.files.list("cache", { recursive: true });
-const bytes = await sdk.files.readBytes("cache/images/preview.png");
 
+const bytes = new TextEncoder().encode("binary-safe");
 await sdk.files.writeBytes("cache/images/copy.png", bytes);
+const restoredBytes = await sdk.files.readBytes("cache/images/copy.png");
 await sdk.files.copy("cache/state.json", "cache/state.backup.json");
 await sdk.files.move("cache/state.backup.json", "archive/state.json");
 await sdk.files.remove("archive", { recursive: true });
+```
+
+## Xbox-Mode Notifications, Logs, and Lifecycle
+
+SDK notifications render inside the Steam interface and never open a desktop dialog. Logging rotates at 1 MB, and lifecycle-owned timers are automatically stopped when TFS reloads or removes the plugin.
+
+```js
+await sdk.notifications.success("Home Assistant", "Lights refreshed.");
+await sdk.log.info("Entity refresh completed", { entityCount: 12 });
+
+sdk.lifecycle.setInterval(() => {
+  void refreshEntities({ signal: sdk.lifecycle.signal });
+}, 30_000);
+
+sdk.lifecycle.onDispose(() => closeWebSocket());
 ```
 
 Home Assistant's REST API is documented at https://developers.home-assistant.io/docs/api/rest/. It uses `/api/states` for entity states and `/api/services/<domain>/<service>` for service calls, authenticated with a Bearer token.
@@ -202,7 +249,7 @@ See these files for the store-side registry format:
 - `tfs-plugin-database/catalog.json`: the live official catalog consumed by the default Store Refresh action.
 - `tfs-catalog.schema.json`: JSON schema for catalog validation.
 
-The catalog is display and delivery metadata. The manifest inside the package is the runtime contract.
+The catalog is display and delivery metadata. Its `sdkVersion` and `permissions` fields must match the package manifest exactly, allowing the Store to explain capabilities before download. The manifest inside the package remains the enforced runtime contract.
 
 Community catalog images are recommended but not required. Entries without images still appear in the local store and use the built-in fallback preview card.
 
@@ -234,6 +281,7 @@ The online catalog uses GitHub Raw URLs and SHA-256 package validation.
 
 - `plugin-template/` is a minimal frontend plugin skeleton.
 - `official-plugins/home-assistant/` is the first SDK-based community plugin example. It demonstrates storing a Home Assistant URL, storing a token as a secret, listing `light.*` entities, and calling `light.turn_on` / `light.turn_off` through the SDK network proxy.
+- `full-trust-plugin-template/` demonstrates an auto-started PowerShell backend, JSON RPC, arbitrary process execution, and unrestricted filesystem access.
 
 ## Publishing A Community Plugin
 
@@ -243,9 +291,17 @@ Recommended flow:
 2. Build a zip with `tfs-plugin.json` at the package root.
 3. Add a preview image if you want a custom store card.
 4. Publish the zip somewhere stable, or add it to `tfs-plugin-database/packages/` for official catalog inclusion.
-5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, and optionally one or more image URLs.
+5. Add a catalog entry in `tfs-plugin-database/catalog.json` with `packageUrl`, `packageSha256`, matching `sdkVersion` and `permissions`, plus optional images and changelog.
 6. Open a pull request against `tfs-plugin-database` and document what permissions the plugin needs.
 
 Use the smallest permission set possible. If your plugin only renders UI, use `frontend`. Add `storage`, `secrets`, `network`, or `files` only when the plugin truly needs them.
 
 See `SUBMITTING.md` for the full pull request checklist and minimal plugin example.
+
+## One-command local sideload
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\tfs-plugin.ps1 sideload .\my-plugin
+```
+
+The command validates and packs the plugin, computes its SHA-256 hash, copies its preview, and updates the active local developer catalog. Open the TFS Store, press Refresh, and install it from Community. Override detection with `-RuntimeDataDirectory <path>` for portable or alternate builds.

@@ -7,6 +7,7 @@ It deliberately uses only public SDK capabilities:
 - `storage` stores the Home Assistant base URL.
 - `secrets` stores the long-lived access token without exposing it back to JavaScript.
 - `network` calls the Home Assistant REST API through the TFS core proxy.
+- `networkHosts: ["<local>"]` limits those requests to local-network Home Assistant instances.
 - `frontend` registers a controller-friendly screen model for the future dynamic loader.
 
 The Home Assistant REST API is documented at https://developers.home-assistant.io/docs/api/rest/.

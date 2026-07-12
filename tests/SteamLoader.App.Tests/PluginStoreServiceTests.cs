@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Settings;
+using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 using Xunit;
@@ -37,6 +38,60 @@ public sealed class PluginStoreServiceTests
             Assert.True(service.TryGetBuiltInImage("smart-home", out var imagePath, out var contentType));
             Assert.True(File.Exists(imagePath));
             Assert.Equal("image/svg+xml", contentType);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_CustomCatalog_IsMarkedAsUnreviewed()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            File.WriteAllText(Path.Combine(storeRoot, "catalog-source.json"), "{\"catalogUrl\":\"https://example.test/catalog.json\"}");
+
+            var snapshot = await CreatePluginStoreService(root).GetSnapshotAsync(CancellationToken.None);
+
+            Assert.True(snapshot.IsCustomCatalog);
+            Assert.Contains("not reviewed", snapshot.CatalogTrustText, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshAsync_LocalDeveloperCatalog_DoesNotOverwriteWithRemoteCatalog()
+    {
+        var root = CreateTempRoot();
+        var handler = new CapturingHandler(() => throw new InvalidOperationException("Remote catalog must not be requested."));
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            WriteCatalog(
+                storeRoot,
+                "local-plugin",
+                "Local Plugin",
+                "1.0.0",
+                "./packages/local-plugin.zip",
+                new string('A', 64),
+                permissions: ["frontend"]);
+            File.WriteAllText(Path.Combine(storeRoot, "catalog-source.json"), "{\"localDevelopment\":true}");
+
+            var snapshot = await CreatePluginStoreService(root, new HttpClient(handler)).RefreshAsync(CancellationToken.None);
+
+            Assert.Single(snapshot.CommunityPlugins);
+            Assert.True(snapshot.IsCustomCatalog);
+            Assert.Null(handler.RequestUri);
         }
         finally
         {
@@ -392,6 +447,110 @@ public sealed class PluginStoreServiceTests
     }
 
     [Fact]
+    public async Task CommunityCatalog_ExposesPermissionsBeforeInstallAndMatchesManifest()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+            var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
+            CreateSamplePluginZip(zipPath, permissions: ["frontend", "files", "notifications"]);
+            WriteCatalog(
+                storeRoot,
+                "sample-plugin",
+                "Sample Plugin",
+                "1.2.3",
+                "./packages/sample-plugin.zip",
+                ComputeSha256(zipPath),
+                ["frontend", "files", "notifications"],
+                "1.0.0");
+
+            var service = CreatePluginStoreService(root);
+            var beforeInstall = await service.GetSnapshotAsync(CancellationToken.None);
+            var plugin = Assert.Single(beforeInstall.CommunityPlugins);
+            Assert.Contains("files", plugin.Permissions);
+            Assert.Contains("notifications", plugin.Permissions);
+            Assert.Empty(plugin.InstalledPermissions);
+
+            var afterInstall = await service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None);
+            Assert.Contains("notifications", Assert.Single(afterInstall.CommunityPlugins).InstalledPermissions);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task InstallCommunityPlugin_WhenCatalogPermissionsDiffer_IsRejected()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+            var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
+            CreateSamplePluginZip(zipPath, permissions: ["frontend", "network"]);
+            WriteCatalog(
+                storeRoot,
+                "sample-plugin",
+                "Sample Plugin",
+                "1.2.3",
+                "./packages/sample-plugin.zip",
+                ComputeSha256(zipPath),
+                ["frontend"],
+                "1.0.0");
+
+            var service = CreatePluginStoreService(root);
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None));
+            Assert.Contains("permissions", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task InstallCommunityPlugin_WhenNetworkHostsAreMissing_IsRejected()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+            var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
+            CreateSamplePluginZip(zipPath, permissions: ["frontend", "network"]);
+            WriteCatalog(
+                storeRoot,
+                "sample-plugin",
+                "Sample Plugin",
+                "1.2.3",
+                "./packages/sample-plugin.zip",
+                ComputeSha256(zipPath),
+                ["frontend", "network"],
+                "1.0.0");
+
+            var service = CreatePluginStoreService(root);
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None));
+            Assert.Contains("networkHosts", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public async Task PluginSdkSettings_RequireStoragePermission()
     {
         var root = CreateTempRoot();
@@ -546,6 +705,299 @@ public sealed class PluginStoreServiceTests
     }
 
     [Fact]
+    public async Task PluginSdkNotifications_RequirePermissionAndApplyRateLimit()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var serviceWithoutPermission = await CreateInstalledSamplePluginStoreAsync(
+                Path.Combine(root, "without-permission"),
+                ["frontend"]);
+            Assert.Throws<InvalidOperationException>(() => serviceWithoutPermission.CreatePluginSdkNotification(
+                "sample-plugin",
+                new PluginSdkNotificationRequest("Ready", "Plugin loaded.", "success", 3000)));
+
+            var service = await CreateInstalledSamplePluginStoreAsync(
+                Path.Combine(root, "with-permission"),
+                ["frontend", "notifications"]);
+            for (var index = 0; index < 5; index++)
+            {
+                var notification = service.CreatePluginSdkNotification(
+                    "sample-plugin",
+                    new PluginSdkNotificationRequest("Ready", $"Message {index}", "success", 3000));
+                Assert.Equal("success", notification.Level);
+                Assert.Equal("sample-plugin", notification.PluginId);
+            }
+
+            var exception = Assert.Throws<InvalidOperationException>(() => service.CreatePluginSdkNotification(
+                "sample-plugin",
+                new PluginSdkNotificationRequest("Too many", "Rate limited", "info", 3000)));
+            Assert.Contains("rate limit", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkLogging_WritesBoundedStructuredLog()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(root, ["frontend", "logging"]);
+            var data = JsonSerializer.SerializeToElement(new { entityCount = 4 }, JsonOptions);
+
+            var result = service.WritePluginSdkLog(
+                "sample-plugin",
+                new PluginSdkLogRequest("warning", "Refresh took longer than expected.", data));
+
+            Assert.Equal("warning", result.Level);
+            Assert.True(result.LogSize > 0);
+            var logPath = Path.Combine(
+                root,
+                "plugin-store",
+                "sdk-data",
+                "sample-plugin",
+                "logs",
+                "plugin.log");
+            var logText = File.ReadAllText(logPath);
+            Assert.Contains("Refresh took longer", logText);
+            Assert.Contains("entityCount", logText);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkNativeCapabilities_RequireExactDeclaredPermission()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var deniedService = await CreateInstalledSamplePluginStoreAsync(
+                Path.Combine(root, "denied"),
+                ["frontend"]);
+            var exception = Assert.Throws<InvalidOperationException>(() =>
+                deniedService.EnsurePluginSdkPermission("sample-plugin", "native.audio"));
+            Assert.Contains("native.audio", exception.Message, StringComparison.OrdinalIgnoreCase);
+
+            var allowedService = await CreateInstalledSamplePluginStoreAsync(
+                Path.Combine(root, "allowed"),
+                [
+                    "frontend",
+                    "native.audio",
+                    "native.processes",
+                    "native.display",
+                    "native.themes",
+                    "native.artwork",
+                    "native.app-start",
+                    "native.store-sync",
+                    "native.automation",
+                    "native.performance",
+                    "native.power",
+                    "native.full-trust"
+                ]);
+
+            foreach (var permission in new[]
+            {
+                "native.audio",
+                "native.processes",
+                "native.display",
+                "native.themes",
+                "native.artwork",
+                "native.app-start",
+                "native.store-sync",
+                "native.automation",
+                "native.performance",
+                "native.power",
+                "native.full-trust"
+            })
+            {
+                allowedService.EnsurePluginSdkPermission("sample-plugin", permission);
+            }
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task FullTrustRuntime_RunsProcessesAndUsesArbitraryFilesystemBridge()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(
+                root,
+                ["frontend", "native.full-trust"]);
+            service.EnsurePluginSdkPermission("sample-plugin", "native.full-trust");
+            await using var runtime = new PluginFullTrustRuntime(
+                service,
+                new SteamDevToolsClient(new HttpClient(), new Uri("http://127.0.0.1:1")));
+
+            var runResult = await runtime.ExecuteSystemAsync(
+                "sample-plugin",
+                "run",
+                JsonSerializer.SerializeToElement(new
+                {
+                    fileName = "cmd.exe",
+                    arguments = new[] { "/d", "/c", "echo", "sdk-full-trust" },
+                    timeoutMs = 10_000
+                }),
+                CancellationToken.None);
+            var runJson = JsonSerializer.SerializeToElement(runResult, JsonOptions);
+            Assert.True(runJson.GetProperty("success").GetBoolean());
+            Assert.Contains("sdk-full-trust", runJson.GetProperty("output").GetString(), StringComparison.OrdinalIgnoreCase);
+
+            await runtime.ExecuteFileSystemAsync(
+                "sample-plugin",
+                "writeText",
+                JsonSerializer.SerializeToElement(new { path = "runtime/test.txt", content = "full trust" }),
+                CancellationToken.None);
+            var readResult = await runtime.ExecuteFileSystemAsync(
+                "sample-plugin",
+                "readText",
+                JsonSerializer.SerializeToElement(new { path = "runtime/test.txt" }),
+                CancellationToken.None);
+            var readJson = JsonSerializer.SerializeToElement(readResult, JsonOptions);
+            Assert.Equal("full trust", readJson.GetProperty("content").GetString());
+
+            var backendDirectory = Path.Combine(service.GetPluginInstallationDirectory("sample-plugin"), "backend");
+            Directory.CreateDirectory(backendDirectory);
+            File.WriteAllText(
+                Path.Combine(backendDirectory, "rpc.ps1"),
+                "while ($null -ne ($line = [Console]::In.ReadLine())) { " +
+                "$request = $line | ConvertFrom-Json; " +
+                "@{ tfsRpcId = $request.tfsRpcId; result = @{ message = 'pong' } } | " +
+                "ConvertTo-Json -Depth 10 -Compress | Write-Output }");
+            var backendResult = await runtime.ExecuteSystemAsync(
+                "sample-plugin",
+                "startBackend",
+                JsonSerializer.SerializeToElement(new
+                {
+                    entryPoint = "backend/rpc.ps1",
+                    runtime = "powershell",
+                    arguments = Array.Empty<string>()
+                }),
+                CancellationToken.None);
+            var backendJson = JsonSerializer.SerializeToElement(backendResult, JsonOptions);
+            var managedProcessId = backendJson.GetProperty("processId").GetString();
+            var rpcResult = await runtime.ExecuteSystemAsync(
+                "sample-plugin",
+                "call",
+                JsonSerializer.SerializeToElement(new
+                {
+                    processId = managedProcessId,
+                    method = "ping",
+                    arguments = new { value = 1 },
+                    timeoutMs = 10_000
+                }),
+                CancellationToken.None);
+            var rpcJson = JsonSerializer.SerializeToElement(rpcResult, JsonOptions);
+            Assert.Equal("pong", rpcJson.GetProperty("message").GetString());
+            runtime.StopAll("sample-plugin");
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task InstallCommunityPlugin_WithBundledFullTrustBackend_IsAccepted()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
+            var zipPath = Path.Combine(storeRoot, "packages", "backend-plugin.zip");
+            CreateSamplePluginZip(
+                zipPath,
+                pluginId: "backend-plugin",
+                version: "1.0.0",
+                permissions: ["frontend", "native.full-trust"],
+                includeBackend: true);
+            WriteCatalog(
+                storeRoot,
+                "backend-plugin",
+                "Backend Plugin",
+                "1.0.0",
+                "./packages/backend-plugin.zip",
+                ComputeSha256(zipPath),
+                permissions: ["frontend", "native.full-trust"],
+                sdkVersion: "1.0.0");
+
+            var snapshot = await CreatePluginStoreService(root).InstallCommunityPluginAsync(
+                "backend-plugin",
+                CancellationToken.None);
+
+            Assert.True(Assert.Single(snapshot.CommunityPlugins).IsInstalled);
+            Assert.True(File.Exists(Path.Combine(
+                root,
+                "plugin-store",
+                "community",
+                "backend-plugin",
+                "backend",
+                "plugin.ps1")));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task FullTrustRuntime_ListsSteamDevToolsTargetsWithoutExposingDebuggerSocket()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(
+                root,
+                ["frontend", "native.full-trust"]);
+            var handler = new CapturingHandler(() => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "[{\"id\":\"target-1\",\"title\":\"Big-Picture\",\"type\":\"page\",\"url\":\"https://steamloopback.host/index.html\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/private\"}]",
+                    Encoding.UTF8,
+                    "application/json")
+            });
+            await using var runtime = new PluginFullTrustRuntime(
+                service,
+                new SteamDevToolsClient(new HttpClient(handler), new Uri("http://127.0.0.1:8080")));
+
+            var result = await runtime.ExecuteSteamAsync(
+                "sample-plugin",
+                "targets",
+                null,
+                CancellationToken.None);
+            var json = JsonSerializer.SerializeToElement(result, JsonOptions);
+
+            var target = Assert.Single(json.EnumerateArray());
+            Assert.Equal("target-1", target.GetProperty("id").GetString());
+            Assert.Equal("Big-Picture", target.GetProperty("title").GetString());
+            Assert.False(target.TryGetProperty("webSocketDebuggerUrl", out _));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public async Task PluginSdkNetworkRequest_UsesStoredAuthorizationSecret()
     {
         var root = CreateTempRoot();
@@ -582,6 +1034,34 @@ public sealed class PluginStoreServiceTests
             Assert.Equal("ha-token", handler.AuthorizationParameter);
             Assert.Contains("light.office", handler.Body);
             Assert.Equal("""{"ok":true}""", response.BodyText);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PluginSdkNetworkRequest_BlocksHostsOutsideManifestAllowlist()
+    {
+        var root = CreateTempRoot();
+        var handler = new CapturingHandler(() => new HttpResponseMessage(HttpStatusCode.OK));
+
+        try
+        {
+            var service = await CreateInstalledSamplePluginStoreAsync(
+                root,
+                ["frontend", "network"],
+                new HttpClient(handler));
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.SendPluginSdkNetworkRequestAsync(
+                    "sample-plugin",
+                    new PluginSdkNetworkRequest("GET", "https://example.com/data", null, null, null, null),
+                    CancellationToken.None));
+
+            Assert.Contains("networkHosts", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Null(handler.RequestUri);
         }
         finally
         {
@@ -674,11 +1154,13 @@ public sealed class PluginStoreServiceTests
         HttpClient? httpClient = null,
         bool enableCommunityCatalogBootstrap = false)
     {
+        var client = httpClient ?? new HttpClient();
         return new PluginStoreService(
-            httpClient ?? new HttpClient(),
+            client,
             CreateSettingsService(Path.Combine(root, "settings.json")),
             Path.Combine(root, "plugin-store"),
-            enableCommunityCatalogBootstrap);
+            enableCommunityCatalogBootstrap,
+            client);
     }
 
     private static async Task<PluginStoreService> CreateInstalledSamplePluginStoreAsync(
@@ -691,14 +1173,18 @@ public sealed class PluginStoreServiceTests
         Directory.CreateDirectory(Path.Combine(storeRoot, "packages"));
 
         var zipPath = Path.Combine(storeRoot, "packages", "sample-plugin.zip");
-        CreateSamplePluginZip(zipPath, permissions: permissions);
+        var networkHosts = permissions.Contains("network", StringComparer.OrdinalIgnoreCase)
+            ? new[] { "<local>" }
+            : Array.Empty<string>();
+        CreateSamplePluginZip(zipPath, permissions: permissions, networkHosts: networkHosts);
         WriteCatalog(
             storeRoot,
             "sample-plugin",
             "Sample Plugin",
             "1.2.3",
             "./packages/sample-plugin.zip",
-            ComputeSha256(zipPath));
+            ComputeSha256(zipPath),
+            networkHosts: networkHosts);
 
         var service = CreatePluginStoreService(root, httpClient);
         await service.InstallCommunityPluginAsync("sample-plugin", CancellationToken.None);
@@ -720,7 +1206,9 @@ public sealed class PluginStoreServiceTests
         bool includeManifest = true,
         string pluginId = "sample-plugin",
         string version = "1.2.3",
-        string[]? permissions = null)
+        string[]? permissions = null,
+        string[]? networkHosts = null,
+        bool includeBackend = false)
     {
         using var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create);
 
@@ -736,14 +1224,32 @@ public sealed class PluginStoreServiceTests
                     version,
                     sdkVersion = "1.0.0",
                     entryPoint = "dist/index.js",
-                    permissions = permissions ?? new[] { "frontend" }
+                    permissions = permissions ?? new[] { "frontend" },
+                    networkHosts = networkHosts ?? Array.Empty<string>(),
+                    backend = includeBackend
+                        ? new
+                        {
+                            entryPoint = "backend/plugin.ps1",
+                            runtime = "powershell",
+                            autoStart = true
+                        }
+                        : null
                 },
                 JsonOptions));
         }
 
         var bundleEntry = archive.CreateEntry("dist/index.js");
-        using var bundleWriter = new StreamWriter(bundleEntry.Open());
-        bundleWriter.Write("console.log('sample');");
+        using (var bundleWriter = new StreamWriter(bundleEntry.Open()))
+        {
+            bundleWriter.Write("console.log('sample');");
+        }
+
+        if (includeBackend)
+        {
+            var backendEntry = archive.CreateEntry("backend/plugin.ps1");
+            using var backendWriter = new StreamWriter(backendEntry.Open());
+            backendWriter.Write("Write-Output 'backend ready'");
+        }
     }
 
     private static void WriteCatalog(
@@ -752,7 +1258,10 @@ public sealed class PluginStoreServiceTests
         string title,
         string version,
         string packagePath,
-        string packageSha256 = "")
+        string packageSha256 = "",
+        string[]? permissions = null,
+        string sdkVersion = "",
+        string[]? networkHosts = null)
     {
         File.WriteAllText(
             Path.Combine(storeRoot, "catalog.json"),
@@ -771,6 +1280,9 @@ public sealed class PluginStoreServiceTests
                             author = "Test Suite",
                             category = "Utility",
                             version,
+                            sdkVersion,
+                            permissions = permissions ?? Array.Empty<string>(),
+                            networkHosts = networkHosts ?? Array.Empty<string>(),
                             packagePath,
                             packageSha256,
                             images = new[] { "api/plugin-store/images/catalog/sample-plugin.png" },

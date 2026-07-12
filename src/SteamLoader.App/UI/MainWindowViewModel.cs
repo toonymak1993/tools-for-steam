@@ -35,7 +35,6 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _autostartEnabled;
     private string _startupMode = SteamLoaderRuntime.StartupModeShell;
     private bool _initialized;
-    private bool _startupSyncTriggered;
     private bool _showStartupSplash;
     private bool _showFirstRunSetup;
     private bool _windowsShellStarted;
@@ -374,7 +373,6 @@ public sealed class MainWindowViewModel : BindableBase
         // need to run - and wait on - a sync at boot. This keeps console-mode
         // startup fast (Steam is already launched first).
         _ = _runStartupSyncOnInitialize;
-        _ = _startupSyncTriggered;
 
         if (_consoleStartupMode)
         {

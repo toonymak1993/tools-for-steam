@@ -1,5 +1,6 @@
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Handheld;
+using SteamLoader.App.Hosting;
 using SteamLoader.App.Services;
 using System.Diagnostics;
 using System.Security.Principal;
@@ -55,6 +56,9 @@ public sealed class TfsGamepadHelperHost
                 BaseAddress = new Uri("http://127.0.0.1:47652/"),
                 Timeout = TimeSpan.FromSeconds(2)
             };
+            controllerApiClient.DefaultRequestHeaders.Add(
+                LocalApiSession.HeaderName,
+                LocalApiSession.GetOrCreateDefault());
             hidMenuButtonMonitor.ReportObserved += report =>
             {
                 var usages = report.ButtonUsages.Count == 0 ? "-" : string.Join(",", report.ButtonUsages);

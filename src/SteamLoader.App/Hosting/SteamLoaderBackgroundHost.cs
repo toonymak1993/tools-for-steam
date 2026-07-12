@@ -45,6 +45,8 @@ public sealed class SteamLoaderBackgroundHost
         var displaySwitchService = new DisplaySwitchService();
         var processWindowService = new ProcessWindowService();
         var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
+        var apiSessionToken = LocalApiSession.GetOrCreate(
+            Path.Combine(dataDirectory, "local-api-session.token"));
         var hltbService = new HltbService(
             new HltbSettingsStore(Path.Combine(dataDirectory, "hltb.json")));
         var autostartService = new WindowsAutostartService(
@@ -97,6 +99,7 @@ public sealed class SteamLoaderBackgroundHost
             httpClient,
             steamLoaderSettingsService,
             Path.Combine(dataDirectory, "plugin-store"));
+        var pluginFullTrustRuntime = new PluginFullTrustRuntime(pluginStoreService, devToolsClient);
         var storeSyncAutomationService = new StoreSyncAutomationService(
             storeSyncService,
             () => steamLoaderSettingsService.IsPluginEnabled("store-sync"));
@@ -193,7 +196,9 @@ public sealed class SteamLoaderBackgroundHost
             frontendComponentService,
             devToolsClient,
             smartHomeService,
+            pluginFullTrustRuntime,
             ApiBaseUri,
+            apiSessionToken,
             _hostState,
             liveUpdateHub,
             requestShutdown);
@@ -201,6 +206,7 @@ public sealed class SteamLoaderBackgroundHost
         var injector = new QuickAccessShellInjector(
             devToolsClient,
             ApiBaseUri,
+            apiSessionToken,
             steamClientLaunchService,
             sharedScript,
             popupScript,

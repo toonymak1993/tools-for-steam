@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 39) {
+  if (existing?.version >= 41) {
     return;
   }
 
@@ -767,6 +767,9 @@
       mediaImageSrc: options.mediaImageSrc || "",
       mediaImageAlt: options.mediaImageAlt || "",
       footerLabel: options.footerLabel || "",
+      progressValue: Number(options.progressValue) || 0,
+      progressMax: Math.max(1, Number(options.progressMax) || 100),
+      progressLabel: options.progressLabel || "",
       stepperLeftDisabled: Boolean(options.stepperLeftDisabled),
       stepperRightDisabled: Boolean(options.stepperRightDisabled),
       nativeComponentId:
@@ -888,6 +891,38 @@
         },
       },
     );
+  }
+
+  function createSliderSlot(title, value, onMoveLeft, onMoveRight, options = {}) {
+    const slot = createInlineStepperSlot(
+      title,
+      options.valueLabel || String(value ?? ""),
+      onMoveLeft,
+      onMoveRight,
+      options,
+    );
+    return {
+      ...slot,
+      role: "slider",
+      value: Number(value) || 0,
+      min: Number.isFinite(Number(options.min)) ? Number(options.min) : 0,
+      max: Number.isFinite(Number(options.max)) ? Number(options.max) : 100,
+    };
+  }
+
+  function createProgressSlot(title, copy, value, options = {}) {
+    const max = Math.max(1, Number(options.max) || 100);
+    const normalizedValue = Math.min(max, Math.max(0, Number(value) || 0));
+    return createSlot(title, copy, () => {}, {
+      ...options,
+      role: "status",
+      layout: "progress",
+      trailing: "none",
+      disabled: true,
+      progressValue: normalizedValue,
+      progressMax: max,
+      progressLabel: options.label || `${Math.round((normalizedValue / max) * 100)}%`,
+    });
   }
 
   function createScreenModel(overrides = {}) {
@@ -1109,6 +1144,43 @@
     );
   }
 
+  function createProgressRowContent(createElement, withChildren, slot) {
+    const max = Math.max(1, Number(slot.progressMax) || 100);
+    const value = Math.min(max, Math.max(0, Number(slot.progressValue) || 0));
+    const percentage = Math.round((value / max) * 100);
+    return createElement(
+      "div",
+      withChildren(
+        { className: "steamloader-progress-row" },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-progress-header" },
+            createElement("span", { className: "steamloader-progress-title", children: slot.title || "Progress" }),
+            createElement("span", { className: "steamloader-progress-label", children: slot.progressLabel || `${percentage}%` }),
+          ),
+        ),
+        slot.copy ? createElement("div", { className: "steamloader-progress-copy", children: slot.copy }) : null,
+        createElement(
+          "div",
+          withChildren(
+            {
+              className: "steamloader-progress-track",
+              role: "progressbar",
+              "aria-valuemin": 0,
+              "aria-valuemax": max,
+              "aria-valuenow": value,
+            },
+            createElement("span", {
+              className: "steamloader-progress-fill",
+              style: { width: `${percentage}%` },
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
   function createRowContent(createElement, withChildren, slot, trailingNode, helpers = {}) {
     if (slot.layout === "accordion") {
       return createAccordionRowContent(createElement, withChildren, slot);
@@ -1120,6 +1192,10 @@
 
     if (slot.layout === "stepper") {
       return createInlineStepperRowContent(createElement, withChildren, slot, helpers);
+    }
+
+    if (slot.layout === "progress") {
+      return createProgressRowContent(createElement, withChildren, slot);
     }
 
     return createElement(
@@ -1194,6 +1270,13 @@
     if (role === "choice") {
       props.role = "option";
       props["aria-selected"] = Boolean(slot.selected);
+    }
+
+    if (role === "slider") {
+      props.role = "slider";
+      props["aria-valuemin"] = Number(slot.min) || 0;
+      props["aria-valuemax"] = Number(slot.max) || 100;
+      props["aria-valuenow"] = Number(slot.value) || 0;
     }
 
     return props;
@@ -1296,7 +1379,10 @@
           createElement("div", {
             className: "steamloader-card-line",
             key: `card-line-${index}-${lineIndex}`,
-            children: line,
+            ...(line && typeof line === "object" && line.liveKey
+              ? { "data-live-value": line.liveKey }
+              : {}),
+            children: line && typeof line === "object" ? line.text : line,
           }),
         ),
         card.swatchHex
@@ -2244,6 +2330,109 @@
     return `${base.replace(/\/+$/, "")}/${relativePath}`;
   }
 
+  function showPluginNotification(notification = {}) {
+    if (!document.body) {
+      return null;
+    }
+
+    let style = document.getElementById("steamloader-sdk-notification-style");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "steamloader-sdk-notification-style";
+      style.textContent = `
+        .steamloader-sdk-notifications {
+          position: fixed;
+          z-index: 2147483638;
+          left: 50%;
+          bottom: max(82px, env(safe-area-inset-bottom));
+          width: min(560px, calc(100vw - 40px));
+          transform: translateX(-50%);
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          pointer-events: none;
+          font-family: "Motiva Sans", "Segoe UI", sans-serif;
+        }
+        .steamloader-sdk-notification {
+          display: grid;
+          grid-template-columns: 10px minmax(0, 1fr);
+          gap: 14px;
+          padding: 16px 18px;
+          border-radius: 18px;
+          background: rgba(28, 36, 46, 0.98);
+          color: #eef3f8;
+          box-shadow: 0 20px 64px rgba(0, 0, 0, 0.48), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+          animation: steamloader-sdk-notification-in 160ms ease-out;
+        }
+        .steamloader-sdk-notification.is-leaving {
+          opacity: 0;
+          transform: translateY(8px);
+          transition: opacity 160ms ease, transform 160ms ease;
+        }
+        .steamloader-sdk-notification-accent {
+          width: 10px;
+          min-height: 48px;
+          border-radius: 999px;
+          background: #66c0f4;
+        }
+        .steamloader-sdk-notification[data-level="success"] .steamloader-sdk-notification-accent { background: #61d68a; }
+        .steamloader-sdk-notification[data-level="warning"] .steamloader-sdk-notification-accent { background: #f5c451; }
+        .steamloader-sdk-notification[data-level="error"] .steamloader-sdk-notification-accent { background: #ff6b78; }
+        .steamloader-sdk-notification-title { font-size: 16px; font-weight: 950; line-height: 1.2; }
+        .steamloader-sdk-notification-message { margin-top: 4px; color: rgba(220, 229, 238, 0.78); font-size: 13px; font-weight: 750; line-height: 1.4; }
+        @keyframes steamloader-sdk-notification-in {
+          from { opacity: 0; transform: translateY(10px) scale(0.98); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .steamloader-sdk-notification { animation: none; }
+        }
+      `;
+      document.head?.append(style);
+    }
+
+    let container = document.getElementById("steamloader-sdk-notifications");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "steamloader-sdk-notifications";
+      container.className = "steamloader-sdk-notifications";
+      container.setAttribute("aria-live", "polite");
+      container.setAttribute("aria-atomic", "false");
+      document.body.append(container);
+    }
+
+    const level = ["info", "success", "warning", "error"].includes(String(notification.level || "").toLowerCase())
+      ? String(notification.level).toLowerCase()
+      : "info";
+    const toast = document.createElement("div");
+    toast.className = "steamloader-sdk-notification";
+    toast.dataset.level = level;
+    toast.setAttribute("role", level === "error" ? "alert" : "status");
+    const accent = document.createElement("div");
+    accent.className = "steamloader-sdk-notification-accent";
+    const content = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "steamloader-sdk-notification-title";
+    title.textContent = String(notification.title || "Plugin notification");
+    const message = document.createElement("div");
+    message.className = "steamloader-sdk-notification-message";
+    message.textContent = String(notification.message || "");
+    content.append(title, message);
+    toast.append(accent, content);
+    container.append(toast);
+
+    while (container.children.length > 3) {
+      container.firstElementChild?.remove();
+    }
+
+    const durationMs = Math.max(1500, Math.min(10000, Number(notification.durationMs) || 4500));
+    window.setTimeout(() => {
+      toast.classList.add("is-leaving");
+      window.setTimeout(() => toast.remove(), 180);
+    }, durationMs);
+    return toast;
+  }
+
   function createPluginSdk(manifest = {}, options = {}) {
     const apiBase = options.apiBase || window.__steamLoaderApiBase || "";
     const pluginId = String(options.pluginId || manifest.id || "").trim();
@@ -2294,6 +2483,13 @@
     function pluginRequest(path, requestOptions = {}) {
       ensurePluginId();
       return request(`${pluginApiBase}/${String(path || "").replace(/^\/+/, "")}`, requestOptions);
+    }
+
+    function capabilityRequest(capability, operation, args = {}) {
+      return pluginRequest(`capabilities/${encodeURIComponent(capability)}`, {
+        method: "POST",
+        body: { operation, arguments: args },
+      });
     }
 
     const storage = {
@@ -2490,6 +2686,418 @@
       },
     };
 
+    const audio = {
+      getState: () => capabilityRequest("audio", "getState"),
+      setDefaultPlayback: (deviceId) => capabilityRequest("audio", "setDefaultPlayback", { deviceId }),
+      setDefaultCapture: (deviceId) => capabilityRequest("audio", "setDefaultCapture", { deviceId }),
+      setPlaybackVolume: (volume) => capabilityRequest("audio", "setPlaybackVolume", { volume }),
+      setCaptureVolume: (volume) => capabilityRequest("audio", "setCaptureVolume", { volume }),
+      adjustPlaybackVolume: (delta) => capabilityRequest("audio", "adjustPlaybackVolume", { delta }),
+      adjustCaptureVolume: (delta) => capabilityRequest("audio", "adjustCaptureVolume", { delta }),
+      togglePlaybackMute: () => capabilityRequest("audio", "togglePlaybackMute"),
+      toggleCaptureMute: () => capabilityRequest("audio", "toggleCaptureMute"),
+      setMixerVolume: (sessionId, volume) => capabilityRequest("audio", "setMixerVolume", { sessionId, volume }),
+      toggleMixerMute: (sessionId) => capabilityRequest("audio", "toggleMixerMute", { sessionId }),
+    };
+
+    const processes = {
+      getState: () => capabilityRequest("processes", "getState"),
+      activate: (handle) => capabilityRequest("processes", "activate", { handle }),
+    };
+
+    const display = {
+      getState: () => capabilityRequest("display", "getState"),
+      switchInternal: () => capabilityRequest("display", "switchInternal"),
+      switchExternal: () => capabilityRequest("display", "switchExternal"),
+      setResolution: (presetId) => capabilityRequest("display", "setResolution", { presetId }),
+      setRefreshRate: (refreshRate) => capabilityRequest("display", "setRefreshRate", { refreshRate }),
+    };
+
+    const themes = {
+      getState: () => capabilityRequest("themes", "getState"),
+      refreshCatalog: () => capabilityRequest("themes", "refreshCatalog"),
+      getStoreCatalog: (options = {}) => capabilityRequest("themes", "getStoreCatalog", options),
+      getStoreTheme: (storeThemeId) => capabilityRequest("themes", "getStoreTheme", { storeThemeId }),
+      installStoreTheme: (storeThemeId) => capabilityRequest("themes", "installStoreTheme", { storeThemeId }),
+      setEnabled: (themeId, enabled) => capabilityRequest("themes", "setEnabled", { themeId, enabled }),
+      toggleOption: (themeId, optionId) => capabilityRequest("themes", "toggleOption", { themeId, optionId }),
+      setChoice: (themeId, optionId, choiceId) => capabilityRequest("themes", "setChoice", { themeId, optionId, choiceId }),
+      adjustRange: (themeId, optionId, delta) => capabilityRequest("themes", "adjustRange", { themeId, optionId, delta }),
+      resetRange: (themeId, optionId) => capabilityRequest("themes", "resetRange", { themeId, optionId }),
+      createProfile: (title) => capabilityRequest("themes", "createProfile", { title }),
+      applyProfile: (profileId) => capabilityRequest("themes", "applyProfile", { profileId }),
+      updateProfile: (profileId) => capabilityRequest("themes", "updateProfile", { profileId }),
+      removeProfile: (profileId) => capabilityRequest("themes", "removeProfile", { profileId }),
+      setWatchEnabled: (enabled) => capabilityRequest("themes", "setWatchEnabled", { enabled }),
+    };
+
+    const artwork = {
+      getState: () => capabilityRequest("artwork", "getState"),
+      searchGames: (term) => capabilityRequest("artwork", "searchGames", { term }),
+      searchAssets: (gameId, assetType, options = {}) => capabilityRequest("artwork", "searchAssets", {
+        gameId,
+        assetType,
+        page: Number(options.page) || 0,
+      }),
+      apply: (appId, assetType, assetUrl) => capabilityRequest("artwork", "apply", { appId, assetType, assetUrl }),
+      toggleSetting: (key) => capabilityRequest("artwork", "toggleSetting", { key }),
+      setResultLimit: (value) => capabilityRequest("artwork", "setResultLimit", { value }),
+    };
+
+    const appStart = {
+      getState: () => capabilityRequest("app-start", "getState"),
+      getCatalog: () => capabilityRequest("app-start", "getCatalog"),
+      add: (appId) => capabilityRequest("app-start", "add", { appId }),
+      remove: (shortcutId) => capabilityRequest("app-start", "remove", { shortcutId }),
+      launch: (shortcutId) => capabilityRequest("app-start", "launch", { shortcutId }),
+    };
+
+    const storeSync = {
+      getState: () => capabilityRequest("store-sync", "getState"),
+      getTitles: (storeId = "") => capabilityRequest("store-sync", "getTitles", { storeId }),
+      getArtworkPreview: (titleId) => capabilityRequest("store-sync", "getArtworkPreview", { titleId }),
+      toggleSetting: (key) => capabilityRequest("store-sync", "toggleSetting", { key }),
+      setStoreEnabled: (storeId, enabled) => capabilityRequest("store-sync", "setStoreEnabled", { storeId, enabled }),
+      setStorePath: (storeId, path) => capabilityRequest("store-sync", "setStorePath", { storeId, path }),
+      clearStorePath: (storeId) => capabilityRequest("store-sync", "clearStorePath", { storeId }),
+      setAdditionalPaths: (storeId, paths = []) => capabilityRequest("store-sync", "setAdditionalPaths", { storeId, paths }),
+      setTitleOverride: (titleId, options = {}) => capabilityRequest("store-sync", "setTitleOverride", {
+        titleId,
+        titleOverride: options.titleOverride || "",
+        artworkTitleOverride: options.artworkTitleOverride || "",
+        excluded: Boolean(options.excluded),
+      }),
+      clearTitleOverride: (titleId) => capabilityRequest("store-sync", "clearTitleOverride", { titleId }),
+      sync: () => capabilityRequest("store-sync", "sync"),
+      refreshStorefront: (storeId = "") => capabilityRequest("store-sync", "refreshStorefront", { storeId }),
+      setStorefrontEnabled: (storeId, enabled) => capabilityRequest("store-sync", "setStorefrontEnabled", { storeId, enabled }),
+      startStorefrontLogin: (storeId) => capabilityRequest("store-sync", "startStorefrontLogin", { storeId }),
+      completeStorefrontAuth: (storeId, value) => capabilityRequest("store-sync", "completeStorefrontAuth", { storeId, value }),
+      launchStorefrontGame: (storeId, gameId) => capabilityRequest("store-sync", "launchStorefrontGame", { storeId, gameId }),
+    };
+
+    const automation = {
+      getState: () => capabilityRequest("automation", "getState"),
+      toggleSetting: (key) => capabilityRequest("automation", "toggleSetting", { key }),
+      setExecutablePath: (path) => capabilityRequest("automation", "setExecutablePath", { path }),
+      resetExecutablePath: () => capabilityRequest("automation", "resetExecutablePath"),
+      toggleWatchedTitle: (titleId) => capabilityRequest("automation", "toggleWatchedTitle", { titleId }),
+    };
+
+    const performance = {
+      getState: () => capabilityRequest("performance", "getState"),
+      setOverlayLevel: (level) => capabilityRequest("performance", "setOverlayLevel", { level }),
+      toggleAutoTarget: () => capabilityRequest("performance", "toggleAutoTarget"),
+      setSettingValue: (key, value) => capabilityRequest("performance", "setSettingValue", { key, value }),
+      startOverlay: () => capabilityRequest("performance", "startOverlay"),
+      stopOverlay: () => capabilityRequest("performance", "stopOverlay"),
+      prepareElevatedHelper: () => capabilityRequest("performance", "prepareElevatedHelper"),
+    };
+
+    function confirmedPowerAction(operation, options = {}) {
+      if (options.confirmed !== true) {
+        return Promise.reject(new Error("TFS power actions require { confirmed: true } after explicit user confirmation."));
+      }
+      return capabilityRequest("power", operation, { confirmed: true });
+    }
+
+    const power = {
+      getState: () => capabilityRequest("power", "getState"),
+      startWindowsDesktop: (options) => confirmedPowerAction("startWindowsDesktop", options),
+      restartSteam: (options) => confirmedPowerAction("restartSteam", options),
+      sleepWindows: (options) => confirmedPowerAction("sleepWindows", options),
+      restartWindows: (options) => confirmedPowerAction("restartWindows", options),
+      shutdownWindows: (options) => confirmedPowerAction("shutdownWindows", options),
+    };
+
+    const system = {
+      getInfo: () => capabilityRequest("system", "getInfo"),
+      run: (fileName, arguments = [], options = {}) => capabilityRequest("system", "run", {
+        ...options,
+        fileName,
+        arguments,
+      }),
+      start: (fileName, arguments = [], options = {}) => capabilityRequest("system", "start", {
+        ...options,
+        fileName,
+        arguments,
+      }),
+      list: () => capabilityRequest("system", "list"),
+      status: (processId) => capabilityRequest("system", "status", { processId }),
+      stop: (processId) => capabilityRequest("system", "stop", { processId }),
+      stopAll: () => capabilityRequest("system", "stopAll"),
+      open: (target, arguments = [], options = {}) => capabilityRequest("system", "open", { ...options, target, arguments }),
+    };
+
+    const filesystem = {
+      paths: () => capabilityRequest("filesystem", "paths"),
+      stat: (path, options = {}) => capabilityRequest("filesystem", "stat", { ...options, path }),
+      list: (path = "", options = {}) => capabilityRequest("filesystem", "list", { ...options, path }),
+      readText: async (path, options = {}) => {
+        const result = await capabilityRequest("filesystem", "readText", { ...options, path });
+        return String(result?.content || "");
+      },
+      readBytes: async (path, options = {}) => {
+        const result = await capabilityRequest("filesystem", "readBytes", { ...options, path });
+        return base64ToBytes(result?.content || "");
+      },
+      writeText: (path, content, options = {}) => capabilityRequest("filesystem", "writeText", {
+        ...options,
+        path,
+        content: String(content ?? ""),
+      }),
+      appendText: (path, content, options = {}) => capabilityRequest("filesystem", "writeText", {
+        ...options,
+        path,
+        content: String(content ?? ""),
+        append: true,
+      }),
+      writeBytes: (path, content, options = {}) => capabilityRequest("filesystem", "writeBytes", {
+        ...options,
+        path,
+        content: bytesToBase64(content),
+      }),
+      mkdir: (path, options = {}) => capabilityRequest("filesystem", "mkdir", { ...options, path }),
+      remove: (path, options = {}) => capabilityRequest("filesystem", "delete", { ...options, path }),
+      copy: (sourcePath, destinationPath, options = {}) => capabilityRequest("filesystem", "copy", {
+        ...options,
+        sourcePath,
+        destinationPath,
+      }),
+      move: (sourcePath, destinationPath, options = {}) => capabilityRequest("filesystem", "move", {
+        ...options,
+        sourcePath,
+        destinationPath,
+      }),
+    };
+
+    const steam = {
+      targets: () => capabilityRequest("steam", "targets"),
+      evaluate: (targetId, expression) => capabilityRequest("steam", "evaluate", { targetId, expression }),
+      inject: (targetId, expression) => capabilityRequest("steam", "inject", { targetId, expression }),
+      get client() {
+        return window.SteamClient || null;
+      },
+      get ui() {
+        return {
+          React: window.SP_REACT || window.React || null,
+          ReactDOM: window.SP_REACTDOM || window.ReactDOM || null,
+          router: window.MainWindowBrowserManager || window.GamepadNavTree || null,
+        };
+      },
+    };
+
+    let backendProcessId = "";
+    let backendStartPromise = null;
+    const backend = {
+      start(options = {}) {
+        const backendManifest = manifest.backend && typeof manifest.backend === "object" ? manifest.backend : {};
+        const entryPoint = String(options.entryPoint || backendManifest.entryPoint || "").trim();
+        if (!entryPoint) {
+          return Promise.reject(new Error("This plugin does not declare backend.entryPoint."));
+        }
+        if (backendStartPromise) {
+          return backendStartPromise;
+        }
+        backendStartPromise = capabilityRequest("system", "startBackend", {
+          ...backendManifest,
+          ...options,
+          entryPoint,
+          arguments: options.arguments || backendManifest.arguments || [],
+          environment: { ...(backendManifest.environment || {}), ...(options.environment || {}) },
+          secretEnvironment: { ...(backendManifest.secretEnvironment || {}), ...(options.secretEnvironment || {}) },
+        }).then((result) => {
+          backendProcessId = String(result?.processId || "");
+          return result;
+        }).catch((error) => {
+          backendStartPromise = null;
+          throw error;
+        });
+        return backendStartPromise;
+      },
+      ready() {
+        return backendStartPromise || backend.start();
+      },
+      status() {
+        return backendProcessId
+          ? system.status(backendProcessId)
+          : Promise.resolve({ running: false, processId: "" });
+      },
+      async call(method, arguments = {}, options = {}) {
+        const process = await backend.ready();
+        return capabilityRequest("system", "call", {
+          processId: process.processId,
+          method,
+          arguments,
+          timeoutMs: options.timeoutMs || 30000,
+        });
+      },
+      async stop() {
+        if (!backendProcessId) {
+          backendStartPromise = null;
+          return { running: false, processId: "" };
+        }
+        const processId = backendProcessId;
+        backendProcessId = "";
+        backendStartPromise = null;
+        return system.stop(processId);
+      },
+    };
+
+    const notifications = {
+      async show(title, message, options = {}) {
+        const result = await pluginRequest("notifications/show", {
+          method: "POST",
+          body: {
+            title: String(title || ""),
+            message: String(message || ""),
+            level: options.level || "info",
+            durationMs: Number(options.durationMs) || 4500,
+          },
+        });
+        showPluginNotification(result);
+        return result;
+      },
+      success(title, message, options = {}) {
+        return notifications.show(title, message, { ...options, level: "success" });
+      },
+      warning(title, message, options = {}) {
+        return notifications.show(title, message, { ...options, level: "warning" });
+      },
+      error(title, message, options = {}) {
+        return notifications.show(title, message, { ...options, level: "error" });
+      },
+    };
+
+    const log = {};
+    for (const level of ["debug", "info", "warning", "error"]) {
+      log[level] = (message, data = null) => pluginRequest("logs/write", {
+        method: "POST",
+        body: {
+          level,
+          message: String(message || ""),
+          data,
+        },
+      });
+    }
+    log.warn = log.warning;
+
+    const lifecycleDisposers = new Set();
+    const lifecycleAbortController = typeof AbortController === "function" ? new AbortController() : null;
+    let lifecycleDisposed = false;
+    const lifecycle = {
+      get disposed() {
+        return lifecycleDisposed;
+      },
+      signal: lifecycleAbortController?.signal || null,
+      onDispose(callback) {
+        if (typeof callback !== "function") {
+          throw new TypeError("TFS lifecycle.onDispose expects a function.");
+        }
+        if (lifecycleDisposed) {
+          callback();
+          return () => {};
+        }
+        lifecycleDisposers.add(callback);
+        return () => lifecycleDisposers.delete(callback);
+      },
+      setTimeout(callback, delayMs = 0) {
+        const timerId = window.setTimeout(() => {
+          lifecycleDisposers.delete(cancel);
+          if (!lifecycleDisposed) {
+            callback();
+          }
+        }, Math.max(0, Number(delayMs) || 0));
+        const cancel = () => window.clearTimeout(timerId);
+        lifecycleDisposers.add(cancel);
+        return cancel;
+      },
+      setInterval(callback, delayMs = 1000) {
+        const timerId = window.setInterval(() => {
+          if (!lifecycleDisposed) {
+            callback();
+          }
+        }, Math.max(100, Number(delayMs) || 1000));
+        const cancel = () => window.clearInterval(timerId);
+        lifecycleDisposers.add(cancel);
+        return cancel;
+      },
+      dispose() {
+        if (lifecycleDisposed) {
+          return;
+        }
+        lifecycleDisposed = true;
+        lifecycleAbortController?.abort();
+        for (const dispose of [...lifecycleDisposers]) {
+          try {
+            dispose();
+          } catch {
+          }
+        }
+        lifecycleDisposers.clear();
+      },
+    };
+
+    const observableSources = {
+      audio: () => audio.getState(),
+      processes: () => processes.getState(),
+      display: () => display.getState(),
+      performance: () => performance.getState(),
+    };
+    const events = {
+      watch(source, listener, options = {}) {
+        const read = typeof source === "function"
+          ? source
+          : observableSources[String(source || "").trim().toLowerCase()];
+        if (typeof read !== "function" || typeof listener !== "function") {
+          throw new TypeError("TFS events.watch expects a supported source or reader function and a listener.");
+        }
+
+        let stopped = false;
+        let running = false;
+        let previousFingerprint = "";
+        const poll = async () => {
+          if (stopped || running || lifecycle.disposed) {
+            return;
+          }
+          running = true;
+          try {
+            const snapshot = await read();
+            const fingerprint = JSON.stringify(snapshot);
+            if (fingerprint !== previousFingerprint) {
+              const previous = previousFingerprint;
+              previousFingerprint = fingerprint;
+              await listener(snapshot, { initial: previous.length === 0 });
+            }
+          } catch (error) {
+            options.onError?.(error);
+          } finally {
+            running = false;
+          }
+        };
+
+        const cancelInterval = lifecycle.setInterval(poll, Math.max(1000, Number(options.intervalMs) || 2000));
+        const stop = () => {
+          if (stopped) {
+            return;
+          }
+          stopped = true;
+          cancelInterval();
+        };
+        lifecycle.onDispose(stop);
+        if (options.immediate !== false) {
+          void poll();
+        }
+        return stop;
+      },
+    };
+
+    lifecycle.onDispose(() => {
+      if (backendProcessId) {
+        void backend.stop().catch(() => {});
+      }
+    });
+
     const declaredPermissions = new Set(
       Array.isArray(manifest.permissions)
         ? manifest.permissions.map((permission) => String(permission || "").trim().toLowerCase())
@@ -2498,17 +3106,34 @@
 
     return {
       version: 1,
+      sdkVersion: "1.0.0",
       pluginId,
       manifest: { ...manifest, id: pluginId || manifest.id || "" },
       apiBase,
-      request,
-      get: (path, requestOptions = {}) => request(path, { ...requestOptions, method: "GET" }),
-      post: (path, body = {}, requestOptions = {}) => request(path, { ...requestOptions, method: "POST", body }),
       state: () => pluginRequest("state", { method: "GET" }),
       storage,
       secrets,
       network,
       files,
+      audio,
+      processes,
+      display,
+      themes,
+      artwork,
+      appStart,
+      storeSync,
+      automation,
+      performance,
+      power,
+      system,
+      filesystem,
+      backend,
+      steam,
+      notifications,
+      log,
+      lifecycle,
+      events,
+      dispose: () => lifecycle.dispose(),
       permissions: Object.freeze([...declaredPermissions]),
       hasPermission: (permission) => declaredPermissions.has(String(permission || "").trim().toLowerCase()),
       ui: {
@@ -2521,13 +3146,15 @@
         createAccordionSlot,
         createFeatureNavigationSlot,
         createInlineStepperSlot,
+        createSliderSlot,
+        createProgressSlot,
         createSecretEditor,
         createScreenModel,
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 39,
-        sdkVersion: 1,
+        libraryVersion: window.STFrontendLib?.version || 41,
+        sdkVersion: "1.0.0",
         pluginId,
       }),
     };
@@ -2538,7 +3165,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 39,
+      version: 41,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -2551,8 +3178,62 @@
     };
   }
 
+  function registerPlugin(manifest = {}, setup = {}, options = {}) {
+    const pluginId = String(options.pluginId || manifest.id || "").trim();
+    if (!pluginId) {
+      throw new Error("TFS plugin registration requires a manifest id.");
+    }
+
+    const sdk = createPluginSdk(manifest, { ...options, pluginId });
+    let definition;
+    try {
+      definition = typeof setup === "function" ? setup(sdk) : setup;
+    } catch (error) {
+      sdk.dispose();
+      throw error;
+    }
+    if (!definition || typeof definition !== "object") {
+      sdk.dispose();
+      throw new Error("TFS plugin setup must return a plugin definition object.");
+    }
+
+    window.ToolsForSteamCommunityPlugins ??= {};
+    window.ToolsForSteamCommunityPlugins[pluginId]?.dispose?.();
+    const definitionDispose = typeof definition.dispose === "function"
+      ? definition.dispose.bind(definition)
+      : null;
+    const entry = {
+      ...definition,
+      manifest: { ...manifest, id: pluginId },
+      sdk,
+      dispose() {
+        try {
+          definitionDispose?.();
+        } finally {
+          sdk.dispose();
+        }
+      },
+    };
+    window.ToolsForSteamCommunityPlugins[pluginId] = entry;
+    if (manifest.backend?.autoStart === true) {
+      void sdk.backend.ready().catch((error) => {
+        console.error(`[TFS:${pluginId}] Backend start failed`, error);
+      });
+    }
+    return entry;
+  }
+
+  function unregisterPlugin(pluginId) {
+    const normalizedPluginId = String(pluginId || "").trim();
+    const entry = window.ToolsForSteamCommunityPlugins?.[normalizedPluginId];
+    entry?.dispose?.();
+    if (window.ToolsForSteamCommunityPlugins && normalizedPluginId) {
+      delete window.ToolsForSteamCommunityPlugins[normalizedPluginId];
+    }
+  }
+
   window.STFrontendLib = {
-    version: 39,
+    version: 41,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,
@@ -2580,6 +3261,8 @@
     createAccordionSlot,
     createFeatureNavigationSlot,
     createInlineStepperSlot,
+    createSliderSlot,
+    createProgressSlot,
     createScreenModel,
     buildRowClassName,
     createRowContent,
@@ -2592,12 +3275,16 @@
     createVolumeActionButton,
     createVolumePanel,
     createPanelShell,
+    showPluginNotification,
     createPluginSdk,
     createDiagnostics,
   };
 
   window.TfsPluginSdk = {
     version: 1,
+    sdkVersion: "1.0.0",
     create: createPluginSdk,
+    register: registerPlugin,
+    unregister: unregisterPlugin,
   };
 })();
