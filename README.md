@@ -1,122 +1,188 @@
+<div align="center">
+
 # Tools for Steam
 
-Tools for Steam (TFS) brings a SteamOS-style console experience to Windows PCs that are used mainly with Steam Big Picture. It adds a native-feeling Tools for Steam tab to Steam's Quick Access side panel and ships with built-in tools for audio, app launching, display control, launcher sync, themes, HLTB, window switching, and recovery actions.
+### A controller-first Windows console layer for Steam Big Picture
 
-This release is part of **GCM - Gaming Console Mode**. The goal is simple: when a living-room PC boots, the first thing you should see is Steam Big Picture, not the Windows desktop.
+[![Beta](https://img.shields.io/badge/release-0.3.9_beta-6f42c1?style=for-the-badge)](https://github.com/toonymak1993/tools-for-steam/releases)
+[![Windows](https://img.shields.io/badge/platform-Windows_10%2F11-0078d4?style=for-the-badge&logo=windows)](#requirements)
+[![SDK](https://img.shields.io/badge/plugin_SDK-1.0.0-2ea44f?style=for-the-badge)](sdk/QUICKSTART.md)
+[![Xbox Mode](https://img.shields.io/badge/Xbox_Mode-controller_first-107c10?style=for-the-badge&logo=xbox)](#three-startup-modes)
 
-![Tools for Steam plugin overview](docs/screenshots/plugin-overview.svg)
+Tools for Steam (TFS) brings a SteamOS-style experience to Windows gaming PCs and handhelds. It integrates directly into Steam's Quick Access panel, starts cleanly into Big Picture, and keeps the important Windows and gaming controls reachable without leaving the controller.
 
-## What TFS Does
+[Download a release](https://github.com/toonymak1993/tools-for-steam/releases) · [Build a plugin](sdk/QUICKSTART.md) · [Developer guide](sdk/DEVELOPER_GUIDE.md) · [Plugin database](https://github.com/toonymak1993/tfs-plugin-database)
 
-- Starts before the normal Windows desktop when console startup is enabled.
-- Launches Steam Big Picture with the local bridge required for the Quick Access integration.
-- Adds a Tools for Steam tab to Steam's native side panel.
-- Syncs supported launcher libraries and custom game folders into Steam.
-- Can hide the Windows taskbar and desktop icons while Big Picture is active.
-- Restores Explorer behind Steam after the startup flow so Windows remains usable.
-- Updates from GitHub releases through the installed app.
+</div>
 
-## Console Startup
+![Tools for Steam running inside Steam Big Picture](docs/assets/tfs.png)
 
-Tools for Steam can change the current user's Windows shell so TFS launches first at sign-in. This is how it can imitate a SteamOS-like boot flow on Windows: TFS starts, prepares the background host, starts Steam Big Picture, hides the regular desktop layer, and then hands the session back to Windows Explorer behind Steam.
+> [!IMPORTANT]
+> The current public build is a beta. TFS changes the current user's startup experience and integrates with Steam UI surfaces that can change after Steam updates. Read [Safety and recovery](#safety-and-recovery) before enabling Shell or Xbox Mode.
 
-![Tools for Steam startup flow](docs/screenshots/startup-flow.svg)
+## Why Tools for Steam?
 
-This shell behavior is intentional and can be disabled again from `Tools for Steam > Settings`. If something goes wrong, the `Power` plugin and the tray app both provide recovery actions to start Windows Explorer manually.
+Windows is a powerful gaming platform, but it was not designed to feel like a console from the sofa. TFS connects the missing pieces:
 
-## Built-In Plugins
+| Console feature | What TFS provides |
+|---|---|
+| Native controller UI | A Tools for Steam tab inside Steam Quick Access, built for `A`, `B`, bumpers, D-pad, and sticks |
+| Console startup | Shell Mode or the signed Xbox Mode Gaming Home package starts the gaming session without exposing the normal desktop first |
+| One gaming hub | Launcher discovery, non-Steam shortcuts, collections, and SteamGridDB artwork |
+| System controls | Audio, displays, windows, performance, themes, apps, power, and recovery from Big Picture |
+| Extensible platform | A Community Store and public SDK 1.0 with normal, native, and Decky-style full-trust plugins |
 
-- `Settings`: Global TFS startup behavior plus plugin enable/disable controls.
-- `Processes`: See visible app windows and bring one to the foreground from the controller.
-- `App Start`: Add installed Windows apps from the Start Menu and launch them later from the controller.
-- `Store Sync`: Import supported launcher games and custom folders into Steam as non-Steam games, with SteamGridDB artwork support.
-- `Audio`: Switch Windows output devices and adjust system volume from Big Picture.
-- `Display`: Switch internal/external display output and choose supported resolution or refresh-rate presets.
-- `Power`: Restart Steam, recover the Windows desktop, sleep, reboot, or shut down the PC.
-- `HLTB`: Show HowLongToBeat estimates on supported Big Picture game pages.
-- `CSSLoader`: Control local CSSLoader themes and presets from Quick Access.
+TFS is part of **GCM — Gaming Console Mode**. The goal is simple: on a living-room PC or handheld, Steam should be the first-class home experience while Windows remains recoverable underneath.
 
-Plugins can be disabled from `Settings`. Disabled plugins are hidden from the TFS home screen and their background routes are blocked.
+## Highlights in the first official beta
 
-## Community Plugin SDK
+- Responsive, controller-native TFS Store with Discover, Built-In, Community, Installed, and Updates sections.
+- Public Plugin SDK `1.0.0` with TypeScript definitions, schemas, templates, packaging, validation, and one-command sideloading.
+- Sandboxed storage, protected secrets, network allowlists, private files, notifications, logs, lifecycle helpers, and change-only events.
+- Reviewed native bridges for audio, processes, displays, CSSLoader, artwork, App Start, Store Sync, automation, performance, and power.
+- `native.full-trust` escape hatch for executable, PowerShell, Python, or Node backends, JSON-RPC, arbitrary files, UAC, processes, and selected Steam CEF surfaces.
+- Community package checks for SDK compatibility, permission parity, safe ZIP extraction, update permission changes, and SHA-256 integrity.
+- Signed Xbox Mode host package with installer recovery, rollback snapshots, and diagnostic collection.
+- Controller focus and Store card layout fixes across 720p, 1080p, and larger displays.
 
-TFS ships a public Plugin SDK 1.0.0 for controller-first community apps. Start here:
+## TDP Control and handheld support
 
-- [Build and sideload your first plugin in about 10 minutes](sdk/QUICKSTART.md)
-- [Complete SDK and native API reference](sdk/DEVELOPER_GUIDE.md)
-- [Manifest and Store contract](sdk/README.md)
-- [Official catalog submission guide](sdk/SUBMITTING.md)
-- [TypeScript declarations](sdk/tfs-plugin-sdk.d.ts)
+This beta includes our first dedicated **Handheld Performance / TDP Control plugin**.
 
-Normal plugins can build native-feeling Steam screens and use settings, protected secrets, HTTP integrations, private files, notifications, logs, managed timers, audio, displays, processes, themes, artwork, App Start, Store Sync, performance, and confirmed power actions.
+The first verified device is the **MSI Claw A8** (`MS-1T8K`). On supported hardware the plugin appears automatically and provides:
 
-When a plugin needs something TFS Core does not already expose, `native.full-trust` provides the Decky-style escape hatch: bundle an executable, PowerShell, Python, or Node backend; call it through managed JSON RPC; run programs; access arbitrary files; request UAC; or extend selected Steam CEF surfaces. Full-trust permissions are shown prominently in the Store and should only be installed from trusted publishers.
+- direct TDP control from **15 W to 35 W**;
+- Battery `15 W`, Balanced `20 W`, and Performance `28 W` presets;
+- separate plugged-in and battery limits;
+- automatic per-game TDP profiles;
+- live battery, power-source, applied-TDP, and game information;
+- profile notifications and automatic restoration of the global profile;
+- elevated hardware access through the bundled PawnIO-based helper.
 
-Create and sideload a plugin from this checkout:
+The plugin stays hidden on unverified devices instead of applying unknown hardware commands. **More handheld models will follow** as their hardware identity, safe limits, and control path are verified.
+
+## Built-in tools
+
+| Tool | Purpose |
+|---|---|
+| **FPS Overlay** | FPS, frametime, process, CPU, and memory telemetry with Steam-style overlay controls |
+| **Processes** | List visible windows and bring an app to the foreground |
+| **App Start** | Curate and launch installed Windows apps with a controller |
+| **Store Sync** | Discover launcher libraries, create Steam shortcuts and collections, and refresh artwork |
+| **SteamGridDB** | Search and apply game artwork from Steam context menus or settings |
+| **Audio** | Switch playback devices, control volume, and manage mixer state |
+| **Display** | Switch displays, resolutions, and refresh rates |
+| **CSSLoader** | Control local themes, profiles, presets, and backend tools |
+| **HLTB** | Show HowLongToBeat estimates on supported game pages |
+| **Auto SISR** | Optional marker-mode automation for selected non-Steam games |
+| **Homey** | Optional rooms, lights, moods, colors, and flows integration |
+| **Power** | Restart Steam, recover Explorer, sleep, restart, or shut down safely |
+
+Most tools can be hidden from TFS Settings. Safety and recovery actions remain available.
+
+## Community Store
+
+The Store is designed to work entirely with a controller and keeps plugin trust visible before installation:
+
+- built-in and community discovery;
+- install, update, uninstall, enable, disable, and hide flows;
+- preview cards with responsive fallback artwork;
+- SDK version, publisher, permissions, network hosts, and full-trust warnings;
+- checksum verification and strict package/manifest/catalog parity;
+- local developer catalogs for sideloading without changing TFS Core.
+
+The official catalog lives in [`tfs-plugin-database`](https://github.com/toonymak1993/tfs-plugin-database). The first official community example is **Home Assistant 0.2.0**, built entirely with SDK 1.0 storage, secrets, network, and controller UI capabilities.
+
+## Plugin SDK 1.0
+
+SDK 1.0 is built for trusted gaming plugins in the same spirit as Decky Loader. A normal plugin can stay capability-based; a full-trust plugin can bundle its own backend when the Core does not expose enough.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tfs-plugin.ps1 new .\plugins\my-plugin -Id my-plugin -Name "My Plugin"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\tfs-plugin.ps1 sideload .\plugins\my-plugin
+# Create a plugin
+.\scripts\tfs-plugin.ps1 new .\plugins\my-plugin -Id my-plugin -Name "My Plugin"
+
+# Validate and sideload it into the local TFS Store
+.\scripts\tfs-plugin.ps1 validate .\plugins\my-plugin
+.\scripts\tfs-plugin.ps1 sideload .\plugins\my-plugin
 ```
 
-Open the TFS Store, press `Refresh`, and install the plugin from `Community`. The CLI validates the manifest, packages the plugin, computes its SHA-256 checksum, copies its preview, and updates a persistent local developer catalog.
+Developer resources:
 
-Community packages are distributed through the TFS Store. The installer verifies package metadata, SDK compatibility, permissions, safe ZIP extraction, and SHA-256 before replacing an installed plugin. SDK v1 grows additively; incompatible runtime changes require a future SDK major version.
+- [Ten-minute quickstart](sdk/QUICKSTART.md)
+- [Complete API and Xbox Mode guide](sdk/DEVELOPER_GUIDE.md)
+- [SDK contract and permission reference](sdk/README.md)
+- [Store submission guide](sdk/SUBMITTING.md)
+- [TypeScript declarations](sdk/tfs-plugin-sdk.d.ts)
+- [Standalone starter repository](https://github.com/toonymak1993/tfs-plugin-template)
+- [Full-trust backend template](sdk/full-trust-plugin-template/)
+
+SDK v1 evolves additively. Breaking runtime changes require a future SDK major version so existing plugins can remain loadable.
+
+## Three startup modes
+
+### Shell Mode
+
+TFS starts before Explorer, prepares Steam Big Picture and the local bridge, then restores Explorer behind Steam. This provides the broadest console-style flow on normal Windows 10 and Windows 11 systems.
+
+### Xbox Mode
+
+On compatible Windows 11 systems with Gaming FSE support, TFS installs a signed Gaming Home package and becomes the controller-first gaming home while Explorer remains the Windows shell. The installer hides this option when the platform capability is unavailable.
+
+### Tray Mode
+
+Windows starts normally and TFS runs quietly as a tray-style launcher service. This is the least invasive option and the easiest starting point for testing the beta.
 
 ## Requirements
 
-- Windows 10 or newer.
-- Steam installed.
-- Steam Big Picture / Gamepad UI.
-- A user account where changing the current user's shell is acceptable.
+- Windows 10 or Windows 11 x64;
+- Steam with Big Picture / Gamepad UI;
+- a controller for the intended console experience;
+- permission to install per-user software under `%LOCALAPPDATA%`;
+- compatible Windows 11 Gaming FSE support specifically for Xbox Mode.
 
-Tools for Steam starts Steam with the required local DevTools endpoint on `127.0.0.1:8080` when needed. If Steam is already running without that endpoint, TFS may perform one controlled Steam restart so it can attach correctly.
+TFS starts Steam with the required local DevTools endpoint on `127.0.0.1:8080` when necessary. If Steam is already running without it, TFS can perform one controlled restart to attach correctly. The local TFS API listens on `127.0.0.1:47652` and uses a private session token for protected routes.
 
-## Install
+## Install and update
 
-Download `ToolsForSteamSetup.exe` from the latest GitHub release and run it.
+1. Open [GitHub Releases](https://github.com/toonymak1993/tools-for-steam/releases).
+2. For the first official beta, expand the newest **Pre-release** entry.
+3. Download `ToolsForSteamSetup.exe`.
+4. Run the installer and choose Tray, Shell, or Xbox Mode when available.
 
 The installer:
 
-- installs per-user under `%LOCALAPPDATA%\Programs\ToolsForSteam`
-- shows the license before installation
-- closes running TFS processes automatically during setup
-- creates Start Menu entries
-- starts the TFS background host after installation when Shell or Tray mode is selected
+- installs per-user under `%LOCALAPPDATA%\Programs\ToolsForSteam`;
+- verifies platform and Xbox Mode requirements;
+- safely leaves an active Xbox Mode session before replacing files;
+- closes TFS, helpers, Xbox Host, and Steam when required;
+- creates a rollback snapshot before an update;
+- installs the signed Xbox Host package and public certificate;
+- restores a safe startup mode if setup cannot complete;
+- writes Xbox Mode diagnostics for failed installations.
 
-## Updates
+Installed builds can update from GitHub releases. Public installer assets are named `ToolsForSteamSetup.exe`.
 
-Installed builds can check for and install updates from GitHub releases. The updater looks for the latest release asset named:
+## Safety and recovery
 
-```text
-ToolsForSteamSetup.exe
-```
+TFS changes only the current user's shell/startup configuration. It does not replace Windows system files.
 
-Updates are expected. TFS touches Steam UI surfaces that can change when Steam updates, so future releases will improve compatibility, plugins, themes, and the console startup experience.
+If the gaming shell does not start correctly:
 
-## Safety And Recovery
+- open `Tools for Steam > Settings` and switch back to Tray Mode;
+- use `Tools for Steam > Power > Start Windows Desktop`;
+- start Explorer from the TFS tray recovery actions;
+- press `Ctrl+Shift+Esc`, open Task Manager, and run `explorer.exe`;
+- uninstall from Windows Apps or the Start Menu entry;
+- use the rollback snapshot stored under the TFS data directory after an interrupted upgrade.
 
-Because TFS can take over the current user's shell, it is important to know how to recover:
-
-- Open `Tools for Steam > Settings` to disable console startup.
-- Use `Tools for Steam > Power > Start Windows Desktop` to bring Explorer back.
-- Use the tray app if you need desktop-side recovery actions outside Steam.
-- Uninstall from Windows Apps settings or the Start Menu uninstall entry.
-
-TFS only changes the current user's shell configuration. It does not replace Windows system files.
-
-## Build From Source
+## Build from source
 
 ```powershell
 dotnet build .\SteamLoader.slnx
 dotnet run --project .\src\SteamLoader.App\SteamLoader.App.csproj
 ```
 
-The background host serves a local API on `http://127.0.0.1:47652/` and injects the Quick Access UI into Steam Big Picture when Steam is available.
-
-## Build The Installer
-
-Inno Setup 6 is used for the Windows installer.
+Build the complete installer, including the signed Xbox Host package:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-installer.ps1
@@ -124,24 +190,35 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-installer.ps1
 
 Outputs:
 
-- `dist\installer\ToolsForSteamSetup.exe`
-- `dist\portable\ToolsForSteam.exe`
+- `dist\installer\ToolsForSteamSetup.exe` — public installer;
+- `dist\installer\ToolsForSteamSetup-<version>.exe` — versioned copy;
+- `dist\portable\ToolsForSteam.exe` — internal installer payload.
 
-`dist\portable\ToolsForSteam.exe` is an internal staging payload used to assemble the installer. Public releases now ship the installer only.
+The Xbox Host build requires the configured TFS signing certificate. The outer installer should also be Authenticode-signed for broad public distribution.
 
-## Repository Layout
+## Repository map
 
-- `src/SteamLoader.App/Hosting`: local API host and Steam injection loop
-- `src/SteamLoader.App/Infrastructure/Steam`: Steam DevTools communication
-- `src/SteamLoader.App/Infrastructure/Audio`: Core Audio integration
-- `src/SteamLoader.App/Infrastructure/Display`: Windows display switching and mode selection
-- `src/SteamLoader.App/Infrastructure/StoreSync`: launcher scanning, shortcut sync, and artwork download
-- `src/SteamLoader.App/Infrastructure/Themes`: CSSLoader bridge, theme state mapping, and preset control
-- `src/SteamLoader.App/Infrastructure/Hltb`: HowLongToBeat integration
-- `src/SteamLoader.App/Assets`: injected Quick Access UI and Big Picture surface scripts
+| Path | Purpose |
+|---|---|
+| `src/SteamLoader.App/Hosting` | Local API, Store routes, Steam injection, and live state |
+| `src/SteamLoader.App/Infrastructure` | Audio, displays, handhelds, Store Sync, Steam, themes, artwork, and native services |
+| `src/SteamLoader.App/Assets` | Quick Access, Store, game-page, controller, and Steam UI assets |
+| `src/ToolsForSteam.XboxHost` | Signed Gaming Home / Xbox Mode package |
+| `sdk` | Public SDK, schemas, documentation, and official examples |
+| `scripts` | Build, package, sideload, installer, and release helpers |
+| `installer` | Inno Setup definition and Xbox Mode recovery tools |
+| `tests` | Runtime, SDK, Store, Xbox Mode, launcher, and update regression tests |
 
-## Status
+## Beta status
 
-Tools for Steam is ready for its first public release, but it will continue to evolve. Some internals still use the older `SteamLoader` codename while the user-facing product is now `Tools for Steam` / `TFS`.
+This is the first official beta of the complete TFS platform: console startup, Xbox Mode, built-in tools, Community Store, SDK 1.0, Home Assistant example, and the first MSI Claw A8 TDP integration.
 
-Feedback from real Big Picture systems is welcome, especially around startup behavior, Steam UI updates, and controller-first navigation.
+Feedback is especially useful for:
+
+- Steam Beta and stable-client UI compatibility;
+- controller focus at 720p, 1080p, ultrawide, and 4K;
+- fresh installs and upgrades while Xbox Mode is active;
+- MSI Claw A8 power limits and automatic game profiles;
+- third-party SDK plugins and full-trust backends.
+
+Some internal namespaces still use the original `SteamLoader` codename; the user-facing product and public SDK are **Tools for Steam / TFS**.
