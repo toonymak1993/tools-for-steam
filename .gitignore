@@ -1,4 +1,6 @@
 bin/
+!src/SteamLoader.App/ThirdParty/DiscordSocialSdk/bin/
+!src/SteamLoader.App/ThirdParty/DiscordSocialSdk/bin/discord_partner_sdk.dll
 obj/
 .vs/
 dist/
