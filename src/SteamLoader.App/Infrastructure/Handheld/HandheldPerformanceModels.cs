@@ -11,6 +11,11 @@ public sealed record HandheldPerformanceSnapshot(
     int MinimumTdpWatts,
     int MaximumTdpWatts,
     int SelectedTdpWatts,
+    int SelectedSpptWatts,
+    int SelectedFpptWatts,
+    int ConfirmedSplWatts,
+    int ConfirmedSpptWatts,
+    int ConfirmedFpptWatts,
     int GlobalTdpWatts,
     int GlobalAcTdpWatts,
     int GlobalBatteryTdpWatts,
@@ -24,7 +29,32 @@ public sealed record HandheldPerformanceSnapshot(
     HandheldGameTdpProfile? ActiveProfile,
     IReadOnlyList<HandheldGameTdpProfile> Profiles,
     string StatusText,
-    string ErrorText);
+    string ErrorText,
+    HandheldLightingSnapshot Lighting,
+    HandheldCpuBoostSnapshot CpuBoost,
+    HandheldAfmfSnapshot Afmf,
+    HandheldOemSoftwareSnapshot OemSoftware);
+
+public sealed record HandheldLightingSnapshot(
+    bool Supported,
+    bool Enabled,
+    string Effect,
+    string LeftColor,
+    string RightColor,
+    string ButtonColor,
+    int Brightness,
+    bool Applied,
+    string StatusText,
+    IReadOnlyList<string> Effects);
+
+internal sealed record HandheldLightingSettings(
+    bool Enabled = true,
+    string Effect = "solid",
+    string LeftColor = "#66C0F4",
+    string RightColor = "#66C0F4",
+    string ButtonColor = "#66C0F4",
+    int Brightness = 100,
+    DateTimeOffset UpdatedAt = default);
 
 internal sealed record HandheldPerformanceSettings(
     int TdpWatts = 20,
@@ -82,7 +112,10 @@ internal sealed record HandheldHardwareCommand(
     string DeviceId,
     string ProductCode,
     string Operation,
-    int TdpWatts);
+    int TdpWatts,
+    HandheldLightingSettings? Lighting = null,
+    int SpptWatts = 0,
+    int FpptWatts = 0);
 
 internal sealed record HandheldHardwareStatus(
     long Nonce = 0,
@@ -91,4 +124,9 @@ internal sealed record HandheldHardwareStatus(
     int AppliedTdpWatts = 0,
     string CpuCodeName = "",
     string Message = "Waiting for the elevated hardware helper.",
-    DateTimeOffset UpdatedAt = default);
+    DateTimeOffset UpdatedAt = default,
+    string Operation = "set-tdp",
+    bool LightingApplied = false,
+    string LightingMessage = "Ready to apply RGB lighting.",
+    int AppliedSpptWatts = 0,
+    int AppliedFpptWatts = 0);

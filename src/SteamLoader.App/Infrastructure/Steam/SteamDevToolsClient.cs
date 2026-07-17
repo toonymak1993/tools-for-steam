@@ -334,6 +334,47 @@ public sealed class SteamDevToolsClient
             cancellationToken);
     }
 
+    public async Task<bool?> TryGetQuickAccessMenuVisibilityAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var target = await GetQuickAccessTargetAsync(cancellationToken);
+            if (target is null || string.IsNullOrWhiteSpace(target.WebSocketDebuggerUrl))
+            {
+                return false;
+            }
+
+            const string expression = """
+(() => {
+  const root = document.getElementById("QuickAccess-NA") ||
+    document.querySelector("[id^='QuickAccess']");
+  if (!root) {
+    return false;
+  }
+
+  const style = window.getComputedStyle(root);
+  return document.visibilityState !== "hidden" &&
+    style.display !== "none" &&
+    style.visibility !== "hidden" &&
+    Number(style.opacity || "1") > 0 &&
+    root.getClientRects().length > 0;
+})()
+""";
+            var result = await EvaluateAsync(target.WebSocketDebuggerUrl, expression, cancellationToken);
+            return result.Success && TryReadBoolean(result.Value, out var visible)
+                ? visible
+                : null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private async Task<int> SendKeyEventAsync(
         ClientWebSocket webSocket,
         string type,

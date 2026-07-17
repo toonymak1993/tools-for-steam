@@ -78,6 +78,7 @@ public sealed class PluginStoreService
             ["audio"] = "#10B981",
             ["auto-sisr"] = "#F43F5E",
             ["display"] = "#EAB308",
+            ["discord"] = "#5865F2",
             ["hltb"] = "#8B5CF6",
             ["performance"] = "#22C55E",
             ["power"] = "#FB7185",

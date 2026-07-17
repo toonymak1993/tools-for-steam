@@ -18,6 +18,41 @@ if ($LASTEXITCODE -ne 0) {
     throw "Installer payload publish failed."
 }
 
+& (Join-Path $PSScriptRoot "prepare-handheld-runtime.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Handheld replacement runtime preparation failed."
+}
+
+$xboxHostPackagePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.msix"
+if (-not (Test-Path -LiteralPath $xboxHostPackagePath)) {
+    throw "Xbox Mode host package was not found at $xboxHostPackagePath."
+}
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$packageArchive = [System.IO.Compression.ZipFile]::OpenRead($xboxHostPackagePath)
+try {
+    $manifestEntry = $packageArchive.GetEntry("AppxManifest.xml")
+    if (-not $manifestEntry) {
+        throw "Xbox Mode host package does not contain AppxManifest.xml."
+    }
+
+    $manifestReader = [System.IO.StreamReader]::new($manifestEntry.Open())
+    try {
+        [xml]$packageManifest = $manifestReader.ReadToEnd()
+    }
+    finally {
+        $manifestReader.Dispose()
+    }
+}
+finally {
+    $packageArchive.Dispose()
+}
+
+$xboxHostPackageVersion = [string]$packageManifest.Package.Identity.Version
+if ($xboxHostPackageVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+    throw "Xbox Mode host package has an invalid manifest version: $xboxHostPackageVersion"
+}
+
 New-Item -ItemType Directory -Path $variantOutputDir -Force | Out-Null
 Get-ChildItem -LiteralPath $variantOutputDir -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force
 
@@ -82,6 +117,7 @@ foreach ($variant in $variants) {
         "/DVariantWizardStyle=$($variant.WizardStyle)"
         "/DVariantCustomPages=$($variant.CustomPages)"
         "/DVariantFpsHelperPrep=$($variant.FpsHelperPrep)"
+        "/DXboxHostBuildVersion=$xboxHostPackageVersion"
         $issPath
     )
 

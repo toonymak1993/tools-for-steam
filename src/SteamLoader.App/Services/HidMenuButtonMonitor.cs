@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Management;
 using System.Windows.Interop;
 using System.Windows.Threading;
 
@@ -17,14 +18,17 @@ public sealed class HidMenuButtonMonitor : IDisposable
     private const int WmInputDeviceChange = 0x00FE;
     private const int GidcRemoval = 2;
     private const int RidInput = 0x10000003;
+    private const int RidDeviceName = 0x20000007;
     private const int RidDevicePreparsedData = 0x20000005;
     private const int RidevInputSink = 0x00000100;
     private const int RidevDevNotify = 0x00002000;
+    private const int RidevPageOnly = 0x00000020;
+    private const int RawInputTypeKeyboard = 1;
     private const int RawInputTypeHid = 2;
     private const ushort GenericDesktopUsagePage = 0x01;
-    private const ushort JoystickUsage = 0x04;
-    private const ushort GamepadUsage = 0x05;
     private const ushort ButtonUsagePage = 0x09;
+    private const ushort MsiDirectInputUsagePage = 0xFFF0;
+    private const ushort MsiDirectInputUsage = 0x0040;
     private const ushort XboxBackButtonUsage = 7;
     private const ushort XboxMenuButtonUsage = 8;
     private const int HidpStatusSuccess = 0x00110000;
@@ -38,10 +42,13 @@ public sealed class HidMenuButtonMonitor : IDisposable
     private readonly Dictionary<nint, HidDeviceMetadata> _devices = [];
     private readonly Dictionary<nint, HidButtonState> _deviceStates = [];
     private readonly Dictionary<nint, string> _lastPublishedUsageSignatures = [];
+    private readonly Dictionary<nint, ushort[]> _lastButtonUsages = [];
+    private readonly Dictionary<nint, byte[]> _lastRawReports = [];
     private readonly Thread _thread;
 
     private Dispatcher? _dispatcher;
     private HwndSource? _source;
+    private ManagementEventWatcher? _msiSpecialKeyWatcher;
     private bool _disposed;
     private volatile bool _isBackDown;
     private volatile bool _isMenuDown;
@@ -117,6 +124,7 @@ public sealed class HidMenuButtonMonitor : IDisposable
             _source = new HwndSource(parameters);
             _source.AddHook(WndProc);
             RegisterRawInputTargets(_source.Handle);
+            StartMsiSpecialKeyWatcher();
         }
         catch
         {
@@ -132,6 +140,8 @@ public sealed class HidMenuButtonMonitor : IDisposable
         }
 
         Dispatcher.Run();
+
+        StopMsiSpecialKeyWatcher();
 
         try
         {
@@ -182,6 +192,13 @@ public sealed class HidMenuButtonMonitor : IDisposable
                 return;
             }
 
+            var header = Marshal.PtrToStructure<RawInputHeader>(rawInputBuffer);
+            if (header.Type == RawInputTypeKeyboard)
+            {
+                ProcessRawKeyboard(rawInputBuffer, header);
+                return;
+            }
+
             var envelope = Marshal.PtrToStructure<RawInputHidEnvelope>(rawInputBuffer);
             if (envelope.Header.Type != RawInputTypeHid || envelope.Hid.SizeHid == 0 || envelope.Hid.Count == 0)
             {
@@ -209,7 +226,7 @@ public sealed class HidMenuButtonMonitor : IDisposable
                     report.Length);
 
                 var pressedButtonUsages = ReadPressedButtonUsages(metadata, report);
-                PublishReport(envelope.Header.Device, pressedButtonUsages, report.Length);
+                PublishReport(envelope.Header.Device, metadata, pressedButtonUsages, report);
 
                 if (pressedButtonUsages.Contains(XboxBackButtonUsage))
                 {
@@ -222,12 +239,51 @@ public sealed class HidMenuButtonMonitor : IDisposable
                 }
             }
 
-            UpdateDeviceState(envelope.Header.Device, isBackDown, isMenuDown);
+            // MSI's DirectInput mode exposes LT/RT as buttons 6/7 in addition
+            // to their analog axes. HID numbers those as usages 7/8, which are
+            // Back/Menu on an Xbox HID descriptor. Keep publishing the report
+            // for Live Detect, but never let the physical MSI endpoint drive
+            // global Steam shortcuts; the VIIPER XInput device is authoritative.
+            if (CanContributeToShortcutState(metadata.DeviceName))
+            {
+                UpdateDeviceState(envelope.Header.Device, isBackDown, isMenuDown);
+            }
+            else
+            {
+                UpdateDeviceState(envelope.Header.Device, isBackDown: false, isMenuDown: false);
+            }
         }
         finally
         {
             Marshal.FreeHGlobal(rawInputBuffer);
         }
+    }
+
+    internal static bool CanContributeToShortcutState(string deviceName) =>
+        !deviceName.Contains("VID_0DB0&PID_1902", StringComparison.OrdinalIgnoreCase);
+
+    private void ProcessRawKeyboard(nint rawInputBuffer, RawInputHeader header)
+    {
+        var envelope = Marshal.PtrToStructure<RawInputKeyboardEnvelope>(rawInputBuffer);
+        var isPressed = envelope.Keyboard.Message is 0x0100 or 0x0104;
+        var isReleased = envelope.Keyboard.Message is 0x0101 or 0x0105;
+        if (!isPressed && !isReleased)
+        {
+            return;
+        }
+
+        var deviceName = ReadDeviceName(header.Device);
+        var inputCode = $"keyboard:vk-{envelope.Keyboard.VirtualKey:X2}:scan-{envelope.Keyboard.MakeCode:X2}:flags-{(envelope.Keyboard.Flags & 0x0003):X}";
+        ReportObserved?.Invoke(new HidMenuButtonReport(
+            header.Device,
+            [],
+            false,
+            Marshal.SizeOf<RawKeyboard>(),
+            deviceName,
+            "keyboard",
+            inputCode,
+            isPressed,
+            $"VK 0x{envelope.Keyboard.VirtualKey:X2}, scan 0x{envelope.Keyboard.MakeCode:X2}"));
     }
 
     private HidDeviceMetadata? GetOrCreateDeviceMetadata(nint deviceHandle)
@@ -261,13 +317,13 @@ public sealed class HidMenuButtonMonitor : IDisposable
                 HidpReportType.Input,
                 ButtonUsagePage,
                 gcHandle.AddrOfPinnedObject());
-
-            if (maxUsageCount == 0)
-            {
-                return null;
-            }
-
-            metadata = new HidDeviceMetadata(preparsedData, maxUsageCount);
+            var capsStatus = HidP_GetCaps(gcHandle.AddrOfPinnedObject(), out var caps);
+            metadata = new HidDeviceMetadata(
+                preparsedData,
+                maxUsageCount,
+                ReadDeviceName(deviceHandle),
+                capsStatus == HidpStatusSuccess ? caps.UsagePage : (ushort)0,
+                capsStatus == HidpStatusSuccess ? caps.Usage : (ushort)0);
             _devices[deviceHandle] = metadata;
             return metadata;
         }
@@ -279,6 +335,11 @@ public sealed class HidMenuButtonMonitor : IDisposable
 
     private static ushort[] ReadPressedButtonUsages(HidDeviceMetadata metadata, byte[] report)
     {
+        if (metadata.MaxUsageCount == 0)
+        {
+            return [];
+        }
+
         var preparsedDataHandle = GCHandle.Alloc(metadata.PreparsedData, GCHandleType.Pinned);
         var reportHandle = GCHandle.Alloc(report, GCHandleType.Pinned);
 
@@ -328,20 +389,47 @@ public sealed class HidMenuButtonMonitor : IDisposable
 
         _deviceStates.Remove(deviceHandle);
         _lastPublishedUsageSignatures.Remove(deviceHandle);
+        _lastButtonUsages.Remove(deviceHandle);
+        _lastRawReports.Remove(deviceHandle);
         UpdateAggregateButtonStates();
     }
 
-    private void PublishReport(nint deviceHandle, IReadOnlyList<ushort> buttonUsages, int reportLength)
+    private void PublishReport(
+        nint deviceHandle,
+        HidDeviceMetadata metadata,
+        IReadOnlyList<ushort> buttonUsages,
+        byte[] report)
     {
         var handler = ReportObserved;
         if (handler is null)
         {
+            _lastButtonUsages[deviceHandle] = buttonUsages.ToArray();
+            _lastRawReports[deviceHandle] = report;
             return;
         }
 
-        var usageSignature = buttonUsages.Count == 0
-            ? "-"
-            : string.Join(",", buttonUsages);
+        var previousUsages = _lastButtonUsages.GetValueOrDefault(deviceHandle) ?? [];
+        var addedUsages = buttonUsages.Except(previousUsages).Order().ToArray();
+        var removedUsages = previousUsages.Except(buttonUsages).Order().ToArray();
+        var previousReport = _lastRawReports.GetValueOrDefault(deviceHandle);
+        var rawChanges = BuildRawChanges(previousReport, report);
+        _lastButtonUsages[deviceHandle] = buttonUsages.ToArray();
+        _lastRawReports[deviceHandle] = report;
+
+        var usesRawReportIdentity = metadata.UsagePage != GenericDesktopUsagePage;
+        var inputCode = addedUsages.Length > 0
+            ? $"hid-button:usage-{addedUsages[0]}"
+            : removedUsages.Length > 0
+                ? $"hid-button:usage-{removedUsages[0]}"
+                : usesRawReportIdentity && rawChanges.Count > 0
+                    ? $"hid-raw:{string.Join(",", rawChanges.Take(8))}"
+                    : string.Empty;
+        if (string.IsNullOrWhiteSpace(inputCode))
+        {
+            return;
+        }
+
+        var usageSignature = $"{inputCode}:{string.Join(",", buttonUsages)}";
         if (_lastPublishedUsageSignatures.TryGetValue(deviceHandle, out var previousSignature) &&
             string.Equals(previousSignature, usageSignature, StringComparison.Ordinal))
         {
@@ -353,7 +441,58 @@ public sealed class HidMenuButtonMonitor : IDisposable
             deviceHandle,
             buttonUsages.ToArray(),
             buttonUsages.Contains(XboxMenuButtonUsage),
-            reportLength));
+            report.Length,
+            metadata.DeviceName,
+            "hid",
+            inputCode,
+            addedUsages.Length > 0 || (usesRawReportIdentity && rawChanges.Any(change => !change.EndsWith("=00", StringComparison.Ordinal))),
+            addedUsages.Length > 0
+                ? $"HID button usage {addedUsages[0]}"
+                : $"HID usage page 0x{metadata.UsagePage:X4}, usage 0x{metadata.Usage:X4}, changed {string.Join(", ", rawChanges.Take(8))}"));
+    }
+
+    private static IReadOnlyList<string> BuildRawChanges(byte[]? previous, byte[] current)
+    {
+        if (previous is null || previous.Length != current.Length)
+        {
+            return [];
+        }
+
+        var changes = new List<string>();
+        for (var index = 0; index < current.Length; index++)
+        {
+            if (previous[index] != current[index])
+            {
+                changes.Add($"b{index}={current[index]:X2}");
+            }
+        }
+
+        return changes;
+    }
+
+    private static string ReadDeviceName(nint deviceHandle)
+    {
+        uint characterCount = 0;
+        if (GetRawInputDeviceInfo(deviceHandle, RidDeviceName, nint.Zero, ref characterCount) == unchecked((uint)-1) ||
+            characterCount == 0)
+        {
+            return string.Empty;
+        }
+
+        var buffer = Marshal.AllocHGlobal(checked((int)(characterCount + 1) * sizeof(char)));
+        try
+        {
+            if (GetRawInputDeviceInfo(deviceHandle, RidDeviceName, buffer, ref characterCount) == unchecked((uint)-1))
+            {
+                return string.Empty;
+            }
+
+            return Marshal.PtrToStringUni(buffer, (int)characterCount)?.TrimEnd('\0') ?? string.Empty;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     private void DisposeAllMetadata()
@@ -366,6 +505,8 @@ public sealed class HidMenuButtonMonitor : IDisposable
         _devices.Clear();
         _deviceStates.Clear();
         _lastPublishedUsageSignatures.Clear();
+        _lastButtonUsages.Clear();
+        _lastRawReports.Clear();
         _isBackDown = false;
         _isMenuDown = false;
     }
@@ -378,38 +519,172 @@ public sealed class HidMenuButtonMonitor : IDisposable
 
     private static void RegisterRawInputTargets(nint targetWindowHandle)
     {
-        var devices = new[]
+        var devices = new List<RawInputDevice>
         {
             new RawInputDevice
             {
                 UsagePage = GenericDesktopUsagePage,
-                Usage = JoystickUsage,
-                Flags = RidevInputSink | RidevDevNotify,
+                Usage = 0,
+                Flags = RidevInputSink | RidevDevNotify | RidevPageOnly,
                 Target = targetWindowHandle
             },
             new RawInputDevice
             {
-                UsagePage = GenericDesktopUsagePage,
-                Usage = GamepadUsage,
+                UsagePage = MsiDirectInputUsagePage,
+                Usage = MsiDirectInputUsage,
                 Flags = RidevInputSink | RidevDevNotify,
                 Target = targetWindowHandle
             }
         };
 
-        _ = RegisterRawInputDevices(devices, (uint)devices.Length, (uint)Marshal.SizeOf<RawInputDevice>());
+        foreach (var target in EnumerateAdditionalRawInputTargets(targetWindowHandle))
+        {
+            if (!devices.Any(device => device.UsagePage == target.UsagePage && device.Usage == target.Usage))
+            {
+                devices.Add(target);
+            }
+        }
+
+        _ = RegisterRawInputDevices(devices.ToArray(), (uint)devices.Count, (uint)Marshal.SizeOf<RawInputDevice>());
+    }
+
+    private void StartMsiSpecialKeyWatcher()
+    {
+        try
+        {
+            var scope = new ManagementScope("\\\\.\\root\\WMI");
+            _msiSpecialKeyWatcher = new ManagementEventWatcher(scope, new WqlEventQuery("SELECT * FROM MSI_Event"));
+            _msiSpecialKeyWatcher.EventArrived += OnMsiSpecialKeyEvent;
+            _msiSpecialKeyWatcher.Start();
+        }
+        catch
+        {
+            StopMsiSpecialKeyWatcher();
+        }
+    }
+
+    private void StopMsiSpecialKeyWatcher()
+    {
+        if (_msiSpecialKeyWatcher is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _msiSpecialKeyWatcher.EventArrived -= OnMsiSpecialKeyEvent;
+            _msiSpecialKeyWatcher.Stop();
+            _msiSpecialKeyWatcher.Dispose();
+        }
+        catch
+        {
+        }
+        finally
+        {
+            _msiSpecialKeyWatcher = null;
+        }
+    }
+
+    private void OnMsiSpecialKeyEvent(object sender, EventArrivedEventArgs args)
+    {
+        var rawValue = args.NewEvent.Properties["MSIEvt"]?.Value;
+        var eventCode = Convert.ToInt32(rawValue) & 0xFF;
+        var inputCode = eventCode switch
+        {
+            41 => "msi-wmi:event-41",
+            88 => "msi-wmi:event-88",
+            _ => string.Empty
+        };
+        if (string.IsNullOrEmpty(inputCode))
+        {
+            return;
+        }
+
+        ReportObserved?.Invoke(new HidMenuButtonReport(
+            0,
+            [],
+            false,
+            0,
+            "MSI_ACPI:MSI Claw",
+            "wmi",
+            inputCode,
+            true,
+            eventCode == 41 ? "MSI Center button (ACPI event 41)" : "Quick Settings button (ACPI event 88)"));
+    }
+
+    private static IEnumerable<RawInputDevice> EnumerateAdditionalRawInputTargets(nint targetWindowHandle)
+    {
+        uint count = 0;
+        var itemSize = (uint)Marshal.SizeOf<RawInputDeviceListEntry>();
+        if (GetRawInputDeviceList(null, ref count, itemSize) == unchecked((uint)-1) || count == 0)
+        {
+            yield break;
+        }
+
+        var entries = new RawInputDeviceListEntry[count];
+        if (GetRawInputDeviceList(entries, ref count, itemSize) == unchecked((uint)-1))
+        {
+            yield break;
+        }
+
+        foreach (var entry in entries.Take((int)count).Where(entry => entry.Type == RawInputTypeHid))
+        {
+            uint size = 0;
+            if (GetRawInputDeviceInfo(entry.Device, RidDevicePreparsedData, nint.Zero, ref size) == unchecked((uint)-1) || size == 0)
+            {
+                continue;
+            }
+
+            var data = Marshal.AllocHGlobal((int)size);
+            try
+            {
+                if (GetRawInputDeviceInfo(entry.Device, RidDevicePreparsedData, data, ref size) == unchecked((uint)-1) ||
+                    HidP_GetCaps(data, out var caps) != HidpStatusSuccess ||
+                    caps.UsagePage == GenericDesktopUsagePage)
+                {
+                    continue;
+                }
+
+                yield return new RawInputDevice
+                {
+                    UsagePage = caps.UsagePage,
+                    Usage = caps.Usage,
+                    Flags = RidevInputSink | RidevDevNotify,
+                    Target = targetWindowHandle
+                };
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(data);
+            }
+        }
     }
 
     private sealed class HidDeviceMetadata : IDisposable
     {
-        public HidDeviceMetadata(byte[] preparsedData, uint maxUsageCount)
+        public HidDeviceMetadata(
+            byte[] preparsedData,
+            uint maxUsageCount,
+            string deviceName,
+            ushort usagePage,
+            ushort usage)
         {
             PreparsedData = preparsedData;
-            MaxUsageCount = Math.Max(8u, maxUsageCount);
+            MaxUsageCount = maxUsageCount;
+            DeviceName = deviceName;
+            UsagePage = usagePage;
+            Usage = usage;
         }
 
         public byte[] PreparsedData { get; }
 
         public uint MaxUsageCount { get; }
+
+        public string DeviceName { get; }
+
+        public ushort UsagePage { get; }
+
+        public ushort Usage { get; }
 
         public void Dispose()
         {
@@ -448,6 +723,52 @@ public sealed class HidMenuButtonMonitor : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct RawKeyboard
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VirtualKey;
+        public uint Message;
+        public uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputKeyboardEnvelope
+    {
+        public RawInputHeader Header;
+        public RawKeyboard Keyboard;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputDeviceListEntry
+    {
+        public nint Device;
+        public uint Type;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HidpCaps
+    {
+        public ushort Usage;
+        public ushort UsagePage;
+        public ushort InputReportByteLength;
+        public ushort OutputReportByteLength;
+        public ushort FeatureReportByteLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)] public ushort[] Reserved;
+        public ushort NumberLinkCollectionNodes;
+        public ushort NumberInputButtonCaps;
+        public ushort NumberInputValueCaps;
+        public ushort NumberInputDataIndices;
+        public ushort NumberOutputButtonCaps;
+        public ushort NumberOutputValueCaps;
+        public ushort NumberOutputDataIndices;
+        public ushort NumberFeatureButtonCaps;
+        public ushort NumberFeatureValueCaps;
+        public ushort NumberFeatureDataIndices;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct RawInputDevice
     {
         public ushort UsagePage;
@@ -470,18 +791,27 @@ public sealed class HidMenuButtonMonitor : IDisposable
         ref uint size,
         uint headerSize);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", EntryPoint = "GetRawInputDeviceInfoW", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetRawInputDeviceInfo(
         nint device,
         int command,
         nint data,
         ref uint size);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputDeviceList(
+        [Out] RawInputDeviceListEntry[]? devices,
+        ref uint deviceCount,
+        uint size);
+
     [DllImport("hid.dll")]
     private static extern uint HidP_MaxUsageListLength(
         HidpReportType reportType,
         ushort usagePage,
         nint preparsedData);
+
+    [DllImport("hid.dll")]
+    private static extern int HidP_GetCaps(nint preparsedData, out HidpCaps capabilities);
 
     [DllImport("hid.dll")]
     private static extern int HidP_GetUsages(
@@ -499,4 +829,9 @@ public sealed record HidMenuButtonReport(
     nint DeviceHandle,
     IReadOnlyList<ushort> ButtonUsages,
     bool IsExpectedMenuUsagePressed,
-    int ReportLength);
+    int ReportLength,
+    string DeviceName = "",
+    string InputKind = "hid",
+    string InputCode = "",
+    bool IsPressed = true,
+    string Detail = "");

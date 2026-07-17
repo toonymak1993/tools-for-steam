@@ -9,7 +9,7 @@ namespace SteamLoader.App.Services;
 /// button behaves differently depending on what is in the foreground:
 /// <list type="bullet">
 /// <item>in Steam Big Picture: short press opens the left STEAM menu, hold opens the right Quick Access menu, and</item>
-/// <item>in a non-Steam game: only MENU / Start hold is handled, which raises the Steam overlay via Shift+Tab while short presses stay untouched for the game itself.</item>
+/// <item>in a non-Steam game: only MENU / Start hold is handled. Store Sync games without an injected overlay open Big Picture Quick Access in front of the game; all other games retain the Steam overlay shortcuts.</item>
 /// </list>
 /// Big Picture continues to use the regular XInput BACK button path because Steam
 /// already responds correctly there. In games, a separate Raw Input HID monitor
@@ -20,10 +20,10 @@ public sealed class ControllerShortcutService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(15);
 
-    // How long BACK must be held before it counts as a "hold" (Ctrl+2) instead
-    // of a "short press" (Ctrl+1). Tune to taste.
-    private static readonly TimeSpan HoldThreshold = TimeSpan.FromMilliseconds(350);
-    private static readonly TimeSpan InGameQuickAccessHoldThreshold = TimeSpan.FromMilliseconds(1100);
+    // Keep ordinary Start presses completely untouched. The primary hold is
+    // deliberately long enough that it cannot be triggered during normal play.
+    private static readonly TimeSpan HoldThreshold = TimeSpan.FromMilliseconds(1050);
+    private static readonly TimeSpan InGameQuickAccessHoldThreshold = TimeSpan.FromMilliseconds(3300);
 
     // XInput button mask for BACK / View (XINPUT_GAMEPAD_BACK).
     private const ushort XinputGamepadBack = 0x0020;
@@ -45,6 +45,7 @@ public sealed class ControllerShortcutService
     private readonly Func<Task<bool>> _openSteamMenuAsync;
     private readonly Func<Task<bool>> _openQuickAccessMenuAsync;
     private readonly Func<int, Task> _sendControlDigitAsync;
+    private readonly Func<Task<bool>> _tryOpenExternalGameQuickAccessAsync;
     private readonly Action<string>? _diagnosticLog;
     private readonly SemaphoreSlim _shortcutGate = new(1, 1);
 
@@ -65,6 +66,10 @@ public sealed class ControllerShortcutService
     /// the DevTools client in the background host as the final compatibility
     /// fallback.
     /// </param>
+    /// <param name="tryOpenExternalGameQuickAccessAsync">
+    /// Attempts the Store Sync fallback before sending in-game Steam shortcuts.
+    /// Returns false when the game has a native Steam overlay or is not managed by Store Sync.
+    /// </param>
     public ControllerShortcutService(
         Func<bool> isEnabled,
         Func<bool> isBigPictureForeground,
@@ -74,7 +79,8 @@ public sealed class ControllerShortcutService
         Func<Task<bool>> openQuickAccessMenuAsync,
         Func<int, Task> sendControlDigitAsync,
         Action<string>? diagnosticLog = null,
-        Func<bool>? isHidBackButtonDown = null)
+        Func<bool>? isHidBackButtonDown = null,
+        Func<Task<bool>>? tryOpenExternalGameQuickAccessAsync = null)
     {
         _isEnabled = isEnabled;
         _isBigPictureForeground = isBigPictureForeground;
@@ -84,6 +90,7 @@ public sealed class ControllerShortcutService
         _openSteamMenuAsync = openSteamMenuAsync;
         _openQuickAccessMenuAsync = openQuickAccessMenuAsync;
         _sendControlDigitAsync = sendControlDigitAsync;
+        _tryOpenExternalGameQuickAccessAsync = tryOpenExternalGameQuickAccessAsync ?? (() => Task.FromResult(false));
         _diagnosticLog = diagnosticLog;
     }
 
@@ -229,6 +236,13 @@ public sealed class ControllerShortcutService
 
     private async Task TriggerShortcutCoreAsync(ShortcutIntent intent)
     {
+        if ((intent is ShortcutIntent.Overlay or ShortcutIntent.InGameQuickAccess) &&
+            await _tryOpenExternalGameQuickAccessAsync())
+        {
+            Log($"external-game-quick-access handled intent={intent}");
+            return;
+        }
+
         if (intent == ShortcutIntent.Overlay)
         {
             var result = await TrySendKeyboardChordAsync(ShiftVirtualKey, TabVirtualKey);

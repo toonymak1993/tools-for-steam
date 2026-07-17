@@ -195,14 +195,13 @@ internal sealed class SteamOsPerformanceOverlayWindow : Window
         var widthLimit = Math.Max(240d, SystemParameters.WorkArea.Width - 12d);
         Width = Math.Min(widthLimit, Math.Max(minimumWidth, configuration.OverlayWidth));
 
-        var opacityFactor = configuration.OverlayLevel == 0 ? 0.35d : 0.72d;
-        var alpha = (byte)Math.Clamp((int)Math.Round(configuration.BackgroundOpacity * 2.55d * opacityFactor), 0, 255);
-        _rootBorder.Background = new SolidColorBrush(MediaColor.FromArgb(alpha, _activePalette.Background.R, _activePalette.Background.G, _activePalette.Background.B));
-        _rootBorder.BorderBrush = new SolidColorBrush(MediaColor.FromArgb((byte)Math.Clamp(alpha + 24, 0, 190), _activePalette.Border.R, _activePalette.Border.G, _activePalette.Border.B));
-        _rootBorder.BorderThickness = alpha > 12
-            ? new Thickness(configuration.OverlayLevel == 0 ? 0.5d : 1d)
-            : new Thickness(0d);
-        _rootBorder.CornerRadius = new CornerRadius(configuration.OverlayLevel == 0 ? 5d * _activeScale : 8d * _activeScale);
+        // Match SteamOS/MangoHud's background-free presentation: the WPF window and
+        // its content plate must both remain transparent. Keeping the border brush
+        // transparent as well avoids a faint grey outline at zero opacity.
+        _rootBorder.Background = MediaBrushes.Transparent;
+        _rootBorder.BorderBrush = MediaBrushes.Transparent;
+        _rootBorder.BorderThickness = new Thickness(0d);
+        _rootBorder.CornerRadius = new CornerRadius(0d);
         _rootBorder.Padding = configuration.OverlayLevel == 0
             ? new Thickness(8d * _activeScale, 3d * _activeScale, 8d * _activeScale, 4d * _activeScale)
             : new Thickness(10d * _activeScale, 8d * _activeScale, 10d * _activeScale, 9d * _activeScale);

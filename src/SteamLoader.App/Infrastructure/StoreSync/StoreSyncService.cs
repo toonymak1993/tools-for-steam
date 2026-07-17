@@ -17,6 +17,7 @@ public sealed class StoreSyncService
     private const string ManagedShortcutMarker = "steamloader://managed";
     private static readonly TimeSpan BaseAutomaticSyncFailureRetryDelay = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan ExpectedAutomationWriteIgnoreDuration = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan IncompleteArtworkRetryDelay = TimeSpan.FromHours(6);
     private static readonly TimeSpan[] OwnershipRepairFollowUpDelays =
     [
         TimeSpan.FromSeconds(3),
@@ -424,6 +425,103 @@ public sealed class StoreSyncService
                 .ThenBy(title => title.Title, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
+    }
+
+    internal StoreSyncManagedGameMatch? TryMatchManagedGame(
+        string executablePath,
+        string? processName = null)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath) && string.IsNullOrWhiteSpace(processName))
+        {
+            return null;
+        }
+
+        lock (_gate)
+        {
+            var normalizedExecutablePath = NormalizePath(executablePath);
+            var configuration = _settingsStore.Load();
+            var candidates = configuration.Manifest.Values
+                .Where(entry => entry is not null && IsManifestLifecycleManaged(entry))
+                .Select(entry => new
+                {
+                    Entry = entry,
+                    ExecutablePath = NormalizePath(entry.ExecutablePath),
+                })
+                .Where(candidate => !string.IsNullOrWhiteSpace(candidate.ExecutablePath))
+                .Select(candidate => new
+                {
+                    candidate.Entry,
+                    candidate.ExecutablePath,
+                    MatchScore = GetManagedGamePathMatchScore(
+                        normalizedExecutablePath,
+                        candidate.ExecutablePath,
+                        processName),
+                })
+                .Where(candidate => candidate.MatchScore < int.MaxValue)
+                .OrderBy(candidate => candidate.MatchScore)
+                .ThenByDescending(candidate => candidate.Entry.LastSeenAtUtc)
+                .ToArray();
+
+            var match = candidates.FirstOrDefault();
+            if (match is null)
+            {
+                return null;
+            }
+
+            // A protected Xbox process may only expose its process name to the
+            // elevated controller helper. Never guess when multiple managed
+            // games use the same executable name (for example "Game.exe").
+            if (match.MatchScore >= 10 &&
+                candidates.Count(candidate => candidate.MatchScore == match.MatchScore) != 1)
+            {
+                return null;
+            }
+
+            return new StoreSyncManagedGameMatch(
+                match.Entry.TitleId,
+                match.Entry.StoreId,
+                FirstNonEmpty(match.Entry.EffectiveTitle, match.Entry.Title) ?? match.Entry.TitleId,
+                match.ExecutablePath);
+        }
+    }
+
+    private static int GetManagedGamePathMatchScore(
+        string runningExecutablePath,
+        string managedExecutablePath,
+        string? processName)
+    {
+        if (!string.IsNullOrWhiteSpace(runningExecutablePath) &&
+            string.Equals(runningExecutablePath, managedExecutablePath, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        if (!string.IsNullOrWhiteSpace(runningExecutablePath))
+        {
+            try
+            {
+                var managedDirectory = Path.GetDirectoryName(managedExecutablePath);
+                if (!string.IsNullOrWhiteSpace(managedDirectory))
+                {
+                    var normalizedDirectory = Path.GetFullPath(managedDirectory)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                    if (Path.GetFullPath(runningExecutablePath)
+                        .StartsWith(normalizedDirectory, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return 1;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var managedProcessName = Path.GetFileNameWithoutExtension(managedExecutablePath);
+        return !string.IsNullOrWhiteSpace(processName) &&
+               string.Equals(processName.Trim(), managedProcessName, StringComparison.OrdinalIgnoreCase)
+            ? 10
+            : int.MaxValue;
     }
 
     public async Task<StoreSyncArtworkPreviewState> GetArtworkPreviewAsync(string titleId, CancellationToken cancellationToken)
@@ -891,7 +989,8 @@ public sealed class StoreSyncService
                 return false;
             }
 
-            if (!HasMeaningfulSyncWork(analysis))
+            if (!HasMeaningfulSyncWork(analysis) &&
+                !HasPendingArtworkWork(configuration, profile, analysis))
             {
                 RememberAppliedSyncSignature(syncSignature);
                 _lastFailedAutomaticSyncSignature = string.Empty;
@@ -1624,9 +1723,10 @@ public sealed class StoreSyncService
             }
 
             var actionKind = ResolveActionKind(configuration, overrideState, manifestEntry, existingShortcut);
+            var shortcutExecutablePath = ResolveShortcutExecutablePath(game);
             var targetAppId = actionKind is StoreSyncActionKind.RefreshManaged or StoreSyncActionKind.AdoptExisting or StoreSyncActionKind.SkipExisting
-                ? existingShortcut?.AppId ?? SteamShortcutIds.ComputeAppId(effectiveTitle, game.ExecutablePath)
-                : SteamShortcutIds.ComputeAppId(effectiveTitle, game.ExecutablePath);
+                ? existingShortcut?.AppId ?? SteamShortcutIds.ComputeAppId(effectiveTitle, shortcutExecutablePath)
+                : SteamShortcutIds.ComputeAppId(effectiveTitle, shortcutExecutablePath);
 
             var debugLines = BuildAnalysisDebugLines(
                 titleId,
@@ -1818,10 +1918,41 @@ public sealed class StoreSyncService
     private bool HasMeaningfulSyncWork(StoreSyncAnalysis analysis)
     {
         return analysis.CleanupCandidates.Count > 0 ||
-               analysis.Items.Any(item => item.ActionKind is
-                   StoreSyncActionKind.Create or
-                   StoreSyncActionKind.RefreshManaged or
-                   StoreSyncActionKind.AdoptExisting);
+               analysis.Items.Any(item =>
+                   item.ActionKind is StoreSyncActionKind.Create or StoreSyncActionKind.AdoptExisting ||
+                   item.ActionKind == StoreSyncActionKind.RefreshManaged && ManagedShortcutNeedsRefresh(item));
+    }
+
+    private static bool ManagedShortcutNeedsRefresh(StoreSyncAnalysisItem item)
+    {
+        if (item.ExistingShortcut is null)
+        {
+            return true;
+        }
+
+        var desiredEntry = CreateShortcutEntry(
+            item,
+            item.ExistingShortcut.AppId,
+            item.ExistingShortcut.Entry).Entry;
+        return !ShortcutEntriesEquivalent(item.ExistingShortcut.Entry, desiredEntry);
+    }
+
+    private bool HasPendingArtworkWork(
+        StoreSyncConfiguration configuration,
+        SteamProfileInfo profile,
+        StoreSyncAnalysis analysis)
+    {
+        if (!configuration.DownloadArtwork)
+        {
+            return false;
+        }
+
+        var gridDirectory = BuildGridDirectory(profile);
+        return analysis.Items.Any(item =>
+        {
+            configuration.ArtworkMatchCache.TryGetValue(item.TitleId, out var artworkCache);
+            return ShouldUpdateArtworkForItem(item, item.TargetAppId, artworkCache, gridDirectory);
+        });
     }
 
     private string BuildDesiredSyncSignature(
@@ -1846,9 +1977,9 @@ public sealed class StoreSyncService
                     action = NormalizeActionKindForSignature(item.ActionKind),
                     storeId = item.Game.StoreId,
                     title = item.Game.Title,
-                    executablePath = NormalizePath(item.Game.ExecutablePath),
-                    startDirectory = NormalizePath(item.Game.StartDirectory),
-                    launchOptions = item.Game.LaunchOptions ?? string.Empty,
+                    executablePath = NormalizePath(ResolveShortcutExecutablePath(item.Game)),
+                    startDirectory = NormalizePath(ResolveShortcutStartDirectory(item.Game)),
+                    launchOptions = ResolveShortcutLaunchOptions(item.Game),
                     item.EffectiveTitle,
                     item.EffectiveArtworkTitle,
                     item.TargetAppId,
@@ -4258,6 +4389,15 @@ public sealed class StoreSyncService
                     })
                     .ToArray();
 
+                var artworkAttemptedAtUtc = DateTimeOffset.UtcNow;
+                foreach (var item in artworkWorkItems)
+                {
+                    if (configuration.Manifest.TryGetValue(item.TitleId, out var manifestEntry) && manifestEntry is not null)
+                    {
+                        manifestEntry.LastArtworkAttemptAtUtc = artworkAttemptedAtUtc;
+                    }
+                }
+
                 await WarmArtworkMatchCacheAsync(configuration, artworkWorkItems, apiKey, CancellationToken.None);
                 artworkTargets.Clear();
                 foreach (var item in artworkWorkItems)
@@ -4879,20 +5019,21 @@ public sealed class StoreSyncService
             return true;
         }
 
-        if (!string.Equals(entry.ExecutablePath, NormalizePath(item.Game.ExecutablePath), StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(entry.ExecutablePath, NormalizePath(ResolveShortcutExecutablePath(item.Game)), StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(entry.ExecutablePath, NormalizePath(item.Game.ExecutablePath), StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
         var normalizedEntryLaunchOptions = NormalizeLaunchOptions(entry.LaunchOptions);
-        var normalizedGameLaunchOptions = NormalizeLaunchOptions(item.Game.LaunchOptions);
+        var normalizedGameLaunchOptions = NormalizeLaunchOptions(ResolveShortcutLaunchOptions(item.Game));
         if ((!string.IsNullOrWhiteSpace(normalizedEntryLaunchOptions) || !string.IsNullOrWhiteSpace(normalizedGameLaunchOptions)) &&
             !string.Equals(normalizedEntryLaunchOptions, normalizedGameLaunchOptions, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        var normalizedGameStartDirectory = NormalizePath(item.Game.StartDirectory);
+        var normalizedGameStartDirectory = NormalizePath(ResolveShortcutStartDirectory(item.Game));
         if (!string.IsNullOrWhiteSpace(normalizedGameStartDirectory) &&
             !string.IsNullOrWhiteSpace(entry.StartDirectory) &&
             !string.Equals(entry.StartDirectory, normalizedGameStartDirectory, StringComparison.OrdinalIgnoreCase))
@@ -5016,9 +5157,9 @@ public sealed class StoreSyncService
                 item.TitleId,
                 item.TargetAppId,
                 item.EffectiveTitle,
-                NormalizePath(item.Game.ExecutablePath),
-                NormalizePath(item.Game.StartDirectory),
-                item.Game.LaunchOptions ?? string.Empty,
+                NormalizePath(ResolveShortcutExecutablePath(item.Game)),
+                NormalizePath(ResolveShortcutStartDirectory(item.Game)),
+                ResolveShortcutLaunchOptions(item.Game),
                 NormalizePath(item.Game.ExecutablePath)))
             .ToArray();
 
@@ -5030,9 +5171,9 @@ public sealed class StoreSyncService
                 item.TargetAppId,
                 item.ExistingShortcut is null,
                 item.EffectiveTitle,
-                NormalizePath(item.Game.ExecutablePath),
-                NormalizePath(item.Game.StartDirectory),
-                item.Game.LaunchOptions ?? string.Empty,
+                NormalizePath(ResolveShortcutExecutablePath(item.Game)),
+                NormalizePath(ResolveShortcutStartDirectory(item.Game)),
+                ResolveShortcutLaunchOptions(item.Game),
                 NormalizePath(item.Game.ExecutablePath)))
             .ToArray();
 
@@ -5380,6 +5521,13 @@ public sealed class StoreSyncService
         var hasPrimaryArtwork = HasPrimaryArtworkFiles(gridDirectory, appId);
         if (!hasPrimaryArtwork)
         {
+            var lastAttemptAtUtc = item.ManifestEntry?.LastArtworkAttemptAtUtc;
+            if (lastAttemptAtUtc.HasValue &&
+                DateTimeOffset.UtcNow - lastAttemptAtUtc.Value < IncompleteArtworkRetryDelay)
+            {
+                return false;
+            }
+
             return true;
         }
 
@@ -6336,12 +6484,13 @@ public sealed class StoreSyncService
         string effectiveTitle,
         out ExistingShortcutEntry? existingShortcut)
     {
-        var normalizedExecutablePath = NormalizePath(game.ExecutablePath);
-        var normalizedStartDirectory = NormalizePath(game.StartDirectory);
-        var normalizedLaunchOptions = NormalizeLaunchOptions(game.LaunchOptions);
+        var normalizedExecutablePath = NormalizePath(ResolveShortcutExecutablePath(game));
+        var normalizedSourceExecutablePath = NormalizePath(game.ExecutablePath);
+        var normalizedStartDirectory = NormalizePath(ResolveShortcutStartDirectory(game));
+        var normalizedLaunchOptions = NormalizeLaunchOptions(ResolveShortcutLaunchOptions(game));
         var normalizedRawTitle = NormalizeKey(game.Title);
         var normalizedEffectiveTitle = NormalizeKey(effectiveTitle);
-        var expectedAppId = SteamShortcutIds.ComputeAppId(effectiveTitle, game.ExecutablePath);
+        var expectedAppId = SteamShortcutIds.ComputeAppId(effectiveTitle, normalizedExecutablePath);
         var manifestAppId = manifestEntry?.AppId ?? 0;
 
         if (string.Equals(game.StoreId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
@@ -6361,7 +6510,9 @@ public sealed class StoreSyncService
         }
 
         existingShortcut = existingEntries
-            .Where(entry => string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase))
+            .Where(entry =>
+                string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(entry.ExecutablePath, normalizedSourceExecutablePath, StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(entry => entry.IsManaged)
             .ThenBy(entry => string.Equals(NormalizeLaunchOptions(entry.LaunchOptions), normalizedLaunchOptions, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .ThenBy(entry => string.Equals(entry.StartDirectory, normalizedStartDirectory, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
@@ -6722,6 +6873,25 @@ public sealed class StoreSyncService
             item.Game.StoreId);
     }
 
+    private static string ResolveShortcutExecutablePath(StoreGameEntry game)
+    {
+        return string.Equals(game.StoreId, "xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+            ? Path.Combine(AppContext.BaseDirectory, "ToolsForSteam.exe")
+            : game.ExecutablePath;
+    }
+
+    private static string ResolveShortcutStartDirectory(StoreGameEntry game)
+    {
+        return game.StartDirectory;
+    }
+
+    private static string ResolveShortcutLaunchOptions(StoreGameEntry game)
+    {
+        return string.Equals(game.StoreId, "xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+            ? XboxStoreLaunchHost.BuildLaunchArguments(game.ExecutablePath, game.StartDirectory)
+            : game.LaunchOptions ?? string.Empty;
+    }
+
     private static ManagedShortcutEntry CreateShortcutEntry(
         StoreSyncAnalysisItem item,
         uint? appIdOverride = null,
@@ -6734,11 +6904,11 @@ public sealed class StoreSyncService
 
         entry["appid"] = unchecked((int)appId);
         entry["appname"] = item.EffectiveTitle;
-        entry["Exe"] = QuotePath(item.Game.ExecutablePath);
-        entry["StartDir"] = QuotePath(item.Game.StartDirectory);
+        entry["Exe"] = QuotePath(ResolveShortcutExecutablePath(item.Game));
+        entry["StartDir"] = QuotePath(ResolveShortcutStartDirectory(item.Game));
         entry["icon"] = item.Game.ExecutablePath;
         entry["ShortcutPath"] = ManagedShortcutMarker;
-        entry["LaunchOptions"] = item.Game.LaunchOptions;
+        entry["LaunchOptions"] = ResolveShortcutLaunchOptions(item.Game);
         entry["IsHidden"] = 0;
         entry["AllowDesktopConfig"] = 1;
         entry["AllowOverlay"] = 1;

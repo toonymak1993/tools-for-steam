@@ -153,7 +153,7 @@
     "native.display": "Reads and changes supported Windows display, resolution, and refresh-rate modes.",
     "native.themes": "Browses, installs, configures, and applies CSSLoader themes and profiles.",
     "native.artwork": "Searches SteamGridDB and writes selected artwork into Steam's grid folder.",
-    "native.app-start": "Manages and launches applications from the curated TFS App Start catalog.",
+    "native.app-start": "Indexes and launches installed desktop and packaged Windows apps.",
     "native.store-sync": "Reads launcher libraries and manages TFS Steam shortcut synchronization.",
     "native.automation": "Controls reviewed TFS automation integrations such as Auto SISR.",
     "native.performance": "Reads FPS, frame-time, CPU, memory, overlay, and target-process telemetry.",
@@ -1395,6 +1395,7 @@
         top: 50%;
         left: 50%;
         width: min(920px, calc(100vw - 72px));
+        height: min(720px, calc(100vh - 124px));
         max-height: calc(100vh - 124px);
         transform: translate(-50%, -50%);
         padding: 18px;
@@ -1428,6 +1429,10 @@
         flex-direction: column;
         gap: 12px;
         overflow: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+        scrollbar-color: rgba(102, 192, 244, 0.48) rgba(255, 255, 255, 0.05);
+        touch-action: pan-y;
         padding: 0 4px 4px 0;
       }
 
@@ -1468,6 +1473,10 @@
         flex-direction: column;
         gap: 12px;
         overflow: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+        scrollbar-color: rgba(102, 192, 244, 0.48) rgba(255, 255, 255, 0.05);
+        touch-action: pan-y;
         padding: 0 4px 4px 0;
       }
 
@@ -1895,6 +1904,7 @@
 
         .steamloader-plugin-store-context-menu {
           width: min(620px, calc(100vw - 32px));
+          height: min(760px, calc(100vh - 88px));
           max-height: calc(100vh - 88px);
           grid-template-columns: minmax(0, 1fr);
           grid-template-rows: auto auto minmax(0, 1fr);
@@ -2024,13 +2034,14 @@
   function announceStoreOverlayState(active) {
     postStoreMessage({
       type: "overlay-state",
+      source: "plugin-store",
       active: Boolean(active),
       expiresAt: active ? Date.now() + 1800 : 0,
     });
   }
 
   function startStoreOverlayAnnouncements() {
-    stopStoreOverlayAnnouncements();
+    stopStoreOverlayAnnouncements(false);
     announceStoreOverlayState(true);
     state.overlayAnnounceTimer = window.setInterval(() => {
       if (state.open) {
@@ -2039,13 +2050,19 @@
     }, 700);
   }
 
-  function stopStoreOverlayAnnouncements() {
+  function stopStoreOverlayAnnouncements(announceClosed = true) {
+    const wasAnnouncing = Boolean(state.overlayAnnounceTimer);
     if (state.overlayAnnounceTimer) {
       window.clearInterval(state.overlayAnnounceTimer);
       state.overlayAnnounceTimer = 0;
     }
 
-    announceStoreOverlayState(false);
+    // This script is injected into several Steam surfaces. A surface that never
+    // hosted the Store must not publish "closed", otherwise it can override the
+    // active host and reopen Quick Access over the freshly rendered Store.
+    if (announceClosed && wasAnnouncing) {
+      announceStoreOverlayState(false);
+    }
   }
 
   function setupStoreInputBridge() {
@@ -2169,7 +2186,10 @@
       item.focus({ preventScroll: true });
     }
 
-    if (item.closest(".steamloader-plugin-store-gallery")) {
+    if (
+      item.closest(".steamloader-plugin-store-gallery") ||
+      item.closest(".steamloader-plugin-store-context-panel")
+    ) {
       item.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
   }
@@ -2601,6 +2621,20 @@
     render();
   }
 
+  function scrollStoreContextPanel(direction) {
+    const panel = getStoreRoot()?.querySelector?.(".steamloader-plugin-store-context-panel");
+    if (!(panel instanceof HTMLElement)) {
+      return false;
+    }
+
+    const pageSize = Math.max(160, Math.round(panel.clientHeight * 0.72));
+    panel.scrollBy({
+      top: (direction < 0 ? -1 : 1) * pageSize,
+      behavior: "smooth",
+    });
+    return true;
+  }
+
   function moveStoreFocus(direction) {
     refreshStoreFocus();
     if (!state.focusItems.length) {
@@ -2758,6 +2792,7 @@
 
     if (action === "previous-section") {
       if (state.contextMenuPluginId) {
+        scrollStoreContextPanel(-1);
         return;
       }
       cycleStoreSection(-1);
@@ -2766,6 +2801,7 @@
 
     if (action === "next-section") {
       if (state.contextMenuPluginId) {
+        scrollStoreContextPanel(1);
         return;
       }
       cycleStoreSection(1);
@@ -4211,7 +4247,16 @@
       createNode("span", "steamloader-plugin-store-controller-key", "B"),
       createNode("span", "steamloader-plugin-store-controller-label", state.contextMenuPluginId ? "Back" : "Close"),
     );
-    controllerBar.append(openHint, closeHint);
+    const contextScrollHint = createNode("div", "steamloader-plugin-store-controller-hint");
+    contextScrollHint.append(
+      createNode("span", "steamloader-plugin-store-controller-key", "LB/RB"),
+      createNode("span", "steamloader-plugin-store-controller-label", "Scroll details"),
+    );
+    controllerBar.append(
+      openHint,
+      ...(state.contextMenuPluginId ? [contextScrollHint] : []),
+      closeHint,
+    );
     main.append(controllerBar);
 
     if (state.searchPadOpen) {

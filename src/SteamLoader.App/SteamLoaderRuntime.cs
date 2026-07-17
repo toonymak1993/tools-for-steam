@@ -28,6 +28,14 @@ internal static class SteamLoaderRuntime
     public const string RepairSteamStartupArgument = "--repair-steam-startup";
     public const string RestoreXboxModeArgument = "--restore-xbox-mode";
     public const string CheckXboxModeSupportArgument = "--check-xbox-mode-support";
+    public const string PrepareHandheldOemArgument = "--prepare-handheld-oem";
+    public const string PrepareHandheldReplacementArgument = "--prepare-handheld-replacement";
+    public const string SuspendHandheldReplacementForUpdateArgument = "--suspend-handheld-replacement-for-update";
+    public const string HandheldDataDirectoryArgumentPrefix = "--handheld-data-directory=";
+    public const string RestoreHandheldReplacementArgument = "--restore-handheld-replacement";
+    public const string RemoveOwnedHandheldDriversArgument = "--remove-owned-handheld-drivers";
+    public const string UsbIpOwnedByTfsArgument = "--usbip-owned-by-tfs";
+    public const string HidHideOwnedByTfsArgument = "--hidhide-owned-by-tfs";
     public const string SetStartupModeArgumentPrefix = "--set-startup-mode=";
     public const string StartupSyncArgument = "--startup-sync";
     public const string ShellBootstrapArgument = "--shell-bootstrap";

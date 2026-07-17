@@ -34,6 +34,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Installer payload publish failed."
 }
 
+& (Join-Path $PSScriptRoot "prepare-handheld-runtime.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "Handheld replacement runtime preparation failed."
+}
+
 $xboxHostPfxPath = if ($env:TFS_XBOX_HOST_PFX) {
     $env:TFS_XBOX_HOST_PFX
 } else {

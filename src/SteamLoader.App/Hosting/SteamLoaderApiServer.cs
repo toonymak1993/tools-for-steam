@@ -7,6 +7,7 @@ using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
+using SteamLoader.App.Infrastructure.Discord;
 using SteamLoader.App.Infrastructure.Hltb;
 using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Performance;
@@ -45,7 +46,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SmartHomeService _smartHomeService;
+    private readonly DiscordService _discordService;
     private readonly PluginFullTrustRuntime _pluginFullTrustRuntime;
+    private readonly ExternalGameQuickAccessService _externalGameQuickAccessService;
     private readonly SteamLoaderHostState _hostState;
     private readonly QuickAccessLiveUpdateHub _liveUpdateHub;
     private readonly HttpListener _listener;
@@ -83,7 +86,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         SteamFrontendComponentService frontendComponentService,
         SteamDevToolsClient devToolsClient,
         SmartHomeService smartHomeService,
+        DiscordService discordService,
         PluginFullTrustRuntime pluginFullTrustRuntime,
+        ExternalGameQuickAccessService externalGameQuickAccessService,
         Uri baseUri,
         string apiSessionToken,
         SteamLoaderHostState hostState,
@@ -108,7 +113,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _frontendComponentService = frontendComponentService;
         _devToolsClient = devToolsClient;
         _smartHomeService = smartHomeService;
+        _discordService = discordService;
         _pluginFullTrustRuntime = pluginFullTrustRuntime;
+        _externalGameQuickAccessService = externalGameQuickAccessService;
         _apiSessionToken = apiSessionToken;
         _hostState = hostState;
         _liveUpdateHub = liveUpdateHub;
@@ -357,6 +364,212 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     await _smartHomeService.GetSnapshotAsync(forceRefresh: true, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.GetSnapshotAsync(forceRefresh: false, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/control/external-game-quick-access")
+            {
+                var target = request.HasEntityBody
+                    ? await JsonSerializer.DeserializeAsync<ExternalGameQuickAccessTarget>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken)
+                    : null;
+                var handled = await _externalGameQuickAccessService.TryOpenForForegroundGameAsync(
+                    cancellationToken,
+                    target);
+                await WriteJsonAsync(
+                    response,
+                    handled ? HttpStatusCode.OK : HttpStatusCode.Conflict,
+                    new { handled, state = _externalGameQuickAccessService.GetState() },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/external-game-quick-access/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _externalGameQuickAccessService.GetState(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/external-game-quick-access/close-game")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _externalGameQuickAccessService.CloseCurrentGameAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/external-game-quick-access/return-game")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _externalGameQuickAccessService.ReturnToGame(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/refresh")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.GetSnapshotAsync(forceRefresh: true, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/widget/refresh")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.GetWidgetFallbackSnapshotAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/connect")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.ConnectAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/disconnect")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.DisconnectAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/guild/select")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<DiscordIdRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.SelectGuildAsync(payload?.Id, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/voice/join")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<DiscordIdRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.JoinVoiceChannelAsync(payload?.Id, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/guild/open")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<DiscordIdRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var target = await _discordService.OpenGuildAsync(payload?.Id, cancellationToken);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new { message = "Opened the Discord server.", target },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/settings")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetDiscordSettingsRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Discord settings are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.SaveSettingsAsync(
+                        payload.ApplicationId,
+                        payload.ServerId,
+                        payload.InviteUrl,
+                        cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/settings/clear")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.ClearSettingsAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/open")
+            {
+                var inviteUrl = await _discordService.OpenServerAsync(cancellationToken);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new { message = "Opened the Discord server invite.", inviteUrl },
                     cancellationToken);
                 return;
             }
@@ -2370,6 +2583,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/catalog/refresh")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _appStartService.RefreshCatalog(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/app-start/apps/add")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
@@ -2444,6 +2668,34 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 }
 
                 var appStartSnapshot = _appStartService.RemoveShortcut(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    appStartSnapshot,
+                    "app-start.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/app-start/apps/favorite")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An app ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var appStartSnapshot = _appStartService.ToggleFavorite(payload.Value);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -2639,6 +2891,157 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     JsonOptions,
                     cancellationToken);
                 var snapshot = _handheldPerformanceService.SetTdp(payload?.Watts ?? 0);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/display/brightness")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(response, HttpStatusCode.BadRequest,
+                        new { message = "A brightness value is required." }, cancellationToken);
+                    return;
+                }
+                await WriteJsonAsync(response, HttpStatusCode.OK,
+                    _displaySwitchService.SetBrightness(payload.Value), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/display/mode")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetDisplayModeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Resolution))
+                {
+                    await WriteJsonAsync(response, HttpStatusCode.BadRequest,
+                        new { message = "A resolution and refresh rate are required." }, cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(response, HttpStatusCode.OK,
+                    _displaySwitchService.SetModePreset(payload.Resolution, payload.RefreshRate), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/lighting")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldLightingRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetLighting(
+                    payload?.Enabled ?? false,
+                    payload?.Effect ?? "solid",
+                    payload?.LeftColor ?? "#000000",
+                    payload?.RightColor ?? "#000000",
+                    payload?.ButtonColor ?? payload?.LeftColor ?? "#000000",
+                    payload?.Brightness ?? 0);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/cpu-boost")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetHandheldCpuBoostRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetCpuBoost(
+                    payload?.PowerSource ?? "ac", payload?.Enabled ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/afmf")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetAfmf(payload?.Value ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/handheld-performance/oem-software/disable")
+            {
+                var snapshot = _handheldPerformanceService.SetOemSoftwareEnabled(false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetOemSoftwareEnabled(payload?.Value ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/vibration-strength")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetOemVibrationStrength(payload?.Value ?? 0);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/ui-haptics-enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetOemUiHapticsEnabled(payload?.Value ?? false);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/controller/ui-haptic")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<UiHapticRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var accepted = _handheldPerformanceService.RequestUiHaptic(payload?.Kind ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, new { accepted }, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/buttons/capture")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<OemButtonRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.StartOemButtonCapture(payload?.ButtonId ?? string.Empty);
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/buttons/capture/cancel")
+            {
+                var snapshot = _handheldPerformanceService.CancelOemButtonCapture();
+                await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/oem-software/buttons/binding")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetOemButtonBindingRequest>(
+                    request.InputStream, JsonOptions, cancellationToken);
+                var snapshot = _handheldPerformanceService.SetOemButtonBinding(
+                    payload?.ButtonId ?? string.Empty,
+                    payload?.ActionId ?? "none",
+                    payload?.CustomShortcut ?? string.Empty);
                 await WriteJsonAsync(response, HttpStatusCode.OK, snapshot, cancellationToken);
                 return;
             }
@@ -4278,6 +4681,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/app-start"] = "app-start",
             ["/api/auto-sisr"] = "auto-sisr",
             ["/api/display"] = "display",
+            ["/api/discord"] = "discord",
             ["/api/performance"] = "performance",
             ["/api/processes"] = "processes",
             ["/api/artwork"] = "artwork",
@@ -4568,8 +4972,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         {
             "getstate" => _appStartService.GetSnapshot(),
             "getcatalog" => _appStartService.GetCatalog(),
+            "refreshcatalog" => _appStartService.RefreshCatalog(),
             "add" => _appStartService.AddShortcut(GetCapabilityString(arguments, "appId")),
             "remove" => _appStartService.RemoveShortcut(GetCapabilityString(arguments, "shortcutId")),
+            "togglefavorite" => _appStartService.ToggleFavorite(GetCapabilityString(arguments, "shortcutId")),
             "launch" => _appStartService.LaunchShortcut(GetCapabilityString(arguments, "shortcutId")),
             _ => throw new InvalidOperationException($"Unknown native app-start operation ({operation}).")
         };
@@ -5076,6 +5482,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record SetHandheldTdpRequest(int Watts);
 
+    private sealed record SetHandheldLightingRequest(
+        bool Enabled, string Effect, string LeftColor, string RightColor, string ButtonColor, int Brightness);
+
     private sealed record SetHandheldPowerTdpRequest(int Watts, string PowerSource);
 
     private sealed record SetHandheldGameProfileRequest(string Key, int Watts, string PowerSource);
@@ -5086,7 +5495,18 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record SetBooleanValueRequest(bool Value);
 
+    private sealed record SetDiscordSettingsRequest(string ApplicationId, string ServerId, string InviteUrl);
+
+    private sealed record DiscordIdRequest(string Id);
+
     private sealed record SetIntegerValueRequest(int Value);
+    private sealed record SetDisplayModeRequest(string Resolution, int RefreshRate);
+    private sealed record SetHandheldCpuBoostRequest(string PowerSource, bool Enabled);
+
+    private sealed record OemButtonRequest(string ButtonId);
+    private sealed record UiHapticRequest(string Kind);
+
+    private sealed record SetOemButtonBindingRequest(string ButtonId, string ActionId, string CustomShortcut);
 
     private sealed record SetUpdateChannelRequest(string Channel);
 

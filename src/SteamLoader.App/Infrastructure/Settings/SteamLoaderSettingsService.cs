@@ -568,6 +568,8 @@ public sealed class SteamLoaderSettingsService
             XboxModeSupportReason: xboxModeSupport.Reason,
             HandheldPerformanceAvailable: HandheldDeviceCatalog.IsSupported(handheld),
             HandheldPerformanceTitle: handheld.DisplayName,
+            OemSoftwareAvailable: HandheldDeviceCatalog.IsSupported(handheld) && handheld.OemSoftware.Supported,
+            OemSoftwareTitle: handheld.OemSoftware.SoftwareName,
             Plugins: BuildPluginStates(settings));
     }
 

@@ -79,11 +79,27 @@ internal static class PerformanceForegroundTargetResolver
                 return null;
             }
 
-            return new ForegroundTargetCandidate(process.Id, process.ProcessName, title.Trim());
+            var executablePath = TryGetExecutablePath(process);
+            return new ForegroundTargetCandidate(process.Id, process.ProcessName, title.Trim(), executablePath)
+            {
+                WindowHandle = $"0x{windowHandle.ToInt64():X}",
+            };
         }
         catch
         {
             return null;
+        }
+    }
+
+    private static string TryGetExecutablePath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
         }
     }
 
@@ -147,5 +163,9 @@ internal static class PerformanceForegroundTargetResolver
 internal sealed record ForegroundTargetCandidate(
     int ProcessId,
     string ProcessName,
-    string WindowTitle);
+    string WindowTitle,
+    string ExecutablePath)
+{
+    public string WindowHandle { get; init; } = string.Empty;
+}
 

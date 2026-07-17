@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Management;
 
 namespace SteamLoader.App.Infrastructure.Display;
 
@@ -20,7 +21,9 @@ public sealed class DisplaySwitchService
 
     private static readonly ResolutionPreset[] ResolutionPresets =
     [
+        new("900p", "900p", 1600, 900),
         new("full-hd", "Full HD", 1920, 1080),
+        new("1200p", "1200p", 1920, 1200),
         new("2k", "2K", 2560, 1440),
         new("4k", "4K", 3840, 2160)
     ];
@@ -89,6 +92,49 @@ public sealed class DisplaySwitchService
         }
 
         ApplyMode(context.Device, candidate);
+        return GetModeSnapshot();
+    }
+
+    public DisplayModeSnapshot SetModePreset(string presetId, int refreshRate)
+    {
+        var preset = ResolutionPresets.FirstOrDefault(entry =>
+            string.Equals(entry.Id, presetId, StringComparison.OrdinalIgnoreCase));
+        if (preset is null || !RefreshRatePresets.Contains(refreshRate))
+        {
+            throw new InvalidOperationException("Unknown display mode preset.");
+        }
+
+        var context = ReadDisplayContext();
+        var candidate = context.Modes
+            .Where(mode => mode.Width == preset.Width && mode.Height == preset.Height)
+            .Where(mode => IsRefreshRateMatch(mode.RefreshRate, refreshRate))
+            .OrderBy(mode => Math.Abs(mode.RefreshRate - refreshRate))
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"{preset.Title} at {refreshRate}Hz is not available on the current display.");
+
+        ApplyMode(context.Device, candidate);
+        return GetModeSnapshot();
+    }
+
+    public DisplayModeSnapshot SetBrightness(int brightness)
+    {
+        var clamped = Math.Clamp(brightness, 0, 100);
+        using var searcher = new ManagementObjectSearcher(
+            @"root\WMI",
+            "SELECT * FROM WmiMonitorBrightnessMethods WHERE Active = TRUE");
+        using var results = searcher.Get();
+        var applied = false;
+        foreach (ManagementObject monitor in results)
+        {
+            monitor.InvokeMethod("WmiSetBrightness", [0u, (byte)clamped]);
+            applied = true;
+        }
+
+        if (!applied)
+        {
+            throw new InvalidOperationException("The internal display does not expose Windows brightness control.");
+        }
         return GetModeSnapshot();
     }
 
@@ -173,7 +219,27 @@ public sealed class DisplaySwitchService
             currentResolution,
             currentRefreshRate,
             resolutionStates,
-            refreshRateStates);
+            refreshRateStates,
+            ReadBrightness());
+    }
+
+    private static DisplayBrightnessState ReadBrightness()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                @"root\WMI",
+                "SELECT CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE");
+            using var results = searcher.Get();
+            foreach (ManagementObject monitor in results)
+            {
+                return new(true, Convert.ToInt32(monitor["CurrentBrightness"]), "Internal display brightness");
+            }
+        }
+        catch
+        {
+        }
+        return new(false, 0, "Brightness control is unavailable for the active display.");
     }
 
     private static DisplayModeCandidate? PickModeForResolution(DisplayContext context, ResolutionPreset preset)
@@ -444,7 +510,10 @@ public sealed record DisplayModeSnapshot(
     DisplayResolutionState? CurrentResolution,
     DisplayRefreshRateState? CurrentRefreshRate,
     IReadOnlyList<DisplayPresetState> ResolutionPresets,
-    IReadOnlyList<DisplayPresetState> RefreshRatePresets);
+    IReadOnlyList<DisplayPresetState> RefreshRatePresets,
+    DisplayBrightnessState Brightness);
+
+public sealed record DisplayBrightnessState(bool Supported, int Value, string StatusText);
 
 public sealed record DisplayDeviceState(
     string DeviceName,

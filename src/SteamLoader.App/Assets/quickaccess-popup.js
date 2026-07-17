@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 104;
+  const stateVersion = 108;
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
   const smartHomeSliderCommitSettleDelayMs = 1000;
@@ -55,6 +55,12 @@
     window.__steamLoaderFocusRepairHandler = null;
   }
 
+  if (window.__steamLoaderExternalGameVisibilityHandler) {
+    document.removeEventListener("visibilitychange", window.__steamLoaderExternalGameVisibilityHandler, true);
+    window.removeEventListener("pagehide", window.__steamLoaderExternalGameVisibilityHandler, true);
+    window.__steamLoaderExternalGameVisibilityHandler = null;
+  }
+
   const previousState = window.__steamLoaderPopupReactState;
   if (previousState?.version !== stateVersion) {
     try {
@@ -72,6 +78,14 @@
 
     if (previousState?.pluginStoreBridge?.quickAccessRestoreTimer) {
       window.clearTimeout(previousState.pluginStoreBridge.quickAccessRestoreTimer);
+    }
+
+    if (previousState?.externalGameQuickAccess?.closeArmTimer) {
+      window.clearTimeout(previousState.externalGameQuickAccess.closeArmTimer);
+    }
+
+    if (previousState?.externalGameQuickAccess?.tabOpenTimer) {
+      window.clearTimeout(previousState.externalGameQuickAccess.tabOpenTimer);
     }
 
     if (previousState?.pluginStoreBridge?.overlayStatePollTimer) {
@@ -161,6 +175,8 @@
             switching: false,
             modesLoading: false,
             modesSaving: false,
+            brightnessSaving: false,
+            brightnessCommitTimer: 0,
             error: "",
             status: "",
             modesSnapshot: null,
@@ -190,7 +206,13 @@
             globalTdpMutationSequences: {},
             profileTdpCommitTimers: {},
             profileTdpMutationSequences: {},
+            lightingCommitTimer: 0,
+            lightingMutationSequence: 0,
+            lightingTarget: "all",
             editingProfileKey: "",
+            oemShortcutDraftByButtonId: {},
+            oemShortcutInputVersionByButtonId: {},
+            oemVibrationCommitTimer: 0,
           },
           power: {
             actioning: false,
@@ -203,6 +225,16 @@
             activating: false,
             error: "",
             snapshot: null,
+          },
+          externalGameQuickAccess: {
+            loading: false,
+            closing: false,
+            error: "",
+            snapshot: null,
+            closeArmedUntil: 0,
+            closeArmTimer: 0,
+            tabOpenTimer: 0,
+            returnRequested: false,
           },
           appStart: {
             loading: false,
@@ -217,6 +249,16 @@
             saving: false,
             error: "",
             snapshot: null,
+          },
+          discord: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            applicationIdDraft: "",
+            serverIdDraft: "",
+            inviteUrlDraft: "",
+            inputVersion: 0,
           },
           artwork: {
             loading: false,
@@ -378,6 +420,7 @@
           pluginStoreBridge: {
             remoteActive: false,
             remoteActiveExpiresAt: 0,
+            activeOverlaySource: "",
             lastOverlayStateNonce: "",
             lastOverlayStateAt: 0,
             activationFallbackTimer: 0,
@@ -767,10 +810,25 @@
     const bridge = state.pluginStoreBridge;
     const wasActive = Boolean(bridge.remoteActive);
     const nextActive = Boolean(active);
+    const overlaySource = String(options.source || "").trim();
     bridge.remoteActive = nextActive;
     bridge.remoteActiveExpiresAt = nextActive
       ? Date.now() + (options.fromOverlay ? 2200 : 3600)
       : 0;
+
+    if (nextActive && overlaySource) {
+      bridge.activeOverlaySource = overlaySource;
+    } else if (!nextActive) {
+      bridge.activeOverlaySource = "";
+    }
+
+    if (nextActive && !options.fromOverlay) {
+      // The shared storage slot can still contain the overlay's last "closed"
+      // announcement when the Store button is pressed. Mark this as a local
+      // activation handshake so that stale state cannot reopen Quick Access
+      // before the overlay has had a chance to announce that it is active.
+      bridge.lastOverlayStateAt = 0;
+    }
 
     if (nextActive) {
       clearPluginStoreQuickAccessRestoreTimer();
@@ -805,10 +863,36 @@
         return;
       }
 
-      state.pluginStoreBridge.lastOverlayStateNonce = payload.nonce;
-      state.pluginStoreBridge.lastOverlayStateAt = Date.now();
-      const stillFresh = !payload.expiresAt || Number(payload.expiresAt) > Date.now();
-      setPluginStoreRemoteActive(Boolean(payload.active) && stillFresh, { fromOverlay: true });
+      const bridge = state.pluginStoreBridge;
+      const receivedAt = Date.now();
+      const stillFresh = !payload.expiresAt || Number(payload.expiresAt) > receivedAt;
+      const overlayActive = Boolean(payload.active) && stillFresh;
+      const overlaySource = String(payload.source || "").trim();
+
+      bridge.lastOverlayStateNonce = payload.nonce;
+      if (
+        !overlayActive &&
+        overlaySource &&
+        bridge.activeOverlaySource &&
+        overlaySource !== bridge.activeOverlaySource
+      ) {
+        return;
+      }
+
+      if (
+        !overlayActive &&
+        bridge.remoteActive &&
+        bridge.lastOverlayStateAt === 0 &&
+        receivedAt < bridge.remoteActiveExpiresAt
+      ) {
+        return;
+      }
+
+      bridge.lastOverlayStateAt = receivedAt;
+      setPluginStoreRemoteActive(overlayActive, {
+        fromOverlay: true,
+        source: overlaySource,
+      });
     } catch {
     }
   }
@@ -1121,6 +1205,18 @@
           title: "Splashscreen Themes",
           description: "Wallpaper, icon, text, and splash timing",
         },
+        {
+          id: "oem-software",
+          title: "OEM Software",
+          description: "Stop or restore the handheld vendor software",
+          requiresOemSoftware: true,
+        },
+        {
+          id: "button-mapping",
+          title: "Button Mapping",
+          description: "Detect and assign the handheld's extra buttons",
+          requiresOemSoftware: true,
+        },
       ],
     },
     {
@@ -1284,6 +1380,24 @@
       ],
     },
     {
+      id: "discord",
+      title: "Discord",
+      description: "See online friends and browse servers with presence counts",
+      defaultEnabled: false,
+      pages: [
+        {
+          id: "server",
+          title: "Friends",
+          description: "See only friends who are currently online, idle, busy, or streaming",
+        },
+        {
+          id: "settings",
+          title: "Settings",
+          description: "Manage Discord authorization and the optional widget fallback",
+        },
+      ],
+    },
+    {
       id: "themes",
       title: "CSSLoader",
       description: "Manage installed themes, store installs, presets, and backend tools",
@@ -1410,7 +1524,7 @@
     if (pluginId === "handheld-performance" && isPluginAvailable(pluginId)) {
       return {
         id: "handheld-performance",
-        title: state.generalSettings.snapshot?.handheldPerformanceTitle || "Handheld Performance",
+        title: "Handheld Performance",
         description: "Automatic per-game TDP profiles and device power controls",
         pages: [],
         isSystemCategory: true,
@@ -1418,6 +1532,82 @@
     }
 
     return plugins.find((plugin) => plugin.id === pluginId) || getCommunityPluginDefinition(pluginId);
+  }
+
+  function getVisiblePluginPages(plugin) {
+    const pages = Array.isArray(plugin?.pages) ? plugin.pages : [];
+    return pages.filter((page) =>
+      page?.requiresOemSoftware !== true || state.generalSettings.snapshot?.oemSoftwareAvailable === true,
+    );
+  }
+
+  const uiHapticLastAtByKind = {};
+  let uiHapticLastFocusKey = "";
+  let uiHapticSuppressMoveUntil = 0;
+
+  function requestUiHaptic(kind) {
+    const oem = state.handheldPerformance.snapshot?.oemSoftware;
+    if (
+      state.handheldPerformance.snapshot?.supported !== true ||
+      oem?.vibrationSupported !== true ||
+      oem?.uiHapticsEnabled !== true ||
+      Number(oem?.vibrationStrengthPercent || 0) <= 0
+    ) {
+      return false;
+    }
+
+    const now = performance.now();
+    const minimumInterval = kind === "move" ? 42 : 70;
+    if (now - Number(uiHapticLastAtByKind[kind] || 0) < minimumInterval) {
+      return false;
+    }
+    if (kind === "move" && now < uiHapticSuppressMoveUntil) {
+      return false;
+    }
+
+    uiHapticLastAtByKind[kind] = now;
+    if (kind === "confirm" || kind === "back") {
+      uiHapticSuppressMoveUntil = now + 180;
+    }
+
+    void fetch(`${apiBase}api/controller/ui-haptic`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+    }).catch(() => {});
+    return true;
+  }
+
+  function requestUiFocusHaptic(focusKey) {
+    const routeFocusKey = `${getRouteKey(state.route)}:${focusKey || "control"}`;
+    if (!uiHapticLastFocusKey) {
+      uiHapticLastFocusKey = routeFocusKey;
+      return;
+    }
+    if (uiHapticLastFocusKey === routeFocusKey) {
+      return;
+    }
+
+    uiHapticLastFocusKey = routeFocusKey;
+    requestUiHaptic("move");
+  }
+
+  function isOemSettingsRoute(route = state.route) {
+    return Boolean(
+      route?.screen === "page" &&
+      route?.pluginId === "settings" &&
+      (
+        route.pageId === "oem-software" ||
+        route.pageId === "button-mapping" ||
+        route.pageId?.startsWith("button-mapping-button-")
+      ),
+    );
+  }
+
+  function getOemButtonIdFromRoute(route = state.route) {
+    return isOemSettingsRoute(route) && route.pageId?.startsWith("button-mapping-button-")
+      ? route.pageId.replace(/^button-mapping-button-/, "")
+      : "";
   }
 
   function isPluginEnabled(pluginId) {
@@ -1754,6 +1944,14 @@
         grid-template-columns: auto minmax(0, 1fr) auto;
       }
 
+      .steamloader-row-shell.is-danger .steamloader-row-title {
+        color: #ff8f8f;
+      }
+
+      .steamloader-row-shell.is-danger .steamloader-row-copy {
+        color: rgba(255, 190, 190, 0.86);
+      }
+
       .steamloader-row-shell-subtle {
         gap: 10px;
         padding: 0;
@@ -1789,6 +1987,42 @@
         height: 100%;
         border-radius: inherit;
         object-fit: cover;
+      }
+
+      .steamloader-discord-avatar {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: inherit;
+      }
+
+      .steamloader-discord-presence-dot {
+        position: absolute;
+        right: -2px;
+        bottom: -2px;
+        width: 10px;
+        height: 10px;
+        border: 2px solid #18212b;
+        border-radius: 999px;
+        background: #80848e;
+        box-sizing: border-box;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.42);
+      }
+
+      .steamloader-discord-presence-dot.is-online,
+      .steamloader-discord-presence-dot.is-streaming {
+        background: #23a55a;
+      }
+
+      .steamloader-discord-presence-dot.is-idle {
+        background: #f0b232;
+      }
+
+      .steamloader-discord-presence-dot.is-dnd {
+        background: #f23f43;
       }
 
       .steamloader-row-shell-subtle .steamloader-row-icon {
@@ -3322,6 +3556,23 @@
         border-radius: 999px;
         background: rgba(255, 255, 255, 0.12);
       }
+
+      .steamloader-divider.steamloader-section-divider {
+        margin: 12px 2px;
+      }
+
+      .steamloader-divider.steamloader-before-slots-divider {
+        height: 2px;
+        margin: 18px 8px;
+        background: linear-gradient(
+          90deg,
+          rgba(118, 180, 238, 0) 0%,
+          rgba(118, 180, 238, 0.62) 18%,
+          rgba(218, 232, 245, 0.78) 50%,
+          rgba(118, 180, 238, 0.62) 82%,
+          rgba(118, 180, 238, 0) 100%
+        );
+      }
     `;
   }
 
@@ -3538,6 +3789,12 @@
       if (matchedIndex >= 0) {
         return matchedIndex;
       }
+
+      // Header actions are focusable, but intentionally live outside renderedSlots.
+      // Let the DOM focus restorer target them by key instead of auto-focusing a row.
+      if (pendingSlotKey.startsWith("header-action:")) {
+        return null;
+      }
     }
 
     if (hasPendingFocus && Number.isInteger(state.pendingFocusIndex)) {
@@ -3691,6 +3948,16 @@
       (Number.isInteger(index) && Array.isArray(state.renderedSlots)
         ? resolveSlotFocusKey(state.renderedSlots[index], index)
         : null);
+
+    if (
+      slotKey &&
+      state.pendingFocusRouteKey === routeKey &&
+      normalizeFocusSlotKey(state.pendingFocusSlotKey) === slotKey
+    ) {
+      state.pendingFocusRouteKey = null;
+      state.pendingFocusIndex = null;
+      state.pendingFocusSlotKey = null;
+    }
 
     if (Number.isInteger(index)) {
       rememberCurrentRouteSelection(index, slotKey || state.renderedSlots?.[index] || null);
@@ -3986,7 +4253,7 @@
       return null;
     }
 
-    for (const element of panel.querySelectorAll("[data-slot-button]")) {
+    for (const element of panel.querySelectorAll('[data-slot-button]:not([data-header-action="true"])')) {
       if (isFocusableSlotElement(element)) {
         return element;
       }
@@ -4226,7 +4493,7 @@
       return null;
     }
 
-    const pageIndex = plugin.pages.findIndex((page) => page.id === pageId);
+    const pageIndex = getVisiblePluginPages(plugin).findIndex((page) => page.id === pageId);
     return pageIndex >= 0 ? pageIndex : null;
   }
 
@@ -4401,6 +4668,7 @@
         return {
           route: parseRoute("root"),
           fallbackIndex: 0,
+          fallbackSlotKey: "header-action:settings",
         };
       }
 
@@ -4412,10 +4680,32 @@
     }
 
     if (route.screen === "page") {
+      if (route.pluginId === "discord") {
+        if (route.pageId === "settings") {
+          return {
+            route: parseRoute("page:discord:server"),
+            fallbackSlotKey: "discord-settings",
+          };
+        }
+
+        return {
+          route: parseRoute("root"),
+          fallbackIndex: getHomePluginIndex("discord"),
+        };
+      }
+
       if (route.pluginId === "settings") {
+        if (route.pageId?.startsWith("button-mapping-button-")) {
+          return {
+            route: parseRoute("page:settings:button-mapping"),
+            fallbackSlotKey: `oem-button-${route.pageId.replace(/^button-mapping-button-/, "")}`,
+          };
+        }
+
         return {
           route: parseRoute("root"),
           fallbackIndex: 0,
+          fallbackSlotKey: "header-action:settings",
         };
       }
 
@@ -4438,8 +4728,8 @@
       if (route.pluginId === "app-start" && route.pageId?.startsWith("app-")) {
         const shortcutId = route.pageId.replace(/^app-/, "");
         return {
-          route: parseRoute("plugin:app-start"),
-          fallbackIndex: getAppStartShortcutIndex(shortcutId),
+          route: { screen: "page", pluginId: "app-start", pageId: "add-app" },
+          fallbackIndex: getAppStartCatalogIndex(shortcutId),
         };
       }
 
@@ -5513,6 +5803,37 @@
     );
   }
 
+  function DiscordPluginIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M10.2 10.8C15.4 8.4 20.6 8.4 25.8 10.8C28.1 14.2 29.2 18.2 29 22.4C26.6 25.1 24.3 26.6 22 27.4L20.4 25.2C21.8 24.8 23 24.2 24 23.5C19.9 25.4 16.1 25.4 12 23.5C13 24.2 14.2 24.8 15.6 25.2L14 27.4C11.7 26.6 9.4 25.1 7 22.4C6.8 18.2 7.9 14.2 10.2 10.8Z",
+          stroke: "currentColor",
+          strokeWidth: "2.1",
+          strokeLinejoin: "round",
+        }),
+        createElement("circle", {
+          cx: "14",
+          cy: "18.5",
+          r: "1.8",
+          fill: "currentColor",
+        }),
+        createElement("circle", {
+          cx: "22",
+          cy: "18.5",
+          r: "1.8",
+          fill: "currentColor",
+        }),
+      ),
+    );
+  }
+
   function getPluginIconComponent(pluginId) {
     switch (pluginId) {
       case "audio":
@@ -5530,6 +5851,8 @@
         return AppStartPluginIcon;
       case "hltb":
         return HltbPluginIcon;
+      case "discord":
+        return DiscordPluginIcon;
       case "store-sync":
       case "unifystore":
         return StoreSyncPluginIcon;
@@ -6283,26 +6606,58 @@
   }
 
   function NativeDialogButton(content, onClick, options = {}) {
+    const extraProps = options.extraProps || {};
+    const originalGamepadFocus = extraProps.onGamepadFocus;
+    const originalCancel = extraProps.onCancelButton;
+    const focusKey =
+      extraProps["data-slot-key"] ||
+      extraProps["data-slot-button"] ||
+      options.slotKey ||
+      options.key ||
+      options.className ||
+      "control";
+    const wrappedOnClick = (event) => {
+      requestUiHaptic("confirm");
+      onClick?.(event);
+    };
+    const wrappedOptions = {
+      ...options,
+      extraProps: {
+        ...extraProps,
+        onGamepadFocus: (event) => {
+          requestUiFocusHaptic(String(focusKey));
+          originalGamepadFocus?.(event);
+        },
+        ...(typeof originalCancel === "function"
+          ? {
+              onCancelButton: (event) => {
+                requestUiHaptic("back");
+                originalCancel(event);
+              },
+            }
+          : {}),
+      },
+    };
     if (window.STFrontendLib?.createDialogButton) {
       return window.STFrontendLib.createDialogButton(
         state,
         createElement,
         content,
-        onClick,
-        options,
+        wrappedOnClick,
+        wrappedOptions,
       );
     }
 
     return createElement("button", {
       type: "button",
-      onClick,
-      onOKButton: onClick,
-      onActivate: onClick,
-      disabled: Boolean(options.disabled),
+      onClick: wrappedOnClick,
+      onOKButton: wrappedOnClick,
+      onActivate: wrappedOnClick,
+      disabled: Boolean(wrappedOptions.disabled),
       className: "steamloader-fallback-button",
       children: content,
-      ...(options.extraProps || {}),
-    }, options.slotKey || options.key || null);
+      ...(wrappedOptions.extraProps || {}),
+    }, wrappedOptions.slotKey || wrappedOptions.key || null);
   }
 
   function renderTrailingContent(slot) {
@@ -6547,6 +6902,7 @@
     }
 
     const HeaderActionIcon = action.icon || SettingsPluginIcon;
+    const focusKey = `header-action:${normalizeFocusSlotKey(action.key || action.title) || "action"}`;
     return NativeDialogButton(
       createElement(
         "div",
@@ -6555,14 +6911,24 @@
           createElement(HeaderActionIcon, {}),
         ),
       ),
-      action.onClick,
+      () => {
+        rememberCurrentRouteSelection(null, focusKey);
+        action.onClick();
+      },
       {
         disabled: action.disabled,
-        className: action.buttonClassName || "steamloader-dialog-button steamloader-header-action-button",
-        extraProps: {
+         className: action.buttonClassName || "steamloader-dialog-button steamloader-header-action-button",
+         extraProps: {
           "aria-label": action.title || "Action",
           title: action.title || "Action",
+          "data-slot-button": focusKey,
+          "data-slot-key": focusKey,
+          "data-header-action": "true",
           style: action.buttonStyle || undefined,
+          onGamepadFocus: () => {
+            rememberCurrentRouteSelection(null, focusKey);
+            action.onGamepadFocus?.();
+          },
         },
       },
     );
@@ -7093,9 +7459,9 @@
     );
   }
 
-  function createDivider(key) {
+  function createDivider(key, className = "") {
     return createElement("div", {
-      className: "steamloader-divider",
+      className: className ? `steamloader-divider ${className}` : "steamloader-divider",
       key,
       "aria-hidden": "true",
     });
@@ -8591,6 +8957,13 @@
     }
   }
 
+  function rerenderDiscordPanel() {
+    if (isCurrentPluginRoute("discord")) {
+      renderPanelDataRefresh();
+      return;
+    }
+  }
+
   function rerenderArtworkPanel() {
     if (isCurrentPluginRoute("artwork")) {
       renderPanelDataRefresh();
@@ -8708,6 +9081,7 @@
 
     if (
       !focusedPluginId ||
+      state.externalGameQuickAccess.snapshot?.active ||
       state.homeReorder.active ||
       state.generalSettings.loading ||
       state.generalSettings.saving
@@ -10405,6 +10779,9 @@
           ? model.editors.map((editor, index) => createEditorCard({ ...editor, inputKey: editor.inputKey || `editor-${index}` }))
           : []),
         model.volumePanel ? createVolumePanel(model.volumePanel) : null,
+        model.dividerBeforeSlots
+          ? createDivider("divider-before-slots", "steamloader-section-divider steamloader-before-slots-divider")
+          : null,
         createElement(
           "div",
           withChildren(
@@ -11027,38 +11404,6 @@
           },
         },
       ),
-      createPerformanceOptionSliderSlot({
-        title: "Background Theme",
-        copy: "Switch the overlay background tint without opening another metrics app.",
-        hint: "Use Left / Right to cycle the overlay theme live.",
-        slotKey: "performance-background-theme",
-        options: performanceBackgroundThemeOptions,
-        settingKey: "background-theme",
-        disabled: isPerformanceBusy(),
-        getValue: () => getPerformanceBackgroundTheme(),
-      }),
-      createPerformanceValueSliderSlot({
-        title: "Transparency",
-        copy: "Control how visible the background plate should be behind the metrics.",
-        hint: "Use Left / Right to change transparency live.",
-        slotKey: "performance-background-opacity",
-        min: 0,
-        max: 100,
-        step: 10,
-        disabled: isPerformanceBusy(),
-        getValue: () => getPerformanceBackgroundOpacity(),
-        displayValue: (value) => `${value}%`,
-        onAdjust: (direction) => {
-          void adjustPerformanceNumberSetting(
-            "background-opacity",
-            getPerformanceBackgroundOpacity(),
-            direction,
-            10,
-            0,
-            100,
-          );
-        },
-      }),
       createPerformanceValueSliderSlot({
         title: "Polling Rate",
         copy: "How often the TFS Overlay polls live metrics from the API.",
@@ -11175,6 +11520,36 @@
     return state.hltb.snapshot;
   }
 
+  function getDiscordSnapshot() {
+    return state.discord.snapshot;
+  }
+
+  function syncDiscordDrafts(forceRemount = false) {
+    const snapshot = getDiscordSnapshot();
+    state.discord.applicationIdDraft = snapshot?.applicationId || "";
+    state.discord.serverIdDraft = snapshot?.serverId || "";
+    state.discord.inviteUrlDraft = snapshot?.configuredInviteUrl || "";
+    if (forceRemount) {
+      state.discord.inputVersion += 1;
+    }
+  }
+
+  function isDiscordBusy() {
+    return state.discord.loading || state.discord.saving;
+  }
+
+  function resolveDiscordStatusText() {
+    if (state.discord.saving) {
+      return "Updating Discord...";
+    }
+
+    if (state.discord.loading) {
+      return "Loading Discord...";
+    }
+
+    return getDiscordSnapshot()?.statusText || "Connect Discord to see which friends are online.";
+  }
+
   function getDisplayModesSnapshot() {
     return state.display.modesSnapshot;
   }
@@ -11208,14 +11583,24 @@
     return Array.isArray(shortcuts) ? shortcuts.find((shortcut) => shortcut.id === shortcutId) || null : null;
   }
 
-  function getAppStartShortcutIndex(shortcutId) {
-    const shortcuts = getAppStartSnapshot()?.shortcuts;
-    if (!Array.isArray(shortcuts)) {
+  function getAppStartApp(appId) {
+    const visibleApp = getAppStartShortcut(appId);
+    if (visibleApp) {
+      return { ...visibleApp, hidden: false, added: true };
+    }
+
+    const apps = getAppStartCatalog()?.apps;
+    return Array.isArray(apps) ? apps.find((app) => app.id === appId) || null : null;
+  }
+
+  function getAppStartCatalogIndex(appId) {
+    const apps = getAppStartCatalog()?.apps;
+    if (!Array.isArray(apps)) {
       return null;
     }
 
-    const index = shortcuts.findIndex((shortcut) => shortcut.id === shortcutId);
-    return index >= 0 ? index + 1 : null;
+    const index = apps.findIndex((app) => app.id === appId);
+    return index >= 0 ? index : null;
   }
 
   function getGeneralSettingsSnapshot() {
@@ -11269,6 +11654,15 @@
       state.handheldPerformance.snapshot = null;
       requestFocusForRoute(parseRoute("root"), 0);
       state.route = parseRoute("root");
+    }
+
+    if (
+      state.generalSettings.snapshot &&
+      isOemSettingsRoute() &&
+      state.generalSettings.snapshot.oemSoftwareAvailable !== true
+    ) {
+      requestFocusForRoute({ screen: "plugin", pluginId: "settings", pageId: null }, 0);
+      state.route = { screen: "plugin", pluginId: "settings", pageId: null };
     }
   }
 
@@ -12536,12 +12930,15 @@
 
   function buildAppStartSummaryCard(shortcuts) {
     const count = Array.isArray(shortcuts) ? shortcuts.length : 0;
+    const favoriteCount = Array.isArray(shortcuts)
+      ? shortcuts.filter((shortcut) => Boolean(shortcut.favorite)).length
+      : 0;
 
     return {
-      title: "App Shortcuts",
+      title: "Installed Apps",
       lines: [
         count === 1 ? "1 app is ready to launch." : `${count} apps are ready to launch.`,
-        "Add apps from the Windows Start Menu, then launch them directly with the controller.",
+        favoriteCount === 1 ? "1 favorite is pinned at the top." : `${favoriteCount} favorites are pinned at the top.`,
       ],
     };
   }
@@ -12557,6 +12954,98 @@
         src: iconDataUri,
         alt: "",
       });
+    };
+  }
+
+  function buildDiscordMemberIcon(avatarUrl, presenceStatus = "") {
+    const normalizedStatus = ["online", "streaming", "idle", "dnd", "offline"].includes(presenceStatus)
+      ? presenceStatus
+      : "";
+    if (!avatarUrl && !normalizedStatus) {
+      return DiscordPluginIcon;
+    }
+
+    return function DiscordMemberIcon() {
+      return createElement(
+        "span",
+        withChildren(
+          { className: "steamloader-discord-avatar" },
+          avatarUrl
+            ? createElement("img", {
+                className: "steamloader-app-start-icon",
+                src: avatarUrl,
+                alt: "",
+              })
+            : createElement(DiscordPluginIcon, {}),
+          normalizedStatus
+            ? createElement("span", {
+                className: `steamloader-discord-presence-dot is-${normalizedStatus}`,
+                title: normalizedStatus === "dnd" ? "Do Not Disturb" : normalizedStatus,
+                "aria-label": normalizedStatus === "dnd" ? "Do Not Disturb" : normalizedStatus,
+              })
+            : null,
+        ),
+      );
+    };
+  }
+
+  function formatDiscordMemberStatus(member) {
+    const status = member?.status === "idle"
+      ? "Idle"
+      : member?.status === "dnd"
+        ? "Do Not Disturb"
+        : "Online";
+    return member?.voiceChannelName ? `${status} - ${member.voiceChannelName}` : status;
+  }
+
+  function formatDiscordVoiceParticipant(participant, channelName) {
+    const stateText = participant?.deafened
+      ? "Deafened"
+      : participant?.muted
+        ? "Muted"
+        : "In voice";
+    return `${stateText} - ${channelName}`;
+  }
+
+  function buildDiscordSetupCard() {
+    return {
+      title: "Optional Public Widget Fallback",
+      lines: [
+        "Use this only when local Discord account access is unavailable.",
+        "The server owner must enable Server Settings > Engagement > Server Widget.",
+        "Unlike account access, the fallback can show only information Discord exposes publicly.",
+      ],
+    };
+  }
+
+  function buildDiscordConnectionCard(snapshot) {
+    if (!snapshot?.applicationConfigured) {
+      return {
+        title: "Publisher Setup Required",
+        lines: [
+          "This development build does not contain the Tools for Steam Discord Application ID yet.",
+          "The publisher must embed a Public Client application with Discord Social SDK access.",
+        ],
+      };
+    }
+
+    if (!snapshot?.authorized) {
+      return {
+        title: "Connect Your Discord Account",
+        lines: [
+          "Select Connect Discord below.",
+          "Sign in in Discord's browser window and approve the requested presence access.",
+          "Tools for Steam then shows your Discord friends and their current online status.",
+        ],
+      };
+    }
+
+    return {
+      title: snapshot?.account?.displayName || "Discord Connected",
+      lines: [
+        `${snapshot?.onlineCount || 0} friends online.`,
+        "Only identity, friends, presence, and server-list access is requested.",
+      ],
     };
   }
 
@@ -13325,12 +13814,189 @@
       }
 
       setGeneralSettingsSnapshot(payload, { forceDraftSync: true });
+      if (
+        payload?.handheldPerformanceAvailable === true &&
+        !state.handheldPerformance.loading &&
+        !state.handheldPerformance.snapshot
+      ) {
+        // Load controller capabilities once at startup so UI haptics work
+        // throughout TFS, not only after visiting the OEM settings page.
+        void loadHandheldPerformanceState();
+      }
     } catch (error) {
       state.generalSettings.error = error instanceof Error ? error.message : String(error);
       state.generalSettings.snapshot = null;
     } finally {
       state.generalSettings.loading = false;
       rerenderGeneralSettingsPanel();
+    }
+  }
+
+  function setExternalGameQuickAccessSnapshot(snapshot) {
+    const wasActive = Boolean(state.externalGameQuickAccess.snapshot?.active);
+    state.externalGameQuickAccess.snapshot = snapshot && typeof snapshot === "object"
+      ? snapshot
+      : { active: false };
+    if (state.externalGameQuickAccess.snapshot.active && !wasActive) {
+      state.externalGameQuickAccess.returnRequested = false;
+      if (state.homeReorder.active) {
+        clearHomeReorderState({ restoreOriginalOrder: true });
+      }
+      const targetRoute = { screen: "root", pluginId: null, pageId: null };
+      requestFreshEntryForRoute(targetRoute, 0, 0);
+      setRoute(targetRoute);
+      scheduleExternalGameToolsTabOpen();
+    }
+
+    if (!state.externalGameQuickAccess.snapshot.active) {
+      state.externalGameQuickAccess.returnRequested = false;
+      if (state.externalGameQuickAccess.tabOpenTimer) {
+        window.clearTimeout(state.externalGameQuickAccess.tabOpenTimer);
+        state.externalGameQuickAccess.tabOpenTimer = 0;
+      }
+      state.externalGameQuickAccess.closeArmedUntil = 0;
+      if (state.externalGameQuickAccess.closeArmTimer) {
+        window.clearTimeout(state.externalGameQuickAccess.closeArmTimer);
+        state.externalGameQuickAccess.closeArmTimer = 0;
+      }
+    }
+  }
+
+  async function loadExternalGameQuickAccessState(options = {}) {
+    if (state.externalGameQuickAccess.loading) {
+      return;
+    }
+
+    state.externalGameQuickAccess.loading = true;
+    state.externalGameQuickAccess.error = "";
+    try {
+      const response = await fetch(`${apiBase}api/external-game-quick-access/state`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `External game Quick Access state could not be loaded (${response.status}).`);
+      }
+
+      setExternalGameQuickAccessSnapshot(payload);
+    } catch (error) {
+      state.externalGameQuickAccess.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.externalGameQuickAccess.loading = false;
+      if (options.render !== false && state.panelVisible && state.route?.screen === "root") {
+        rerenderHomePanel();
+      }
+    }
+  }
+
+  function ensureExternalGameQuickAccessVisibilityHandler() {
+    if (window.__steamLoaderExternalGameVisibilityHandler) {
+      return;
+    }
+
+    const handler = (event) => {
+      const surfaceHidden = event?.type === "pagehide" || document.visibilityState === "hidden";
+      if (
+        !surfaceHidden ||
+        !state.externalGameQuickAccess.snapshot?.active ||
+        state.externalGameQuickAccess.returnRequested
+      ) {
+        return;
+      }
+
+      state.externalGameQuickAccess.returnRequested = true;
+      void fetch(`${apiBase}api/external-game-quick-access/return-game`, {
+        method: "POST",
+        keepalive: true,
+      }).catch(() => {
+        state.externalGameQuickAccess.returnRequested = false;
+      });
+    };
+
+    window.__steamLoaderExternalGameVisibilityHandler = handler;
+    document.addEventListener("visibilitychange", handler, true);
+    window.addEventListener("pagehide", handler, true);
+  }
+
+  function scheduleExternalGameToolsTabOpen(attempt = 0) {
+    if (!state.externalGameQuickAccess.snapshot?.active) {
+      return;
+    }
+
+    if (state.externalGameQuickAccess.tabOpenTimer) {
+      window.clearTimeout(state.externalGameQuickAccess.tabOpenTimer);
+    }
+
+    state.externalGameQuickAccess.tabOpenTimer = window.setTimeout(() => {
+      state.externalGameQuickAccess.tabOpenTimer = 0;
+      if (!state.externalGameQuickAccess.snapshot?.active) {
+        return;
+      }
+
+      const tab = document.getElementById(`quickaccess_tab_${soundtrackTabKey}`) ||
+        document.querySelector(`[data-tab-key='${soundtrackTabKey}']`);
+      if (tab) {
+        tab.click?.();
+        return;
+      }
+
+      if (attempt < 20) {
+        scheduleExternalGameToolsTabOpen(attempt + 1);
+      }
+    }, attempt === 0 ? 0 : 100);
+  }
+
+  function armCloseCurrentGame() {
+    const externalState = state.externalGameQuickAccess.snapshot;
+    if (!externalState?.active || !externalState?.canCloseCurrentGame) {
+      return;
+    }
+
+    state.externalGameQuickAccess.closeArmedUntil = Date.now() + 5000;
+    if (state.externalGameQuickAccess.closeArmTimer) {
+      window.clearTimeout(state.externalGameQuickAccess.closeArmTimer);
+    }
+
+    state.externalGameQuickAccess.closeArmTimer = window.setTimeout(() => {
+      state.externalGameQuickAccess.closeArmTimer = 0;
+      state.externalGameQuickAccess.closeArmedUntil = 0;
+      if (state.panelVisible && state.route?.screen === "root") {
+        rerenderHomePanel();
+      }
+    }, 5100);
+    rerenderHomePanel();
+  }
+
+  async function closeCurrentExternalGame() {
+    const externalState = state.externalGameQuickAccess.snapshot;
+    if (!externalState?.active || state.externalGameQuickAccess.closing) {
+      return;
+    }
+
+    if (Date.now() > state.externalGameQuickAccess.closeArmedUntil) {
+      armCloseCurrentGame();
+      return;
+    }
+
+    state.externalGameQuickAccess.closing = true;
+    state.externalGameQuickAccess.error = "";
+    rerenderHomePanel();
+    try {
+      const response = await fetch(`${apiBase}api/external-game-quick-access/close-game`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The current game could not be closed (${response.status}).`);
+      }
+
+      setExternalGameQuickAccessSnapshot(payload);
+    } catch (error) {
+      state.externalGameQuickAccess.error = error instanceof Error ? error.message : String(error);
+      state.externalGameQuickAccess.closeArmedUntil = 0;
+    } finally {
+      state.externalGameQuickAccess.closing = false;
+      rerenderHomePanel();
     }
   }
 
@@ -13643,6 +14309,8 @@
     state.handheldPerformance.error = "";
     if (isCurrentPluginRoute("handheld-performance")) {
       renderPanelDataRefresh();
+    } else if (isOemSettingsRoute()) {
+      rerenderGeneralSettingsPanel();
     }
 
     try {
@@ -13652,14 +14320,137 @@
         throw new Error(payload.message || `Handheld performance could not be loaded (${response.status}).`);
       }
       state.handheldPerformance.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncOemShortcutDrafts(false);
     } catch (error) {
       state.handheldPerformance.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.handheldPerformance.loading = false;
       if (isCurrentPluginRoute("handheld-performance")) {
         renderPanelDataRefresh();
+      } else if (isOemSettingsRoute()) {
+        rerenderGeneralSettingsPanel();
       }
     }
+  }
+
+  function getOemSoftwareSnapshot() {
+    return state.handheldPerformance.snapshot?.oemSoftware || null;
+  }
+
+  function getOemButtonBinding(buttonId) {
+    const buttons = getOemSoftwareSnapshot()?.buttons;
+    return Array.isArray(buttons)
+      ? buttons.find((button) => button.buttonId === buttonId) || null
+      : null;
+  }
+
+  function syncOemShortcutDrafts(force = false) {
+    const buttons = getOemSoftwareSnapshot()?.buttons;
+    if (!Array.isArray(buttons)) {
+      return;
+    }
+
+    for (const button of buttons) {
+      if (force || !Object.prototype.hasOwnProperty.call(state.handheldPerformance.oemShortcutDraftByButtonId, button.buttonId)) {
+        state.handheldPerformance.oemShortcutDraftByButtonId[button.buttonId] = button.customShortcut || "";
+        if (force) {
+          state.handheldPerformance.oemShortcutInputVersionByButtonId[button.buttonId] =
+            Number(state.handheldPerformance.oemShortcutInputVersionByButtonId[button.buttonId] || 0) + 1;
+        }
+      }
+    }
+  }
+
+  async function sendOemSoftwareRequest(path, body = {}) {
+    if (state.handheldPerformance.saving) {
+      return false;
+    }
+
+    state.handheldPerformance.saving = true;
+    state.handheldPerformance.error = "";
+    rerenderGeneralSettingsPanel();
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The OEM software request failed (${response.status}).`);
+      }
+      state.handheldPerformance.snapshot = payload && typeof payload === "object" ? payload : null;
+      syncOemShortcutDrafts(false);
+      return true;
+    } catch (error) {
+      state.handheldPerformance.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.handheldPerformance.saving = false;
+      rerenderGeneralSettingsPanel();
+    }
+  }
+
+  async function setOemSoftwareEnabled(enabled) {
+    const succeeded = await sendOemSoftwareRequest("api/oem-software/enabled", { value: enabled });
+    if (succeeded) {
+      window.setTimeout(() => void loadHandheldPerformanceState(), 700);
+    }
+  }
+
+  async function setOemUiHapticsEnabled(enabled) {
+    await sendOemSoftwareRequest("api/oem-software/ui-haptics-enabled", { value: enabled });
+  }
+
+  function stepOemVibrationStrength(direction) {
+    const snapshot = state.handheldPerformance.snapshot;
+    const oem = snapshot?.oemSoftware;
+    if (!snapshot || oem?.vibrationSupported !== true || !direction) {
+      return;
+    }
+
+    const minimum = Number(oem.minimumVibrationStrengthPercent ?? 0);
+    const maximum = Number(oem.maximumVibrationStrengthPercent ?? 100);
+    const current = Number(oem.vibrationStrengthPercent ?? minimum);
+    const next = Math.max(minimum, Math.min(maximum, current + direction * 10));
+    if (next === current) {
+      return;
+    }
+
+    playSliderMoveSound(direction);
+    state.handheldPerformance.snapshot = {
+      ...snapshot,
+      oemSoftware: { ...oem, vibrationStrengthPercent: next },
+    };
+    syncVisibleSlotSliderUi();
+
+    if (state.handheldPerformance.oemVibrationCommitTimer) {
+      window.clearTimeout(state.handheldPerformance.oemVibrationCommitTimer);
+    }
+    state.handheldPerformance.oemVibrationCommitTimer = window.setTimeout(() => {
+      state.handheldPerformance.oemVibrationCommitTimer = 0;
+      void sendOemSoftwareRequest("api/oem-software/vibration-strength", { value: next });
+    }, 220);
+  }
+
+  async function startOemButtonCapture(buttonId) {
+    await sendOemSoftwareRequest("api/oem-software/buttons/capture", { buttonId });
+  }
+
+  async function cancelOemButtonCapture() {
+    await sendOemSoftwareRequest("api/oem-software/buttons/capture/cancel", {});
+  }
+
+  async function setOemButtonAction(buttonId, actionId) {
+    await sendOemSoftwareRequest("api/oem-software/buttons/binding", {
+      buttonId,
+      actionId,
+      customShortcut: state.handheldPerformance.oemShortcutDraftByButtonId[buttonId] || "",
+    });
+  }
+
+  async function saveOemCustomShortcut(buttonId) {
+    await setOemButtonAction(buttonId, "custom-shortcut");
   }
 
   async function sendHandheldPerformanceRequest(path, body, options = {}) {
@@ -13668,7 +14459,7 @@
     }
     state.handheldPerformance.saving = true;
     state.handheldPerformance.error = "";
-    if (options.silent !== true && isCurrentPluginRoute("handheld-performance")) {
+    if (options.silent !== true && options.noRender !== true && isCurrentPluginRoute("handheld-performance")) {
       renderPanelDataRefresh();
     }
     try {
@@ -13686,7 +14477,7 @@
       state.handheldPerformance.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.handheldPerformance.saving = false;
-      if (options.silent === true && isCurrentPluginRoute("handheld-performance")) {
+      if ((options.silent === true || options.noRender === true) && isCurrentPluginRoute("handheld-performance")) {
         syncVisibleSlotSliderUi();
       } else if (isCurrentPluginRoute("handheld-performance")) {
         renderPanelDataRefresh();
@@ -13705,6 +14496,8 @@
     state.handheldPerformance.snapshot = {
       ...snapshot,
       selectedTdpWatts: watts,
+      selectedSpptWatts: Math.min(40, watts + 5),
+      selectedFpptWatts: Math.min(48, watts + 13),
       selectedModeId: matchingMode?.id || "custom",
     };
     return true;
@@ -13754,6 +14547,83 @@
       syncVisibleSlotSliderUi();
     }
     queueHandheldTdpCommit(nextWatts);
+  }
+
+  function applyHandheldLighting(overrides = {}) {
+    const lighting = state.handheldPerformance.snapshot?.lighting;
+    if (!lighting) {
+      return;
+    }
+    const nextLighting = {
+      enabled: overrides.enabled ?? lighting.enabled,
+      effect: overrides.effect ?? lighting.effect,
+      leftColor: overrides.leftColor ?? lighting.leftColor,
+      rightColor: overrides.rightColor ?? lighting.rightColor,
+      buttonColor: overrides.buttonColor ?? lighting.buttonColor ?? lighting.leftColor,
+      brightness: overrides.brightness ?? lighting.brightness,
+    };
+    state.handheldPerformance.snapshot = {
+      ...state.handheldPerformance.snapshot,
+      lighting: { ...lighting, ...nextLighting },
+    };
+    syncVisibleSlotSliderUi();
+    const sequence = ++state.handheldPerformance.lightingMutationSequence;
+    const commit = () => {
+      if (sequence !== state.handheldPerformance.lightingMutationSequence) {
+        return;
+      }
+      if (state.handheldPerformance.saving) {
+        window.setTimeout(commit, 80);
+        return;
+      }
+      const current = state.handheldPerformance.snapshot?.lighting || nextLighting;
+      void sendHandheldPerformanceRequest(
+        "api/handheld-performance/lighting",
+        {
+          enabled: current.enabled,
+          effect: current.effect,
+          leftColor: current.leftColor,
+          rightColor: current.rightColor,
+          buttonColor: current.buttonColor,
+          brightness: current.brightness,
+        },
+        { noRender: true },
+      );
+    };
+    commit();
+  }
+
+  function queueHandheldLightingBrightness(brightness) {
+    const handheldState = state.handheldPerformance;
+    const lighting = handheldState.snapshot?.lighting;
+    if (!lighting) {
+      return;
+    }
+    handheldState.snapshot = {
+      ...handheldState.snapshot,
+      lighting: { ...lighting, brightness },
+    };
+    syncVisibleSlotSliderUi();
+    if (handheldState.lightingCommitTimer) {
+      window.clearTimeout(handheldState.lightingCommitTimer);
+    }
+    handheldState.lightingCommitTimer = window.setTimeout(() => {
+      handheldState.lightingCommitTimer = 0;
+      applyHandheldLighting({ brightness });
+    }, 250);
+  }
+
+  function applyHandheldLightingTargetColor(color) {
+    const target = state.handheldPerformance.lightingTarget || "all";
+    if (target === "left") {
+      applyHandheldLighting({ leftColor: color, effect: "dual-zone", enabled: true });
+    } else if (target === "right") {
+      applyHandheldLighting({ rightColor: color, effect: "dual-zone", enabled: true });
+    } else if (target === "buttons") {
+      applyHandheldLighting({ buttonColor: color, effect: "dual-zone", enabled: true });
+    } else {
+      applyHandheldLighting({ leftColor: color, rightColor: color, buttonColor: color, effect: "solid", enabled: true });
+    }
   }
 
   function previewHandheldGlobalTdp(powerSource, watts) {
@@ -13926,6 +14796,9 @@
       "handheld-applied-tdp": telemetry.appliedTdpConfirmed
         ? `${telemetry.appliedTdpWatts} W applied`
         : `${snapshot.selectedTdpWatts} W requested`,
+      "handheld-confirmed-spl": `SPL: ${Number(snapshot.confirmedSplWatts || 0) || "pending"} W`,
+      "handheld-confirmed-sppt": `SPPT: ${Number(snapshot.confirmedSpptWatts || 0) || "pending"} W`,
+      "handheld-confirmed-fppt": `FPPT: ${Number(snapshot.confirmedFpptWatts || 0) || "pending"} W`,
     };
 
     Object.entries(liveValues).forEach(([key, value]) => {
@@ -13957,6 +14830,40 @@
     } finally {
       state.hltb.loading = false;
       rerenderHltbPanel();
+    }
+  }
+
+  async function loadDiscordState(options = {}) {
+    const force = options.force === true;
+    state.discord.loading = true;
+    state.discord.error = "";
+    rerenderDiscordPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/discord/${force ? "refresh" : "state"}`, {
+        method: force ? "POST" : "GET",
+        headers: force ? { "Content-Type": "application/json" } : undefined,
+        body: force ? "{}" : undefined,
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Discord could not be loaded (${response.status}).`);
+      }
+
+      state.discord.snapshot = payload && typeof payload === "object" ? payload : null;
+      state.discord.error = state.discord.snapshot?.errorMessage || "";
+      if (options.preserveDrafts !== true) {
+        syncDiscordDrafts(true);
+      }
+    } catch (error) {
+      state.discord.error = error instanceof Error ? error.message : String(error);
+      if (!state.discord.snapshot) {
+        state.discord.snapshot = null;
+      }
+    } finally {
+      state.discord.loading = false;
+      rerenderDiscordPanel();
     }
   }
 
@@ -14520,7 +15427,7 @@
 
   async function openPluginStoreOverlay() {
     setupPluginStoreBridge();
-    setPluginStoreRemoteActive(true);
+    setPluginStoreRemoteActive(true, { source: "plugin-store" });
     closeQuickAccessMenuForPluginStoreSession();
 
     try {
@@ -14544,7 +15451,7 @@
 
   async function openUnifyStoreOverlay() {
     setupPluginStoreBridge();
-    setPluginStoreRemoteActive(true);
+    setPluginStoreRemoteActive(true, { source: "unifystore" });
     closeQuickAccessMenuForPluginStoreSession();
 
     try {
@@ -14700,6 +15607,110 @@
       state.hltb.saving = false;
       rerenderHltbPanel();
     }
+  }
+
+  async function refreshAppStartCatalog() {
+    state.appStart.catalogLoading = true;
+    state.appStart.error = "";
+    rerenderAppStartPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/app-start/catalog/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `App index could not be refreshed (${response.status}).`);
+      }
+
+      state.appStart.catalog = payload && typeof payload === "object" ? payload : null;
+      await loadAppStartState({ showLoading: false });
+    } catch (error) {
+      state.appStart.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.appStart.catalogLoading = false;
+      rerenderAppStartPanel();
+    }
+  }
+
+  async function sendDiscordRequest(path, bodyPayload = null, options = {}) {
+    state.discord.saving = true;
+    state.discord.error = "";
+    rerenderDiscordPanel();
+
+    try {
+      const response = await fetch(`${apiBase}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: bodyPayload === null ? "{}" : JSON.stringify(bodyPayload),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The Discord request failed (${response.status}).`);
+      }
+
+      if (options.updateSnapshot !== false && payload && typeof payload === "object") {
+        state.discord.snapshot = payload;
+        state.discord.error = payload.errorMessage || "";
+        syncDiscordDrafts(true);
+      }
+      return true;
+    } catch (error) {
+      state.discord.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.discord.saving = false;
+      rerenderDiscordPanel();
+    }
+  }
+
+  async function saveDiscordSettings() {
+    await sendDiscordRequest("api/discord/settings", {
+      applicationId: state.discord.applicationIdDraft || "",
+      serverId: state.discord.serverIdDraft || "",
+      inviteUrl: state.discord.inviteUrlDraft || "",
+    });
+  }
+
+  async function connectDiscord() {
+    await sendDiscordRequest("api/discord/connect");
+  }
+
+  async function disconnectDiscord() {
+    await sendDiscordRequest("api/discord/disconnect");
+  }
+
+  async function selectDiscordGuild(guildId) {
+    await sendDiscordRequest("api/discord/guild/select", { id: guildId || "" });
+  }
+
+  async function openDiscordGuild(guildId) {
+    await sendDiscordRequest("api/discord/guild/open", { id: guildId || "" }, { updateSnapshot: false });
+  }
+
+  async function joinDiscordVoiceChannel(channelId) {
+    await sendDiscordRequest("api/discord/voice/join", { id: channelId || "" });
+  }
+
+  async function openDiscordWidgetFallback() {
+    const opened = await sendDiscordRequest("api/discord/widget/refresh");
+    if (opened) {
+      const targetRoute = { screen: "page", pluginId: "discord", pageId: "server" };
+      requestFreshEntryForRoute(targetRoute, 0, 0);
+      setRoute(targetRoute);
+    }
+  }
+
+  async function clearDiscordSettings() {
+    await sendDiscordRequest("api/discord/settings/clear");
+  }
+
+  async function openDiscordServer() {
+    await sendDiscordRequest("api/discord/open", null, { updateSnapshot: false });
   }
 
   async function sendArtworkRequest(path, bodyPayload = null) {
@@ -15038,6 +16049,13 @@
         state.hltb.snapshot = null;
       }
 
+      if (!enabled && pluginId === "discord") {
+        state.discord.snapshot = null;
+        state.discord.applicationIdDraft = "";
+        state.discord.serverIdDraft = "";
+        state.discord.inviteUrlDraft = "";
+      }
+
       if (!enabled && pluginId === "artwork") {
         state.artwork.snapshot = null;
       }
@@ -15255,9 +16273,6 @@
     const succeeded = await sendAppStartRequest("api/app-start/apps/add", { value: appId });
     if (succeeded) {
       await loadAppStartCatalog();
-      const shortcut = getAppStartSnapshot()?.shortcuts?.find((entry) => entry.id === appId);
-      requestFocusForRoute(parseRoute("plugin:app-start"), getAppStartShortcutIndex(shortcut?.id || appId));
-      setRoute(parseRoute("plugin:app-start"));
     }
   }
 
@@ -15268,9 +16283,14 @@
   async function removeAppStartShortcut(shortcutId) {
     const succeeded = await sendAppStartRequest("api/app-start/apps/remove", { value: shortcutId });
     if (succeeded) {
-      state.appStart.catalog = null;
-      requestFocusForRoute(parseRoute("plugin:app-start"), 0);
-      setRoute(parseRoute("plugin:app-start"));
+      await loadAppStartCatalog();
+    }
+  }
+
+  async function toggleAppStartFavorite(shortcutId) {
+    const succeeded = await sendAppStartRequest("api/app-start/apps/favorite", { value: shortcutId });
+    if (succeeded) {
+      await loadAppStartCatalog();
     }
   }
 
@@ -16555,7 +17575,11 @@
       const currentGame = snapshot?.currentGame || null;
       const activeProfile = snapshot?.activeProfile || null;
       const profiles = Array.isArray(snapshot?.profiles) ? snapshot.profiles : [];
+      const lighting = snapshot?.lighting || null;
+      const lightingSupported = Boolean(lighting?.supported);
       const editingProfile = profiles.find((profile) => profile.key === state.handheldPerformance.editingProfileKey) || null;
+      const formatOemPowerLimits = (watts) =>
+        `SPL ${watts} W · SPPT ${Math.min(40, Number(watts) + 5)} W · FPPT ${Math.min(48, Number(watts) + 13)} W`;
       const modeSlots = modes.map((mode) =>
         makeCommandSlot(
           mode.title,
@@ -16569,22 +17593,19 @@
         ),
       );
       const tdpSlider = createPerformanceValueSliderSlot({
-        title: `${currentGame?.title || "Game"} TDP`,
-        copy: supported ? "Saved automatically for the active game" : "No supported device detected",
-        hint: "Left / Right changes TDP by 1 watt.",
-        slotKey: "handheld-tdp-slider",
-        min: minimumWatts,
-        max: maximumWatts,
-        step: 1,
+        title: currentGame?.title ? `${currentGame.title} TDP` : "Global TDP",
+        copy: `Applies ${formatOemPowerLimits(selectedWatts)}`,
+        hint: "Left / Right changes the profile by 1 watt.",
+        slotKey: "handheld-tdp-slider", min: minimumWatts, max: 35, step: 1,
         disabled: busy || !supported,
-        getValue: () => selectedWatts,
+        getValue: () => Number(state.handheldPerformance.snapshot?.selectedTdpWatts || selectedWatts),
         displayValue: (value) => `${value} W`,
         onAdjust: (direction) => stepHandheldTdp(direction),
       });
       const createGlobalTdpSlider = (source, title, watts) => createPerformanceValueSliderSlot({
         title,
         copy: supported
-          ? `${minimumWatts}-${maximumWatts} W fallback for games without their own ${source} profile`
+          ? `${formatOemPowerLimits(watts)} · fallback for games without their own ${source} profile`
           : "No supported device detected",
         hint: "Left / Right changes this persistent profile by 1 watt.",
         slotKey: `handheld-global-${source}-tdp-slider`,
@@ -16622,7 +17643,7 @@
         ? [
             createPerformanceValueSliderSlot({
               title: `${editingProfile.title} - Plugged In`,
-              copy: "Saved TDP while the charger is connected.",
+              copy: `${formatOemPowerLimits(getHandheldProfileTdp(editingProfile, "ac"))} · charger connected`,
               hint: "Left / Right changes the game profile by 1 watt.",
               slotKey: `handheld-profile-editor-${editingProfile.key}-ac`,
               min: minimumWatts,
@@ -16635,7 +17656,7 @@
             }),
             createPerformanceValueSliderSlot({
               title: `${editingProfile.title} - Battery`,
-              copy: "Saved TDP while running from the internal battery.",
+              copy: `${formatOemPowerLimits(getHandheldProfileTdp(editingProfile, "battery"))} · internal battery`,
               hint: "Left / Right changes the game profile by 1 watt.",
               slotKey: `handheld-profile-editor-${editingProfile.key}-battery`,
               min: minimumWatts,
@@ -16665,16 +17686,202 @@
             ),
           ]
         : [];
-      const activeGameSlots = currentGame ? [tdpSlider] : [];
-      const globalProfileStartIndex = 2;
-      const activeGameStartIndex = globalProfileStartIndex + globalTdpSliders.length;
-      const modeStartIndex = activeGameStartIndex + activeGameSlots.length;
-      const profileStartIndex = modeStartIndex + modeSlots.length;
-      const profileEditorStartIndex = profileStartIndex + profileSlots.length;
-      const maintenanceStartIndex = profileEditorStartIndex + profileEditorSlots.length;
+      const lightingColors = [
+        ["Steam Blue", "#66C0F4"], ["Red", "#FF3B4F"], ["Green", "#55D66B"],
+        ["Purple", "#A855F7"], ["Orange", "#FF9F43"], ["White", "#FFFFFF"],
+      ];
+      const lightingExpanded = lightingSupported && isExpandedSection("handheld-rgb-lighting", false);
+      const lightingTargets = ["all", "left", "right", "buttons"];
+      const lightingControlSlots = lightingExpanded ? [
+        makeSettingToggleSlot(
+          "handheld-performance", "rgb-enabled", "RGB Lighting",
+          "Enable or disable the button and stick lighting.", lighting?.enabled !== false,
+          () => applyHandheldLighting({ enabled: lighting?.enabled === false }),
+          { disabled: busy },
+        ),
+        createPerformanceValueSliderSlot({
+          title: "RGB Brightness", copy: lighting?.statusText || "MSI controller lighting",
+          hint: "Left / Right changes brightness by 5 percent.", slotKey: "handheld-rgb-brightness",
+          min: 0, max: 100, step: 5, disabled: busy || lighting?.enabled === false,
+          getValue: () => Number(lighting?.brightness || 0), displayValue: (value) => `${value}%`,
+          onAdjust: (direction) => {
+            const current = Number(state.handheldPerformance.snapshot?.lighting?.brightness || 0);
+            queueHandheldLightingBrightness(Math.max(0, Math.min(100, current + direction * 5)));
+          },
+        }),
+        createPerformanceValueSliderSlot({
+          title: "Color Target", copy: "Choose whether colors affect everything, one stick side, or the buttons.",
+          hint: "Left / Right selects the RGB zone.", slotKey: "handheld-rgb-target",
+          min: 0, max: lightingTargets.length - 1, step: 1, disabled: busy,
+          getValue: () => Math.max(0, lightingTargets.indexOf(state.handheldPerformance.lightingTarget || "all")),
+          displayValue: (value) => ({ all: "All LEDs", left: "Left stick", right: "Right stick", buttons: "Buttons" })[lightingTargets[value]] || "All LEDs",
+          onAdjust: (direction) => {
+            const current = Math.max(0, lightingTargets.indexOf(state.handheldPerformance.lightingTarget || "all"));
+            const next = Math.max(0, Math.min(lightingTargets.length - 1, current + direction));
+            state.handheldPerformance.lightingTarget = lightingTargets[next];
+            syncVisibleSlotSliderUi();
+          },
+        }),
+        makeCommandSlot(
+          "Dual-zone Effect", "Use separate colors for the left and right controls.",
+          () => applyHandheldLighting({ effect: lighting?.effect === "dual-zone" ? "solid" : "dual-zone" }),
+          { slotKey: "handheld-rgb-effect", disabled: busy, selected: lighting?.effect === "dual-zone" },
+        ),
+        makeCommandSlot(
+          "Ice & Fire", "Blue left zone and red right zone.",
+          () => applyHandheldLighting({ leftColor: "#3B82F6", rightColor: "#FF3B4F", effect: "dual-zone", enabled: true }),
+          { slotKey: "handheld-rgb-ice-fire", disabled: busy },
+        ),
+        makeCommandSlot(
+          "Steam Split", "Steam blue left zone and purple right zone.",
+          () => applyHandheldLighting({ leftColor: "#66C0F4", rightColor: "#A855F7", effect: "dual-zone", enabled: true }),
+          { slotKey: "handheld-rgb-steam-split", disabled: busy },
+        ),
+        ...lightingColors.map(([title, color]) => makeCommandSlot(
+          title, `Apply ${color} to the selected RGB target.`,
+          () => applyHandheldLightingTargetColor(color),
+          { slotKey: `handheld-rgb-${color}`, disabled: busy, selected: lighting?.effect === "solid" && lighting?.leftColor === color },
+        )),
+      ] : [];
+      const lightingSlots = lightingSupported ? [
+        makeAccordionSlot(
+          "RGB Lighting",
+          lighting?.enabled === false ? "Off" : `${lighting?.brightness || 0}% · ${lighting?.effect === "dual-zone" ? "separate zones" : "solid color"}`,
+          lightingExpanded,
+          () => {
+            toggleExpandedSection("handheld-rgb-lighting", false);
+            renderPanelDataRefresh();
+          },
+          { slotKey: "handheld-rgb-accordion", leadingIcon: PerformancePluginIcon },
+        ),
+        ...lightingControlSlots,
+      ] : [];
+      const tdpExpanded = isExpandedSection("handheld-tdp", true);
+      const profilesExpanded = isExpandedSection("handheld-game-profiles", false);
+      const cpuExpanded = isExpandedSection("handheld-cpu-boost", false);
+      const displayExpanded = isExpandedSection("handheld-display", false);
+      const afmfExpanded = isExpandedSection("handheld-afmf", false);
+      const maintenanceExpanded = isExpandedSection("handheld-maintenance", false);
+      const accordion = (key, title, copy, expanded, children, defaultExpanded = false) => [
+        makeAccordionSlot(title, copy, expanded, () => {
+          toggleExpandedSection(key, defaultExpanded);
+          renderPanelDataRefresh();
+        }, { slotKey: `${key}-accordion`, leadingIcon: PerformancePluginIcon }),
+        ...(expanded ? children : []),
+      ];
+      const profileControls = [
+        makeSettingToggleSlot(
+          "handheld-performance", "automatic-profiles", "Automatic Game Profiles",
+          "Apply a saved TDP when a Steam game starts and restore the global profile afterwards.",
+          snapshot?.autoProfilesEnabled !== false,
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/profiles/auto-enabled",
+            { value: snapshot?.autoProfilesEnabled === false }, { noRender: true }),
+          { disabled: busy || !supported },
+        ),
+        makeSettingToggleSlot(
+          "handheld-performance", "profile-notifications", "Windows Profile Notifications",
+          "Show a notification when an automatic profile is applied.",
+          snapshot?.profileNotificationsEnabled !== false,
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/profiles/notifications-enabled",
+            { value: snapshot?.profileNotificationsEnabled === false }, { noRender: true }),
+          { disabled: busy || !supported },
+        ),
+        ...profileSlots, ...profileEditorSlots,
+      ];
+      const tdpControls = [...(currentGame ? [tdpSlider] : []), ...globalTdpSliders, ...modeSlots];
+      const cpuBoost = snapshot?.cpuBoost || {};
+      const cpuControls = [
+        makeSettingToggleSlot(
+          "handheld-performance", "cpu-boost-ac", "CPU Boost - Plugged In", cpuBoost.statusText || "Windows power plan",
+          Number(cpuBoost.acMode) > 0,
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/cpu-boost",
+            { powerSource: "ac", enabled: !(Number(cpuBoost.acMode) > 0) }, { noRender: true }),
+          { disabled: busy || cpuBoost.supported === false },
+        ),
+        makeSettingToggleSlot(
+          "handheld-performance", "cpu-boost-battery", "CPU Boost - Battery", "Disable for lower heat and more GPU headroom.",
+          Number(cpuBoost.batteryMode) > 0,
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/cpu-boost",
+            { powerSource: "battery", enabled: !(Number(cpuBoost.batteryMode) > 0) }, { noRender: true }),
+          { disabled: busy || cpuBoost.supported === false },
+        ),
+      ];
+      const displaySnapshot = state.display.modesSnapshot;
+      const wantedResolutions = new Set(["900p", "full-hd", "1200p"]);
+      const brightness = displaySnapshot?.brightness || {};
+      const brightnessControl = createPerformanceValueSliderSlot({
+        title: "Display Brightness",
+        copy: brightness.statusText || "Internal display brightness",
+        hint: "Left / Right changes brightness by 5 percent.",
+        slotKey: "handheld-display-brightness",
+        min: 0, max: 100, step: 5,
+        disabled: busy || brightness.supported !== true,
+        getValue: () => Number(state.display.modesSnapshot?.brightness?.value || 0),
+        displayValue: (value) => `${value}%`,
+        onAdjust: (direction) => stepHandheldDisplayBrightness(direction),
+      });
+      const displayControls = [brightnessControl].concat((Array.isArray(displaySnapshot?.resolutionPresets)
+        ? displaySnapshot.resolutionPresets.filter((preset) => wantedResolutions.has(preset.id) && preset.available)
+        : []).flatMap((preset) => [60, 120].map((rate) =>
+          makeCommandSlot(
+            `${preset.title} - ${rate} Hz`, preset.description,
+            () => void setHandheldDisplayMode(preset.id, rate),
+            {
+              slotKey: `handheld-display-${preset.id}-${rate}`,
+              disabled: busy || state.display.modesSaving,
+              selected: Boolean(preset.selected) && Number(displaySnapshot?.currentRefreshRate?.refreshRate) === rate,
+            },
+          )))
+        .concat([makeCommandSlot("Refresh Display Modes", "Read supported modes from Windows.", () => loadDisplayModes(), {
+          slotKey: "handheld-display-refresh", disabled: state.display.modesLoading,
+        })]));
+      const afmf = snapshot?.afmf || {};
+      const afmfControls = [makeSettingToggleSlot(
+        "handheld-performance", "afmf-enabled", "AMD Fluid Motion Frames",
+        afmf.statusText || "AMD frame generation", afmf.enabled === true,
+        () => void sendHandheldPerformanceRequest("api/handheld-performance/afmf", { value: afmf.enabled !== true }, { noRender: true }),
+        { disabled: busy || afmf.supported !== true },
+      )];
+      const maintenanceControls = [
+        makeCommandSlot("Test Profile Notification", "Show the automatic profile banner.",
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/profiles/notifications/test", {}, { noRender: true }),
+          { slotKey: "handheld-notification-test", disabled: busy || !supported }),
+        makeCommandSlot(pawnIoInstalled ? "Repair PawnIO" : "Install PawnIO",
+          "Install the driver required for TDP control.",
+          () => void sendHandheldPerformanceRequest("api/handheld-performance/pawnio/install", {}),
+          { slotKey: "handheld-pawnio-install", disabled: busy || !supported }),
+        makeCommandSlot("Refresh Status", "Read the latest hardware state.", () => void loadHandheldPerformanceState(),
+          { slotKey: "handheld-refresh", disabled: busy }),
+      ];
+      const tdpSlots = accordion("handheld-tdp", "TDP Control", `${selectedWatts} W active`, tdpExpanded, tdpControls, true);
+      const gameProfileSlots = accordion(
+        "handheld-game-profiles", "Game Profiles", `${profiles.length} saved`, profilesExpanded, profileControls,
+      );
+      const profileStartIndex = tdpSlots.length;
+      const handheldSectionHeaders = [
+        ...(tdpExpanded ? [
+          ...(currentGame ? [createSectionHeader(1, "Active Game TDP", "One profile value controls all three safe OEM power limits.", {
+            icon: PerformancePluginIcon,
+          })] : []),
+          createSectionHeader(currentGame ? 2 : 1, "Global Defaults", "Separate defaults for plugged-in and battery operation.", {
+            icon: PerformancePluginIcon,
+          }),
+          ...(modeSlots.length ? [createSectionHeader(currentGame ? 4 : 3, "TDP Presets", "Quick presets for the current profile.", {
+            icon: PerformancePluginIcon,
+          })] : []),
+        ] : []),
+        ...(profilesExpanded ? [
+          createSectionHeader(profileStartIndex + 1, "Profile Automation", "Create and restore a profile when a game starts.", {
+            icon: PerformancePluginIcon,
+          }),
+          ...(profileSlots.length ? [createSectionHeader(profileStartIndex + 3, "Saved Games", "Select a game to edit its plugged-in and battery values.", {
+            icon: PerformancePluginIcon,
+          })] : []),
+        ] : []),
+      ];
       return {
         ...defaultModel,
-        title: snapshot?.pluginTitle || "Handheld Performance",
+        title: "Handheld Performance",
         subtitle: snapshot?.productCode || "Device detection",
         status: snapshot?.statusText || "Loading handheld state...",
         error: state.handheldPerformance.error || snapshot?.errorText || "",
@@ -16703,6 +17910,9 @@
                   ? `${telemetry.appliedTdpWatts} W applied`
                   : `${selectedWatts} W requested`,
               },
+              { liveKey: "handheld-confirmed-spl", text: `SPL: ${Number(snapshot?.confirmedSplWatts || 0) || "pending"} W` },
+              { liveKey: "handheld-confirmed-sppt", text: `SPPT: ${Number(snapshot?.confirmedSpptWatts || 0) || "pending"} W` },
+              { liveKey: "handheld-confirmed-fppt", text: `FPPT: ${Number(snapshot?.confirmedFpptWatts || 0) || "pending"} W` },
             ],
           },
           {
@@ -16721,105 +17931,17 @@
           },
         ],
         autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
-        sectionHeaders: [
-          createSectionHeader(0, "Automatic Profiles", "Detect Steam games and restore their saved TDP.", {
-            icon: PerformancePluginIcon,
-          }),
-          createSectionHeader(globalProfileStartIndex, "Global Profiles", "Separate persistent defaults for plugged-in and battery use.", {
-            icon: PerformancePluginIcon,
-          }),
-          ...(currentGame
-            ? [createSectionHeader(activeGameStartIndex, "Active Game Profile", `Saved automatically for ${currentGame.title}.`, {
-                icon: PerformancePluginIcon,
-              })]
-            : []),
-          createSectionHeader(modeStartIndex, "TDP Modes", "Apply device-specific presets.", {
-            icon: PerformancePluginIcon,
-          }),
-          ...(profileSlots.length
-            ? [createSectionHeader(profileStartIndex, "Saved Game Profiles", "Open a profile to edit both power states.", {
-                icon: PerformancePluginIcon,
-              })]
-            : []),
-          ...(profileEditorSlots.length
-            ? [createSectionHeader(profileEditorStartIndex, `Edit ${editingProfile.title}`, "Fine-tune and maintain this game profile.", {
-                icon: PerformancePluginIcon,
-              })]
-            : []),
-          createSectionHeader(maintenanceStartIndex, "Maintenance", "Install PawnIO or reload helper status.", {
-            icon: RefreshActionIcon,
-          }),
-        ],
-        dividerAfterIndices: [
-          1,
-          activeGameStartIndex - 1,
-          ...(currentGame ? [modeStartIndex - 1] : []),
-          profileStartIndex - 1,
-          ...(profileSlots.length ? [profileEditorStartIndex - 1] : []),
-          ...(profileEditorSlots.length ? [maintenanceStartIndex - 1] : []),
-        ],
+        sectionHeaders: handheldSectionHeaders,
+        dividerAfterIndices: [tdpSlots.length - 1, profileStartIndex + gameProfileSlots.length - 1],
+        dividerBeforeSlots: true,
         slots: [
-          makeSettingToggleSlot(
-            "handheld-performance",
-            "automatic-profiles",
-            "Automatic Game Profiles",
-            "Apply a saved TDP when a Steam game starts and return to the global profile when it closes.",
-            snapshot?.autoProfilesEnabled !== false,
-            () => void sendHandheldPerformanceRequest(
-              "api/handheld-performance/profiles/auto-enabled",
-              { value: snapshot?.autoProfilesEnabled === false },
-            ),
-            { disabled: busy || !supported },
-          ),
-          makeSettingToggleSlot(
-            "handheld-performance",
-            "profile-notifications",
-            "Windows Profile Notifications",
-            "Show one Windows notification when TFS automatically applies a profile.",
-            snapshot?.profileNotificationsEnabled !== false,
-            () => void sendHandheldPerformanceRequest(
-              "api/handheld-performance/profiles/notifications-enabled",
-              { value: snapshot?.profileNotificationsEnabled === false },
-            ),
-            { disabled: busy || !supported },
-          ),
-          ...globalTdpSliders,
-          ...activeGameSlots,
-          ...modeSlots,
-          ...profileSlots,
-          ...profileEditorSlots,
-          makeCommandSlot(
-            "Test Profile Notification",
-            "Show the same TFS profile banner used for automatic game and global profile changes.",
-            () => void sendHandheldPerformanceRequest(
-              "api/handheld-performance/profiles/notifications/test",
-              {},
-            ),
-            {
-              slotKey: "handheld-notification-test",
-              disabled: busy || !supported,
-              leadingIcon: PerformancePluginIcon,
-            },
-          ),
-          makeCommandSlot(
-            pawnIoInstalled ? "Repair PawnIO" : "Install PawnIO",
-            pawnIoInstalled
-              ? "Run the bundled verified PawnIO 2.2.0 setup again."
-              : "Install the verified PawnIO 2.2.0 driver required for TDP control.",
-            () => void sendHandheldPerformanceRequest("api/handheld-performance/pawnio/install", {}),
-            {
-              slotKey: "handheld-pawnio-install",
-              disabled: busy || !supported,
-              leadingIcon: SaveActionIcon,
-            },
-          ),
-          makeCommandSlot("Refresh Status", "Read the latest result from the elevated helper.", () => {
-            void loadHandheldPerformanceState();
-          }, {
-            slotKey: "handheld-refresh",
-            disabled: busy,
-            leadingIcon: RefreshActionIcon,
-          }),
+          ...tdpSlots,
+          ...gameProfileSlots,
+          ...accordion("handheld-cpu-boost", "CPU Boost", Number(cpuBoost.acMode) > 0 ? "Enabled" : "Disabled", cpuExpanded, cpuControls),
+          ...accordion("handheld-display", "Display", displaySnapshot?.statusText || "Resolution and refresh rate", displayExpanded, displayControls),
+          ...accordion("handheld-afmf", "AMD Fluid Motion Frames", afmf.enabled ? "Enabled" : "Disabled", afmfExpanded, afmfControls),
+          ...lightingSlots,
+          ...accordion("handheld-maintenance", "Maintenance", "Driver and diagnostics", maintenanceExpanded, maintenanceControls),
         ],
       };
     }
@@ -17081,33 +18203,40 @@
       const shortcuts = Array.isArray(getAppStartSnapshot()?.shortcuts)
         ? getAppStartSnapshot().shortcuts
         : [];
+      const favorites = shortcuts.filter((shortcut) => Boolean(shortcut.favorite));
+      const otherApps = shortcuts.filter((shortcut) => !shortcut.favorite);
 
       return {
         ...defaultModel,
         title: "App Start",
-        subtitle: "Controller app launcher",
+        subtitle: "All Windows apps",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
-        note: "Add Windows apps once, then start them from Big Picture without reaching for the desktop.",
+        note: "Select any app to launch it immediately. Favorites always stay at the top.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         cards: [buildAppStartSummaryCard(shortcuts)],
         sectionHeaders: [
-          createSectionHeader(0, "Launcher", "Add new Windows apps or jump into your saved shortcuts.", {
+          createSectionHeader(0, "Manage", "Choose favorites or hide apps you do not want to see.", {
             icon: AppStartPluginIcon,
           }),
-          ...(shortcuts.length
-            ? [createSectionHeader(1, "Saved Shortcuts", "These apps are ready to launch from the controller.", {
+          ...(favorites.length
+            ? [createSectionHeader(1, "Favorites", "Your pinned apps, ready with one click.", {
                 icon: LaunchActionIcon,
               })]
             : []),
-          createSectionHeader(shortcuts.length + 1, "Maintenance", "Reload the saved launcher list and the Start Menu catalog.", {
+          ...(otherApps.length
+            ? [createSectionHeader(1 + favorites.length, "All Apps", "Installed desktop and Microsoft Store apps.", {
+                icon: AppStartPluginIcon,
+              })]
+            : []),
+          createSectionHeader(1 + shortcuts.length, "Maintenance", "Check Windows for newly installed or removed apps.", {
             icon: RefreshActionIcon,
           }),
         ],
         slots: [
           makeNavigationSlot(
-            "Add App",
-            "Choose an installed Start Menu app and add it to this launcher.",
+            "Manage Apps",
+            "Set favorites, hide apps, or restore hidden apps.",
             () => {
               rememberCurrentRouteIndex(0);
               setRoute({ screen: "page", pluginId: "app-start", pageId: "add-app" });
@@ -17118,34 +18247,40 @@
               leadingIcon: AppStartPluginIcon,
             },
           ),
-          ...shortcuts.map((shortcut, shortcutIndex) =>
-            makeNavigationSlot(
+          ...favorites.map((shortcut) =>
+            makeCommandSlot(
               shortcut.name,
-              "Open launch and removal actions.",
-              () => {
-                rememberCurrentRouteIndex(shortcutIndex + 1);
-                setRoute({
-                  screen: "page",
-                  pluginId: "app-start",
-                  pageId: `app-${shortcut.id}`,
-                });
-              },
+              "Launch favorite now.",
+              () => launchAppStartShortcut(shortcut.id),
               {
                 slotKey: `app-start-shortcut-${shortcut.id}`,
                 disabled: isAppStartBusy(),
                 leadingIcon: buildAppStartIcon(shortcut.iconDataUri),
+                badge: "Favorite",
+                trailing: "none",
+              },
+            ),
+          ),
+          ...otherApps.map((shortcut) =>
+            makeCommandSlot(
+              shortcut.name,
+              shortcut.sourceKind === "packaged" ? "Launch Microsoft Store app." : "Launch desktop app.",
+              () => launchAppStartShortcut(shortcut.id),
+              {
+                slotKey: `app-start-shortcut-${shortcut.id}`,
+                disabled: isAppStartBusy(),
+                leadingIcon: buildAppStartIcon(shortcut.iconDataUri),
+                trailing: "none",
               },
             ),
           ),
           makeCommandSlot(
-            "Refresh Apps",
-            "Reload saved shortcuts and the current Start Menu catalog.",
-            async () => {
-              state.appStart.catalog = null;
-              await loadAppStartState();
-            },
+            "Check for App Changes",
+            "Update only new, changed, or removed Windows apps.",
+            () => refreshAppStartCatalog(),
             {
               disabled: isAppStartBusy(),
+              leadingIcon: RefreshActionIcon,
             },
           ),
         ],
@@ -17162,45 +18297,47 @@
       return {
         ...defaultModel,
         title: "App Start",
-        subtitle: "Add App",
+        subtitle: "Manage Apps",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
         note:
           apps.length > 0
-            ? "Apps are discovered from the Windows Start Menu so helpers and uninstallers stay mostly out of the list."
-            : "Refresh the catalog if an app was installed while Tools for Steam was already running.",
+            ? "Open an app to pin it as a favorite, hide it, or restore it."
+            : "Check Windows again if an app was installed while Tools for Steam was already running.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         sectionHeaders: [
-          createSectionHeader(0, "Detected Start Menu Apps", "Pick any app here to add it into App Start.", {
+          createSectionHeader(0, "Installed Apps", "Desktop and Microsoft Store apps found by Windows.", {
             icon: AddActionIcon,
           }),
-          ...(apps.length
-            ? [createSectionHeader(apps.length, "Maintenance", "Rescan the Start Menu after new installs.", {
-                icon: RefreshActionIcon,
-              })]
-            : []),
+          createSectionHeader(apps.length, "Maintenance", "Apply only changes since the last app index.", {
+            icon: RefreshActionIcon,
+          }),
         ],
         slots: [
           ...apps.map((app) =>
-            makeCommandSlot(
+            makeNavigationSlot(
               app.name,
-              app.added ? "Already added to App Start." : "Add this app to the launcher.",
-              () => addAppStartShortcut(app.id),
+              app.hidden
+                ? "Hidden from the launcher. Open to restore."
+                : app.favorite
+                  ? "Favorite. Open to manage."
+                  : "Open app options.",
+              () => setRoute({ screen: "page", pluginId: "app-start", pageId: `app-${app.id}` }),
               {
                 slotKey: `app-start-catalog-${app.id}`,
-                disabled: isAppStartBusy() || Boolean(app.added),
-                badge: app.added ? "Added" : "",
+                disabled: isAppStartBusy(),
+                badge: app.hidden ? "Hidden" : app.favorite ? "Favorite" : "",
                 leadingIcon: buildAppStartIcon(app.iconDataUri),
-                trailing: app.added ? "none" : "chevron",
               },
             ),
           ),
           makeCommandSlot(
-            "Refresh App List",
-            "Scan the Windows Start Menu again.",
-            () => loadAppStartCatalog(),
+            "Check for App Changes",
+            "Find new desktop and Microsoft Store apps and remove stale entries.",
+            () => refreshAppStartCatalog(),
             {
               disabled: isAppStartBusy(),
+              leadingIcon: RefreshActionIcon,
             },
           ),
         ],
@@ -17213,7 +18350,9 @@
       state.route.pageId?.startsWith("app-")
     ) {
       const shortcutId = state.route.pageId.replace(/^app-/, "");
-      const shortcut = getAppStartShortcut(shortcutId);
+      const shortcut = getAppStartApp(shortcutId);
+      const isHidden = Boolean(shortcut?.hidden);
+      const isFavorite = Boolean(shortcut?.favorite);
 
       return {
         ...defaultModel,
@@ -17221,10 +18360,12 @@
         subtitle: shortcut?.name || "App",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
-        note: shortcut ? shortcut.sourcePath : "The selected app shortcut could not be found.",
+        note: shortcut
+          ? shortcut.sourceKind === "packaged" ? "Microsoft Store / packaged app" : shortcut.sourcePath
+          : "The selected app could not be found.",
         autoFocusIndex: resolveAutoFocusIndex(state.route),
         sectionHeaders: [
-          createSectionHeader(0, "Launch", "Start the app or remove it from the launcher library.", {
+          createSectionHeader(0, "App Actions", "Launch, pin, or change launcher visibility.", {
             icon: LaunchActionIcon,
           }),
         ],
@@ -17232,14 +18373,17 @@
           ? [
               {
                 title: shortcut.name,
-                lines: ["Ready to launch from Windows.", shortcut.sourcePath],
+                lines: [
+                  isHidden ? "Hidden from the App Start launcher." : "Visible in the App Start launcher.",
+                  isFavorite ? "Pinned as a favorite." : "Not pinned as a favorite.",
+                ],
               },
             ]
           : [],
         slots: [
           makeCommandSlot(
             "Launch App",
-            "Start this app and keep Tools for Steam ready in the background.",
+            "Start this app immediately.",
             () => launchAppStartShortcut(shortcutId),
             {
               disabled: isAppStartBusy() || !shortcut,
@@ -17248,11 +18392,632 @@
             },
           ),
           makeCommandSlot(
-            "Remove App",
-            "Remove this shortcut from App Start. The app stays installed in Windows.",
-            () => removeAppStartShortcut(shortcutId),
+            isFavorite ? "Remove from Favorites" : "Add to Favorites",
+            isFavorite ? "Keep the app in the launcher without pinning it." : "Pin the app at the top of App Start.",
+            () => toggleAppStartFavorite(shortcutId),
             {
               disabled: isAppStartBusy() || !shortcut,
+              badge: isFavorite ? "Favorite" : "",
+              leadingIcon: AppStartPluginIcon,
+            },
+          ),
+          makeCommandSlot(
+            isHidden ? "Restore to Launcher" : "Hide from Launcher",
+            isHidden
+              ? "Show this app in the main one-click launcher again."
+              : "Remove only this entry from App Start. The Windows app stays installed.",
+            () => isHidden ? addAppStartShortcut(shortcutId) : removeAppStartShortcut(shortcutId),
+            {
+              disabled: isAppStartBusy() || !shortcut,
+              badge: isHidden ? "Hidden" : "",
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "discord" &&
+      state.route.pageId === "server"
+    ) {
+      const snapshot = getDiscordSnapshot();
+      const guilds = Array.isArray(snapshot?.guilds) ? snapshot.guilds : [];
+      const voiceChannels = Array.isArray(snapshot?.voiceChannels) ? snapshot.voiceChannels : [];
+      const fallbackMembers = Array.isArray(snapshot?.members) ? snapshot.members : [];
+      const fallbackActive = snapshot?.connectionMode === "widget" && snapshot?.configured;
+      const refreshedAt = snapshot?.refreshedAtUtc
+        ? new Date(snapshot.refreshedAtUtc).toLocaleTimeString()
+        : "Not refreshed yet";
+      const socialSdkActive = snapshot?.connectionMode === "social-sdk";
+
+      if (socialSdkActive) {
+        const friends = Array.isArray(snapshot?.friends) ? snapshot.friends : [];
+        const onlineFriends = friends.filter((friend) => friend?.status !== "offline");
+        const friendSlots = onlineFriends.map((friend, index) => {
+          const status = friend?.status === "idle"
+            ? "Idle"
+            : friend?.status === "dnd"
+              ? "Do Not Disturb"
+              : friend?.status === "streaming"
+                ? "Streaming"
+                : friend?.status === "offline"
+                  ? "Offline"
+                  : "Online";
+          return makeCommandSlot(
+            friend?.displayName || friend?.username || `Discord Friend ${index + 1}`,
+            friend?.username && friend?.displayName !== friend?.username
+              ? `${status} - @${friend.username}`
+              : status,
+            () => {},
+            {
+              slotKey: `discord-social-friend-${friend?.id || index}`,
+              badge: status,
+              leadingIcon: buildDiscordMemberIcon(friend?.avatarUrl, friend?.status),
+              trailing: "none",
+            },
+          );
+        });
+        const guildSlots = guilds.map((guild, index) => {
+          const onlineCount = Number(guild?.onlineCount) || 0;
+          const memberCount = Number(guild?.memberCount) || 0;
+          return makeCommandSlot(
+            guild?.name || `Discord Server ${index + 1}`,
+            `${onlineCount} online${memberCount > 0 ? ` - ${memberCount} members` : ""}`,
+            () => openDiscordGuild(guild.id),
+            {
+              slotKey: `discord-main-guild-${guild?.id || index}`,
+              disabled: isDiscordBusy(),
+              badge: `${onlineCount} online`,
+              leadingIcon: buildDiscordMemberIcon(guild?.iconUrl),
+              trailing: "chevron",
+            },
+          );
+        });
+        const friendDisplaySlots = friendSlots.length
+          ? friendSlots
+          : [makeCommandSlot(
+              "No friends online",
+              "Offline friends stay hidden on this page.",
+              () => {},
+              {
+                slotKey: "discord-no-online-friends",
+                disabled: true,
+                trailing: "none",
+              },
+            )];
+        const guildDisplaySlots = guildSlots.length
+          ? guildSlots
+          : [makeCommandSlot(
+              "No servers available",
+              snapshot?.guildsErrorMessage || "Reconnect Discord if your server list is missing.",
+              () => {},
+              {
+                slotKey: "discord-no-servers",
+                disabled: true,
+                trailing: "none",
+              },
+            )];
+        const actionSlots = snapshot?.authorized
+          ? []
+          : [
+              makeCommandSlot(
+                "Connect Discord",
+                "Open Discord's secure sign-in and permission screen.",
+                () => connectDiscord(),
+                {
+                  slotKey: "discord-connect-social-sdk",
+                  disabled: isDiscordBusy() || !snapshot?.applicationConfigured,
+                  leadingIcon: DiscordPluginIcon,
+                  trailing: "chevron",
+                },
+              ),
+            ];
+        const settingsSlot = makeNavigationSlot(
+          "Settings",
+          "Manage authorization, privacy, and the optional public-server fallback.",
+          () => {
+            const targetRoute = { screen: "page", pluginId: "discord", pageId: "settings" };
+            requestFreshEntryForRoute(targetRoute, 0, 0);
+            setRoute(targetRoute);
+          },
+          { slotKey: "discord-settings", leadingIcon: SettingsPluginIcon },
+        );
+
+        return {
+          ...defaultModel,
+          title: "Discord",
+          subtitle: snapshot?.authorized ? "Friends" : "Connect",
+          status: resolveDiscordStatusText(),
+          error: state.discord.error || snapshot?.guildsErrorMessage || snapshot?.errorMessage || "",
+          note: snapshot?.authorized
+            ? "Only currently available friends are shown. Select a server to bring Discord to the foreground."
+            : "Discord Social SDK handles sign-in securely. Tools for Steam never receives your Discord password.",
+          cards: snapshot?.authorized ? [] : [buildDiscordConnectionCard(snapshot)],
+          sectionHeaders: snapshot?.authorized
+            ? [
+                createSectionHeader(0, "Friends", `${onlineFriends.length} currently online.`, {
+                  icon: EyeActionIcon,
+                }),
+                createSectionHeader(friendDisplaySlots.length, "Servers", `${guilds.length} available through Discord.`, {
+                  icon: DiscordPluginIcon,
+                }),
+                createSectionHeader(friendDisplaySlots.length + guildDisplaySlots.length, "Settings", "Connection, privacy, refresh, and fallback options.", {
+                  icon: SettingsPluginIcon,
+                }),
+              ]
+            : [
+                createSectionHeader(0, "Discord Account", "Connect once with Discord.", {
+                  icon: DiscordPluginIcon,
+                }),
+              ],
+          dividerAfterIndices: snapshot?.authorized
+            ? [friendDisplaySlots.length - 1, friendDisplaySlots.length + guildDisplaySlots.length - 1]
+            : [],
+          slots: snapshot?.authorized
+            ? [...friendDisplaySlots, ...guildDisplaySlots, settingsSlot]
+            : [...actionSlots, settingsSlot],
+        };
+      }
+      const participantSlots = voiceChannels.flatMap((channel) =>
+        (Array.isArray(channel?.participants) ? channel.participants : []).map((participant, index) =>
+          makeCommandSlot(
+            participant.displayName || participant.username || `Participant ${index + 1}`,
+            formatDiscordVoiceParticipant(participant, channel.name || "Voice channel"),
+            () => {},
+            {
+              slotKey: `discord-voice-participant-${channel.id}-${participant.id || index}`,
+              disabled: true,
+              badge: "Voice",
+              leadingIcon: buildDiscordMemberIcon(participant.avatarUrl),
+              trailing: "none",
+            },
+          ),
+        ),
+      );
+      const fallbackMemberSlots = fallbackMembers.map((member, index) =>
+        makeCommandSlot(
+          member.username || `Member ${index + 1}`,
+          formatDiscordMemberStatus(member),
+          () => {},
+          {
+            slotKey: `discord-member-${index}-${member.id || "anonymous"}`,
+            disabled: true,
+            badge: member.status === "idle" ? "Idle" : member.status === "dnd" ? "DND" : "Online",
+            leadingIcon: buildDiscordMemberIcon(member.avatarUrl),
+            trailing: "none",
+          },
+        ),
+      );
+
+      if (fallbackActive) {
+        const fallbackActions = [
+          makeCommandSlot(
+            "Open Discord Server",
+            snapshot?.inviteUrl ? "Open the configured Discord invite." : "No invite is available for this widget.",
+            () => openDiscordServer(),
+            {
+              slotKey: "discord-open-server",
+              disabled: isDiscordBusy() || !snapshot?.inviteUrl,
+              leadingIcon: DiscordPluginIcon,
+              trailing: "chevron",
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Public Presence",
+            "Reload the optional public widget fallback.",
+            () => loadDiscordState({ force: true }),
+            {
+              slotKey: "discord-refresh-widget",
+              disabled: isDiscordBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+        ];
+
+        return {
+          ...defaultModel,
+          title: "Discord",
+          subtitle: snapshot?.serverName || "Public Widget",
+          status: resolveDiscordStatusText(),
+          error: state.discord.error || snapshot?.errorMessage || "",
+          note: "Fallback mode: this server must expose its public widget. Connect a Discord account in Settings for the full server and voice-channel experience.",
+          cards: [
+            {
+              title: snapshot?.serverName || "Discord Server",
+              lines: [
+                `${snapshot?.onlineCount || 0} publicly visible online`,
+                `${Array.isArray(snapshot?.channels) ? snapshot.channels.length : 0} public voice channels`,
+                `Last refresh: ${refreshedAt}`,
+              ],
+            },
+          ],
+          sectionHeaders: [
+            createSectionHeader(0, "Public Fallback", "Open the invite or refresh public presence.", {
+              icon: DiscordPluginIcon,
+            }),
+            ...(fallbackMemberSlots.length
+              ? [createSectionHeader(fallbackActions.length, "Visible Members", `${fallbackMembers.length} exposed by Discord.`, {
+                  icon: EyeActionIcon,
+                })]
+              : []),
+          ],
+          dividerAfterIndices: fallbackMemberSlots.length ? [fallbackActions.length - 1] : [],
+          slots: [...fallbackActions, ...fallbackMemberSlots],
+        };
+      }
+
+      const actionSlots = snapshot?.authorized
+        ? [
+            ...(snapshot?.selectedGuildId
+              ? [
+                  makeCommandSlot(
+                    "All Discord Servers",
+                    "Return to your server list.",
+                    () => selectDiscordGuild(""),
+                    {
+                      slotKey: "discord-all-servers",
+                      leadingIcon: BackIcon,
+                    },
+                  ),
+                ]
+              : []),
+            makeCommandSlot(
+              "Refresh Discord",
+              "Reload servers, voice channels, and connected participants.",
+              () => loadDiscordState({ force: true }),
+              {
+                slotKey: "discord-refresh-rpc",
+                disabled: isDiscordBusy(),
+                leadingIcon: RefreshActionIcon,
+              },
+            ),
+          ]
+        : [
+            makeCommandSlot(
+              "Connect Discord",
+              snapshot?.applicationConfigured
+                ? "Open Discord's permission dialog and connect your account."
+                : "The publisher application ID must be configured first.",
+              () => connectDiscord(),
+              {
+                slotKey: "discord-connect-account",
+                disabled: isDiscordBusy() || !snapshot?.applicationConfigured,
+                leadingIcon: DiscordPluginIcon,
+                trailing: "chevron",
+              },
+            ),
+          ];
+      const guildSlots = snapshot?.authorized && !snapshot?.selectedGuildId
+        ? guilds.map((guild, index) =>
+            makeCommandSlot(
+              guild.name || `Discord Server ${index + 1}`,
+              "View voice channels and connected participants.",
+              () => selectDiscordGuild(guild.id),
+              {
+                slotKey: `discord-guild-${guild.id || index}`,
+                disabled: isDiscordBusy(),
+                leadingIcon: buildDiscordMemberIcon(guild.iconUrl),
+                trailing: "chevron",
+              },
+            ),
+          )
+        : [];
+      const voiceChannelSlots = snapshot?.authorized && snapshot?.selectedGuildId
+        ? voiceChannels.map((channel, index) => {
+            const count = Array.isArray(channel?.participants) ? channel.participants.length : 0;
+            return makeCommandSlot(
+              channel.name || `Voice Channel ${index + 1}`,
+              channel.connected
+                ? (count === 1 ? "Connected - 1 participant in voice." : `Connected - ${count} participants in voice.`)
+                : (count === 1 ? "1 participant connected - select to join." : `${count} participants connected - select to join.`),
+              () => joinDiscordVoiceChannel(channel.id),
+              {
+                slotKey: `discord-voice-channel-${channel.id || index}`,
+                disabled: isDiscordBusy(),
+                badge: channel.connected ? "Connected" : `${count} in voice`,
+                leadingIcon: DiscordPluginIcon,
+                trailing: "chevron",
+              },
+            );
+          })
+        : [];
+      const contentSlots = [...guildSlots, ...voiceChannelSlots, ...participantSlots];
+      const settingsSlot = makeNavigationSlot(
+        "Discord Settings",
+        "Manage account authorization and the optional widget fallback.",
+        () => {
+          const targetRoute = { screen: "page", pluginId: "discord", pageId: "settings" };
+          requestFreshEntryForRoute(targetRoute, 0, 0);
+          setRoute(targetRoute);
+        },
+        { leadingIcon: SettingsPluginIcon },
+      );
+
+      return {
+        ...defaultModel,
+        title: "Discord",
+        subtitle: snapshot?.selectedGuildName || (snapshot?.authorized ? "Servers" : "Connect"),
+        status: resolveDiscordStatusText(),
+        error: state.discord.error || snapshot?.errorMessage || "",
+          note: "Legacy local RPC mode. New installations use Discord Social SDK for the friends and presence view.",
+        cards: [
+          buildDiscordConnectionCard(snapshot),
+          ...(snapshot?.selectedGuildId
+            ? [{
+                title: snapshot.selectedGuildName || "Discord Server",
+                lines: [
+                  `${voiceChannels.length} voice channels`,
+                  `${participantSlots.length} connected voice participants`,
+                  `Last refresh: ${refreshedAt}`,
+                ],
+              }]
+            : []),
+        ],
+        sectionHeaders: [
+          createSectionHeader(0, snapshot?.authorized ? "Discord" : "Account", snapshot?.authorized ? "Refresh or choose another server." : "Authorize Tools for Steam in Discord.", {
+            icon: DiscordPluginIcon,
+          }),
+          ...(guildSlots.length
+            ? [createSectionHeader(actionSlots.length, "Your Servers", `${guilds.length} available through Discord.`, {
+                icon: DiscordPluginIcon,
+              })]
+            : []),
+          ...(voiceChannelSlots.length
+            ? [createSectionHeader(actionSlots.length, "Voice Channels", "Select a channel to join it in Discord.", {
+                icon: DiscordPluginIcon,
+              })]
+            : []),
+          ...(participantSlots.length
+            ? [createSectionHeader(actionSlots.length + voiceChannelSlots.length, "Connected People", `${participantSlots.length} currently in voice channels.`, {
+                icon: EyeActionIcon,
+              })]
+            : []),
+        ],
+        dividerAfterIndices: contentSlots.length ? [actionSlots.length - 1] : [],
+        slots: [...actionSlots, ...contentSlots, settingsSlot],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "discord" &&
+      state.route.pageId === "servers"
+    ) {
+      const snapshot = getDiscordSnapshot();
+      const guilds = Array.isArray(snapshot?.guilds) ? snapshot.guilds : [];
+      const selectedGuild = guilds.find((guild) => guild?.id === snapshot?.selectedGuildId) || null;
+      const refreshedAt = snapshot?.refreshedAtUtc
+        ? new Date(snapshot.refreshedAtUtc).toLocaleTimeString()
+        : "Not refreshed yet";
+      const actionSlots = snapshot?.authorized
+        ? [
+            ...(selectedGuild
+              ? [
+                  makeCommandSlot(
+                    "All Discord Servers",
+                    "Return to your server list.",
+                    () => selectDiscordGuild(""),
+                    {
+                      slotKey: "discord-social-all-servers",
+                      leadingIcon: BackIcon,
+                    },
+                  ),
+                  makeCommandSlot(
+                    "Open Server in Discord",
+                    "Open this server in the Discord desktop app.",
+                    () => openDiscordGuild(selectedGuild.id),
+                    {
+                      slotKey: `discord-social-open-guild-${selectedGuild.id}`,
+                      leadingIcon: DiscordPluginIcon,
+                      trailing: "chevron",
+                    },
+                  ),
+                ]
+              : []),
+            makeCommandSlot(
+              "Refresh Servers",
+              "Reload server names and approximate presence counts from Discord.",
+              () => loadDiscordState({ force: true }),
+              {
+                slotKey: "discord-social-refresh-guilds",
+                disabled: isDiscordBusy(),
+                leadingIcon: RefreshActionIcon,
+              },
+            ),
+          ]
+        : [
+            makeCommandSlot(
+              "Connect Discord",
+              "Approve friends, presence, and server-list access in Discord.",
+              () => connectDiscord(),
+              {
+                slotKey: "discord-social-connect-for-guilds",
+                disabled: isDiscordBusy() || !snapshot?.applicationConfigured,
+                leadingIcon: DiscordPluginIcon,
+                trailing: "chevron",
+              },
+            ),
+          ];
+      const guildSlots = snapshot?.authorized && !selectedGuild
+        ? guilds.map((guild, index) => {
+            const onlineCount = Number(guild?.onlineCount) || 0;
+            const memberCount = Number(guild?.memberCount) || 0;
+            return makeCommandSlot(
+              guild?.name || `Discord Server ${index + 1}`,
+              `${onlineCount} online${memberCount > 0 ? ` - ${memberCount} members` : ""}`,
+              () => selectDiscordGuild(guild.id),
+              {
+                slotKey: `discord-social-guild-${guild?.id || index}`,
+                disabled: isDiscordBusy(),
+                badge: `${onlineCount} online`,
+                leadingIcon: buildDiscordMemberIcon(guild?.iconUrl),
+                trailing: "chevron",
+              },
+            );
+          })
+        : [];
+
+      return {
+        ...defaultModel,
+        title: "Discord",
+        subtitle: selectedGuild?.name || "Servers",
+        status: snapshot?.authorized
+          ? `${guilds.length} Discord servers - refreshed ${refreshedAt}`
+          : resolveDiscordStatusText(),
+        error: state.discord.error || snapshot?.guildsErrorMessage || snapshot?.errorMessage || "",
+        note: selectedGuild
+          ? "Discord provides an approximate online count for this server, but does not expose the identities of its online members to account integrations. Open the server in Discord to see its member list."
+          : "Server presence counts are approximate. Discord does not expose individual online member names through Social SDK or user OAuth.",
+        cards: [
+          buildDiscordConnectionCard(snapshot),
+          ...(selectedGuild
+            ? [{
+                title: selectedGuild.name || "Discord Server",
+                lines: [
+                  `${Number(selectedGuild.onlineCount) || 0} approximately online`,
+                  `${Number(selectedGuild.memberCount) || 0} members`,
+                  `Last refresh: ${refreshedAt}`,
+                ],
+              }]
+            : snapshot?.authorized
+              ? [{
+                  title: "Your Servers",
+                  lines: [
+                    `${guilds.length} available`,
+                    "Select a server for details or to open it in Discord",
+                    `Last refresh: ${refreshedAt}`,
+                  ],
+                }]
+              : []),
+        ],
+        sectionHeaders: [
+          createSectionHeader(0, selectedGuild ? "Server" : "Discord Account", selectedGuild ? "Open this server or go back." : "Connect or refresh Discord.", {
+            icon: DiscordPluginIcon,
+          }),
+          ...(guildSlots.length
+            ? [createSectionHeader(actionSlots.length, "Your Servers", `${guilds.length} available through Discord.`, {
+                icon: DiscordPluginIcon,
+              })]
+            : []),
+        ],
+        dividerAfterIndices: guildSlots.length ? [actionSlots.length - 1] : [],
+        slots: [...actionSlots, ...guildSlots],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "discord" &&
+      state.route.pageId === "settings"
+    ) {
+      const snapshot = getDiscordSnapshot();
+      return {
+        ...defaultModel,
+        title: "Discord",
+        subtitle: "Settings",
+        status: resolveDiscordStatusText(),
+        error: state.discord.error || snapshot?.errorMessage || "",
+        note: "Account access uses Discord Social SDK. Access and refresh tokens are encrypted for the current Windows user and are never returned to the Steam interface.",
+        editors: [
+          {
+            label: "Fallback Server ID",
+            help: "Optional. Used only for a public widget fallback when local Discord access is unavailable.",
+            value: state.discord.serverIdDraft,
+            placeholder: "123456789012345678",
+            inputKey: `discord-server-id-${state.discord.inputVersion}`,
+            onInput: (value) => {
+              state.discord.serverIdDraft = value;
+            },
+          },
+          {
+            label: "Fallback Invite URL",
+            help: "Optional discord.gg invite used when the server widget has no invite channel.",
+            value: state.discord.inviteUrlDraft,
+            placeholder: "https://discord.gg/example",
+            inputKey: `discord-invite-${state.discord.inputVersion}`,
+            onInput: (value) => {
+              state.discord.inviteUrlDraft = value;
+            },
+          },
+        ],
+        cards: [
+          buildDiscordConnectionCard(snapshot),
+          {
+            title: "Security",
+            lines: [
+              "No bot token or Discord password is requested.",
+              "OAuth tokens are protected with Windows DPAPI for the signed-in Windows account.",
+              "Disconnecting removes the local authorization tokens. Requested access: friends, presence, and your server list.",
+            ],
+          },
+          buildDiscordSetupCard(),
+        ],
+        sectionHeaders: [
+          createSectionHeader(0, "Connection", "Connect securely through Discord Social SDK.", {
+            icon: DiscordPluginIcon,
+          }),
+          createSectionHeader(4, "Public Fallback", "Open the optional server widget without account access.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(5, "Reset", "Remove account authorization and fallback settings.", {
+            icon: DeleteActionIcon,
+          }),
+        ],
+        dividerAfterIndices: [3, 4],
+        slots: [
+          makeCommandSlot(
+            "Save Discord Settings",
+            "Store the application ID and optional fallback settings locally.",
+            () => saveDiscordSettings(),
+            {
+              disabled: isDiscordBusy(),
+              leadingIcon: SaveActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            snapshot?.authorized ? "Reconnect Discord" : "Connect Discord",
+            "Open Discord's browser sign-in and permission screen.",
+            () => connectDiscord(),
+            {
+              disabled: isDiscordBusy() || !snapshot?.applicationConfigured,
+              leadingIcon: DiscordPluginIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Disconnect Discord Account",
+            "Remove encrypted account tokens while keeping optional fallback settings.",
+            () => disconnectDiscord(),
+            {
+              disabled: isDiscordBusy() || !snapshot?.authorized,
+              leadingIcon: DeleteActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh Discord Data",
+            "Reload online friends and your server list now.",
+            () => loadDiscordState({ force: true }),
+            {
+              disabled: isDiscordBusy() || !snapshot?.authorized,
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Open Public Widget Fallback",
+            "Load the configured server's public widget instead of local Discord account data.",
+            () => openDiscordWidgetFallback(),
+            {
+              disabled: isDiscordBusy() || !String(state.discord.serverIdDraft || "").trim(),
+              leadingIcon: EyeActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Reset All Discord Settings",
+            "Remove the application ID, account authorization, server ID, and fallback invite.",
+            () => clearDiscordSettings(),
+            {
+              disabled: isDiscordBusy(),
+              leadingIcon: DeleteActionIcon,
             },
           ),
         ],
@@ -18422,6 +20187,246 @@
             {
               disabled: isStoreSyncBusy(),
             },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "oem-software"
+    ) {
+      const oem = getOemSoftwareSnapshot();
+      const busy = state.handheldPerformance.loading || state.handheldPerformance.saving;
+      const vibrationStrength = Number(oem?.vibrationStrengthPercent ?? 0);
+      const vibrationControl = createPerformanceValueSliderSlot({
+        title: "Controller Vibration",
+        copy: vibrationStrength > 0
+          ? `MSI motor output is limited to ${vibrationStrength}% and protected by a safety timeout.`
+          : "Controller vibration is disabled.",
+        hint: "Left / Right changes vibration strength by 10 percent. Set 0% to disable it.",
+        slotKey: "oem-vibration-strength",
+        min: Number(oem?.minimumVibrationStrengthPercent ?? 0),
+        max: Number(oem?.maximumVibrationStrengthPercent ?? 100),
+        step: 10,
+        disabled: busy || oem?.vibrationSupported !== true,
+        getValue: () => Number(getOemSoftwareSnapshot()?.vibrationStrengthPercent ?? 0),
+        displayValue: (value) => `${value}%`,
+        onAdjust: (direction) => stepOemVibrationStrength(direction),
+      });
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "OEM Software",
+        status: oem?.statusText || "Reading handheld OEM state...",
+        error: state.handheldPerformance.error,
+        note: "On a supported handheld this replacement is mandatory. TFS verifies VIIPER and HidHide first, then hides the physical controller and keeps MSI Center M unavailable. Uninstalling TFS restores the original controller and OEM state.",
+        sectionHeaders: [
+          createSectionHeader(0, "MSI Center M", "TFS owns the Claw controller and its special buttons on this supported device.", {
+            icon: SettingsPluginIcon,
+          }),
+          createSectionHeader(2, "Maintenance", "Reload the current Windows service and task state.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: oem
+          ? [{
+              title: oem.softwareName || "OEM Software",
+              lines: [
+                `TFS control: ${oem.controlActive ? "Active" : "Inactive"}`,
+                `Foundation service: ${oem.serviceRunning ? "Running" : oem.serviceInstalled ? "Stopped" : "Not installed"}`,
+                `Service startup: ${oem.serviceStartEnabled ? "Enabled" : "Disabled"}`,
+                `Center M tasks: ${oem.startupTaskRunning ? "Running" : oem.startupTaskEnabled ? "Enabled" : "Disabled"}`,
+                oem.vibrationSupported ? `Vibration: ${vibrationStrength}%` : null,
+              ].filter(Boolean),
+            }]
+          : [],
+        slots: [
+          vibrationControl,
+          makeSettingToggleSlot(
+            "oem-software",
+            "ui-haptics",
+            "UI Haptics",
+            "Give subtle controller feedback while navigating and confirming inside Tools for Steam.",
+            oem?.uiHapticsEnabled === true,
+            () => void setOemUiHapticsEnabled(oem?.uiHapticsEnabled !== true),
+            {
+              disabled: busy || oem?.vibrationSupported !== true,
+            },
+          ),
+          makeCommandSlot(
+            "Refresh OEM State",
+            "Read MSI services, scheduled tasks, and processes again.",
+            () => void loadHandheldPerformanceState(),
+            { slotKey: "oem-software-refresh", disabled: busy },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "button-mapping"
+    ) {
+      const oem = getOemSoftwareSnapshot();
+      const buttons = Array.isArray(oem?.buttons) ? oem.buttons : [];
+      const busy = state.handheldPerformance.loading || state.handheldPerformance.saving;
+      const capture = oem?.capture || {};
+      const configuredCount = buttons.filter((button) => button.configured).length;
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "Button Mapping",
+        status: capture.active
+          ? capture.statusText
+          : oem?.controlActive
+            ? `${configuredCount} of ${buttons.length} extra buttons detected.`
+            : "Enable TFS Button Control under OEM Software before detecting buttons.",
+        error: state.handheldPerformance.error,
+        note: "Each supported handheld gets its own extra-button layout. Open a button, detect its physical input, then assign a TFS action.",
+        sectionHeaders: [
+          createSectionHeader(0, "MSI Claw A8", "Detect and assign M1, M2, MSI Center, and Quick Settings.", {
+            icon: SteamLoaderIcon,
+          }),
+          createSectionHeader(buttons.length, "Maintenance", "Reload saved mappings and the current capture state.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: oem
+          ? [{
+              title: "Extra Buttons",
+              lines: [
+                `TFS control: ${oem.controlActive ? "Active" : "Inactive"}`,
+                `Detected: ${configuredCount} of ${buttons.length}`,
+                capture.active ? capture.statusText : null,
+              ].filter(Boolean),
+            }]
+          : [],
+        slots: [
+          ...buttons.map((button, buttonIndex) =>
+            makeNavigationSlot(
+              button.title,
+              button.configured
+                ? `${button.actionTitle} - ${button.inputName || button.inputCode}`
+                : "Not detected yet - open to run Live Detect.",
+              () => {
+                rememberCurrentRouteIndex(buttonIndex);
+                const targetRoute = {
+                  screen: "page",
+                  pluginId: "settings",
+                  pageId: `button-mapping-button-${button.buttonId}`,
+                };
+                requestFreshEntryForRoute(targetRoute, 0, 0);
+                setRoute(targetRoute);
+              },
+              {
+                slotKey: `oem-button-${button.buttonId}`,
+                badge: button.configured ? button.actionTitle : "Detect",
+                disabled: busy,
+              },
+            ),
+          ),
+          makeCommandSlot(
+            "Refresh Button Mappings",
+            "Read saved button mappings and the current live-detection state again.",
+            () => void loadHandheldPerformanceState(),
+            { slotKey: "button-mapping-refresh", disabled: busy },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId?.startsWith("button-mapping-button-")
+    ) {
+      const buttonId = getOemButtonIdFromRoute();
+      const button = getOemButtonBinding(buttonId);
+      const oem = getOemSoftwareSnapshot();
+      const actions = Array.isArray(oem?.actions) ? oem.actions : [];
+      const capture = oem?.capture || {};
+      const capturingThisButton = capture.active === true && capture.buttonId === buttonId;
+      const busy = state.handheldPerformance.loading || state.handheldPerformance.saving;
+      const shortcutDraft = state.handheldPerformance.oemShortcutDraftByButtonId[buttonId] ?? button?.customShortcut ?? "";
+
+      return {
+        ...defaultModel,
+        title: "Button Mapping",
+        subtitle: button?.title || "Extra Button",
+        status: capturingThisButton ? capture.statusText : oem?.statusText || "Reading button mapping...",
+        error: state.handheldPerformance.error,
+        note: button?.description || "Detect the physical input, then assign an action.",
+        sectionHeaders: [
+          createSectionHeader(0, "Live Detect", "Press only this physical button while TFS is listening.", {
+            icon: RefreshActionIcon,
+          }),
+          createSectionHeader(capturingThisButton ? 2 : 1, "Action", "Choose what TFS should do when the detected button is pressed.", {
+            icon: SteamLoaderIcon,
+          }),
+        ],
+        cards: button
+          ? [{
+              title: button.title,
+              lines: [
+                `Input: ${button.configured ? button.inputName || button.inputCode : "Not detected"}`,
+                `Action: ${button.actionTitle || "Unassigned"}`,
+                button.customShortcut ? `Shortcut: ${button.customShortcut}` : null,
+                capture.detectedInput && capture.buttonId === buttonId ? capture.statusText : null,
+              ].filter(Boolean),
+            }]
+          : [],
+        editor: {
+          label: "Custom Keyboard Shortcut",
+          help: "Examples: Ctrl+Shift+F12, Alt+Enter, Win+G. Save it by selecting Custom Shortcut below.",
+          value: shortcutDraft,
+          placeholder: "Ctrl+Shift+F12",
+          rows: 1,
+          inputKey: `oem-shortcut-${buttonId}-${state.handheldPerformance.oemShortcutInputVersionByButtonId[buttonId] || 0}`,
+          onInput: (value) => {
+            state.handheldPerformance.oemShortcutDraftByButtonId[buttonId] = value;
+          },
+        },
+        slots: [
+          makeCommandSlot(
+            capturingThisButton ? "Listening... Press the Button" : "Start Live Detect",
+            oem?.controlActive
+              ? "Capture the next MSI keyboard or HID button event for this mapping."
+              : "Enable TFS Button Control first so MSI Center M cannot consume the event.",
+            () => void startOemButtonCapture(buttonId),
+            {
+              slotKey: "oem-button-live-detect",
+              selected: capturingThisButton,
+              disabled: busy || capturingThisButton || !button || oem?.controlActive !== true,
+            },
+          ),
+          ...(capturingThisButton
+            ? [makeCommandSlot(
+                "Cancel Live Detect",
+                "Stop listening without changing the saved input.",
+                () => void cancelOemButtonCapture(),
+                { slotKey: "oem-button-live-detect-cancel", disabled: busy },
+              )]
+            : []),
+          ...actions.map((action) =>
+            makeChoiceSlot(
+              action.title,
+              action.id === "custom-shortcut"
+                ? `${action.description} ${shortcutDraft || "Enter a shortcut above first."}`
+                : action.description,
+              () => void (action.id === "custom-shortcut"
+                ? saveOemCustomShortcut(buttonId)
+                : setOemButtonAction(buttonId, action.id)),
+              {
+                slotKey: `oem-button-action-${action.id}`,
+                selected: button?.actionId === action.id,
+                badge: button?.actionId === action.id ? "Current" : "",
+                disabled: busy || !button || !button.configured ||
+                  (action.id === "custom-shortcut" && !String(shortcutDraft || "").trim()),
+              },
+            ),
           ),
         ],
       };
@@ -20827,6 +22832,7 @@
     if (state.route.screen === "plugin") {
       const plugin = plugins.find((entry) => entry.id === state.route.pluginId);
       if (plugin) {
+        const visiblePages = getVisiblePluginPages(plugin);
         return {
           ...defaultModel,
           title: plugin.title,
@@ -20854,6 +22860,8 @@
                 ? "Open overlay controls."
               : plugin.id === "hltb"
                 ? "Use Settings to choose which HowLongToBeat values appear on the open game page."
+              : plugin.id === "discord"
+                ? "Connect Discord once, then see which friends are online from Quick Access."
               : plugin.id === "themes"
                 ? "Use Installed Themes, Store, Presets, and Settings to control CSSLoader from Quick Access."
                 : plugin.id === "settings"
@@ -20865,7 +22873,7 @@
               : [],
           autoFocusIndex: resolveAutoFocusIndex(state.route),
           slots: [
-            ...plugin.pages.map((page, pageIndex) =>
+            ...visiblePages.map((page, pageIndex) =>
               makeNavigationSlot(page.title, page.description, () => {
                 rememberCurrentRouteIndex(pageIndex);
                 const targetRoute = { screen: "page", pluginId: plugin.id, pageId: page.id };
@@ -20879,6 +22887,10 @@
     }
 
     const homePlugins = getHomePlugins();
+    const externalGameState = state.externalGameQuickAccess.snapshot;
+    const externalGameActive = Boolean(externalGameState?.active);
+    const closeCurrentGameArmed =
+      externalGameActive && Date.now() <= state.externalGameQuickAccess.closeArmedUntil;
     const movingPluginId = state.homeReorder.movingPluginId;
     const movingPlugin = homePlugins.find((plugin) => plugin.id === movingPluginId) || null;
     const updateSnapshot = getUpdateSnapshot();
@@ -20886,7 +22898,11 @@
       Boolean(updateSnapshot?.updateAvailable) &&
       Boolean(updateSnapshot?.canInstall) &&
       !state.homeReorder.active;
-    const homeStatus = state.generalSettings.saving
+    const homeStatus = state.externalGameQuickAccess.closing
+      ? `Closing ${externalGameState?.gameTitle || "the current game"}...`
+      : state.externalGameQuickAccess.error
+        ? state.externalGameQuickAccess.error
+      : state.generalSettings.saving
       ? "Saving home order..."
       : updateSnapshot?.installInProgress
         ? formatUpdateInstallStatus(updateSnapshot)
@@ -20898,14 +22914,21 @@
         ? state.communityPlugins.error
         : "";
     const homeDebugNote = getDeveloperDebugNote("home-reorder", "waiting for Y input...");
-    const homeNote = state.homeReorder.active
+    const homeNote = externalGameActive
+      ? `Steam Quick Access is shown in front of ${externalGameState?.gameTitle || "the current game"}. Press B to return to the game.`
+      : state.homeReorder.active
       ? [`Moving ${movingPlugin?.title || "plugin"}. Use Up / Down to reposition it. Press A to drop or B to cancel.`, homeDebugNote]
           .filter(Boolean)
           .join(" ")
       : ["Press Y to move a plugin.", homeDebugNote]
           .filter(Boolean)
           .join(" ");
-    const homeFooterLegend = state.homeReorder.active
+    const homeFooterLegend = externalGameActive
+      ? [
+          { button: "A", label: "Open" },
+          { button: "B", label: "Return to Game" },
+        ]
+      : state.homeReorder.active
       ? [
           { button: "Y", label: "Move", active: true },
           { button: "A", label: "Drop" },
@@ -20924,10 +22947,34 @@
       status: homeStatus,
       note: homeNote,
       footerLegend: homeFooterLegend,
+      autoFocusIndex: externalGameActive ? 0 : defaultModel.autoFocusIndex,
+      topSlots: externalGameActive
+        ? [
+            makeCommandSlot(
+              closeCurrentGameArmed ? "Confirm Close Current Game" : "Close Current Game",
+              closeCurrentGameArmed
+                ? `Press A again to close ${externalGameState?.gameTitle || "the current game"}. Unsaved progress may be lost.`
+                : `Close ${externalGameState?.gameTitle || "the current game"} and remain in Steam.`,
+              () => {
+                void closeCurrentExternalGame();
+              },
+              {
+                slotKey: "external-game-close-current",
+                badge: String(externalGameState?.storeId || "External").toUpperCase(),
+                disabled:
+                  state.externalGameQuickAccess.closing ||
+                  !externalGameState?.canCloseCurrentGame,
+                trailing: "none",
+                rowClassName: closeCurrentGameArmed ? "is-danger" : "",
+              },
+            ),
+          ]
+        : [],
       headerActions: [
         ...(updateReady
           ? [
               {
+                key: "update",
                 title: `Install ${updateSnapshot?.latestVersion || "Update"}`,
                 icon: HeaderUpdateIcon,
                 disabled: state.homeReorder.active || state.generalSettings.saving || isUpdatesBusy(),
@@ -20945,6 +22992,7 @@
             ]
           : []),
         {
+          key: "store",
           title: "Store",
           icon: HeaderStoreIcon,
           disabled: state.homeReorder.active || state.generalSettings.saving,
@@ -20960,6 +23008,7 @@
           },
         },
         {
+          key: "settings",
           title: "Settings",
           icon: HeaderSettingsIcon,
           disabled: state.homeReorder.active || state.generalSettings.saving,
@@ -20999,9 +23048,11 @@
               ? { screen: "page", pluginId: "artwork", pageId: "settings" }
               : plugin.id === "hltb"
                 ? { screen: "page", pluginId: "hltb", pageId: "settings" }
-                : plugin.id === "performance"
+              : plugin.id === "performance"
                   ? { screen: "page", pluginId: "performance", pageId: "overlay" }
-                : { screen: "plugin", pluginId: plugin.id, pageId: null };
+                  : plugin.id === "discord"
+                    ? { screen: "page", pluginId: "discord", pageId: "server" }
+                    : { screen: "plugin", pluginId: plugin.id, pageId: null };
           requestFreshEntryForRoute(targetRoute, 0, 0);
           setRoute(targetRoute);
         }, {
@@ -21074,6 +23125,10 @@
 
     if (route?.pluginId && !isPluginEnabled(route.pluginId)) {
       route = parseRoute("root");
+    }
+
+    if (isOemSettingsRoute(route) && state.generalSettings.snapshot?.oemSoftwareAvailable !== true) {
+      route = { screen: "plugin", pluginId: "settings", pageId: null };
     }
 
     const nextRouteKey = getRouteKey(route);
@@ -21214,7 +23269,16 @@
     }
 
     if (
-      route.pluginId === "display" &&
+      isOemSettingsRoute(route) &&
+      !state.handheldPerformance.loading &&
+      !state.handheldPerformance.snapshot &&
+      !state.handheldPerformance.error
+    ) {
+      void loadHandheldPerformanceState();
+    }
+
+    if (
+      (route.pluginId === "display" || route.pluginId === "handheld-performance") &&
       !state.display.modesLoading &&
       !state.display.modesSnapshot &&
       !state.display.error
@@ -21238,6 +23302,15 @@
       !state.hltb.error
     ) {
       void loadHltbState();
+    }
+
+    if (
+      route.pluginId === "discord" &&
+      !state.discord.loading &&
+      !state.discord.snapshot &&
+      !state.discord.error
+    ) {
+      void loadDiscordState();
     }
 
     if (
@@ -21960,18 +24033,18 @@
 
   function resolveAppStartStatusText() {
     if (state.appStart.saving) {
-      return "Updating App Start shortcuts...";
+      return "Updating App Start...";
     }
 
     if (state.appStart.catalogLoading) {
-      return "Scanning installed Start Menu apps...";
+      return "Checking Windows for app changes...";
     }
 
     if (state.appStart.loading) {
-      return "Loading App Start shortcuts...";
+      return "Loading the app index...";
     }
 
-    return getAppStartSnapshot()?.statusText || "Add apps to launch them from Steam.";
+    return getAppStartSnapshot()?.statusText || "Installed apps will appear automatically.";
   }
 
   function supportsLiveUpdates() {
@@ -22144,6 +24217,7 @@
               errorText: payload.errorText,
             }
           : payload;
+        syncOemShortcutDrafts(false);
 
         if (state.panelVisible && state.route?.pluginId === "handheld-performance") {
           if (gameChanged || powerSourceChanged || profileKeysChanged) {
@@ -22151,6 +24225,8 @@
           } else {
             refreshHandheldPerformanceLiveUi();
           }
+        } else if (state.panelVisible && isOemSettingsRoute()) {
+          rerenderGeneralSettingsPanel();
         }
         return true;
       }
@@ -22173,6 +24249,12 @@
         setProcessesSnapshot(payload);
         if (state.panelVisible && state.route?.pluginId === "processes") {
           rerenderProcessesPanel();
+        }
+        return true;
+      case "external-game-quick-access.state":
+        setExternalGameQuickAccessSnapshot(payload);
+        if (state.panelVisible && state.route?.screen === "root") {
+          rerenderHomePanel();
         }
         return true;
       case "store-sync.state": {
@@ -22260,6 +24342,7 @@
       case "audio.dashboard":
       case "audio.mixer":
       case "processes.state":
+      case "external-game-quick-access.state":
       case "store-sync.state":
       case "updates.state":
       case "settings.state":
@@ -22504,6 +24587,74 @@
     );
   }
 
+  async function setHandheldDisplayMode(resolution, refreshRate) {
+    state.display.modesSaving = true;
+    state.display.error = "";
+    try {
+      const response = await fetch(`${apiBase}api/display/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution, refreshRate: Number(refreshRate) }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The display mode could not be applied (${response.status}).`);
+      }
+      state.display.modesSnapshot = payload;
+      state.display.status = payload?.statusText || "Display mode applied.";
+    } catch (error) {
+      state.display.error = error instanceof Error ? error.message : String(error);
+      state.handheldPerformance.error = state.display.error;
+    } finally {
+      state.display.modesSaving = false;
+      refreshHandheldPerformanceLiveUi();
+    }
+  }
+
+  function stepHandheldDisplayBrightness(direction) {
+    const snapshot = state.display.modesSnapshot;
+    const brightness = snapshot?.brightness;
+    if (!snapshot || brightness?.supported !== true || !direction) return;
+    const current = Number(brightness.value || 0);
+    const next = Math.max(0, Math.min(100, current + direction * 5));
+    if (next === current) return;
+
+    playSliderMoveSound(direction);
+    state.display.modesSnapshot = {
+      ...snapshot,
+      brightness: { ...brightness, value: next },
+    };
+    syncVisibleSlotSliderUi();
+    if (state.display.brightnessCommitTimer) window.clearTimeout(state.display.brightnessCommitTimer);
+    state.display.brightnessCommitTimer = window.setTimeout(() => {
+      state.display.brightnessCommitTimer = 0;
+      void setHandheldDisplayBrightness(next);
+    }, 220);
+  }
+
+  async function setHandheldDisplayBrightness(value) {
+    if (state.display.brightnessSaving) return;
+    state.display.brightnessSaving = true;
+    try {
+      const response = await fetch(`${apiBase}api/display/brightness`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: Number(value) }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Brightness could not be applied (${response.status}).`);
+      }
+      state.display.modesSnapshot = payload;
+    } catch (error) {
+      state.display.error = error instanceof Error ? error.message : String(error);
+      state.handheldPerformance.error = state.display.error;
+    } finally {
+      state.display.brightnessSaving = false;
+      syncVisibleSlotSliderUi();
+    }
+  }
+
   async function sendPowerRequest(path, statusText, options = {}) {
     if (options.confirmText && state.power.confirmingPath !== path) {
       state.power.confirmingPath = path;
@@ -22676,6 +24827,7 @@
 
   function install() {
     ensureStyles();
+    ensureExternalGameQuickAccessVisibilityHandler();
     applyActiveThemeCss();
     cleanupLegacyNodes();
     captureNativeUi();
@@ -22703,6 +24855,10 @@
 
     if (!state.communityPlugins.loading && !state.communityPlugins.snapshot && !state.communityPlugins.error) {
       void loadCommunityPluginsState({ showLoading: false });
+    }
+
+    if (!state.externalGameQuickAccess.loading && state.externalGameQuickAccess.snapshot === null) {
+      void loadExternalGameQuickAccessState({ render: false });
     }
 
     if (!state.updates.loading && !state.updates.snapshot && !state.updates.error) {

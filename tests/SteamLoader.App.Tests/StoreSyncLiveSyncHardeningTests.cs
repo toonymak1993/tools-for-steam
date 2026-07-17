@@ -102,7 +102,7 @@ public sealed class StoreSyncLiveSyncHardeningTests
     }
 
     [Fact]
-    public void TryBuildLiveShortcutMirrorEntries_DoesNotAppendDuplicateCreatedShortcut()
+    public void TryBuildLiveShortcutMirrorEntries_UpgradesXboxShortcutWithoutAppendingDuplicate()
     {
         var serviceType = typeof(StoreSyncService);
         var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
@@ -205,11 +205,13 @@ public sealed class StoreSyncLiveSyncHardeningTests
 
         var changed = (bool?)method!.Invoke(null, arguments);
 
-        Assert.False(changed);
+        Assert.True(changed);
 
         var mirroredEntries = Assert.IsType<List<Dictionary<string, object?>>>(arguments[3]);
         var shortcutEntry = Assert.Single(mirroredEntries);
         Assert.Equal("QUAKE", shortcutEntry["appname"]);
+        Assert.Equal($"\"{Path.Combine(AppContext.BaseDirectory, "ToolsForSteam.exe")}\"", shortcutEntry["Exe"]);
+        Assert.StartsWith(XboxStoreLaunchHost.LaunchArgument, Assert.IsType<string>(shortcutEntry["LaunchOptions"]));
     }
 
     [Fact]

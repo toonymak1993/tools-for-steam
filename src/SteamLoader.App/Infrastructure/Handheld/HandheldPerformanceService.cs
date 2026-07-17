@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using SteamLoader.App.Services;
 
 namespace SteamLoader.App.Infrastructure.Handheld;
 
@@ -13,12 +14,24 @@ public sealed class HandheldPerformanceService
     private readonly string _profilesPath;
     private readonly string _commandPath;
     private readonly string _statusPath;
+    private readonly string _lightingPath;
+    private readonly string _hapticCommandPath;
     private readonly WindowsProfileNotificationService? _notificationService;
     private readonly HandheldPowerStateReader _powerStateReader = new();
+    private readonly HandheldSystemControlService _systemControls;
     private HandheldRunningGame? _currentGame;
     private HandheldPowerState _powerState = new();
     private string _lastAutomaticTargetKey = string.Empty;
     private int _lastAutomaticTdpWatts;
+    private HandheldDeviceProfile? _uiHapticDevice;
+    private int? _uiHapticVibrationStrength;
+    private bool? _uiHapticsEnabled;
+
+    public event Action<HandheldOemButtonBinding>? OemButtonPressed
+    {
+        add => _systemControls.OemButtonPressed += value;
+        remove => _systemControls.OemButtonPressed -= value;
+    }
 
     public HandheldPerformanceService(string dataDirectory)
         : this(dataDirectory, null)
@@ -33,6 +46,9 @@ public sealed class HandheldPerformanceService
         _profilesPath = Path.Combine(dataDirectory, "handheld-performance-profiles.json");
         _commandPath = Path.Combine(dataDirectory, "handheld-hardware-command.json");
         _statusPath = Path.Combine(dataDirectory, "handheld-hardware-status.json");
+        _lightingPath = Path.Combine(dataDirectory, "handheld-lighting.json");
+        _hapticCommandPath = Path.Combine(dataDirectory, "handheld-ui-haptic.json");
+        _systemControls = new HandheldSystemControlService(dataDirectory);
         _notificationService = notificationService;
         _powerState = _powerStateReader.Read(force: true);
     }
@@ -69,8 +85,20 @@ public sealed class HandheldPerformanceService
                 _powerState.BatteryPercent,
                 _powerState.EstimatedMinutesRemaining,
                 status.AppliedTdpWatts,
-                status.Success && status.AppliedTdpWatts == selectedWatts,
+                status.AppliedTdpWatts > 0 && status.AppliedTdpWatts == selectedWatts,
                 _powerState.UpdatedAt);
+            var lightingSettings = LoadLightingSettings(device);
+            var lighting = new HandheldLightingSnapshot(
+                supported && device.Lighting.Supported,
+                lightingSettings.Enabled,
+                lightingSettings.Effect,
+                lightingSettings.LeftColor,
+                lightingSettings.RightColor,
+                lightingSettings.ButtonColor,
+                lightingSettings.Brightness,
+                status.LightingApplied,
+                status.LightingMessage,
+                device.Lighting.Effects);
 
             return new HandheldPerformanceSnapshot(
                 device.DisplayName,
@@ -83,6 +111,11 @@ public sealed class HandheldPerformanceService
                 device.MinimumTdpWatts,
                 device.MaximumTdpWatts,
                 selectedWatts,
+                ResolveSppt(selectedWatts),
+                ResolveFppt(selectedWatts),
+                status.AppliedTdpWatts,
+                status.AppliedSpptWatts,
+                status.AppliedFpptWatts,
                 globalWatts,
                 globalAcWatts,
                 globalBatteryWatts,
@@ -96,7 +129,167 @@ public sealed class HandheldPerformanceService
                 activeProfile,
                 (profileSettings.Profiles ?? []).OrderByDescending(profile => profile.UpdatedAt).ToArray(),
                 statusText,
-                status.Success || status.Nonce == 0 ? string.Empty : status.Message);
+                status.Success || status.Nonce == 0 ? string.Empty : status.Message,
+                lighting,
+                _systemControls.GetCpuBoost(),
+                _systemControls.GetAfmf(),
+                _systemControls.GetOemSoftware(device));
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetCpuBoost(string powerSource, bool enabled)
+    {
+        lock (_sync)
+        {
+            _systemControls.SetCpuBoost(powerSource, enabled);
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetAfmf(bool enabled)
+    {
+        lock (_sync)
+        {
+            _systemControls.SetAfmf(enabled);
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetOemSoftwareEnabled(bool enabled)
+    {
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            if (!device.OemSoftware.Supported)
+            {
+                throw new InvalidOperationException("OEM software control is not supported by this device.");
+            }
+
+            WriteJsonAtomically(_commandPath, new HandheldHardwareCommand(
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                device.Id,
+                device.ProductCode,
+                enabled ? "oem-software-enable" : "oem-software-disable",
+                0));
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetOemVibrationStrength(int strengthPercent)
+    {
+        lock (_sync)
+        {
+            _systemControls.SetVibrationStrength(RequireSupportedDevice(), strengthPercent);
+            _uiHapticVibrationStrength = strengthPercent;
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetOemUiHapticsEnabled(bool enabled)
+    {
+        lock (_sync)
+        {
+            _systemControls.SetUiHapticsEnabled(RequireSupportedDevice(), enabled);
+            _uiHapticsEnabled = enabled;
+            return GetSnapshot();
+        }
+    }
+
+    public bool RequestUiHaptic(string kind)
+    {
+        lock (_sync)
+        {
+            var dataDirectory = Path.GetDirectoryName(_hapticCommandPath)!;
+            var device = _uiHapticDevice ??= HandheldDeviceCatalog.Detect();
+            if (!HandheldDeviceCatalog.IsSupported(device) || !device.Controller.VibrationSupported)
+            {
+                return false;
+            }
+
+            _uiHapticsEnabled ??= HandheldControllerSettingsStore.ReadUiHapticsEnabled(dataDirectory, device.Id);
+            _uiHapticVibrationStrength ??= HandheldControllerSettingsStore.ReadVibrationStrengthPercent(
+                dataDirectory,
+                device.Id,
+                device.Controller.DefaultVibrationStrengthPercent);
+            if (!_uiHapticsEnabled.Value || _uiHapticVibrationStrength.Value == 0)
+            {
+                return false;
+            }
+
+            var command = HandheldUiHapticPatternCatalog.Create(
+                device.Id,
+                kind,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            WriteJsonAtomically(_hapticCommandPath, command);
+            return true;
+        }
+    }
+
+    public HandheldPerformanceSnapshot StartOemButtonCapture(string buttonId)
+    {
+        lock (_sync)
+        {
+            _systemControls.StartButtonCapture(RequireSupportedDevice(), buttonId);
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot CancelOemButtonCapture()
+    {
+        lock (_sync)
+        {
+            _systemControls.CancelButtonCapture(RequireSupportedDevice());
+            return GetSnapshot();
+        }
+    }
+
+    public HandheldPerformanceSnapshot SetOemButtonBinding(
+        string buttonId,
+        string actionId,
+        string customShortcut)
+    {
+        lock (_sync)
+        {
+            _systemControls.SetButtonBinding(RequireSupportedDevice(), buttonId, actionId, customShortcut);
+            return GetSnapshot();
+        }
+    }
+
+    public void ObserveOemInput(HidMenuButtonReport report)
+    {
+        _systemControls.ObserveOemInput(HandheldDeviceCatalog.Detect(), report);
+    }
+
+    public HandheldPerformanceSnapshot SetLighting(
+        bool enabled, string effect, string leftColor, string rightColor, string buttonColor, int brightness)
+    {
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            if (!device.Lighting.Supported)
+            {
+                throw new InvalidOperationException("RGB lighting is not supported by this device.");
+            }
+
+            var normalizedEffect = effect?.Trim().ToLowerInvariant() ?? string.Empty;
+            if (!device.Lighting.Effects.Contains(normalizedEffect, StringComparer.Ordinal))
+            {
+                throw new ArgumentOutOfRangeException(nameof(effect), "The selected RGB effect is not supported by this device.");
+            }
+
+            var settings = new HandheldLightingSettings(
+                enabled,
+                normalizedEffect,
+                NormalizeRgbColor(leftColor),
+                NormalizeRgbColor(rightColor),
+                NormalizeRgbColor(buttonColor),
+                Math.Clamp(brightness, device.Lighting.MinimumBrightness, device.Lighting.MaximumBrightness),
+                DateTimeOffset.UtcNow);
+            WriteJsonAtomically(_lightingPath, settings);
+            WriteJsonAtomically(_commandPath, new HandheldHardwareCommand(
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), device.Id, device.ProductCode,
+                "set-lighting", 0, settings));
+            return GetSnapshot();
         }
     }
 
@@ -430,12 +623,19 @@ public sealed class HandheldPerformanceService
 
     private void WriteCommand(HandheldDeviceProfile device, int watts)
     {
+        WritePowerLimitsCommand(device, watts, ResolveSppt(watts), ResolveFppt(watts));
+    }
+
+    private void WritePowerLimitsCommand(HandheldDeviceProfile device, int splWatts, int spptWatts, int fpptWatts)
+    {
         var command = new HandheldHardwareCommand(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             device.Id,
             device.ProductCode,
             "set-tdp",
-            watts);
+            splWatts,
+            SpptWatts: spptWatts,
+            FpptWatts: fpptWatts);
         WriteJsonAtomically(_commandPath, command);
     }
 
@@ -598,6 +798,10 @@ public sealed class HandheldPerformanceService
     private static int ClampTdp(HandheldDeviceProfile device, int watts) =>
         Math.Clamp(watts, device.MinimumTdpWatts, device.MaximumTdpWatts);
 
+    private static int ResolveSppt(int splWatts) => Math.Min(40, splWatts + 5);
+
+    private static int ResolveFppt(int splWatts) => Math.Min(48, splWatts + 13);
+
     private static string ResolveModeId(HandheldDeviceProfile device, int watts) =>
         device.Modes.FirstOrDefault(mode => mode.Watts == watts)?.Id ?? "custom";
 
@@ -613,6 +817,34 @@ public sealed class HandheldPerformanceService
         {
             return new();
         }
+    }
+
+    private HandheldLightingSettings LoadLightingSettings(HandheldDeviceProfile device)
+    {
+        try
+        {
+            if (File.Exists(_lightingPath))
+            {
+                return JsonSerializer.Deserialize<HandheldLightingSettings>(File.ReadAllText(_lightingPath), JsonOptions) ?? new();
+            }
+        }
+        catch
+        {
+        }
+
+        return new HandheldLightingSettings(
+            Brightness: device.Lighting.Supported ? device.Lighting.MaximumBrightness : 0);
+    }
+
+    private static string NormalizeRgbColor(string value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant() ?? string.Empty;
+        if (normalized.Length != 7 || normalized[0] != '#' ||
+            !normalized.AsSpan(1).ToString().All(Uri.IsHexDigit))
+        {
+            throw new ArgumentException("RGB colors must use #RRGGBB format.");
+        }
+        return normalized;
     }
 
     private void SaveSettings(HandheldPerformanceSettings settings) => WriteJsonAtomically(_settingsPath, settings);

@@ -12,7 +12,7 @@ param(
     [string]$InstallerState = "",
     [string]$ExpectedPackageName = "GCM.ToolsForSteam.XboxHost",
     [string]$ExpectedPackageFamilyName = "GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j",
-    [string]$ExpectedThumbprint = "B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251"
+    [string]$ExpectedThumbprint = "E38C2E0BDF195C5F4329102504002F4E0766FF99"
 )
 
 $ErrorActionPreference = "Continue"

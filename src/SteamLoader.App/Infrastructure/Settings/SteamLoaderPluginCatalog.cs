@@ -10,7 +10,7 @@ public static class SteamLoaderPluginCatalog
         var definitions = new List<SteamLoaderPluginDefinition>
         {
         new("processes", "Processes", "Window switcher for visible app windows.", true),
-        new("app-start", "App Start", "Controller launcher for selected Windows apps.", true),
+        new("app-start", "App Start", "One-click launcher for installed Windows apps.", true),
         new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true),
         new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
@@ -18,6 +18,7 @@ public static class SteamLoaderPluginCatalog
         new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),
         new("performance", "FPS Overlay", "Built-in TFS FPS meter and Steam-style overlay controls.", true),
         new("hltb", "HLTB", "HowLongToBeat game page estimates.", true),
+        new("discord", "Discord", "See online friends and browse servers with presence counts.", true, false),
         new("themes", "CSSLoader", "Controller for local CSSLoader themes, presets, and backend tools.", true),
         new("smart-home", "Homey", "Rooms, lights, moods, colors, and flows from Homey with a provider-neutral foundation.", true, false),
         new("power", "Power", "Recovery and power actions. This stays available for safety.", false),

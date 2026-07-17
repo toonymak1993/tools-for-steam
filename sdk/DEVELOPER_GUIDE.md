@@ -505,14 +505,16 @@ Declare `native.app-start`.
 
 ```js
 const catalog = await sdk.appStart.getCatalog();
-await sdk.appStart.add(catalog.apps[0].id);
+await sdk.appStart.toggleFavorite(catalog.apps[0].id);
 
 const shortcuts = await sdk.appStart.getState();
 await sdk.appStart.launch(shortcuts.shortcuts[0].id);
 await sdk.appStart.remove(shortcuts.shortcuts[0].id);
+await sdk.appStart.add(shortcuts.shortcuts[0].id); // restore a hidden app
+await sdk.appStart.refreshCatalog();
 ```
 
-App Start uses the curated Windows application catalog discovered by TFS. It is not an arbitrary process execution API.
+App Start uses TFS's cached catalog of launchable desktop and packaged Windows apps. It is not an arbitrary process execution API.
 
 ## 20. Native Store Sync
 

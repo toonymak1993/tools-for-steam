@@ -15,6 +15,8 @@ public sealed record SteamLoaderGeneralSettingsSnapshot(
     string XboxModeSupportReason,
     bool HandheldPerformanceAvailable,
     string HandheldPerformanceTitle,
+    bool OemSoftwareAvailable,
+    string OemSoftwareTitle,
     IReadOnlyList<SteamLoaderPluginSettingsState> Plugins);
 
 public sealed record SteamLoaderPluginSettingsState(

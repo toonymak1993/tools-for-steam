@@ -336,6 +336,12 @@ internal sealed class SteamGridDbArtworkDownloader
 
         foreach (var slot in ArtworkSlots)
         {
+            var fileStem = slot.FileStemBuilder(gridId);
+            if (HasArtworkVariant(gridDirectory, fileStem))
+            {
+                continue;
+            }
+
             try
             {
                 if (await DownloadArtworkSlotAsync(httpClient, gridDirectory, gridId, slot, gameId, cancellationToken))

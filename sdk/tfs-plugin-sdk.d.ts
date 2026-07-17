@@ -191,6 +191,9 @@ export interface TfsAppStartCatalogEntry {
   sourcePath: string;
   iconDataUri: string | null;
   added: boolean;
+  favorite: boolean;
+  hidden: boolean;
+  sourceKind: "desktop" | "packaged";
 }
 
 export interface TfsAppStartShortcut {
@@ -198,6 +201,8 @@ export interface TfsAppStartShortcut {
   name: string;
   sourcePath: string;
   iconDataUri: string | null;
+  favorite: boolean;
+  sourceKind: "desktop" | "packaged";
 }
 
 export interface TfsPerformanceRuntimeState {
@@ -481,10 +486,12 @@ export interface TfsPluginSdk {
   };
 
   appStart: {
-    getState(): Promise<{ shortcuts: TfsAppStartShortcut[]; statusText: string }>;
+    getState(): Promise<{ shortcuts: TfsAppStartShortcut[]; statusText: string; lastIndexedAtUtc: string | null }>;
     getCatalog(): Promise<{ apps: TfsAppStartCatalogEntry[]; statusText: string }>;
+    refreshCatalog(): Promise<{ apps: TfsAppStartCatalogEntry[]; statusText: string }>;
     add(appId: string): Promise<unknown>;
     remove(shortcutId: string): Promise<unknown>;
+    toggleFavorite(shortcutId: string): Promise<unknown>;
     launch(shortcutId: string): Promise<unknown>;
   };
 

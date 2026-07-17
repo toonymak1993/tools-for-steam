@@ -5,7 +5,7 @@ namespace SteamLoader.App.Infrastructure.Handheld;
 internal sealed class HandheldPerformanceProfileCoordinator
 {
     private readonly HandheldPerformanceService _performanceService;
-    private readonly SteamGameProcessMonitor? _gameMonitor;
+    private readonly HybridGameProcessMonitor _gameMonitor;
     private readonly WindowsProfileNotificationService _notificationService;
 
     public HandheldPerformanceProfileCoordinator(
@@ -15,15 +15,12 @@ internal sealed class HandheldPerformanceProfileCoordinator
     {
         _performanceService = performanceService;
         _notificationService = notificationService;
-        _gameMonitor = string.IsNullOrWhiteSpace(steamRootPath)
-            ? null
-            : new SteamGameProcessMonitor(steamRootPath);
+        _gameMonitor = new HybridGameProcessMonitor(steamRootPath);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        if (_gameMonitor is null ||
-            !HandheldDeviceCatalog.IsSupported(HandheldDeviceCatalog.Detect()))
+        if (!HandheldDeviceCatalog.IsSupported(HandheldDeviceCatalog.Detect()))
         {
             return;
         }

@@ -43,12 +43,7 @@ internal sealed class SteamGameProcessMonitor
 
     public HandheldRunningGame? Poll()
     {
-        ReadNewLines();
-
-        foreach (var app in _apps.Values)
-        {
-            app.ProcessIds.RemoveWhere(processId => !_isProcessAlive(processId));
-        }
+        RefreshTrackedApps();
 
         var current = _apps.Values
             .Where(app => app.ProcessIds.Count > 0)
@@ -59,14 +54,52 @@ internal sealed class SteamGameProcessMonitor
             return null;
         }
 
-        var processId = current.ProcessIds.LastOrDefault();
+        return BuildRunningGame(current, current.ProcessIds.LastOrDefault());
+    }
+
+    internal HandheldRunningGame? PollForProcess(int processId)
+    {
+        RefreshTrackedApps();
+        var current = _apps.Values.FirstOrDefault(app => app.ProcessIds.Contains(processId));
+        return current is null ? null : BuildRunningGame(current, processId);
+    }
+
+    internal bool IsAppRunning(string key)
+    {
+        RefreshTrackedApps();
+        return _apps.Values.Any(app =>
+            app.ProcessIds.Count > 0 &&
+            string.Equals(BuildAppKey(app), key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal bool IsProcessTrackedByApp(string key, int processId)
+    {
+        RefreshTrackedApps();
+        return _apps.Values.Any(app =>
+            app.ProcessIds.Contains(processId) &&
+            string.Equals(BuildAppKey(app), key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void RefreshTrackedApps()
+    {
+        ReadNewLines();
+        foreach (var app in _apps.Values)
+        {
+            app.ProcessIds.RemoveWhere(processId => !_isProcessAlive(processId));
+        }
+    }
+
+    private HandheldRunningGame BuildRunningGame(TrackedApp current, int processId)
+    {
         var executablePath = current.ExecutablePath;
         var title = ResolveAppTitle(current.AppId, executablePath);
-        var key = !string.IsNullOrWhiteSpace(current.AppId)
-            ? $"steam:{current.AppId}"
-            : $"exe:{executablePath.ToLowerInvariant()}";
-        return new HandheldRunningGame(key, current.AppId, title, executablePath, processId);
+        return new HandheldRunningGame(BuildAppKey(current), current.AppId, title, executablePath, processId);
     }
+
+    private static string BuildAppKey(TrackedApp app) =>
+        !string.IsNullOrWhiteSpace(app.AppId)
+            ? $"steam:{app.AppId}"
+            : $"exe:{app.ExecutablePath.ToLowerInvariant()}";
 
     private void ReadNewLines()
     {

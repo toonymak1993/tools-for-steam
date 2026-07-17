@@ -211,6 +211,8 @@ public sealed class StoreSyncManifestEntry
 
     public bool ArtworkLocked { get; set; }
 
+    public DateTimeOffset? LastArtworkAttemptAtUtc { get; set; }
+
     public DateTimeOffset LastSeenAtUtc { get; set; }
 
     public DateTimeOffset LastUpdatedAtUtc { get; set; }

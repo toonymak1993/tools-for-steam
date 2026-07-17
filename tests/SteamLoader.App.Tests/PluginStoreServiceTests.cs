@@ -34,6 +34,9 @@ public sealed class PluginStoreServiceTests
             Assert.NotEmpty(snapshot.BuiltInPlugins);
             var smartHome = Assert.Single(snapshot.BuiltInPlugins, plugin => plugin.Id == "smart-home");
             Assert.NotEmpty(smartHome.Images);
+            var discord = Assert.Single(snapshot.BuiltInPlugins, plugin => plugin.Id == "discord");
+            Assert.False(discord.IsEnabled);
+            Assert.NotEmpty(discord.Images);
             Assert.Empty(snapshot.CommunityPlugins);
             Assert.True(service.TryGetBuiltInImage("smart-home", out var imagePath, out var contentType));
             Assert.True(File.Exists(imagePath));

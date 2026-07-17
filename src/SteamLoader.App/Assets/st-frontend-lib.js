@@ -1408,12 +1408,13 @@
     );
   }
 
-  function createHeaderActionButton(state, createElement, withChildren, action) {
+  function createHeaderActionButton(state, createElement, withChildren, action, helpers = {}) {
     if (!action || typeof action.onClick !== "function") {
       return null;
     }
 
     const HeaderActionIcon = action.icon;
+    const focusKey = `header-action:${String(action.key || action.title || "action").trim() || "action"}`;
     return createDialogButton(
       state,
       createElement,
@@ -1424,14 +1425,24 @@
           HeaderActionIcon ? createElement(HeaderActionIcon, {}) : null,
         ),
       ),
-      action.onClick,
+      () => {
+        helpers.rememberCurrentRouteSlot?.(null, focusKey);
+        action.onClick();
+      },
       {
         disabled: action.disabled,
         className: action.buttonClassName || "steamloader-dialog-button steamloader-header-action-button",
         extraProps: {
           "aria-label": action.title || "Action",
           title: action.title || "Action",
+          "data-slot-button": focusKey,
+          "data-slot-key": focusKey,
+          "data-header-action": "true",
           style: action.buttonStyle || undefined,
+          onGamepadFocus: () => {
+            helpers.rememberCurrentRouteSlot?.(null, focusKey);
+            action.onGamepadFocus?.();
+          },
         },
       },
     );
@@ -2271,7 +2282,7 @@
                   withChildren(
                     { className: "steamloader-header-actions" },
                     ...headerActions
-                      .map((action) => createHeaderActionButton(state, createElement, withChildren, action))
+                      .map((action) => createHeaderActionButton(state, createElement, withChildren, action, helpers))
                       .filter(Boolean),
                   ),
                 )
@@ -2747,8 +2758,10 @@
     const appStart = {
       getState: () => capabilityRequest("app-start", "getState"),
       getCatalog: () => capabilityRequest("app-start", "getCatalog"),
+      refreshCatalog: () => capabilityRequest("app-start", "refreshCatalog"),
       add: (appId) => capabilityRequest("app-start", "add", { appId }),
       remove: (shortcutId) => capabilityRequest("app-start", "remove", { shortcutId }),
+      toggleFavorite: (shortcutId) => capabilityRequest("app-start", "toggleFavorite", { shortcutId }),
       launch: (shortcutId) => capabilityRequest("app-start", "launch", { shortcutId }),
     };
 

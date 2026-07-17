@@ -33,11 +33,31 @@ if (-not [version]::TryParse($PackageVersion, [ref]$parsedPackageVersion) -or
     throw "Invalid MSIX package version '$PackageVersion'. Every component must be between 0 and 65535."
 }
 
-$sdkBin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
-    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-    Sort-Object { [version]$_.Name } -Descending |
-    ForEach-Object { Join-Path $_.FullName "x64" } |
-    Where-Object { Test-Path (Join-Path $_ "makeappx.exe") -PathType Leaf } |
+$sdkBinCandidates = @()
+$windowsKitsBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+if (Test-Path -LiteralPath $windowsKitsBin -PathType Container) {
+    $sdkBinCandidates += Get-ChildItem -LiteralPath $windowsKitsBin -Directory |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Join-Path $_.FullName "x64" }
+}
+
+$visualStudioSdkPackages = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Shared\NuGetPackages\microsoft.windows.sdk.buildtools"
+if (Test-Path -LiteralPath $visualStudioSdkPackages -PathType Container) {
+    $sdkBinCandidates += Get-ChildItem -LiteralPath $visualStudioSdkPackages -Directory |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object {
+            Get-ChildItem -LiteralPath (Join-Path $_.FullName "bin") -Directory -ErrorAction SilentlyContinue |
+                Sort-Object { [version]$_.Name } -Descending |
+                ForEach-Object { Join-Path $_.FullName "x64" }
+        }
+}
+
+$sdkBin = $sdkBinCandidates |
+    Where-Object {
+        (Test-Path (Join-Path $_ "makeappx.exe") -PathType Leaf) -and
+        (Test-Path (Join-Path $_ "signtool.exe") -PathType Leaf)
+    } |
     Select-Object -First 1
 if (-not $sdkBin) {
     throw "A Windows SDK containing makeappx.exe and signtool.exe is required."

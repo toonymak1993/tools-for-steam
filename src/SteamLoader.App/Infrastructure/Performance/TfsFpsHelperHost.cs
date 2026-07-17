@@ -8,6 +8,7 @@ using System.Windows.Shapes;
 using System.Windows.Threading;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Session;
+using SteamLoader.App.Infrastructure.Handheld;
 using MediaBrushes = System.Windows.Media.Brushes;
 using MediaColor = System.Windows.Media.Color;
 
@@ -15,8 +16,12 @@ namespace SteamLoader.App.Infrastructure.Performance;
 
 public sealed class TfsFpsHelperHost
 {
+    private static readonly TimeSpan TrackedGameExitGrace = TimeSpan.FromSeconds(2);
+
     private readonly PerformanceSettingsStore _settingsStore;
     private readonly PerformanceStatusStore _statusStore;
+    private readonly SteamGameProcessMonitor? _steamGameMonitor;
+    private readonly StoreSyncGameProcessMonitor? _storeSyncGameMonitor;
     private readonly EtwFpsSampler _sampler = new();
     private readonly DispatcherTimer _managementTimer;
     private readonly DispatcherTimer _overlayTimer;
@@ -24,6 +29,10 @@ public sealed class TfsFpsHelperHost
     private PerformanceSettingsConfiguration _configuration = new();
     private ForegroundTargetCandidate? _currentTarget;
     private PerformanceRuntimeStatus _lastStatus = new();
+    private string _trackedSteamGameKey = string.Empty;
+    private string _trackedStoreSyncGameKey = string.Empty;
+    private int _trackedStoreSyncGameProcessId;
+    private DateTimeOffset _trackedGameMissingSince = DateTimeOffset.MinValue;
     private SteamOsPerformanceOverlayWindow? _window;
     private System.Windows.Application? _application;
     private DateTimeOffset _lastTelemetrySampleAt = DateTimeOffset.MinValue;
@@ -33,9 +42,20 @@ public sealed class TfsFpsHelperHost
     private OverlayMetricsSnapshot _lastMetrics = OverlayMetricsSnapshot.Empty;
 
     public TfsFpsHelperHost(PerformanceSettingsStore settingsStore, PerformanceStatusStore statusStore)
+        : this(settingsStore, statusStore, null, null)
+    {
+    }
+
+    internal TfsFpsHelperHost(
+        PerformanceSettingsStore settingsStore,
+        PerformanceStatusStore statusStore,
+        SteamGameProcessMonitor? steamGameMonitor,
+        StoreSyncGameProcessMonitor? storeSyncGameMonitor)
     {
         _settingsStore = settingsStore;
         _statusStore = statusStore;
+        _steamGameMonitor = steamGameMonitor;
+        _storeSyncGameMonitor = storeSyncGameMonitor;
         _managementTimer = new DispatcherTimer(DispatcherPriority.Background);
         _managementTimer.Tick += (_, _) => OnManagementTick();
         _overlayTimer = new DispatcherTimer(DispatcherPriority.Render);
@@ -99,6 +119,14 @@ public sealed class TfsFpsHelperHost
             return;
         }
 
+        if (ShouldStopForClosedGame())
+        {
+            _configuration.OverlayEnabled = false;
+            _settingsStore.Save(_configuration);
+            StopHelper("The tracked game session closed. TFS FPS Overlay stopped automatically.");
+            return;
+        }
+
         ApplyConfigurationToWindow();
         UpdateTimerIntervals();
 
@@ -121,6 +149,25 @@ public sealed class TfsFpsHelperHost
 
         var metrics = _sampler.GetSnapshot();
         _lastMetrics = metrics;
+        if (string.IsNullOrWhiteSpace(_trackedSteamGameKey) &&
+            string.IsNullOrWhiteSpace(_trackedStoreSyncGameKey) &&
+            _currentTarget is not null &&
+            metrics.SampleCount > 0)
+        {
+            var steamGame = _steamGameMonitor?
+                .PollForProcess(_currentTarget.ProcessId)?
+                .Key;
+            if (!string.IsNullOrWhiteSpace(steamGame))
+            {
+                _trackedSteamGameKey = steamGame;
+            }
+            else if (_storeSyncGameMonitor?.TryMatch(_currentTarget) is { } storeSyncGame)
+            {
+                _trackedStoreSyncGameKey = storeSyncGame.Key;
+                _trackedStoreSyncGameProcessId = storeSyncGame.ProcessId;
+            }
+        }
+
         _lastStatus = new PerformanceRuntimeStatus
         {
             OverlayVisible = true,
@@ -182,6 +229,40 @@ public sealed class TfsFpsHelperHost
 
     private ForegroundTargetCandidate? ResolveTarget()
     {
+        if (!string.IsNullOrWhiteSpace(_trackedSteamGameKey) && _steamGameMonitor is not null)
+        {
+            var steamGameForeground = PerformanceForegroundTargetResolver.TryResolve();
+            if (steamGameForeground is not null &&
+                _steamGameMonitor.IsProcessTrackedByApp(_trackedSteamGameKey, steamGameForeground.ProcessId))
+            {
+                return steamGameForeground;
+            }
+
+            return _currentTarget is not null &&
+                   IsProcessAlive(_currentTarget.ProcessId) &&
+                   _steamGameMonitor.IsProcessTrackedByApp(_trackedSteamGameKey, _currentTarget.ProcessId)
+                ? _currentTarget
+                : null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_trackedStoreSyncGameKey) && _storeSyncGameMonitor is not null)
+        {
+            var storeSyncForeground = PerformanceForegroundTargetResolver.TryResolve();
+            if (storeSyncForeground is not null &&
+                _storeSyncGameMonitor.IsProcessForGame(_trackedStoreSyncGameKey, storeSyncForeground))
+            {
+                _trackedStoreSyncGameProcessId = storeSyncForeground.ProcessId;
+                return storeSyncForeground;
+            }
+
+            return _currentTarget is not null &&
+                   _currentTarget.ProcessId == _trackedStoreSyncGameProcessId &&
+                   IsProcessAlive(_currentTarget.ProcessId) &&
+                   _storeSyncGameMonitor.IsProcessForGame(_trackedStoreSyncGameKey, _currentTarget)
+                ? _currentTarget
+                : null;
+        }
+
         if (_configuration.AutoTargetEnabled)
         {
             var foreground = PerformanceForegroundTargetResolver.TryResolve();
@@ -249,6 +330,37 @@ public sealed class TfsFpsHelperHost
         _lastProcessCpuTime = TimeSpan.Zero;
         _targetCpuPercent = 0d;
         _targetMemoryMb = 0L;
+    }
+
+    private bool ShouldStopForClosedGame()
+    {
+        var steamGameRunning = !string.IsNullOrWhiteSpace(_trackedSteamGameKey) &&
+                               _steamGameMonitor is not null &&
+                               _steamGameMonitor.IsAppRunning(_trackedSteamGameKey);
+        var storeSyncGameRunning = !string.IsNullOrWhiteSpace(_trackedStoreSyncGameKey) &&
+                                   _trackedStoreSyncGameProcessId > 0 &&
+                                   IsProcessAlive(_trackedStoreSyncGameProcessId);
+        var hasTrackedGame = !string.IsNullOrWhiteSpace(_trackedSteamGameKey) ||
+                             !string.IsNullOrWhiteSpace(_trackedStoreSyncGameKey);
+        if (!hasTrackedGame)
+        {
+            return false;
+        }
+
+        if (steamGameRunning || storeSyncGameRunning)
+        {
+            _trackedGameMissingSince = DateTimeOffset.MinValue;
+            return false;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_trackedGameMissingSince == DateTimeOffset.MinValue)
+        {
+            _trackedGameMissingSince = now;
+            return false;
+        }
+
+        return now - _trackedGameMissingSince >= TrackedGameExitGrace;
     }
 
     private string BuildDetailText(OverlayMetricsSnapshot metrics)

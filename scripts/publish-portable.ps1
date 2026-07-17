@@ -39,6 +39,14 @@ if ($LASTEXITCODE -ne 0) {
 
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination (Join-Path $portableRoot "README.md")
 Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE.txt") -Destination (Join-Path $portableRoot "LICENSE.txt")
+$discordNoticesRoot = Join-Path $portableRoot "ThirdParty\DiscordSocialSdk"
+New-Item -ItemType Directory -Path $discordNoticesRoot -Force | Out-Null
+Copy-Item `
+    -LiteralPath (Join-Path $projectRoot "src\SteamLoader.App\ThirdParty\DiscordSocialSdk\License-Notices.txt") `
+    -Destination (Join-Path $discordNoticesRoot "License-Notices.txt")
+Copy-Item `
+    -LiteralPath (Join-Path $projectRoot "src\SteamLoader.App\ThirdParty\DiscordSocialSdk\NOTICE.txt") `
+    -Destination (Join-Path $discordNoticesRoot "NOTICE.txt")
 
 Write-Host ""
 Write-Host "Installer payload prepared:"

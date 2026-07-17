@@ -4,6 +4,7 @@ using SteamLoader.App.Infrastructure.AutoSisir;
 using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
+using SteamLoader.App.Infrastructure.Discord;
 using SteamLoader.App.Infrastructure.Helpers;
 using SteamLoader.App.Infrastructure.Hltb;
 using SteamLoader.App.Infrastructure.Handheld;
@@ -44,11 +45,15 @@ public sealed class SteamLoaderBackgroundHost
         var audioOutputDeviceService = new CoreAudioOutputDeviceService();
         var displaySwitchService = new DisplaySwitchService();
         var processWindowService = new ProcessWindowService();
+        var steamWindowFocusService = new SteamWindowFocusService(processWindowService);
         var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
         var apiSessionToken = LocalApiSession.GetOrCreate(
             Path.Combine(dataDirectory, "local-api-session.token"));
         var hltbService = new HltbService(
             new HltbSettingsStore(Path.Combine(dataDirectory, "hltb.json")));
+        await using var discordService = new DiscordService(
+            httpClient,
+            new DiscordSettingsStore(Path.Combine(dataDirectory, "discord.json")));
         var autostartService = new WindowsAutostartService(
             SteamLoaderRuntime.AutostartValueName,
             "SteamLoader",
@@ -82,6 +87,15 @@ public sealed class SteamLoaderBackgroundHost
         var handheldPerformanceService = new HandheldPerformanceService(
             dataDirectory,
             handheldProfileNotificationService);
+        handheldPerformanceService.OemButtonPressed += binding =>
+        {
+            _ = ExecuteOemButtonActionAsync(
+                binding,
+                devToolsClient,
+                steamWindowFocusService,
+                dataDirectory,
+                cancellationToken);
+        };
         var handheldProfileCoordinator = new HandheldPerformanceProfileCoordinator(
             handheldPerformanceService,
             steamInstallationService.ResolveSteamRootPath(),
@@ -130,6 +144,13 @@ public sealed class SteamLoaderBackgroundHost
             Path.Combine(dataDirectory, "gamepad-helper-watchdog.log"));
         var releaseUpdateService = new ReleaseUpdateService();
         var liveUpdateHub = new QuickAccessLiveUpdateHub();
+        var externalGameQuickAccessService = new ExternalGameQuickAccessService(
+            storeSyncService,
+            processWindowService,
+            steamWindowFocusService,
+            devToolsClient,
+            liveUpdateHub,
+            Path.Combine(dataDirectory, "external-game-quick-access.log"));
         var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
         var popupScript = string.Join(
             Environment.NewLine,
@@ -162,6 +183,7 @@ public sealed class SteamLoaderBackgroundHost
             handheldPerformanceService,
             () => steamLoaderSettingsService.IsPluginEnabled("smart-home"));
         using var hidMenuButtonMonitor = new HidMenuButtonMonitor();
+        hidMenuButtonMonitor.ReportObserved += handheldPerformanceService.ObserveOemInput;
         var controllerShortcutService = new ControllerShortcutService(
             isEnabled: () => !gamepadHelperSupervisor.IsHelperRunning,
             isBigPictureForeground: SteamBigPictureForegroundDetector.IsBigPictureForeground,
@@ -175,7 +197,9 @@ public sealed class SteamLoaderBackgroundHost
             diagnosticLog: message => AppendDiagnosticLog(
                 Path.Combine(dataDirectory, "controller-shortcuts.log"),
                 message),
-            isHidBackButtonDown: () => hidMenuButtonMonitor.IsBackDown);
+            isHidBackButtonDown: () => hidMenuButtonMonitor.IsBackDown,
+            tryOpenExternalGameQuickAccessAsync: () =>
+                externalGameQuickAccessService.TryOpenForForegroundGameAsync(cancellationToken));
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
@@ -196,7 +220,9 @@ public sealed class SteamLoaderBackgroundHost
             frontendComponentService,
             devToolsClient,
             smartHomeService,
+            discordService,
             pluginFullTrustRuntime,
+            externalGameQuickAccessService,
             ApiBaseUri,
             apiSessionToken,
             _hostState,
@@ -321,4 +347,69 @@ public sealed class SteamLoaderBackgroundHost
         {
         }
     }
+
+    private static async Task ExecuteOemButtonActionAsync(
+        HandheldOemButtonBinding binding,
+        SteamDevToolsClient devToolsClient,
+        SteamWindowFocusService steamWindowFocusService,
+        string dataDirectory,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var delivery = "local";
+            switch (binding.ActionId)
+            {
+                case "steam-menu":
+                    var steamMenuDirect = await devToolsClient.TryOpenSteamMenuAsync(cancellationToken);
+                    var steamMenuDelivered = steamMenuDirect ||
+                        await devToolsClient.SendControlDigitShortcutAsync(1, cancellationToken);
+                    if (!steamMenuDelivered)
+                    {
+                        throw new InvalidOperationException("Steam did not accept the Steam Menu command.");
+                    }
+                    delivery = steamMenuDirect ? "steam-direct" : "steam-ctrl-1";
+                    break;
+                case "quick-access":
+                    var quickAccessDirect = await devToolsClient.TryOpenQuickAccessMenuAsync(cancellationToken);
+                    var quickAccessDelivered = quickAccessDirect ||
+                        await devToolsClient.SendControlDigitShortcutAsync(2, cancellationToken);
+                    if (!quickAccessDelivered)
+                    {
+                        throw new InvalidOperationException("Steam did not accept the Quick Access command.");
+                    }
+                    delivery = quickAccessDirect ? "steam-direct" : "steam-ctrl-2";
+                    break;
+                case "focus-steam":
+                    delivery = await steamWindowFocusService.FocusSteamWindowAsync(cancellationToken);
+                    break;
+                case "escape":
+                    HandheldSystemControlService.SendOemKeyboardShortcut("ESC");
+                    break;
+                case "alt-tab":
+                    HandheldSystemControlService.SendOemKeyboardShortcut("ALT+TAB");
+                    break;
+                case "xbox-game-bar":
+                    HandheldSystemControlService.SendOemKeyboardShortcut("WIN+G");
+                    break;
+                case "task-manager":
+                    HandheldSystemControlService.SendOemKeyboardShortcut("CTRL+SHIFT+ESC");
+                    break;
+                case "custom-shortcut":
+                    HandheldSystemControlService.SendOemKeyboardShortcut(binding.CustomShortcut);
+                    break;
+            }
+
+            AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "handheld-oem-buttons.log"),
+                $"button={binding.ButtonId} action={binding.ActionId} delivery={delivery} input={binding.InputCode}");
+        }
+        catch (Exception exception)
+        {
+            AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "handheld-oem-buttons.log"),
+                $"button={binding.ButtonId} action={binding.ActionId} failed={exception.GetType().Name}:{exception.Message}");
+        }
+    }
+
 }

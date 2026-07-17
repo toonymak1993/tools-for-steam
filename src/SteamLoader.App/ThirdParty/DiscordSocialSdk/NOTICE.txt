@@ -1,0 +1,13 @@
+Discord Social SDK runtime
+==========================
+
+Package version: 1.9.17379 (Windows x64 release)
+Runtime-reported version: 1.9.17380
+Released by Discord: 2026-06-30
+Downloaded from: https://discord.com/developers/applications/1526906410359848990/social-sdk/downloads
+Archive: DiscordSocialSdk-1.9.17379.zip
+Archive SHA-256: B94694BF839A509FA72C3F20B1881B8EBF19C5344065D85D2A19041554759863
+
+The repository keeps only the Windows x64 runtime, import library, public headers, and Discord's
+license notices from the multi-platform SDK archive. Tools for Steam loads the runtime through the
+documented C API in cdiscord.h. See License-Notices.txt for Discord's notices and bundled licenses.

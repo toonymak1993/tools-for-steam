@@ -74,11 +74,25 @@ The plugin stays hidden on unverified devices instead of applying unknown hardwa
 | **Display** | Switch displays, resolutions, and refresh rates |
 | **CSSLoader** | Control local themes, profiles, presets, and backend tools |
 | **HLTB** | Show HowLongToBeat estimates on supported game pages |
+| **Discord** | See online friends and browse servers with approximate presence counts |
 | **Auto SISR** | Optional marker-mode automation for selected non-Steam games |
 | **Homey** | Optional rooms, lights, moods, colors, and flows integration |
 | **Power** | Restart Steam, recover Explorer, sleep, restart, or shut down safely |
 
 Most tools can be hidden from TFS Settings. Safety and recovery actions remain available.
+
+### Discord setup
+
+1. Enable the built-in **Discord** plugin in the TFS Store or Settings.
+2. Open **Discord > Friends** in Quick Access and select **Connect Discord**.
+3. Sign in in Discord's browser window and approve the friends/presence permission.
+4. Return to Tools for Steam to see currently online friends and browse your Discord servers.
+
+The primary integration uses the official Discord Social SDK and requests `openid sdk.social_layer_presence guilds`. Discord handles browser sign-in and consent; Tools for Steam never requests a password or bot token. OAuth access and refresh tokens are protected with Windows DPAPI for the current Windows account and are removed when the user disconnects. Discord's supported user API exposes an approximate online count per server, but not the identities of individual online server members.
+
+The former [public server widget](https://docs.discord.com/developers/resources/guild#get-guild-widget) remains available as an optional fallback. It still requires the server owner to enable **Server Settings > Engagement > Server Widget**, and it can show only data that Discord exposes publicly.
+
+For development and Store publishing, create and approve a Discord application, enable **Public Client**, accept the Social SDK terms, and build with `-p:DiscordClientId=<application-id>` or set `TOOLS_FOR_STEAM_DISCORD_CLIENT_ID`. The Windows x64 Social SDK runtime and Discord license notices are copied into published builds automatically.
 
 ## Community Store
 

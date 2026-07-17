@@ -1,9 +1,11 @@
 using System.Windows;
 using SteamLoader.App.Hosting;
 using SteamLoader.App.Infrastructure.Helpers;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.Steam;
+using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Services;
 using SteamLoader.App.UI;
 
@@ -26,6 +28,49 @@ public static class Program
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckXboxModeSupportArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return CheckXboxModeSupport();
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PrepareHandheldOemArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return HandheldReplacementRuntime.PrepareOemSoftware(
+                Path.Combine(AppContext.BaseDirectory, "data"));
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PrepareHandheldReplacementArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return HandheldReplacementRuntime.Prepare(
+                Path.Combine(AppContext.BaseDirectory, "data"),
+                args.Any(argument => string.Equals(argument, SteamLoaderRuntime.UsbIpOwnedByTfsArgument, StringComparison.OrdinalIgnoreCase)),
+                args.Any(argument => string.Equals(argument, SteamLoaderRuntime.HidHideOwnedByTfsArgument, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        if (args.Any(argument => string.Equals(
+                argument,
+                SteamLoaderRuntime.SuspendHandheldReplacementForUpdateArgument,
+                StringComparison.OrdinalIgnoreCase)))
+        {
+            var dataDirectoryArgument = args.FirstOrDefault(argument => argument.StartsWith(
+                SteamLoaderRuntime.HandheldDataDirectoryArgumentPrefix,
+                StringComparison.OrdinalIgnoreCase));
+            var dataDirectory = dataDirectoryArgument is null
+                ? Path.Combine(AppContext.BaseDirectory, "data")
+                : Path.GetFullPath(dataDirectoryArgument[SteamLoaderRuntime.HandheldDataDirectoryArgumentPrefix.Length..]);
+            return HandheldReplacementRuntime.SuspendForUpdate(dataDirectory);
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RestoreHandheldReplacementArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return HandheldReplacementRuntime.RestoreForUninstall(Path.Combine(AppContext.BaseDirectory, "data"));
+        }
+
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RemoveOwnedHandheldDriversArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return HandheldReplacementRuntime.RemoveOwnedDrivers(Path.Combine(AppContext.BaseDirectory, "data"));
+        }
+
+        if (Infrastructure.StoreSync.XboxStoreLaunchHost.TryParseArguments(args, out var xboxLaunchPayload))
+        {
+            return Infrastructure.StoreSync.XboxStoreLaunchHost.Run(xboxLaunchPayload);
         }
 
         var unifyLaunchIndex = Array.FindIndex(args, argument =>
@@ -426,7 +471,20 @@ public static class Program
             var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
             var settingsStore = new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json"));
             var statusStore = new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json"));
-            var helperHost = new TfsFpsHelperHost(settingsStore, statusStore);
+            var steamInstallationService = new SteamInstallationService(
+                new SteamInstallPathSettingsStore(Path.Combine(dataDirectory, "steam-install-path.json")),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
+            var steamRootPath = steamInstallationService.ResolveSteamRootPath();
+            var steamGameMonitor = string.IsNullOrWhiteSpace(steamRootPath)
+                ? null
+                : new SteamGameProcessMonitor(steamRootPath);
+            var storeSyncGameMonitor = new StoreSyncGameProcessMonitor(
+                new StoreSyncSettingsStore(Path.Combine(dataDirectory, "store-sync.json")));
+            var helperHost = new TfsFpsHelperHost(
+                settingsStore,
+                statusStore,
+                steamGameMonitor,
+                storeSyncGameMonitor);
             return helperHost.Run();
         }
         catch (Exception exception)
@@ -441,7 +499,7 @@ public static class Program
         try
         {
             var helperHost = new TfsGamepadHelperHost();
-            return helperHost.Run();
+            return helperHost.RunAsync().GetAwaiter().GetResult();
         }
         catch (Exception exception)
         {
@@ -522,7 +580,9 @@ public static class Program
                 var line =
                     $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} " +
                     $"device={deviceHandleText} reportLength={report.ReportLength} " +
-                    $"usages=[{usagesText}] expectedUsageDown={report.IsExpectedMenuUsagePressed}";
+                    $"kind={report.InputKind} pressed={report.IsPressed} code={report.InputCode} " +
+                    $"usages=[{usagesText}] expectedUsageDown={report.IsExpectedMenuUsagePressed} " +
+                    $"detail=\"{report.Detail}\" path=\"{report.DeviceName}\"";
                 AppendLine(line);
             };
 

@@ -18,7 +18,7 @@
   #define VariantFpsHelperPrep "1"
 #endif
 #ifndef XboxHostBuildVersion
-  #define XboxHostBuildVersion "0.3.9.0"
+  #error XboxHostBuildVersion must match the signed MSIX manifest and be supplied by the build script.
 #endif
 
 [Setup]
@@ -40,7 +40,7 @@ OutputBaseFilename={#VariantOutputBaseFilename}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle={#VariantWizardStyle}
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -57,6 +57,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#PayloadDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "{#PayloadDir}\{#MyAppExeName}"; DestName: "ToolsForSteamUpdateHelper.exe"; Flags: dontcopy noencryption
 Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.msix"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
 Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.cer"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
 Source: "XboxModePackage.ps1"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
@@ -68,6 +69,13 @@ Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\COPYING"; DestDir: "{app}\ThirdParty\PawnIO"; DestName: "COPYING-LGPL-2.1.txt"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\NOTICE.txt"; DestDir: "{app}\ThirdParty\PawnIO"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\PawnIO_setup.exe"; DestDir: "{app}\ThirdParty\PawnIO"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\DiscordSocialSdk\License-Notices.txt"; DestDir: "{app}\ThirdParty\DiscordSocialSdk"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\DiscordSocialSdk\NOTICE.txt"; DestDir: "{app}\ThirdParty\DiscordSocialSdk"; Flags: ignoreversion
+Source: "..\dist\handheld-runtime\VIIPER\viiper.exe"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion
+Source: "..\dist\handheld-runtime\VIIPER\licenses.txt"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion
+Source: "..\dist\handheld-runtime\VIIPER\VIIPER-v0.7.0-source.zip"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion
+Source: "..\dist\handheld-runtime\Drivers\USBip-0.9.7.8-x64.exe"; DestDir: "{app}\ThirdParty\HandheldDrivers"; Flags: ignoreversion
+Source: "..\dist\handheld-runtime\Drivers\HidHide_1.5.230_x64.exe"; DestDir: "{app}\ThirdParty\HandheldDrivers"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\SteamLoader.exe"
@@ -77,6 +85,9 @@ Type: files; Name: "{app}\SteamLoader.deps.json"
 Type: files; Name: "{app}\SteamLoader.runtimeconfig.json"
 Type: files; Name: "{app}\install-toolsforsteam.ps1"
 Type: files; Name: "{app}\uninstall-toolsforsteam.ps1"
+Type: files; Name: "{app}\data\viiper-runtime.log"
+Type: filesandordirs; Name: "{app}\data\viiper-profile"
+Type: filesandordirs; Name: "{app}\data\oem-shortcut-quarantine"
 
 [Icons]
 Name: "{group}\Tools for Steam"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; WorkingDir: "{app}"
@@ -90,9 +101,12 @@ Root: HKCU; Subkey: "Software\GCM\SteamTools"; ValueType: string; ValueName: "In
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM ToolsForSteam.exe /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseToolsForSteam"
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM SteamLoader.exe /F"; Flags: runhidden waituntilterminated; RunOnceId: "CloseLegacySteamLoader"
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-handheld-replacement"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreHandheldReplacement"
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--remove-owned-handheld-drivers"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveOwnedHandheldDrivers"
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-xbox-mode"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreXboxModeSettings"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Get-AppxPackage -Name 'GCM.ToolsForSteam.XboxHost' | Remove-AppxPackage"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModePackage"
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Start-Process -FilePath '{sys}\certutil.exe' -ArgumentList '-delstore','TrustedPeople','B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251' -Verb RunAs -WindowStyle Hidden -Wait"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModeCertificate"
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople E38C2E0BDF195C5F4329102504002F4E0766FF99"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModeCertificate"
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveLegacyXboxModeCertificate"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\GamepadHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveGamepadHelperTask"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\FpsHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveFpsHelperTask"
 
@@ -102,8 +116,11 @@ const
   XboxHostPackageFamilyName = 'GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j';
   XboxHostPackageVersion = '{#XboxHostBuildVersion}';
   XboxHostPublisher = 'CN=GCM Gaming Console Mode';
-  XboxHostCertificateThumbprint = 'B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251';
+  XboxHostCertificateThumbprint = 'E38C2E0BDF195C5F4329102504002F4E0766FF99';
+  LegacyXboxHostCertificateThumbprint = 'B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251';
   PawnIOSetupSha256 = '1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032';
+  UsbIpSetupSha256 = '44451fe06f4186125c2a5ecd25b099c5560a61a60b1e56f5a0758e77a60afa44';
+  HidHideSetupSha256 = 'f4bbbcb82e6258641b887c74bc81c4c5f66e4aa811808dfc304347687b7605f6';
 
 var
   SystemCheckPage: TWizardPage;
@@ -142,6 +159,10 @@ var
   FinalizedStartupMode: string;
   XboxModeFailureReason: string;
   DiagnosticFailureReason: string;
+  HandheldDriversInstalledThisRun: Boolean;
+  ElevatedHelperTasksSuspended: Boolean;
+
+function IsMsiClawA8: Boolean; forward;
 
 function GetRegistryStringValue(RootKey: Integer; SubKey: string; ValueName: string): string;
 begin
@@ -280,8 +301,7 @@ begin
   end;
 
   UpdateSetupStatus('Rolling back the Xbox Mode certificate...');
-  if ShellExec(
-      'runas',
+  if Exec(
       ExpandConstant('{sys}\certutil.exe'),
       '-delstore TrustedPeople "' + XboxHostCertificateThumbprint + '"',
       ExpandConstant('{app}\XboxMode'),
@@ -331,6 +351,54 @@ begin
   Log('Xbox Mode package installed by this setup run was rolled back.');
 end;
 
+function MigrateLegacyXboxSigningCertificate: Boolean;
+var
+  LegacyCertificateKeyPath: string;
+  ResultCode: Integer;
+begin
+  Result := True;
+  LegacyCertificateKeyPath :=
+    'SOFTWARE\Microsoft\SystemCertificates\TrustedPeople\Certificates\' +
+    LegacyXboxHostCertificateThumbprint;
+  if not RegKeyExists(HKLM64, LegacyCertificateKeyPath) then
+  begin
+    Exit;
+  end;
+
+  UpdateSetupStatus('Migrating the Tools for Steam Xbox Mode signing certificate...');
+  if IsXboxPackageInstalled then
+  begin
+    if not Exec(
+        ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+        '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-AppxPackage -Name ''' + XboxHostPackageName + ''' | Remove-AppxPackage -ErrorAction Stop"',
+        '',
+        SW_HIDE,
+        ewWaitUntilTerminated,
+        ResultCode) or (ResultCode <> 0) then
+    begin
+      RecordXboxModeFailure('The Xbox Mode package signed with the retired certificate could not be removed. Result code: ' + IntToStr(ResultCode) + '.');
+      Result := False;
+      Exit;
+    end;
+    XboxPackageExistedBeforeInstall := False;
+  end;
+
+  if not Exec(
+      ExpandConstant('{sys}\certutil.exe'),
+      '-delstore TrustedPeople "' + LegacyXboxHostCertificateThumbprint + '"',
+      ExpandConstant('{app}\XboxMode'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) or (ResultCode <> 0) then
+  begin
+    RecordXboxModeFailure('The retired Xbox Mode certificate could not be removed. Result code: ' + IntToStr(ResultCode) + '.');
+    Result := False;
+    Exit;
+  end;
+
+  Log('The retired Xbox Mode signing certificate was removed successfully.');
+end;
+
 procedure InstallXboxModeSupport;
 var
   CertificatePath: string;
@@ -371,11 +439,16 @@ begin
     Exit;
   end;
 
+  if not MigrateLegacyXboxSigningCertificate then
+  begin
+    Log('Xbox Mode signing certificate migration failed.');
+    Exit;
+  end;
+
   if not RegKeyExists(HKLM64, CertificateKeyPath) then
   begin
     UpdateSetupStatus('Installing the Tools for Steam Xbox Mode certificate...');
-    if not ShellExec(
-        'runas',
+    if not Exec(
         ExpandConstant('{sys}\certutil.exe'),
         '-f -addstore TrustedPeople "' + CertificatePath + '"',
         ExpandConstant('{app}\XboxMode'),
@@ -623,24 +696,69 @@ begin
     ResultCode);
 end;
 
-procedure StopElevatedHelperTasksForInstall;
+function StopElevatedHelperTasksForInstall: Boolean;
+var
+  ScriptPath: string;
+  Script: string;
+  ResultCode: Integer;
+begin
+  ScriptPath := ExpandConstant('{tmp}\tools-for-steam-stop-elevated-helpers.ps1');
+  Script :=
+    '$ErrorActionPreference = "SilentlyContinue"' + #13#10 +
+    '$tasks = @("\ToolsForSteam\GamepadHelper", "\ToolsForSteam\FpsHelper")' + #13#10 +
+    'foreach ($task in $tasks) {' + #13#10 +
+    '  & "$env:WINDIR\System32\schtasks.exe" /Change /TN $task /Disable 2>$null | Out-Null' + #13#10 +
+    '  & "$env:WINDIR\System32\schtasks.exe" /End /TN $task 2>$null | Out-Null' + #13#10 +
+    '}' + #13#10 +
+    'Start-Sleep -Milliseconds 500' + #13#10 +
+    '$helpers = Get-CimInstance Win32_Process | Where-Object {' + #13#10 +
+    '  $_.Name -eq "ToolsForSteam.exe" -and $_.CommandLine -match "--(gamepad|fps)-helper"' + #13#10 +
+    '}' + #13#10 +
+    '$helpers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }' + #13#10 +
+    'Start-Sleep -Milliseconds 500' + #13#10 +
+    '$remaining = Get-CimInstance Win32_Process | Where-Object {' + #13#10 +
+    '  $_.Name -eq "ToolsForSteam.exe" -and $_.CommandLine -match "--(gamepad|fps)-helper"' + #13#10 +
+    '}' + #13#10 +
+    'if ($remaining) { exit 1 }' + #13#10 +
+    'exit 0' + #13#10;
+
+  Result :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+  ElevatedHelperTasksSuspended := Result;
+end;
+
+procedure ResumeElevatedHelperTasks;
 var
   ResultCode: Integer;
 begin
+  if not ElevatedHelperTasksSuspended then
+  begin
+    Exit;
+  end;
+
   Exec(
     ExpandConstant('{sys}\schtasks.exe'),
-    '/End /TN "\ToolsForSteam\GamepadHelper"',
+    '/Change /TN "\ToolsForSteam\GamepadHelper" /Enable',
     '',
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode);
   Exec(
     ExpandConstant('{sys}\schtasks.exe'),
-    '/End /TN "\ToolsForSteam\FpsHelper"',
+    '/Change /TN "\ToolsForSteam\FpsHelper" /Enable',
     '',
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode);
+  ElevatedHelperTasksSuspended := False;
 end;
 
 function EnsureToolsForSteamRuntimeStopped: Boolean;
@@ -891,8 +1009,7 @@ begin
 
   UpdateSetupStatus('Installing helpers: elevated Xbox Mode and FPS helpers...');
 
-  if not ShellExec(
-    'runas',
+  if not Exec(
     ExpandConstant('{app}\{#MyAppExeName}'),
     '--register-installed-helper-tasks',
     ExpandConstant('{app}'),
@@ -974,6 +1091,131 @@ begin
     (CompareText(ProductName, 'MS-1T8K') = 0);
 end;
 
+function SuspendHandheldReplacementForInstall: Boolean;
+var
+  UpdateHelperPath: string;
+  DataDirectory: string;
+  ReplacementStatePath: string;
+  ResultCode: Integer;
+begin
+  Result := True;
+  if not IsMsiClawA8 then
+    Exit;
+
+  DataDirectory := ExpandConstant('{app}\data');
+  ReplacementStatePath := ExpandConstant('{app}\data\handheld-replacement-state.json');
+  if not FileExists(ReplacementStatePath) then
+    Exit;
+
+  UpdateSetupStatus('Safely suspending the handheld controller replacement for the update...');
+  ExtractTemporaryFile('ToolsForSteamUpdateHelper.exe');
+  UpdateHelperPath := ExpandConstant('{tmp}\ToolsForSteamUpdateHelper.exe');
+  Result := Exec(
+      UpdateHelperPath,
+      '--suspend-handheld-replacement-for-update --handheld-data-directory="' + DataDirectory + '"',
+      ExpandConstant('{tmp}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and (ResultCode = 0);
+end;
+
+function IsUsbIpWin2Installed: Boolean;
+begin
+  Result :=
+    RegKeyExists(HKLM64, 'SYSTEM\CurrentControlSet\Services\usbip2_ude') or
+    RegKeyExists(HKLM64, 'SYSTEM\CurrentControlSet\Services\usbip2_stub');
+end;
+
+function IsHidHideInstalled: Boolean;
+begin
+  Result := RegKeyExists(HKLM64, 'SYSTEM\CurrentControlSet\Services\HidHide');
+end;
+
+procedure InstallMandatoryHandheldReplacement;
+var
+  UsbIpSetupPath: string;
+  HidHideSetupPath: string;
+  PrepareArguments: string;
+  ResultCode: Integer;
+  RestoreResultCode: Integer;
+  UsbIpOwnedByTfs: Boolean;
+  HidHideOwnedByTfs: Boolean;
+begin
+  if not IsMsiClawA8 then
+  begin
+    Log('Mandatory handheld replacement skipped because this is not a supported MSI Claw A8.');
+    Exit;
+  end;
+
+  UsbIpSetupPath := ExpandConstant('{app}\ThirdParty\HandheldDrivers\USBip-0.9.7.8-x64.exe');
+  HidHideSetupPath := ExpandConstant('{app}\ThirdParty\HandheldDrivers\HidHide_1.5.230_x64.exe');
+  if not FileExists(ExpandConstant('{app}\ThirdParty\VIIPER\viiper.exe')) or
+     not FileExists(UsbIpSetupPath) or not FileExists(HidHideSetupPath) then
+  begin
+    RaiseException('The mandatory handheld controller runtime is incomplete.');
+  end;
+
+  if LowerCase(GetSHA256OfFile(UsbIpSetupPath)) <> UsbIpSetupSha256 then
+    RaiseException('USBIP-Win2 failed SHA-256 verification.');
+  if LowerCase(GetSHA256OfFile(HidHideSetupPath)) <> HidHideSetupSha256 then
+    RaiseException('HidHide failed SHA-256 verification.');
+
+  UsbIpOwnedByTfs := not IsUsbIpWin2Installed;
+  if UsbIpOwnedByTfs then
+  begin
+    UpdateSetupStatus('Installing the signed USBIP controller driver for this handheld...');
+    if not Exec(UsbIpSetupPath, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
+        ExtractFileDir(UsbIpSetupPath), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
+       ((ResultCode <> 0) and (ResultCode <> 3010)) then
+      RaiseException('The mandatory USBIP-Win2 driver could not be installed.');
+    HandheldDriversInstalledThisRun := True;
+  end;
+
+  HidHideOwnedByTfs := not IsHidHideInstalled;
+  if HidHideOwnedByTfs then
+  begin
+    UpdateSetupStatus('Installing the signed HidHide input isolation driver for this handheld...');
+    if not Exec(HidHideSetupPath, '/qn /norestart',
+        ExtractFileDir(HidHideSetupPath), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
+       ((ResultCode <> 0) and (ResultCode <> 3010)) then
+      RaiseException('The mandatory HidHide driver could not be installed.');
+    HandheldDriversInstalledThisRun := True;
+  end;
+
+  UpdateSetupStatus('Disabling MSI Center M services and autostarts for the TFS replacement...');
+  if not Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--prepare-handheld-oem',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) or (ResultCode <> 0) then
+  begin
+    Exec(
+      ExpandConstant('{app}\{#MyAppExeName}'),
+      '--restore-handheld-replacement',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      RestoreResultCode);
+    RaiseException('MSI Center M could not be prepared for the mandatory TFS controller replacement.');
+  end;
+
+  PrepareArguments := '--prepare-handheld-replacement';
+  if UsbIpOwnedByTfs then
+    PrepareArguments := PrepareArguments + ' --usbip-owned-by-tfs';
+  if HidHideOwnedByTfs then
+    PrepareArguments := PrepareArguments + ' --hidhide-owned-by-tfs';
+
+  UpdateSetupStatus('Preparing the mandatory TFS controller replacement...');
+  if not Exec(ExpandConstant('{app}\{#MyAppExeName}'), PrepareArguments,
+      ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
+     (ResultCode <> 0) then
+    RaiseException('Tools for Steam could not prepare the mandatory handheld replacement.');
+
+  Log('Mandatory VIIPER handheld replacement was prepared successfully.');
+end;
+
 procedure InstallPawnIOIfNeeded;
 var
   SetupPath: string;
@@ -1009,8 +1251,7 @@ begin
   end;
 
   UpdateSetupStatus('Installing PawnIO 2.2.0 for handheld TDP control...');
-  if not ShellExec(
-      'runas',
+  if not Exec(
       SetupPath,
       '-install -silent',
       ExpandConstant('{app}\ThirdParty\PawnIO'),
@@ -1506,6 +1747,7 @@ end;
 
 procedure RestoreSuspendedXboxModeAfterFailure;
 begin
+  ResumeElevatedHelperTasks;
   if not XboxModeSuspendedForInstall then
   begin
     Exit;
@@ -1701,8 +1943,10 @@ begin
   begin
     InstallXboxModeSupport;
     InstallPawnIOIfNeeded;
+    InstallMandatoryHandheldReplacement;
 #if VariantFpsHelperPrep == "1"
     RegisterElevatedHelperTaskSupport;
+    ResumeElevatedHelperTasks;
 #endif
     SanitizeSteamAutostartSources;
     { Startup mode finalization is deliberately deferred until setup teardown.
@@ -1842,7 +2086,7 @@ end;
 
 function NeedRestart: Boolean;
 begin
-  Result := False;
+  Result := HandheldDriversInstalledThisRun;
 end;
 
 function IsUpdateOrUpgradeInstall: Boolean;
@@ -1861,9 +2105,22 @@ begin
   end;
 
   UpdateSetupStatus('Stopping every Tools for Steam, helper, Xbox Host, and Steam process before install...');
-  StopElevatedHelperTasksForInstall;
   RequestToolsForSteamShutdown;
-  Sleep(2000);
+  Sleep(1000);
+  if not StopElevatedHelperTasksForInstall then
+  begin
+    RecordDiagnosticFailure('The elevated Tools for Steam helper tasks could not be stopped before file replacement.');
+    RestoreSuspendedXboxModeAfterFailure;
+    Result := 'The elevated Tools for Steam helpers could not be stopped. Installation was stopped before replacing files.';
+    Exit;
+  end;
+  if not SuspendHandheldReplacementForInstall then
+  begin
+    RecordDiagnosticFailure('The physical handheld controller could not be suspended safely without restoring MSI Center M.');
+    RestoreSuspendedXboxModeAfterFailure;
+    Result := 'Tools for Steam could not suspend the handheld controller replacement safely. Installation was stopped.';
+    Exit;
+  end;
   RestoreWindowsShellChrome;
   CloseProcess('ToolsForSteam.exe');
   CloseProcess('SteamLoader.exe');
@@ -1898,7 +2155,6 @@ begin
     end;
 
     { Nothing may recreate Steam between shutdown and file replacement. }
-    StopElevatedHelperTasksForInstall;
     CloseProcess('ToolsForSteam.exe');
     CloseProcess('ToolsForSteam.XboxHost.exe');
     if not EnsureToolsForSteamRuntimeStopped then

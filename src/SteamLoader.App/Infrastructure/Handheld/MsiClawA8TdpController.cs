@@ -15,6 +15,9 @@ internal sealed class MsiClawA8TdpController
     private static readonly Mutex PciMutex = new(false, @"Global\Access_PCI");
 
     public string Apply(int watts)
+        => Apply(watts, watts, watts);
+
+    public string Apply(int splWatts, int spptWatts, int fpptWatts)
     {
         var device = HandheldDeviceCatalog.Detect();
         if (!device.IsDetected || !string.Equals(device.Id, "msi-claw-a8", StringComparison.Ordinal))
@@ -22,9 +25,12 @@ internal sealed class MsiClawA8TdpController
             throw new InvalidOperationException("TDP writes are restricted to a detected MSI Claw A8 (MS-1T8K).");
         }
 
-        if (watts < device.MinimumTdpWatts || watts > device.MaximumTdpWatts)
+        if (splWatts < device.MinimumTdpWatts || splWatts > 35 ||
+            spptWatts < splWatts || spptWatts > 40 ||
+            fpptWatts < spptWatts || fpptWatts > 48)
         {
-            throw new ArgumentOutOfRangeException(nameof(watts), $"TDP must be between {device.MinimumTdpWatts} W and {device.MaximumTdpWatts} W.");
+            throw new ArgumentOutOfRangeException(nameof(splWatts),
+                "Power limits must satisfy SPL <= SPPT <= FPPT and the OEM maximums 35/40/48 W.");
         }
 
         using var pawnIo = new PawnIoClient();
@@ -43,10 +49,9 @@ internal sealed class MsiClawA8TdpController
         try
         {
             ValidateMailbox(pawnIo);
-            var milliwatts = checked((uint)watts * 1000u);
-            SetAndVerify(pawnIo, SetStapmCommand, milliwatts, "STAPM");
-            SetAndVerify(pawnIo, SetSlowCommand, milliwatts, "Slow");
-            SetAndVerify(pawnIo, SetFastCommand, milliwatts, "Fast");
+            SetAndVerify(pawnIo, SetStapmCommand, checked((uint)splWatts * 1000u), "STAPM");
+            SetAndVerify(pawnIo, SetSlowCommand, checked((uint)spptWatts * 1000u), "Slow");
+            SetAndVerify(pawnIo, SetFastCommand, checked((uint)fpptWatts * 1000u), "Fast");
         }
         finally
         {

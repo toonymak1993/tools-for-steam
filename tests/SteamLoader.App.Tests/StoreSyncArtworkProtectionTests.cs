@@ -7,6 +7,83 @@ namespace SteamLoader.App.Tests;
 public sealed class StoreSyncArtworkProtectionTests
 {
     [Fact]
+    public void ShouldUpdateArtworkForItem_DelaysRetryAfterIncompleteArtworkAttempt()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            const uint appId = 3132913252;
+            var gridDirectory = Path.Combine(root, "grid");
+            Directory.CreateDirectory(gridDirectory);
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{appId}p.png"), [1]);
+
+            var serviceType = typeof(StoreSyncService);
+            var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic)!;
+            var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic)!;
+            var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic)!;
+            var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic)!;
+            var method = serviceType.GetMethod("ShouldUpdateArtworkForItem", BindingFlags.NonPublic | BindingFlags.Static)!;
+
+            var definition = CreateNonPublicInstance(
+                storeDefinitionType,
+                "xbox-game-pass",
+                "Xbox / Game Pass",
+                "Test store",
+                false,
+                true);
+            var game = CreateNonPublicInstance(
+                storeGameEntryType,
+                "xbox-game-pass",
+                "xbox|high-on-life-2",
+                "High On Life 2",
+                @"C:\XboxGames\High On Life 2\Content\HighOnLife2.exe",
+                @"C:\XboxGames\High On Life 2\Content",
+                string.Empty);
+            var manifestEntry = new StoreSyncManifestEntry
+            {
+                TitleId = "xbox-game-pass-high-on-life-2",
+                StoreId = "xbox-game-pass",
+                AppId = appId,
+                ManagedShortcut = true,
+                ArtworkLocked = true,
+                LastArtworkAttemptAtUtc = DateTimeOffset.UtcNow.Subtract(TimeSpan.FromMinutes(5)),
+            };
+            var artworkCache = new StoreSyncArtworkCacheEntry
+            {
+                GameId = 5491700,
+                MatchName = "High On Life 2",
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            var analysisItem = CreateNonPublicInstance(
+                analysisItemType,
+                manifestEntry.TitleId,
+                manifestEntry.TitleId,
+                definition,
+                game,
+                new StoreSyncTitleOverride(),
+                "High On Life 2",
+                "High On Life 2",
+                appId,
+                Enum.Parse(actionKindType, "RefreshManaged"),
+                "Refresh Managed",
+                string.Empty,
+                null,
+                manifestEntry,
+                artworkCache,
+                Array.Empty<string>());
+
+            var shouldUpdate = (bool?)method.Invoke(null, [analysisItem, appId, artworkCache, gridDirectory]);
+
+            Assert.False(shouldUpdate);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public void ShouldUpdateArtworkForItem_PreservesExistingManagedArtwork()
     {
         var root = CreateTempRoot();

@@ -69,6 +69,11 @@ public sealed class ProcessWindowService
         return GetSnapshot();
     }
 
+    public bool IsForegroundWindow(string handle) =>
+        TryParseHandle(handle, out var windowHandle) &&
+        IsWindow(windowHandle) &&
+        GetForegroundWindow() == windowHandle;
+
     private static IReadOnlyList<ProcessWindowInfo> EnumerateWindows()
     {
         var windows = new List<ProcessWindowInfo>();
@@ -98,11 +103,57 @@ public sealed class ProcessWindowService
     {
         if (IsIconic(windowHandle))
         {
-            ShowWindowAsync(windowHandle, ShowWindowRestore);
+            ShowWindow(windowHandle, ShowWindowRestore);
         }
         else
         {
-            ShowWindowAsync(windowHandle, ShowWindowShow);
+            ShowWindow(windowHandle, ShowWindowShow);
+        }
+
+        if (TryFocusWindow(windowHandle))
+        {
+            return;
+        }
+
+        // Windows normally prevents a background process from stealing focus.
+        // A short ALT input grants the caller the same foreground permission as
+        // an interactive window switch without leaving a modifier held down.
+        KeybdEvent(VirtualKeyMenu, 0, 0, 0);
+        try
+        {
+            if (TryFocusWindow(windowHandle))
+            {
+                return;
+            }
+        }
+        finally
+        {
+            KeybdEvent(VirtualKeyMenu, 0, KeyEventKeyUp, 0);
+        }
+
+        SwitchToThisWindow(windowHandle, true);
+        Thread.Sleep(75);
+        if (GetForegroundWindow() == windowHandle)
+        {
+            return;
+        }
+
+        // Last-resort z-order pulse for SDL/Chromium windows such as Steam Big
+        // Picture. The window is immediately returned to normal (non-topmost)
+        // state after it has been brought above the current foreground window.
+        SetWindowPos(windowHandle, WindowTopMost, 0, 0, 0, 0, SetWindowPositionFlags);
+        SetWindowPos(windowHandle, WindowNotTopMost, 0, 0, 0, 0, SetWindowPositionFlags);
+        if (!TryFocusWindow(windowHandle))
+        {
+            throw new InvalidOperationException("Windows did not grant foreground focus to the selected window.");
+        }
+    }
+
+    private static bool TryFocusWindow(nint windowHandle)
+    {
+        if (GetForegroundWindow() == windowHandle)
+        {
+            return true;
         }
 
         var foregroundWindow = GetForegroundWindow();
@@ -114,28 +165,36 @@ public sealed class ProcessWindowService
 
         try
         {
-            if (foregroundThreadId != 0)
+            if (foregroundThreadId != 0 && foregroundThreadId != currentThreadId)
             {
                 AttachThreadInput(currentThreadId, foregroundThreadId, true);
             }
 
-            if (targetThreadId != 0 && targetThreadId != currentThreadId)
+            if (targetThreadId != 0 &&
+                targetThreadId != currentThreadId &&
+                targetThreadId != foregroundThreadId)
             {
                 AttachThreadInput(currentThreadId, targetThreadId, true);
             }
 
+            SetWindowPos(windowHandle, WindowTop, 0, 0, 0, 0, SetWindowPositionFlags);
             BringWindowToTop(windowHandle);
+            SetActiveWindow(windowHandle);
             SetForegroundWindow(windowHandle);
             SetFocus(windowHandle);
+            Thread.Sleep(50);
+            return GetForegroundWindow() == windowHandle;
         }
         finally
         {
-            if (foregroundThreadId != 0)
+            if (foregroundThreadId != 0 && foregroundThreadId != currentThreadId)
             {
                 AttachThreadInput(currentThreadId, foregroundThreadId, false);
             }
 
-            if (targetThreadId != 0 && targetThreadId != currentThreadId)
+            if (targetThreadId != 0 &&
+                targetThreadId != currentThreadId &&
+                targetThreadId != foregroundThreadId)
             {
                 AttachThreadInput(currentThreadId, targetThreadId, false);
             }
@@ -310,6 +369,12 @@ public sealed class ProcessWindowService
     private const int GetWindowOwner = 4;
     private const int ShowWindowRestore = 9;
     private const int ShowWindowShow = 5;
+    private const byte VirtualKeyMenu = 0x12;
+    private const uint KeyEventKeyUp = 0x0002;
+    private const uint SetWindowPositionFlags = 0x0001 | 0x0002 | 0x0040;
+    private static readonly nint WindowTop = 0;
+    private static readonly nint WindowTopMost = -1;
+    private static readonly nint WindowNotTopMost = -2;
     private const long WindowExStyleToolWindow = 0x00000080L;
     private const long WindowExStyleAppWindow = 0x00040000L;
 
@@ -376,10 +441,29 @@ public sealed class ProcessWindowService
     private static extern bool SetForegroundWindow(nint windowHandle);
 
     [DllImport("user32.dll")]
+    private static extern nint SetActiveWindow(nint windowHandle);
+
+    [DllImport("user32.dll")]
     private static extern nint SetFocus(nint windowHandle);
 
     [DllImport("user32.dll")]
-    private static extern bool ShowWindowAsync(nint windowHandle, int command);
+    private static extern bool ShowWindow(nint windowHandle, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(
+        nint windowHandle,
+        nint insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern void SwitchToThisWindow(nint windowHandle, bool altTab);
+
+    [DllImport("user32.dll", EntryPoint = "keybd_event")]
+    private static extern void KeybdEvent(byte virtualKey, byte scanCode, uint flags, nuint extraInfo);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

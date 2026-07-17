@@ -14,6 +14,7 @@ public sealed class AppStartService
 {
     private const uint ShgfiIcon = 0x000000100;
     private const uint ShgfiLargeIcon = 0x000000000;
+    private static readonly TimeSpan AutomaticRefreshInterval = TimeSpan.FromMinutes(10);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -36,92 +37,84 @@ public sealed class AppStartService
     ];
 
     private readonly string _settingsPath;
+    private readonly string _catalogPath;
+    private readonly Func<AppStartDiscoveryResult> _discoverApps;
+    private readonly Func<DateTimeOffset> _utcNow;
     private readonly object _gate = new();
+    private AppStartCatalogData? _catalog;
 
     public AppStartService(string settingsPath)
+        : this(settingsPath, DiscoverInstalledApps, () => DateTimeOffset.UtcNow)
+    {
+    }
+
+    internal AppStartService(
+        string settingsPath,
+        Func<AppStartDiscoveryResult> discoverApps,
+        Func<DateTimeOffset>? utcNow = null)
     {
         _settingsPath = settingsPath;
+        _catalogPath = Path.Combine(
+            Path.GetDirectoryName(settingsPath) ?? string.Empty,
+            $"{Path.GetFileNameWithoutExtension(settingsPath)}-catalog.json");
+        _discoverApps = discoverApps;
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     public AppStartSnapshot GetSnapshot()
     {
-        var settings = LoadSettings();
-        var shortcuts = settings.Shortcuts
-            .Where(shortcut => !string.IsNullOrWhiteSpace(shortcut.Id))
-            .Select(ToState)
-            .OrderBy(shortcut => shortcut.Name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        lock (_gate)
+        {
+            var settings = LoadSettingsNoLock();
+            var catalog = EnsureCatalogNoLock();
+            var favorites = settings.FavoriteIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var hidden = settings.HiddenIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var shortcuts = catalog.Entries
+                .Where(entry => !hidden.Contains(entry.Id))
+                .Select(entry => ToShortcutState(entry, favorites.Contains(entry.Id)))
+                .OrderByDescending(entry => entry.Favorite)
+                .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var favoriteCount = shortcuts.Count(entry => entry.Favorite);
 
-        return new AppStartSnapshot(
-            shortcuts,
-            shortcuts.Length switch
-            {
-                0 => "No app shortcuts added yet.",
-                1 => "1 app shortcut ready.",
-                _ => $"{shortcuts.Length} app shortcuts ready.",
-            });
+            return new AppStartSnapshot(
+                shortcuts,
+                shortcuts.Length switch
+                {
+                    0 => "No launchable Windows apps were detected.",
+                    1 => favoriteCount == 1 ? "1 app ready · 1 favorite." : "1 app ready.",
+                    _ when favoriteCount > 0 => $"{shortcuts.Length} apps ready · {favoriteCount} favorites.",
+                    _ => $"{shortcuts.Length} apps ready."
+                },
+                catalog.LastScanUtc);
+        }
     }
 
     public AppStartCatalogSnapshot GetCatalog()
     {
-        var savedIds = LoadSettings()
-            .Shortcuts
-            .Select(shortcut => shortcut.Id)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        lock (_gate)
+        {
+            return BuildCatalogSnapshotNoLock(EnsureCatalogNoLock());
+        }
+    }
 
-        var apps = EnumerateStartMenuShortcuts()
-            .Select(entry => entry with { Added = savedIds.Contains(entry.Id) })
-            .OrderBy(entry => entry.Added)
-            .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        return new AppStartCatalogSnapshot(
-            apps,
-            apps.Length switch
-            {
-                0 => "No Start Menu apps were detected.",
-                1 => "1 Start Menu app detected.",
-                _ => $"{apps.Length} Start Menu apps detected.",
-            });
+    public AppStartCatalogSnapshot RefreshCatalog()
+    {
+        lock (_gate)
+        {
+            return BuildCatalogSnapshotNoLock(RefreshCatalogNoLock());
+        }
     }
 
     public AppStartSnapshot AddShortcut(string appId)
     {
-        if (string.IsNullOrWhiteSpace(appId))
-        {
-            throw new InvalidOperationException("An app ID is required.");
-        }
-
-        var app = EnumerateStartMenuShortcuts().FirstOrDefault(entry =>
-            string.Equals(entry.Id, appId, StringComparison.OrdinalIgnoreCase));
-        if (app is null)
-        {
-            throw new InvalidOperationException("The selected app is no longer available.");
-        }
+        ValidateAppId(appId);
 
         lock (_gate)
         {
+            EnsureAppExistsNoLock(appId);
             var settings = LoadSettingsNoLock();
-            var existingIndex = settings.Shortcuts.FindIndex(shortcut =>
-                string.Equals(shortcut.Id, app.Id, StringComparison.OrdinalIgnoreCase));
-
-            var shortcut = new AppStartShortcutConfiguration
-            {
-                Id = app.Id,
-                Name = app.Name,
-                SourcePath = app.SourcePath,
-                IconDataUri = app.IconDataUri
-            };
-
-            if (existingIndex >= 0)
-            {
-                settings.Shortcuts[existingIndex] = shortcut;
-            }
-            else
-            {
-                settings.Shortcuts.Add(shortcut);
-            }
-
+            RemoveId(settings.HiddenIds, appId);
             SaveSettingsNoLock(settings);
         }
 
@@ -130,16 +123,33 @@ public sealed class AppStartService
 
     public AppStartSnapshot RemoveShortcut(string shortcutId)
     {
-        if (string.IsNullOrWhiteSpace(shortcutId))
-        {
-            throw new InvalidOperationException("An app shortcut ID is required.");
-        }
+        ValidateAppId(shortcutId);
 
         lock (_gate)
         {
             var settings = LoadSettingsNoLock();
-            settings.Shortcuts.RemoveAll(shortcut =>
-                string.Equals(shortcut.Id, shortcutId, StringComparison.OrdinalIgnoreCase));
+            AddId(settings.HiddenIds, shortcutId);
+            RemoveId(settings.FavoriteIds, shortcutId);
+            SaveSettingsNoLock(settings);
+        }
+
+        return GetSnapshot();
+    }
+
+    public AppStartSnapshot ToggleFavorite(string shortcutId)
+    {
+        ValidateAppId(shortcutId);
+
+        lock (_gate)
+        {
+            EnsureAppExistsNoLock(shortcutId);
+            var settings = LoadSettingsNoLock();
+            RemoveId(settings.HiddenIds, shortcutId);
+            if (!RemoveId(settings.FavoriteIds, shortcutId))
+            {
+                AddId(settings.FavoriteIds, shortcutId);
+            }
+
             SaveSettingsNoLock(settings);
         }
 
@@ -148,83 +158,251 @@ public sealed class AppStartService
 
     public AppStartSnapshot LaunchShortcut(string shortcutId)
     {
-        if (string.IsNullOrWhiteSpace(shortcutId))
+        ValidateAppId(shortcutId);
+
+        AppStartCatalogConfiguration app;
+        lock (_gate)
         {
-            throw new InvalidOperationException("An app shortcut ID is required.");
+            app = EnsureAppExistsNoLock(shortcutId);
         }
 
-        var shortcut = LoadSettings()
-            .Shortcuts
-            .FirstOrDefault(entry => string.Equals(entry.Id, shortcutId, StringComparison.OrdinalIgnoreCase));
-        if (shortcut is null)
+        if (string.Equals(app.SourceKind, AppStartSourceKinds.Packaged, StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException("The selected app shortcut was not found.");
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                UseShellExecute = true
+            };
+            startInfo.ArgumentList.Add($"shell:AppsFolder\\{app.SourcePath}");
+            Process.Start(startInfo)?.Dispose();
         }
-
-        if (!File.Exists(shortcut.SourcePath))
+        else
         {
-            throw new InvalidOperationException("The selected app shortcut no longer exists.");
+            if (!File.Exists(app.SourcePath))
+            {
+                throw new InvalidOperationException("The selected app shortcut no longer exists. Refresh the app index.");
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = app.SourcePath,
+                UseShellExecute = true
+            })?.Dispose();
         }
-
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = shortcut.SourcePath,
-            UseShellExecute = true
-        })?.Dispose();
 
         return GetSnapshot();
     }
 
-    private AppStartSettingsData LoadSettings()
+    private AppStartCatalogSnapshot BuildCatalogSnapshotNoLock(AppStartCatalogData catalog)
     {
-        lock (_gate)
+        var settings = LoadSettingsNoLock();
+        var favorites = settings.FavoriteIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var hidden = settings.HiddenIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var apps = catalog.Entries
+            .Select(entry => ToCatalogEntry(entry, favorites.Contains(entry.Id), hidden.Contains(entry.Id)))
+            .OrderBy(entry => entry.Hidden)
+            .ThenByDescending(entry => entry.Favorite)
+            .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var hiddenCount = apps.Count(entry => entry.Hidden);
+
+        return new AppStartCatalogSnapshot(
+            apps,
+            apps.Length switch
+            {
+                0 => "No launchable Windows apps were detected.",
+                1 => "1 installed app indexed.",
+                _ when hiddenCount > 0 => $"{apps.Length} installed apps indexed · {hiddenCount} hidden.",
+                _ => $"{apps.Length} installed apps indexed."
+            });
+    }
+
+    private AppStartCatalogData EnsureCatalogNoLock()
+    {
+        _catalog ??= LoadCatalogNoLock();
+        if (_catalog.LastScanUtc == default || _utcNow() - _catalog.LastScanUtc >= AutomaticRefreshInterval)
         {
-            return LoadSettingsNoLock();
+            _catalog = RefreshCatalogNoLock();
         }
+
+        return _catalog;
+    }
+
+    private AppStartCatalogData RefreshCatalogNoLock()
+    {
+        _catalog ??= LoadCatalogNoLock();
+        var previousById = _catalog.Entries.ToDictionary(entry => entry.Id, StringComparer.OrdinalIgnoreCase);
+        var discovery = _discoverApps();
+        var updated = new Dictionary<string, AppStartCatalogConfiguration>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var discovered in discovery.Entries)
+        {
+            if (previousById.TryGetValue(discovered.Id, out var previous) &&
+                string.Equals(previous.Fingerprint, discovered.Fingerprint, StringComparison.Ordinal))
+            {
+                updated[discovered.Id] = previous;
+                continue;
+            }
+
+            updated[discovered.Id] = new AppStartCatalogConfiguration
+            {
+                Id = discovered.Id,
+                Name = discovered.Name,
+                SourcePath = discovered.SourcePath,
+                SourceKind = discovered.SourceKind,
+                Fingerprint = discovered.Fingerprint,
+                IconDataUri = TryCreateShellIconDataUri(discovered.IconPath) ?? CreateIconDataUri(discovered.Name)
+            };
+        }
+
+        if (!discovery.PackagedAppsScanSucceeded)
+        {
+            foreach (var previous in previousById.Values.Where(entry =>
+                         string.Equals(entry.SourceKind, AppStartSourceKinds.Packaged, StringComparison.OrdinalIgnoreCase)))
+            {
+                updated.TryAdd(previous.Id, previous);
+            }
+        }
+
+        _catalog = new AppStartCatalogData
+        {
+            LastScanUtc = _utcNow(),
+            Entries = updated.Values
+                .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList()
+        };
+        SaveJsonNoLock(_catalogPath, _catalog);
+        return _catalog;
+    }
+
+    private AppStartCatalogConfiguration EnsureAppExistsNoLock(string appId)
+    {
+        return EnsureCatalogNoLock().Entries.FirstOrDefault(entry =>
+                   string.Equals(entry.Id, appId, StringComparison.OrdinalIgnoreCase))
+               ?? throw new InvalidOperationException("The selected app is no longer available. Refresh the app index.");
     }
 
     private AppStartSettingsData LoadSettingsNoLock()
     {
+        AppStartSettingsData settings;
         try
         {
             if (!File.Exists(_settingsPath))
             {
-                return new AppStartSettingsData();
+                return new AppStartSettingsData { AutomaticCatalogEnabled = true };
             }
 
-            var json = File.ReadAllText(_settingsPath);
-            return JsonSerializer.Deserialize<AppStartSettingsData>(json, JsonOptions)
-                ?? new AppStartSettingsData();
+            settings = JsonSerializer.Deserialize<AppStartSettingsData>(File.ReadAllText(_settingsPath), JsonOptions)
+                       ?? new AppStartSettingsData();
         }
         catch
         {
-            return new AppStartSettingsData();
+            return new AppStartSettingsData { AutomaticCatalogEnabled = true };
+        }
+
+        settings = settings with
+        {
+            FavoriteIds = settings.FavoriteIds ?? [],
+            HiddenIds = settings.HiddenIds ?? [],
+            Shortcuts = settings.Shortcuts ?? []
+        };
+
+        if (!settings.AutomaticCatalogEnabled)
+        {
+            foreach (var shortcut in settings.Shortcuts.Where(entry => !string.IsNullOrWhiteSpace(entry.Id)))
+            {
+                AddId(settings.FavoriteIds, shortcut.Id);
+            }
+
+            settings = settings with { AutomaticCatalogEnabled = true };
+            SaveSettingsNoLock(settings);
+        }
+
+        return settings;
+    }
+
+    private AppStartCatalogData LoadCatalogNoLock()
+    {
+        try
+        {
+            if (!File.Exists(_catalogPath))
+            {
+                return new AppStartCatalogData();
+            }
+
+            var catalog = JsonSerializer.Deserialize<AppStartCatalogData>(File.ReadAllText(_catalogPath), JsonOptions)
+                          ?? new AppStartCatalogData();
+            return catalog with { Entries = catalog.Entries ?? [] };
+        }
+        catch
+        {
+            return new AppStartCatalogData();
         }
     }
 
     private void SaveSettingsNoLock(AppStartSettingsData settings)
     {
-        var directory = Path.GetDirectoryName(_settingsPath);
+        SaveJsonNoLock(_settingsPath, settings);
+    }
+
+    private static void SaveJsonNoLock<T>(string path, T value)
+    {
+        var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory))
         {
             Directory.CreateDirectory(directory);
         }
 
-        File.WriteAllText(_settingsPath, JsonSerializer.Serialize(settings, JsonOptions));
+        var temporaryPath = path + ".tmp";
+        File.WriteAllText(temporaryPath, JsonSerializer.Serialize(value, JsonOptions));
+        File.Move(temporaryPath, path, true);
     }
 
-    private static AppStartShortcutState ToState(AppStartShortcutConfiguration shortcut)
+    private static AppStartShortcutState ToShortcutState(AppStartCatalogConfiguration entry, bool favorite)
     {
         return new AppStartShortcutState(
-            shortcut.Id,
-            shortcut.Name,
-            shortcut.SourcePath,
-            string.IsNullOrWhiteSpace(shortcut.IconDataUri)
-                ? CreateIconDataUri(shortcut.Name)
-                : shortcut.IconDataUri);
+            entry.Id,
+            entry.Name,
+            entry.SourcePath,
+            entry.IconDataUri,
+            favorite,
+            entry.SourceKind);
     }
 
-    private static IReadOnlyList<AppStartCatalogEntry> EnumerateStartMenuShortcuts()
+    private static AppStartCatalogEntry ToCatalogEntry(
+        AppStartCatalogConfiguration entry,
+        bool favorite,
+        bool hidden)
+    {
+        return new AppStartCatalogEntry(
+            entry.Id,
+            entry.Name,
+            entry.SourcePath,
+            entry.IconDataUri,
+            Added: !hidden,
+            favorite,
+            hidden,
+            entry.SourceKind);
+    }
+
+    private static AppStartDiscoveryResult DiscoverInstalledApps()
+    {
+        var entries = new Dictionary<string, AppStartDiscoveredEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in DiscoverDesktopShortcuts())
+        {
+            entries[entry.Id] = entry;
+        }
+
+        var packagedAppsScanSucceeded = TryDiscoverPackagedApps(out var packagedApps);
+        foreach (var entry in packagedApps)
+        {
+            entries.TryAdd(entry.Id, entry);
+        }
+
+        return new AppStartDiscoveryResult(entries.Values.ToArray(), packagedAppsScanSucceeded);
+    }
+
+    private static IEnumerable<AppStartDiscoveredEntry> DiscoverDesktopShortcuts()
     {
         var roots = new[]
         {
@@ -232,7 +410,6 @@ public sealed class AppStartService
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
         };
 
-        var byId = new Dictionary<string, AppStartCatalogEntry>(StringComparer.OrdinalIgnoreCase);
         foreach (var root in roots.Where(Directory.Exists))
         {
             foreach (var shortcutPath in EnumerateShortcutFiles(root))
@@ -243,17 +420,107 @@ public sealed class AppStartService
                     continue;
                 }
 
-                var id = CreateStableId(shortcutPath);
-                byId[id] = new AppStartCatalogEntry(
-                    id,
+                FileInfo info;
+                try
+                {
+                    info = new FileInfo(shortcutPath);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                yield return new AppStartDiscoveredEntry(
+                    CreateStableId(shortcutPath),
                     name,
                     shortcutPath,
-                    TryCreateShellIconDataUri(shortcutPath) ?? CreateIconDataUri(name),
-                    Added: false);
+                    AppStartSourceKinds.Desktop,
+                    $"{shortcutPath.ToUpperInvariant()}|{info.Length}|{info.LastWriteTimeUtc.Ticks}",
+                    shortcutPath);
             }
         }
+    }
 
-        return byId.Values.ToArray();
+    private static bool TryDiscoverPackagedApps(out IReadOnlyList<AppStartDiscoveredEntry> entries)
+    {
+        entries = [];
+        try
+        {
+            var powerShellPath = Path.Combine(
+                Environment.SystemDirectory,
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe");
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = File.Exists(powerShellPath) ? powerShellPath : "powershell.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("-NoLogo");
+            startInfo.ArgumentList.Add("-NoProfile");
+            startInfo.ArgumentList.Add("-NonInteractive");
+            startInfo.ArgumentList.Add("-Command");
+            startInfo.ArgumentList.Add(
+                "Get-StartApps | Where-Object { $_.AppID -like '*!*' } | Select-Object Name,AppID | ConvertTo-Json -Compress");
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(8000))
+            {
+                process.Kill(true);
+                return false;
+            }
+
+            var output = outputTask.GetAwaiter().GetResult();
+            _ = errorTask.GetAwaiter().GetResult();
+            if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(output))
+            {
+                return process.ExitCode == 0;
+            }
+
+            using var document = JsonDocument.Parse(output);
+            var elements = document.RootElement.ValueKind == JsonValueKind.Array
+                ? document.RootElement.EnumerateArray().ToArray()
+                : [document.RootElement];
+            entries = elements
+                .Select(element => new
+                {
+                    Name = GetJsonString(element, "Name"),
+                    AppId = GetJsonString(element, "AppID")
+                })
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Name) &&
+                                !string.IsNullOrWhiteSpace(entry.AppId) &&
+                                !ShouldIgnoreShortcut(entry.Name))
+                .Select(entry => new AppStartDiscoveredEntry(
+                    CreateStableId($"packaged:{entry.AppId}"),
+                    entry.Name,
+                    entry.AppId,
+                    AppStartSourceKinds.Packaged,
+                    $"{entry.AppId.ToUpperInvariant()}|{entry.Name}",
+                    $"shell:AppsFolder\\{entry.AppId}"))
+                .ToArray();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string GetJsonString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? string.Empty
+            : string.Empty;
     }
 
     private static IEnumerable<string> EnumerateShortcutFiles(string root)
@@ -272,12 +539,8 @@ public sealed class AppStartService
 
     private static bool ShouldIgnoreShortcut(string name)
     {
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return true;
-        }
-
-        return IgnoredNameParts.Any(part => name.Contains(part, StringComparison.OrdinalIgnoreCase));
+        return string.IsNullOrWhiteSpace(name) ||
+               IgnoredNameParts.Any(part => name.Contains(part, StringComparison.OrdinalIgnoreCase));
     }
 
     private static string CleanShortcutName(string name)
@@ -292,6 +555,27 @@ public sealed class AppStartService
         }
 
         return cleaned;
+    }
+
+    private static void ValidateAppId(string appId)
+    {
+        if (string.IsNullOrWhiteSpace(appId))
+        {
+            throw new InvalidOperationException("An app ID is required.");
+        }
+    }
+
+    private static void AddId(List<string> ids, string id)
+    {
+        if (!ids.Contains(id, StringComparer.OrdinalIgnoreCase))
+        {
+            ids.Add(id);
+        }
+    }
+
+    private static bool RemoveId(List<string> ids, string id)
+    {
+        return ids.RemoveAll(existing => string.Equals(existing, id, StringComparison.OrdinalIgnoreCase)) > 0;
     }
 
     private static string CreateStableId(string value)
@@ -372,16 +656,38 @@ public sealed class AppStartService
 
     private sealed record AppStartSettingsData
     {
-        public List<AppStartShortcutConfiguration> Shortcuts { get; init; } = [];
+        public bool AutomaticCatalogEnabled { get; init; }
+
+        public List<string> FavoriteIds { get; init; } = [];
+
+        public List<string> HiddenIds { get; init; } = [];
+
+        public List<LegacyAppStartShortcutConfiguration> Shortcuts { get; init; } = [];
     }
 
-    private sealed record AppStartShortcutConfiguration
+    private sealed record LegacyAppStartShortcutConfiguration
+    {
+        public string Id { get; init; } = string.Empty;
+    }
+
+    private sealed record AppStartCatalogData
+    {
+        public DateTimeOffset LastScanUtc { get; init; }
+
+        public List<AppStartCatalogConfiguration> Entries { get; init; } = [];
+    }
+
+    private sealed record AppStartCatalogConfiguration
     {
         public string Id { get; init; } = string.Empty;
 
         public string Name { get; init; } = string.Empty;
 
         public string SourcePath { get; init; } = string.Empty;
+
+        public string SourceKind { get; init; } = AppStartSourceKinds.Desktop;
+
+        public string Fingerprint { get; init; } = string.Empty;
 
         public string? IconDataUri { get; init; }
     }
@@ -413,3 +719,21 @@ public sealed class AppStartService
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(nint handle);
 }
+
+internal static class AppStartSourceKinds
+{
+    public const string Desktop = "desktop";
+    public const string Packaged = "packaged";
+}
+
+internal sealed record AppStartDiscoveryResult(
+    IReadOnlyList<AppStartDiscoveredEntry> Entries,
+    bool PackagedAppsScanSucceeded = true);
+
+internal sealed record AppStartDiscoveredEntry(
+    string Id,
+    string Name,
+    string SourcePath,
+    string SourceKind,
+    string Fingerprint,
+    string IconPath);
