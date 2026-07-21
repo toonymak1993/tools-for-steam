@@ -194,6 +194,7 @@ sdk.ui.createSliderSlot("Volume", 65, decreaseVolume, increaseVolume, {
   min: 0,
   max: 100,
   valueLabel: "65%",
+  onValueChange: (value) => setVolume(value),
 });
 
 sdk.ui.createProgressSlot("Syncing library", "Applying Steam shortcuts...", 7, {
@@ -201,6 +202,8 @@ sdk.ui.createProgressSlot("Syncing library", "Applying Steam shortcuts...", 7, {
   label: "7 / 12",
 });
 ```
+
+`onValueChange` receives the absolute value when the user clicks or drags the slider track. The left and right actions remain available for controller and keyboard input.
 
 ## 6. Permission reference
 

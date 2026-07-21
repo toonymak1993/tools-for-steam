@@ -274,14 +274,20 @@ export interface TfsUiSlotOptions {
   footerLabel?: string;
   min?: number;
   max?: number;
+  step?: number;
   valueLabel?: string;
   label?: string;
+  trackStyle?: Record<string, unknown> | null;
+  fillStyle?: Record<string, unknown> | null;
+  thumbStyle?: Record<string, unknown> | null;
   leftDisabled?: boolean;
   rightDisabled?: boolean;
   onClick?: TfsUiAction;
+  onValueChange?: TfsUiValueAction;
 }
 
 export type TfsUiAction = (event?: unknown) => void | Promise<void>;
+export type TfsUiValueAction = (value: number, event?: unknown) => void | Promise<void>;
 
 export interface TfsUiSlot extends TfsUiSlotOptions {
   kind: "button";

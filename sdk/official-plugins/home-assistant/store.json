@@ -1,0 +1,15 @@
+{
+  "author": "Tools for Steam",
+  "category": "Smart Home",
+  "tags": [
+    "smart-home",
+    "areas",
+    "entities",
+    "lights",
+    "scenes",
+    "sdk-v1"
+  ],
+  "homepageUrl": "https://www.home-assistant.io/",
+  "repositoryUrl": "https://github.com/toonymak1993/tools-for-steam",
+  "changelog": "Adds directly draggable Homey-style sliders without visible arrow buttons, including colored tracks for hue, saturation, brightness, and white temperature. Controls remain grouped inside each supported device."
+}
