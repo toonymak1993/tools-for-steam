@@ -1,0 +1,22 @@
+{
+  "id": "crackwatch",
+  "name": "Crackwatch",
+  "description": "Browse Hot Games, all cracked games newest first, and personal favorites from CrackRelease with artwork and background updates.",
+  "version": "0.3.0",
+  "sdkVersion": "1.0.0",
+  "entryPoint": "dist/index.js",
+  "permissions": [
+    "frontend",
+    "storage",
+    "notifications",
+    "logging",
+    "native.full-trust"
+  ],
+  "backend": {
+    "entryPoint": "backend/plugin.ps1",
+    "runtime": "powershell",
+    "arguments": [],
+    "autoStart": true,
+    "createNoWindow": true
+  }
+}

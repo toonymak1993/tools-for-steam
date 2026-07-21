@@ -91,10 +91,62 @@ if ($manifest.id -ne $PluginId) {
     throw "Manifest id '$($manifest.id)' does not match requested plugin id '$PluginId'."
 }
 
+$catalogAuthor = "Tools for Steam"
+$catalogCategory = "Utility"
+$catalogTags = @("sdk-v1")
+$catalogHomepageUrl = "https://github.com/toonymak1993/tools-for-steam"
+$catalogRepositoryUrl = "https://github.com/toonymak1993/tools-for-steam"
+$catalogChangelog = "Initial community plugin release."
+if ($PluginId -eq "home-assistant") {
+    $catalogCategory = "Smart Home"
+    $catalogTags = @("smart-home", "lights", "sdk-v1")
+    $catalogHomepageUrl = "https://www.home-assistant.io/"
+    $catalogRepositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
+    $catalogChangelog = "Initial Home Assistant light controls."
+}
+
+$storeMetadataPath = Join-Path $pluginRoot "store.json"
+if (Test-Path -LiteralPath $storeMetadataPath -PathType Leaf) {
+    $storeMetadata = Get-Content -LiteralPath $storeMetadataPath -Raw | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.author)) {
+        $catalogAuthor = [string]$storeMetadata.author
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.category)) {
+        $catalogCategory = [string]$storeMetadata.category
+    }
+    $metadataTags = @($storeMetadata.tags |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($metadataTags.Count -gt 0) {
+        $catalogTags = $metadataTags
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.homepageUrl)) {
+        $catalogHomepageUrl = [string]$storeMetadata.homepageUrl
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.repositoryUrl)) {
+        $catalogRepositoryUrl = [string]$storeMetadata.repositoryUrl
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.changelog)) {
+        $catalogChangelog = [string]$storeMetadata.changelog
+    }
+}
+
 $entryPoint = if ([string]::IsNullOrWhiteSpace($manifest.entryPoint)) { "dist/index.js" } else { $manifest.entryPoint }
 $entryPointPath = Join-Path $pluginRoot ($entryPoint -replace "/", "\")
 if (-not (Test-Path -LiteralPath $entryPointPath)) {
     throw "Plugin entry point not found: $entryPointPath"
+}
+
+if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+    $bundledPreview = Get-ChildItem -LiteralPath (Join-Path $pluginRoot "assets") -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.BaseName -eq "preview" -and
+            $_.Extension.ToLowerInvariant() -in @(".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+        } |
+        Select-Object -First 1
+    if ($bundledPreview) {
+        $ImagePath = $bundledPreview.FullName
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($ImagePath) -and $PluginId -eq "home-assistant") {
@@ -151,9 +203,19 @@ if (Test-Path -LiteralPath $assetsSource) {
     Copy-Item -LiteralPath $assetsSource -Destination (Join-Path $stagingRoot "assets") -Recurse -Force
 }
 
+$backendSource = Join-Path $pluginRoot "backend"
+if (Test-Path -LiteralPath $backendSource) {
+    Copy-Item -LiteralPath $backendSource -Destination (Join-Path $stagingRoot "backend") -Recurse -Force
+}
+
 $pluginAssetsRoot = Join-Path $pluginRoot "assets"
 New-Item -ItemType Directory -Force -Path $pluginAssetsRoot | Out-Null
-Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $pluginAssetsRoot "preview$imageExtension") -Force
+$pluginPreviewPath = Join-Path $pluginAssetsRoot "preview$imageExtension"
+if (-not [System.IO.Path]::GetFullPath($ImagePath).Equals(
+    [System.IO.Path]::GetFullPath($pluginPreviewPath),
+    [System.StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $ImagePath -Destination $pluginPreviewPath -Force
+}
 
 $stagingAssetsRoot = Join-Path $stagingRoot "assets"
 New-Item -ItemType Directory -Force -Path $stagingAssetsRoot | Out-Null
@@ -179,29 +241,38 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $sha256 = Get-FileSha256 -Path $packagePath
 Copy-Item -LiteralPath $packagePath -Destination $storePackagePath -Force
 
+$localCatalogPlugins = @()
+if (Test-Path -LiteralPath $catalogPath -PathType Leaf) {
+    try {
+        $existingLocalCatalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+        $localCatalogPlugins = @($existingLocalCatalog.plugins | Where-Object { $_.id -ne $manifest.id })
+    }
+    catch {
+        $localCatalogPlugins = @()
+    }
+}
+$localCatalogPlugins += [pscustomobject][ordered]@{
+    id = $manifest.id
+    title = $manifest.name
+    description = $manifest.description
+    author = $catalogAuthor
+    category = $catalogCategory
+    version = $manifest.version
+    sdkVersion = $manifest.sdkVersion
+    permissions = @($manifest.permissions)
+    networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    packagePath = "./packages/$PluginId.zip"
+    packageSha256 = $sha256
+    images = @("api/plugin-store/images/catalog/$storeImageFileName")
+    tags = @($catalogTags)
+    homepageUrl = $catalogHomepageUrl
+    repositoryUrl = $catalogRepositoryUrl
+    changelog = $catalogChangelog
+}
 $catalog = [ordered]@{
     title = "TFS Community"
     description = "Local Tools for Steam community plugin catalog."
-    plugins = @(
-        [ordered]@{
-            id = $manifest.id
-            title = $manifest.name
-            description = $manifest.description
-            author = "Tools for Steam"
-            category = "Smart Home"
-            version = $manifest.version
-            sdkVersion = $manifest.sdkVersion
-            permissions = @($manifest.permissions)
-            networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-            packagePath = "./packages/$PluginId.zip"
-            packageSha256 = $sha256
-            images = @("api/plugin-store/images/catalog/$storeImageFileName")
-            tags = @("smart-home", "lights", "sdk-v1")
-            homepageUrl = "https://www.home-assistant.io/"
-            repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
-            changelog = "Initial Home Assistant light controls."
-        }
-    )
+    plugins = $localCatalogPlugins
 }
 
 $catalogJson = $catalog | ConvertTo-Json -Depth 10
@@ -220,32 +291,41 @@ if (-not [string]::IsNullOrWhiteSpace($PluginDatabaseRoot)) {
     Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $pluginDatabaseImagesRoot $sdkImageFileName) -Force
 
     $pluginDatabaseRawBaseUrl = $PluginDatabaseRawBaseUrl.TrimEnd("/")
+    $pluginDatabaseCatalogPath = Join-Path $pluginDatabaseRootPath "catalog.json"
+    $onlineCatalogPlugins = @()
+    if (Test-Path -LiteralPath $pluginDatabaseCatalogPath -PathType Leaf) {
+        try {
+            $existingOnlineCatalog = Get-Content -LiteralPath $pluginDatabaseCatalogPath -Raw | ConvertFrom-Json
+            $onlineCatalogPlugins = @($existingOnlineCatalog.plugins | Where-Object { $_.id -ne $manifest.id })
+        }
+        catch {
+            throw "Existing plugin database catalog is invalid: $pluginDatabaseCatalogPath"
+        }
+    }
+    $onlineCatalogPlugins += [pscustomobject][ordered]@{
+        id = $manifest.id
+        title = $manifest.name
+        description = $manifest.description
+        author = $catalogAuthor
+        category = $catalogCategory
+        version = $manifest.version
+        sdkVersion = $manifest.sdkVersion
+        permissions = @($manifest.permissions)
+        networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        packageUrl = "$pluginDatabaseRawBaseUrl/packages/$PluginId.zip"
+        packageSha256 = $sha256
+        images = @("$pluginDatabaseRawBaseUrl/images/$sdkImageFileName")
+        tags = @($catalogTags)
+        homepageUrl = $catalogHomepageUrl
+        repositoryUrl = $catalogRepositoryUrl
+        changelog = $catalogChangelog
+    }
     $onlineCatalog = [ordered]@{
         title = "TFS Community"
         description = "Official Tools for Steam community plugin catalog."
-        plugins = @(
-            [ordered]@{
-                id = $manifest.id
-                title = $manifest.name
-                description = $manifest.description
-                author = "Tools for Steam"
-                category = "Smart Home"
-                version = $manifest.version
-                sdkVersion = $manifest.sdkVersion
-                permissions = @($manifest.permissions)
-                networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-                packageUrl = "$pluginDatabaseRawBaseUrl/packages/$PluginId.zip"
-                packageSha256 = $sha256
-                images = @("$pluginDatabaseRawBaseUrl/images/$sdkImageFileName")
-                tags = @("smart-home", "lights", "sdk-v1")
-                homepageUrl = "https://www.home-assistant.io/"
-                repositoryUrl = "https://developers.home-assistant.io/docs/api/rest/"
-                changelog = "Initial Home Assistant light controls."
-            }
-        )
+        plugins = $onlineCatalogPlugins
     }
 
-    $pluginDatabaseCatalogPath = Join-Path $pluginDatabaseRootPath "catalog.json"
     Write-Utf8NoBom -Path $pluginDatabaseCatalogPath -Value ($onlineCatalog | ConvertTo-Json -Depth 10)
 }
 

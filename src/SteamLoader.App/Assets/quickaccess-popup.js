@@ -6768,6 +6768,8 @@
                   className: "steamloader-feature-media",
                   src: slot.mediaImageSrc,
                   alt: slot.mediaImageAlt || slot.title || "",
+                  loading: "lazy",
+                  decoding: "async",
                 })
               : createElement(
                   "div",
@@ -6953,6 +6955,8 @@
                 className: "steamloader-card-image",
                 src: card.imageSrc,
                 alt: card.imageAlt || card.title || "",
+                loading: "lazy",
+                decoding: "async",
               }),
             })
           : null,
@@ -7215,7 +7219,8 @@
     const cardKey = editor.inputKey || editor.cardKey || "steamloader-editor";
     const editorDataKey = `editor-${cardKey}`;
     const isSecretEditor = editor.inputType === "password" || editor.secret === true;
-    const editorElementType = isSecretEditor ? "input" : "textarea";
+    const isSingleLineEditor = isSecretEditor || editor.inputType === "search" || editor.inputType === "text";
+    const editorElementType = isSingleLineEditor ? "input" : "textarea";
 
     function focusEditorTextarea() {
       const panel = getPanelScrollContainer();
@@ -7287,10 +7292,11 @@
       className: `steamloader-editor-textarea${isSecretEditor ? " steamloader-editor-input-secret" : ""}`,
       "data-editor-key": editorDataKey,
       "data-custom-path-input": editor.isCustomPath ? "true" : undefined,
-      type: isSecretEditor ? "password" : undefined,
+      type: isSecretEditor ? "password" : isSingleLineEditor ? editor.inputType || "text" : undefined,
       defaultValue: editor.value || "",
       placeholder: editor.placeholder || "",
-      rows: isSecretEditor ? undefined : editor.rows || 3,
+      rows: isSingleLineEditor ? undefined : editor.rows || 3,
+      enterKeyHint: editor.enterKeyHint || (editor.inputType === "search" ? "search" : undefined),
       spellCheck: false,
       autoCapitalize: "off",
       autoCorrect: "off",
