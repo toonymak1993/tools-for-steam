@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 42) {
+  if (existing?.version >= 44) {
     return;
   }
 
@@ -894,19 +894,34 @@
   }
 
   function createSliderSlot(title, value, onMoveLeft, onMoveRight, options = {}) {
+    const sliderOptions = {
+      ...options,
+      onClick: options.onClick || (() => {}),
+      buttonClassName:
+        options.buttonClassName ||
+        "steamloader-dialog-button steamloader-volume-slider-fallback-button steamloader-performance-slider-button",
+    };
     const slot = createInlineStepperSlot(
       title,
       options.valueLabel || String(value ?? ""),
       onMoveLeft,
       onMoveRight,
-      options,
+      sliderOptions,
     );
     return {
       ...slot,
       role: "slider",
+      layout: "slider",
       value: Number(value) || 0,
       min: Number.isFinite(Number(options.min)) ? Number(options.min) : 0,
       max: Number.isFinite(Number(options.max)) ? Number(options.max) : 100,
+      step: Number.isFinite(Number(options.step)) && Number(options.step) > 0
+        ? Number(options.step)
+        : 1,
+      onValueChange: typeof options.onValueChange === "function" ? options.onValueChange : null,
+      trackStyle: options.trackStyle || null,
+      fillStyle: options.fillStyle || null,
+      thumbStyle: options.thumbStyle || null,
     };
   }
 
@@ -1146,6 +1161,119 @@
     );
   }
 
+  function createSliderRowContent(createElement, withChildren, slot) {
+    const min = Number.isFinite(Number(slot.min)) ? Number(slot.min) : 0;
+    const max = Number.isFinite(Number(slot.max)) ? Number(slot.max) : 100;
+    const step = Number.isFinite(Number(slot.step)) && Number(slot.step) > 0 ? Number(slot.step) : 1;
+    const value = Math.max(min, Math.min(max, Number(slot.value) || 0));
+    const percent = ((value - min) / Math.max(1, max - min)) * 100;
+    const updateFromPointer = (event) => {
+      if (slot.disabled || typeof slot.onValueChange !== "function") {
+        return;
+      }
+
+      const track = event?.currentTarget;
+      const bounds = track?.getBoundingClientRect?.();
+      if (!bounds || bounds.width <= 0 || !Number.isFinite(Number(event?.clientX))) {
+        return;
+      }
+
+      const ratio = Math.max(0, Math.min(1, (Number(event.clientX) - bounds.left) / bounds.width));
+      const rawValue = min + (ratio * (max - min));
+      const steppedValue = min + (Math.round((rawValue - min) / step) * step);
+      const nextValue = Math.max(min, Math.min(max, Number(steppedValue.toFixed(6))));
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      slot.onValueChange(nextValue, event);
+    };
+    const capturePointer = (event) => {
+      event?.currentTarget?.setPointerCapture?.(event.pointerId);
+      updateFromPointer(event);
+    };
+    const moveCapturedPointer = (event) => {
+      if (event?.currentTarget?.hasPointerCapture?.(event.pointerId)) {
+        updateFromPointer(event);
+      }
+    };
+    const releasePointer = (event) => {
+      updateFromPointer(event);
+      if (event?.currentTarget?.hasPointerCapture?.(event.pointerId)) {
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+      }
+    };
+    const cancelPointer = (event) => {
+      if (event?.currentTarget?.hasPointerCapture?.(event.pointerId)) {
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+      }
+    };
+
+    return createElement(
+      "div",
+      withChildren(
+        { className: "steamloader-volume-card steamloader-sdk-slider" },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-volume-head" },
+            createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-volume-copy-wrap" },
+                createElement("div", {
+                  className: "steamloader-volume-title",
+                  children: slot.title || "Value",
+                }),
+                createElement("div", {
+                  className: "steamloader-volume-slider-value",
+                  children: slot.copy || String(value),
+                }),
+              ),
+            ),
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-volume-slider-wrap" },
+            createElement(
+              "div",
+              withChildren(
+                {
+                  className: "steamloader-volume-slider-track-shell steamloader-sdk-slider-track-shell",
+                  "aria-hidden": "true",
+                  style: { cursor: slot.onValueChange ? "pointer" : "default", touchAction: "none" },
+                  onClick: updateFromPointer,
+                  onPointerDown: capturePointer,
+                  onPointerMove: moveCapturedPointer,
+                  onPointerUp: releasePointer,
+                  onPointerCancel: cancelPointer,
+                },
+                createElement("div", {
+                  className: "steamloader-volume-slider-track",
+                  style: slot.trackStyle || undefined,
+                }),
+                createElement("div", {
+                  className: "steamloader-volume-slider-fill",
+                  style: {
+                    width: `${percent}%`,
+                    ...(slot.fillStyle || {}),
+                  },
+                }),
+                createElement("div", {
+                  className: "steamloader-volume-slider-thumb",
+                  style: {
+                    left: `${percent}%`,
+                    ...(slot.thumbStyle || {}),
+                  },
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   function createProgressRowContent(createElement, withChildren, slot) {
     const max = Math.max(1, Number(slot.progressMax) || 100);
     const value = Math.min(max, Math.max(0, Number(slot.progressValue) || 0));
@@ -1194,6 +1322,10 @@
 
     if (slot.layout === "stepper") {
       return createInlineStepperRowContent(createElement, withChildren, slot, helpers);
+    }
+
+    if (slot.layout === "slider") {
+      return createSliderRowContent(createElement, withChildren, slot, helpers);
     }
 
     if (slot.layout === "progress") {
@@ -1279,6 +1411,7 @@
       props["aria-valuemin"] = Number(slot.min) || 0;
       props["aria-valuemax"] = Number(slot.max) || 100;
       props["aria-valuenow"] = Number(slot.value) || 0;
+      props["aria-valuetext"] = slot.copy || String(slot.value ?? "");
     }
 
     return props;
@@ -3170,7 +3303,7 @@
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 42,
+        libraryVersion: window.STFrontendLib?.version || 44,
         sdkVersion: "1.0.0",
         pluginId,
       }),
@@ -3182,7 +3315,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 42,
+      version: 44,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3250,7 +3383,7 @@
   }
 
   window.STFrontendLib = {
-    version: 42,
+    version: 44,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,
