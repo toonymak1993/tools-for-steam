@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 41) {
+  if (existing?.version >= 42) {
     return;
   }
 
@@ -1006,6 +1006,8 @@
                   className: "steamloader-feature-media",
                   src: slot.mediaImageSrc,
                   alt: slot.mediaImageAlt || slot.title || "",
+                  loading: "lazy",
+                  decoding: "async",
                 })
               : createElement(
                   "div",
@@ -1745,7 +1747,8 @@
     const editorKey = editor.cardKey || editor.inputKey || "steamloader-editor";
     const editorDataKey = `editor-${editorKey}`;
     const isSecretEditor = editor.inputType === "password" || editor.secret === true;
-    const editorElementType = isSecretEditor ? "input" : "textarea";
+    const isSingleLineEditor = isSecretEditor || editor.inputType === "search" || editor.inputType === "text";
+    const editorElementType = isSingleLineEditor ? "input" : "textarea";
 
     const focusEditorTextarea = () => {
       const textarea = findEditorTextarea(editorDataKey);
@@ -1815,10 +1818,11 @@
           className: `steamloader-editor-textarea${isSecretEditor ? " steamloader-editor-input-secret" : ""}`,
           "data-editor-key": editorDataKey,
           "data-custom-path-input": editor.isCustomPath ? "true" : undefined,
-          type: isSecretEditor ? "password" : undefined,
+          type: isSecretEditor ? "password" : isSingleLineEditor ? editor.inputType || "text" : undefined,
           defaultValue: editor.value || "",
           placeholder: editor.placeholder || "",
-          rows: isSecretEditor ? undefined : editor.rows || 3,
+          rows: isSingleLineEditor ? undefined : editor.rows || 3,
+          enterKeyHint: editor.enterKeyHint || (editor.inputType === "search" ? "search" : undefined),
           spellCheck: false,
           autoCapitalize: "off",
           autoCorrect: "off",
@@ -3166,7 +3170,7 @@
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 41,
+        libraryVersion: window.STFrontendLib?.version || 42,
         sdkVersion: "1.0.0",
         pluginId,
       }),
@@ -3178,7 +3182,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 41,
+      version: 42,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3246,7 +3250,7 @@
   }
 
   window.STFrontendLib = {
-    version: 41,
+    version: 42,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

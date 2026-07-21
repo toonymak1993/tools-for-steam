@@ -1,0 +1,15 @@
+{
+  "author": "Tools for Steam",
+  "category": "Game Information",
+  "tags": [
+    "games",
+    "crack-status",
+    "favorites",
+    "hot-games",
+    "tracker",
+    "sdk-v1"
+  ],
+  "homepageUrl": "https://crackrelease.com/",
+  "repositoryUrl": "https://github.com/toonymak1993/tools-for-steam",
+  "changelog": "Starts with Hot Games, adds every cracked game sorted newest to oldest by CrackRelease update date, and improves global multi-word search with a clear action."
+}

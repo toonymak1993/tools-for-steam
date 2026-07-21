@@ -13,7 +13,11 @@ param(
 
     [string]$OutputPath = "",
 
-    [string]$RuntimeDataDirectory = ""
+    [string]$RuntimeDataDirectory = "",
+
+    [string]$CommunityCatalogUrl = "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json",
+
+    [string]$CommunityCatalogPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +31,16 @@ $supportedPermissions = @(
 
 function Resolve-PluginRoot([string]$Value) {
     return [System.IO.Path]::GetFullPath($Value)
+}
+
+function Write-Utf8NoBom {
+    param(
+        [string]$Path,
+        [string]$Value
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Value, $encoding)
 }
 
 function Test-NetworkHost([string]$HostName) {
@@ -214,41 +228,132 @@ switch ($Command) {
         }
 
         $catalogPath = Join-Path $storeRoot "catalog.json"
-        $plugins = @()
+        $existingCatalog = $null
+        $existingPlugins = @()
         if (Test-Path -LiteralPath $catalogPath) {
             try {
                 $existingCatalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
-                $plugins = @($existingCatalog.plugins | Where-Object { $_.id -ne $manifest.id })
+                $existingPlugins = @($existingCatalog.plugins)
             } catch {
-                $plugins = @()
+                $existingCatalog = $null
+                $existingPlugins = @()
             }
         }
+
+        $publicCatalog = $null
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($CommunityCatalogPath)) {
+                $resolvedCommunityCatalogPath = [System.IO.Path]::GetFullPath($CommunityCatalogPath)
+                $publicCatalog = Get-Content -LiteralPath $resolvedCommunityCatalogPath -Raw | ConvertFrom-Json
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($CommunityCatalogUrl)) {
+                $publicCatalog = Invoke-RestMethod -Uri $CommunityCatalogUrl -Method Get -Headers @{
+                    "User-Agent" = "ToolsForSteam-Plugin-Sideload/1.0"
+                    "Accept" = "application/json"
+                } -TimeoutSec 20
+            }
+        }
+        catch {
+            Write-Warning "The public community catalog could not be loaded; preserving existing local entries. $($_.Exception.Message)"
+            $publicCatalog = $null
+        }
+
+        $publicPlugins = @()
+        if ($null -ne $publicCatalog) {
+            $publicPlugins = @($publicCatalog.plugins | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.id) })
+        }
+        $publicPluginIds = @($publicPlugins | ForEach-Object { ([string]$_.id).Trim().ToLowerInvariant() })
+        $plugins = @($publicPlugins)
+        $plugins += @($existingPlugins | Where-Object {
+            $existingId = ([string]$_.id).Trim().ToLowerInvariant()
+            -not [string]::IsNullOrWhiteSpace($existingId) -and
+                $existingId -notin $publicPluginIds -and
+                $existingId -ne $manifest.id
+        })
+
+        $catalogAuthor = "Local Developer"
+        $catalogCategory = "Development"
+        $catalogTags = @("development", "sideload")
+        $catalogHomepageUrl = ""
+        $catalogRepositoryUrl = ""
+        $catalogChangelog = "Local sideload build."
+        $storeMetadataPath = Join-Path $root "store.json"
+        if (Test-Path -LiteralPath $storeMetadataPath -PathType Leaf) {
+            $storeMetadata = Get-Content -LiteralPath $storeMetadataPath -Raw | ConvertFrom-Json
+            if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.author)) {
+                $catalogAuthor = [string]$storeMetadata.author
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.category)) {
+                $catalogCategory = [string]$storeMetadata.category
+            }
+            $metadataTags = @($storeMetadata.tags |
+                ForEach-Object { ([string]$_).Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($metadataTags.Count -gt 0) {
+                $catalogTags = $metadataTags
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.homepageUrl)) {
+                $catalogHomepageUrl = [string]$storeMetadata.homepageUrl
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.repositoryUrl)) {
+                $catalogRepositoryUrl = [string]$storeMetadata.repositoryUrl
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$storeMetadata.changelog)) {
+                $catalogChangelog = [string]$storeMetadata.changelog
+            }
+        }
+
+        $manifestNetworkHosts = @($manifest.networkHosts |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $catalogImages = @()
+        if (-not [string]::IsNullOrWhiteSpace($imageUrl)) {
+            $catalogImages = @($imageUrl)
+        }
+
         $entry = [ordered]@{
             id = $manifest.id
             title = $manifest.name
             description = if ([string]::IsNullOrWhiteSpace($manifest.description)) { "Local development plugin." } else { $manifest.description }
-            author = "Local Developer"
-            category = "Development"
+            author = $catalogAuthor
+            category = $catalogCategory
             version = $manifest.version
             sdkVersion = $manifest.sdkVersion
             permissions = @($manifest.permissions)
-            networkHosts = @($manifest.networkHosts)
+            networkHosts = $manifestNetworkHosts
             packagePath = "./packages/$packageFileName"
             packageSha256 = $hash
-            images = if ($imageUrl) { @($imageUrl) } else { @() }
-            tags = @("development", "sideload")
-            changelog = "Local sideload build."
+            images = $catalogImages
+            tags = @($catalogTags)
+            changelog = $catalogChangelog
         }
+        if (-not [string]::IsNullOrWhiteSpace($catalogHomepageUrl)) {
+            $entry.homepageUrl = $catalogHomepageUrl
+        }
+        if (-not [string]::IsNullOrWhiteSpace($catalogRepositoryUrl)) {
+            $entry.repositoryUrl = $catalogRepositoryUrl
+        }
+        $plugins = @($plugins | Where-Object { $_.id -ne $manifest.id })
         $plugins += [pscustomobject]$entry
+        $publicTitle = if ($null -eq $publicCatalog) { "" } else { [string]$publicCatalog.title }
+        $publicDescription = if ($null -eq $publicCatalog) { "" } else { [string]$publicCatalog.description }
         $catalog = [ordered]@{
-            title = "TFS Developer Catalog"
-            description = "Local sideloaded full-trust and community plugins."
+            title = if ([string]::IsNullOrWhiteSpace($publicTitle)) { "TFS Community + Local" } else { "$publicTitle + Local" }
+            description = if ([string]::IsNullOrWhiteSpace($publicDescription)) {
+                "Public community plugins with local sideloads."
+            } else {
+                "$publicDescription Local sideloads are included on this device."
+            }
             plugins = $plugins
         }
-        $catalog | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $catalogPath -Encoding UTF8
-        [ordered]@{ localDevelopment = $true } |
-            ConvertTo-Json |
-            Set-Content -LiteralPath (Join-Path $storeRoot "catalog-source.json") -Encoding UTF8
+        Write-Utf8NoBom -Path $catalogPath -Value ($catalog | ConvertTo-Json -Depth 20)
+        $catalogSource = [ordered]@{
+            catalogUrl = $CommunityCatalogUrl
+            localDevelopment = $true
+        }
+        Write-Utf8NoBom `
+            -Path (Join-Path $storeRoot "catalog-source.json") `
+            -Value ($catalogSource | ConvertTo-Json)
         Write-Output "Sideloaded $($manifest.id) $($manifest.version)"
         Write-Output "Catalog $catalogPath"
         Write-Output "Package $packagePath"
