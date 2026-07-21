@@ -308,9 +308,12 @@ test("community Store builder packages plugin backends and consumes per-plugin m
   assert.match(builder, /\$backendSource/);
   assert.match(builder, /category = \$catalogCategory/);
   assert.match(builder, /tags = @\(\$catalogTags\)/);
+  assert.match(builder, /publishedAtUtc = \$localPublishedAtUtc/);
+  assert.match(builder, /Get-PluginPublishedAtUtc/);
   assert.match(pluginTool, /store\.json/);
   assert.match(pluginTool, /category = \$catalogCategory/);
   assert.match(pluginTool, /tags = @\(\$catalogTags\)/);
+  assert.match(pluginTool, /publishedAtUtc = \$publishedAtUtc/);
 });
 
 test("sideload merges the public catalog and serializes single-value fields as arrays", {
@@ -360,6 +363,7 @@ test("sideload merges the public catalog and serializes single-value fields as a
     assert.ok(crackwatch);
     assert.deepEqual(crackwatch.images, ["api/plugin-store/images/catalog/crackwatch.png"]);
     assert.deepEqual(crackwatch.networkHosts, []);
+    assert.ok(Number.isFinite(Date.parse(crackwatch.publishedAtUtc)));
     assert.equal(source.localDevelopment, true);
   } finally {
     await rm(testRoot, { recursive: true, force: true });

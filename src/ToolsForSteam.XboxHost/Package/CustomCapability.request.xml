@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Submission template only. Do not package this file.
+
+  Microsoft owns Microsoft.appCategory.gamingHome_8wekyb3d8bbwe and must return
+  a signed SCCD whose catalog covers this descriptor. The signature hash below is
+  the SHA-256 hash of the current self-signed package certificate (SHA-1 thumbprint
+  F12969BBD718F0BDAE024A02C716BEBF39141CA7, valid through 2031-07-18). Regenerate
+  it before submission if the package-signing certificate changes.
+-->
+<CustomCapabilityDescriptor xmlns="http://schemas.microsoft.com/appx/2016/sccd" xmlns:s="http://schemas.microsoft.com/appx/2016/sccd">
+  <CustomCapabilities>
+    <CustomCapability Name="Microsoft.appCategory.gamingHome_8wekyb3d8bbwe" />
+  </CustomCapabilities>
+  <AuthorizedEntities>
+    <AuthorizedEntity AppPackageFamilyName="GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j" CertificateSignatureHash="d27c716f3d91f333b276a22dfd608c551a35e265dc09a88c8257489bc3492126" />
+  </AuthorizedEntities>
+  <Catalog>0000</Catalog>
+</CustomCapabilityDescriptor>

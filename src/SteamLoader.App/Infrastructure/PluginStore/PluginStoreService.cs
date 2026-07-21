@@ -11,6 +11,7 @@ namespace SteamLoader.App.Infrastructure.PluginStore;
 
 public sealed class PluginStoreService
 {
+    private const int NewCommunityPluginWindowDays = 30;
     private const string ManifestFileName = "tfs-plugin.json";
     private const string PermissionStorage = "storage";
     private const string PermissionSecrets = "secrets";
@@ -45,6 +46,7 @@ public sealed class PluginStoreService
     private const long MaxCommunityPackageExtractedBytes = 512L * 1024 * 1024;
     private const long MaxCommunityPackageEntryBytes = 256L * 1024 * 1024;
     private const int MaxCommunityPackageEntries = 2048;
+    private static readonly TimeSpan CommunityPublicationDateRetryDelay = TimeSpan.FromHours(6);
     private const string DefaultCommunityCatalogUrl =
         "https://raw.githubusercontent.com/toonymak1993/tfs-plugin-database/main/catalog.json";
 
@@ -99,6 +101,7 @@ public sealed class PluginStoreService
     private readonly string _rootPath;
     private readonly string _catalogPath;
     private readonly string _catalogSourcePath;
+    private readonly string _communityPublicationDatesPath;
     private readonly string _installedStatePath;
     private readonly string _communityRootPath;
     private readonly string _sdkDataRootPath;
@@ -111,6 +114,7 @@ public sealed class PluginStoreService
         new(StringComparer.OrdinalIgnoreCase);
     private readonly List<PluginStoreInputState> _inputQueue = [];
     private readonly SemaphoreSlim _catalogSyncSemaphore = new(1, 1);
+    private readonly SemaphoreSlim _communityPublicationDatesSemaphore = new(1, 1);
     private readonly object _catalogBootstrapGate = new();
     private bool _overlayOpen;
     private long _inputNonce;
@@ -136,6 +140,7 @@ public sealed class PluginStoreService
         _rootPath = rootPath;
         _catalogPath = Path.Combine(rootPath, "catalog.json");
         _catalogSourcePath = Path.Combine(rootPath, "catalog-source.json");
+        _communityPublicationDatesPath = Path.Combine(rootPath, "publication-dates.json");
         _installedStatePath = Path.Combine(rootPath, "installed.json");
         _communityRootPath = Path.Combine(rootPath, "community");
         _sdkDataRootPath = Path.Combine(rootPath, "sdk-data");
@@ -185,6 +190,10 @@ public sealed class PluginStoreService
                     RepositoryUrl: string.Empty,
                     Changelog: string.Empty,
                     IsBuiltIn: true,
+                    IsAvailableOnline: false,
+                    IsLocalDevelopment: false,
+                    PublishedAtUtc: null,
+                    IsNew: false,
                     IsInstalled: true,
                     IsEnabled: enabled,
                     CanToggleVisibility: plugin.CanDisable,
@@ -1662,13 +1671,22 @@ public sealed class PluginStoreService
         var hasPackageSource = plugin.HasPackageSource;
         var hasPackageChecksum = !string.IsNullOrWhiteSpace(plugin.PackageSha256);
         var canInstall = hasPackageSource && hasPackageChecksum;
+        var isAvailableOnline = !string.IsNullOrWhiteSpace(plugin.PackageUrl);
+        var isLocalDevelopment = !string.IsNullOrWhiteSpace(plugin.PackagePath);
+        var publishedAtUtc = ParsePublishedAtUtc(plugin.PublishedAtUtc);
+        var now = DateTimeOffset.UtcNow;
+        var isNew = publishedAtUtc is { } publishedAt &&
+            publishedAt <= now &&
+            publishedAt >= now.AddDays(-NewCommunityPluginWindowDays);
 
         var statusText = !hasPackageSource
             ? "Listed in the catalog, but not downloadable yet."
             : !hasPackageChecksum
                 ? "Listed in the catalog, but blocked because the package checksum is missing."
                 : !isInstalled
-                    ? "Ready to install from the community catalog."
+                    ? isLocalDevelopment
+                        ? "Local development build ready to install."
+                        : "Available online from the community catalog."
                     : hasUpdate
                         ? "Installed locally. A newer catalog version is available."
                         : "Installed locally and up to date.";
@@ -1709,6 +1727,10 @@ public sealed class PluginStoreService
             RepositoryUrl: plugin.RepositoryUrl,
             Changelog: plugin.Changelog,
             IsBuiltIn: false,
+            IsAvailableOnline: isAvailableOnline,
+            IsLocalDevelopment: isLocalDevelopment,
+            PublishedAtUtc: publishedAtUtc,
+            IsNew: isNew,
             IsInstalled: isInstalled,
             IsEnabled: isInstalled,
             CanToggleVisibility: false,
@@ -1794,6 +1816,7 @@ public sealed class PluginStoreService
                 .GroupBy(plugin => plugin.Id, StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
                 .ToArray();
+            plugins = await EnrichCommunityPublicationDatesAsync(plugins, cancellationToken);
 
             return new CommunityCatalogSnapshot(
                 Available: true,
@@ -1863,10 +1886,293 @@ public sealed class PluginStoreService
             PackagePath = (plugin?.PackagePath ?? string.Empty).Trim(),
             PackageUrl = (plugin?.PackageUrl ?? string.Empty).Trim(),
             PackageSha256 = NormalizeSha256(plugin?.PackageSha256),
+            PublishedAtUtc = NormalizePublishedAtUtc(plugin?.PublishedAtUtc),
             HomepageUrl = (plugin?.HomepageUrl ?? string.Empty).Trim(),
             RepositoryUrl = (plugin?.RepositoryUrl ?? string.Empty).Trim(),
             Changelog = (plugin?.Changelog ?? string.Empty).Trim()
         };
+    }
+
+    private static string NormalizePublishedAtUtc(string? value)
+    {
+        var publishedAtUtc = ParsePublishedAtUtc(value);
+        return publishedAtUtc?.ToString("O") ?? string.Empty;
+    }
+
+    private static DateTimeOffset? ParsePublishedAtUtc(string? value)
+    {
+        return DateTimeOffset.TryParse(value, out var publishedAtUtc)
+            ? publishedAtUtc.ToUniversalTime()
+            : null;
+    }
+
+    private async Task<CommunityCatalogPluginData[]> EnrichCommunityPublicationDatesAsync(
+        CommunityCatalogPluginData[] plugins,
+        CancellationToken cancellationToken)
+    {
+        if (!plugins.Any(plugin =>
+                string.IsNullOrWhiteSpace(plugin.PublishedAtUtc) &&
+                TryBuildGithubCommitsUrl(plugin.PackageUrl, out _)))
+        {
+            return plugins;
+        }
+
+        await _communityPublicationDatesSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            var cachedDates = LoadCommunityPublicationDates();
+            var cacheChanged = false;
+            var enrichedPlugins = new CommunityCatalogPluginData[plugins.Length];
+
+            for (var index = 0; index < plugins.Length; index++)
+            {
+                var plugin = plugins[index];
+                if (!string.IsNullOrWhiteSpace(plugin.PublishedAtUtc) ||
+                    !TryBuildGithubCommitsUrl(plugin.PackageUrl, out var commitsUrl))
+                {
+                    enrichedPlugins[index] = plugin;
+                    continue;
+                }
+
+                DateTimeOffset? publishedAtUtc = null;
+                if (cachedDates.PackageUrls.TryGetValue(plugin.PackageUrl, out var cachedValue))
+                {
+                    publishedAtUtc = ParsePublishedAtUtc(cachedValue);
+                }
+
+                if (publishedAtUtc is null)
+                {
+                    if (cachedDates.LastAttemptsUtc.TryGetValue(plugin.PackageUrl, out var lastAttemptValue) &&
+                        ParsePublishedAtUtc(lastAttemptValue) is { } lastAttemptUtc &&
+                        lastAttemptUtc >= DateTimeOffset.UtcNow.Subtract(CommunityPublicationDateRetryDelay))
+                    {
+                        enrichedPlugins[index] = plugin;
+                        continue;
+                    }
+
+                    cachedDates.LastAttemptsUtc[plugin.PackageUrl] = DateTimeOffset.UtcNow.ToString("O");
+                    cacheChanged = true;
+                    publishedAtUtc = await TryGetOldestGithubCommitDateAsync(commitsUrl, cancellationToken);
+                    if (publishedAtUtc is null)
+                    {
+                        enrichedPlugins[index] = plugin;
+                        continue;
+                    }
+
+                    cachedValue = publishedAtUtc.Value.ToString("O");
+                    cachedDates.PackageUrls[plugin.PackageUrl] = cachedValue;
+                    cacheChanged = true;
+                }
+
+                enrichedPlugins[index] = plugin with
+                {
+                    PublishedAtUtc = publishedAtUtc.Value.ToString("O")
+                };
+            }
+
+            if (cacheChanged)
+            {
+                SaveCommunityPublicationDates(cachedDates);
+            }
+
+            return enrichedPlugins;
+        }
+        finally
+        {
+            _communityPublicationDatesSemaphore.Release();
+        }
+    }
+
+    private static bool TryBuildGithubCommitsUrl(string? packageUrl, out Uri commitsUrl)
+    {
+        commitsUrl = null!;
+        if (!Uri.TryCreate(packageUrl, UriKind.Absolute, out var packageUri) ||
+            packageUri.Scheme != Uri.UriSchemeHttps ||
+            !packageUri.Host.Equals("raw.githubusercontent.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var segments = packageUri.AbsolutePath
+            .Trim('/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.UnescapeDataString)
+            .ToArray();
+        if (segments.Length < 4)
+        {
+            return false;
+        }
+
+        var owner = Uri.EscapeDataString(segments[0]);
+        var repository = Uri.EscapeDataString(segments[1]);
+        var packagePath = Uri.EscapeDataString(string.Join('/', segments.Skip(3)));
+        if (!Uri.TryCreate(
+                $"https://api.github.com/repos/{owner}/{repository}/commits?path={packagePath}&per_page=100",
+                UriKind.Absolute,
+                out var candidate))
+        {
+            return false;
+        }
+
+        commitsUrl = candidate;
+        return true;
+    }
+
+    private async Task<DateTimeOffset?> TryGetOldestGithubCommitDateAsync(
+        Uri commitsUrl,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var response = await SendGithubRequestAsync(commitsUrl, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            var oldestDate = ParseOldestGithubCommitDate(
+                await response.Content.ReadAsStringAsync(cancellationToken));
+            if (TryGetGithubLastPageUri(response, out var lastPageUri))
+            {
+                using var lastPageResponse = await SendGithubRequestAsync(lastPageUri, cancellationToken);
+                if (lastPageResponse.IsSuccessStatusCode)
+                {
+                    var lastPageDate = ParseOldestGithubCommitDate(
+                        await lastPageResponse.Content.ReadAsStringAsync(cancellationToken));
+                    if (lastPageDate is not null && (oldestDate is null || lastPageDate < oldestDate))
+                    {
+                        oldestDate = lastPageDate;
+                    }
+                }
+            }
+
+            return oldestDate;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendGithubRequestAsync(
+        Uri requestUri,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.UserAgent.ParseAdd("ToolsForSteam-PluginStore/1.0");
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        return await _httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken);
+    }
+
+    private static DateTimeOffset? ParseOldestGithubCommitDate(string responseJson)
+    {
+        using var document = JsonDocument.Parse(responseJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        DateTimeOffset? oldestDate = null;
+        foreach (var item in document.RootElement.EnumerateArray())
+        {
+            if (!item.TryGetProperty("commit", out var commit))
+            {
+                continue;
+            }
+
+            var dateValue = TryGetGithubCommitDate(commit, "committer") ??
+                TryGetGithubCommitDate(commit, "author");
+            var commitDate = ParsePublishedAtUtc(dateValue);
+            if (commitDate is not null && (oldestDate is null || commitDate < oldestDate))
+            {
+                oldestDate = commitDate;
+            }
+        }
+
+        return oldestDate;
+    }
+
+    private static string? TryGetGithubCommitDate(JsonElement commit, string identityName)
+    {
+        return commit.TryGetProperty(identityName, out var identity) &&
+            identity.TryGetProperty("date", out var date) &&
+            date.ValueKind == JsonValueKind.String
+                ? date.GetString()
+                : null;
+    }
+
+    private static bool TryGetGithubLastPageUri(HttpResponseMessage response, out Uri lastPageUri)
+    {
+        lastPageUri = null!;
+        if (!response.Headers.TryGetValues("Link", out var linkHeaders))
+        {
+            return false;
+        }
+
+        foreach (var link in linkHeaders.SelectMany(value => value.Split(',')))
+        {
+            if (!link.Contains("rel=\"last\"", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var start = link.IndexOf('<');
+            var end = link.IndexOf('>', start + 1);
+            if (start < 0 || end <= start ||
+                !Uri.TryCreate(link[(start + 1)..end], UriKind.Absolute, out var candidate) ||
+                candidate.Scheme != Uri.UriSchemeHttps ||
+                !candidate.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            lastPageUri = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private CommunityPublicationDatesState LoadCommunityPublicationDates()
+    {
+        try
+        {
+            if (File.Exists(_communityPublicationDatesPath))
+            {
+                var state = JsonSerializer.Deserialize<CommunityPublicationDatesState>(
+                        File.ReadAllText(_communityPublicationDatesPath),
+                        JsonOptions)
+                    ?? new CommunityPublicationDatesState();
+                return state with
+                {
+                    PackageUrls = state.PackageUrls ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                    LastAttemptsUtc = state.LastAttemptsUtc ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                };
+            }
+        }
+        catch
+        {
+        }
+
+        return new CommunityPublicationDatesState();
+    }
+
+    private void SaveCommunityPublicationDates(CommunityPublicationDatesState state)
+    {
+        try
+        {
+            Directory.CreateDirectory(_rootPath);
+            File.WriteAllText(
+                _communityPublicationDatesPath,
+                JsonSerializer.Serialize(state, JsonOptions));
+        }
+        catch
+        {
+        }
     }
 
     private async Task<string> ResolvePackageZipAsync(
@@ -2841,6 +3147,15 @@ public sealed class PluginStoreService
         public bool LocalDevelopment { get; init; }
     }
 
+    private sealed record CommunityPublicationDatesState
+    {
+        public Dictionary<string, string> PackageUrls { get; init; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<string, string> LastAttemptsUtc { get; init; } =
+            new(StringComparer.OrdinalIgnoreCase);
+    }
+
     private sealed record CommunityCatalogPluginData
     {
         public string Id { get; init; } = string.Empty;
@@ -2870,6 +3185,8 @@ public sealed class PluginStoreService
         public string PackageUrl { get; init; } = string.Empty;
 
         public string PackageSha256 { get; init; } = string.Empty;
+
+        public string PublishedAtUtc { get; init; } = string.Empty;
 
         public string HomepageUrl { get; init; } = string.Empty;
 

@@ -157,6 +157,69 @@ Add-SafeBlock "Installed Xbox payload" {
     } | Format-List
     if ($certificate) { $certificate.Dispose() }
 }
+Add-SafeBlock "Packaged Xbox Gaming Home SCCD" {
+    $packagePath = Join-Path $InstallRoot "XboxMode\ToolsForSteam.XboxHost.msix"
+    if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+        throw "The Xbox Mode MSIX is missing."
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($packagePath)
+    try {
+        $entry = $archive.Entries | Where-Object {
+            $_.FullName -notmatch '[/\\]' -and $_.FullName -match '(?i)\.sccd$'
+        } | Select-Object -First 1
+        if (-not $entry) {
+            throw "The package does not contain a root-level SCCD."
+        }
+        $reader = [IO.StreamReader]::new($entry.Open())
+        try {
+            [xml]$sccd = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    $capability = $sccd.SelectSingleNode("//*[local-name()='CustomCapability']")
+    $authorizedEntities = $sccd.SelectSingleNode("//*[local-name()='AuthorizedEntities']")
+    $catalogNode = $sccd.SelectSingleNode("//*[local-name()='Catalog']")
+    $catalog = if ($catalogNode) { $catalogNode.InnerText.Trim() } else { "" }
+    $catalogBytes = try { [Convert]::FromBase64String($catalog) } catch { @() }
+    $developerMode = Get-ItemProperty `
+        -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
+        -Name "AllowDevelopmentWithoutDevLicense" `
+        -ErrorAction SilentlyContinue
+    $signatureValid = $false
+    if ($catalogBytes.Length -ge 256) {
+        try {
+            try { Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction Stop }
+            catch { Add-Type -AssemblyName System.Security -ErrorAction Stop }
+            $signedCatalog = [Security.Cryptography.Pkcs.SignedCms]::new()
+            $signedCatalog.Decode($catalogBytes)
+            $signedCatalog.CheckSignature($true)
+            $signatureValid = $true
+        }
+        catch {
+        }
+    }
+
+    [pscustomobject]@{
+        FileName = $entry.FullName
+        Capability = $capability.Name
+        AllowAny = $authorizedEntities.AllowAny
+        AuthorizedPackageFamilies = @($authorizedEntities.SelectNodes("*[local-name()='AuthorizedEntity']") |
+            ForEach-Object { $_.AppPackageFamilyName }) -join "; "
+        CatalogCharacters = $catalog.Length
+        CatalogDecodedBytes = $catalogBytes.Length
+        CatalogIsPlaceholder = [string]::IsNullOrWhiteSpace($catalog) -or $catalog -match '^(?:0+|F+)$'
+        CatalogSignatureValid = $signatureValid
+        DeveloperModeEnabled = $null -ne $developerMode -and $developerMode.AllowDevelopmentWithoutDevLicense -eq 1
+    } | Format-List
+}
 
 Add-Section "WINDOWS AND DEVICE"
 Add-SafeBlock "Windows version registry" {

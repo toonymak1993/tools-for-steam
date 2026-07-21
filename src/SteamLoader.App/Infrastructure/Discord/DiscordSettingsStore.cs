@@ -12,6 +12,7 @@ public sealed class DiscordSettingsStore
     };
 
     private readonly string _settingsPath;
+    private readonly object _fileGate = new();
 
     public DiscordSettingsStore(string settingsPath)
     {
@@ -22,12 +23,17 @@ public sealed class DiscordSettingsStore
     {
         try
         {
-            if (!File.Exists(_settingsPath))
+            string json;
+            lock (_fileGate)
             {
-                return new DiscordConfiguration();
+                if (!File.Exists(_settingsPath))
+                {
+                    return new DiscordConfiguration();
+                }
+
+                json = File.ReadAllText(_settingsPath);
             }
 
-            var json = File.ReadAllText(_settingsPath);
             var configuration = JsonSerializer.Deserialize<DiscordConfiguration>(json, JsonOptions)
                 ?? new DiscordConfiguration();
             configuration.AccessToken = UnprotectToken(configuration.AccessToken);
@@ -44,7 +50,6 @@ public sealed class DiscordSettingsStore
     public void Save(DiscordConfiguration configuration)
     {
         Normalize(configuration);
-        Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
         var persisted = new DiscordConfiguration
         {
             ApplicationId = configuration.ApplicationId,
@@ -55,16 +60,26 @@ public sealed class DiscordSettingsStore
             TokenExpiresAtUtc = configuration.TokenExpiresAtUtc,
             SelectedGuildId = configuration.SelectedGuildId,
             TokenProvider = configuration.TokenProvider,
-            TokenScopes = configuration.TokenScopes
+            TokenScopes = configuration.TokenScopes,
+            FavoriteGuildIds = [.. configuration.FavoriteGuildIds],
+            FriendOnlineNotificationsEnabled = configuration.FriendOnlineNotificationsEnabled
         };
-        File.WriteAllText(_settingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
+        var json = JsonSerializer.Serialize(persisted, JsonOptions);
+        lock (_fileGate)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
+            File.WriteAllText(_settingsPath, json);
+        }
     }
 
     public void Clear()
     {
-        if (File.Exists(_settingsPath))
+        lock (_fileGate)
         {
-            File.Delete(_settingsPath);
+            if (File.Exists(_settingsPath))
+            {
+                File.Delete(_settingsPath);
+            }
         }
     }
 
@@ -78,6 +93,16 @@ public sealed class DiscordSettingsStore
         configuration.SelectedGuildId = (configuration.SelectedGuildId ?? string.Empty).Trim();
         configuration.TokenProvider = (configuration.TokenProvider ?? string.Empty).Trim().ToLowerInvariant();
         configuration.TokenScopes = (configuration.TokenScopes ?? string.Empty).Trim();
+        configuration.FavoriteGuildIds = (configuration.FavoriteGuildIds ?? [])
+            .Select(guildId => (guildId ?? string.Empty).Trim())
+            .Where(guildId =>
+                guildId.Length is >= 16 and <= 32 &&
+                guildId.All(char.IsAsciiDigit) &&
+                ulong.TryParse(guildId, out var parsed) &&
+                parsed > 0)
+            .Distinct(StringComparer.Ordinal)
+            .Take(200)
+            .ToList();
     }
 
     private static string ProtectToken(string? value)
@@ -145,4 +170,8 @@ public sealed class DiscordConfiguration
     public string TokenProvider { get; set; } = string.Empty;
 
     public string TokenScopes { get; set; } = string.Empty;
+
+    public List<string> FavoriteGuildIds { get; set; } = [];
+
+    public bool FriendOnlineNotificationsEnabled { get; set; }
 }

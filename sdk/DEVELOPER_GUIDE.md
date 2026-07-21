@@ -562,11 +562,10 @@ Declare `native.performance`.
 ```js
 const performance = await sdk.performance.getState();
 await sdk.performance.setOverlayLevel(2);
-await sdk.performance.toggleAutoTarget();
-await sdk.performance.startOverlay();
+await sdk.performance.setSettingValue("frame-limit", 60);
 ```
 
-The snapshot includes FPS, frametime, one-percent-low FPS, frame pacing, target CPU usage, target memory, overlay state, and helper status. Do not poll faster than the configured telemetry rate.
+The snapshot includes RTSS installation state, FPS, frametime, rolling one-percent-low FPS, frame pacing, target CPU usage, target memory, overlay state, and the active per-game frame limit. Setting an overlay level applies it immediately: `0` Off, `1` FPS, `2` SteamOS Strip, `3` SteamOS Full, and `4` Frame Pacing. `startOverlay()` and `stopOverlay()` remain compatibility aliases for selecting FPS and Off. The compatibility method `prepareElevatedHelper()` closes RTSS background components, repairs RTSS, and restarts it; it no longer creates an elevated TFS FPS helper. Do not poll faster than the configured telemetry rate.
 
 ## 23. Native power
 

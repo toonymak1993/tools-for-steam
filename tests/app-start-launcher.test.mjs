@@ -30,3 +30,8 @@ test("App Start exposes one-click launch, favorites, and visibility management",
   assert.match(apiSource, /\/api\/app-start\/apps\/favorite/);
   assert.match(apiSource, /\/api\/app-start\/catalog\/refresh/);
 });
+
+test("every App Start launch hands the target window to the foreground service", () => {
+  assert.match(serviceSource, /ActivateLaunchedAppWhenReady\(/);
+  assert.match(serviceSource, /windowsBeforeLaunch/);
+});

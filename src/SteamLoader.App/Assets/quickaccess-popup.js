@@ -1,11 +1,14 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 108;
+  const stateVersion = 116;
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
   const smartHomeSliderCommitSettleDelayMs = 1000;
   const smartHomeSliderCommitRetryDelayMs = 140;
   const audioVolumeCommitSettleDelayMs = 260;
+  const audioPlaybackDeviceSectionKey = "audio-playback-devices";
+  const audioCaptureDeviceSectionKey = "audio-capture-devices";
+  const audioMixerSectionKey = "audio-volume-mixer";
   const soundtrackTabKey = 7;
   const storeSyncPinnedTitlesStorageKey = "steamloader.storeSyncPinnedTitles.v1";
   const pluginStoreInputStorageKey = "ToolsForSteamPluginStoreInput";
@@ -88,6 +91,20 @@
       window.clearTimeout(previousState.externalGameQuickAccess.tabOpenTimer);
     }
 
+    if (previousState?.generalSettings?.overlayCapture?.timer) {
+      window.clearTimeout(previousState.generalSettings.overlayCapture.timer);
+    }
+
+    if (
+      previousState?.generalSettings?.overlayCapture?.catchAllInstalled &&
+      window.FocusNavController?.SetCatchAllGamepadInput &&
+      window.FocusNavController.m_fnCatchAllGamepadInput?.__steamLoaderOverlayCaptureCatchAll
+    ) {
+      window.FocusNavController.SetCatchAllGamepadInput(
+        previousState.generalSettings.overlayCapture.previousCatchAllGamepadInput || undefined,
+      );
+    }
+
     if (previousState?.pluginStoreBridge?.overlayStatePollTimer) {
       window.clearInterval(previousState.pluginStoreBridge.overlayStatePollTimer);
     }
@@ -147,6 +164,10 @@
             devices: [],
             captureDevices: [],
             error: "",
+            playbackDeviceSwitchingId: "",
+            captureDeviceSwitchingId: "",
+            playbackDeviceSwitchError: "",
+            captureDeviceSwitchError: "",
             dashboardLoading: false,
             dashboardError: "",
             volumeLoading: false,
@@ -235,6 +256,7 @@
             closeArmTimer: 0,
             tabOpenTimer: 0,
             returnRequested: false,
+            returnArmedAt: 0,
           },
           appStart: {
             loading: false,
@@ -315,10 +337,21 @@
             saving: false,
             error: "",
             snapshot: null,
-            splashWallpaperDraft: "",
-            splashIconDraft: "",
-            splashWallpaperInputVersion: 0,
-            splashIconInputVersion: 0,
+            splashCustomImageDraft: "",
+            splashCustomImageInputVersion: 0,
+            overlayCommitTimersByKey: {},
+            overlayCapture: {
+              active: false,
+              actionId: "",
+              phase: "idle",
+              buttons: [],
+              message: "",
+              timer: 0,
+              sequence: 0,
+              catchAllInstalled: false,
+              catchAllCallback: null,
+              previousCatchAllGamepadInput: null,
+            },
           },
           updates: {
             loading: false,
@@ -1184,6 +1217,62 @@
     );
   }
 
+  const controllerShortcutButtonOptions = [
+    { id: "back", title: "View / Back", shortTitle: "View" },
+    { id: "start", title: "Menu / Start", shortTitle: "Menu" },
+    { id: "left-bumper", title: "Left Bumper", shortTitle: "LB" },
+    { id: "right-bumper", title: "Right Bumper", shortTitle: "RB" },
+    { id: "left-stick", title: "Left Stick Click", shortTitle: "LS" },
+    { id: "right-stick", title: "Right Stick Click", shortTitle: "RS" },
+    { id: "a", title: "A", shortTitle: "A" },
+    { id: "b", title: "B", shortTitle: "B" },
+    { id: "x", title: "X", shortTitle: "X" },
+    { id: "y", title: "Y", shortTitle: "Y" },
+    { id: "dpad-up", title: "D-Pad Up", shortTitle: "D-Up" },
+    { id: "dpad-down", title: "D-Pad Down", shortTitle: "D-Down" },
+    { id: "dpad-left", title: "D-Pad Left", shortTitle: "D-Left" },
+    { id: "dpad-right", title: "D-Pad Right", shortTitle: "D-Right" },
+  ];
+
+  const controllerShortcutActionDefinitions = [
+    {
+      id: "steam-menu",
+      property: "steamMenuButtons",
+      title: "Steam Menu",
+      context: "Steam Window",
+      trigger: "Tap and release",
+      description: "Open the left Steam menu while Big Picture is in front.",
+      defaultButtons: ["back"],
+    },
+    {
+      id: "steam-quick-access",
+      property: "steamQuickAccessButtons",
+      title: "Steam Quick Access",
+      context: "Steam Window",
+      trigger: "Hold",
+      description: "Open the right Quick Access menu while Big Picture is in front.",
+      defaultButtons: ["back"],
+    },
+    {
+      id: "in-game-overlay",
+      property: "inGameOverlayButtons",
+      title: "In-Game Steam Overlay",
+      context: "In Game",
+      trigger: "Hold",
+      description: "Open the regular Steam overlay; Store Sync titles without an injected overlay use the external Quick Access fallback.",
+      defaultButtons: ["start"],
+    },
+    {
+      id: "in-game-quick-access",
+      property: "inGameQuickAccessButtons",
+      title: "In-Game Quick Access",
+      context: "In Game",
+      trigger: "Keep holding",
+      description: "Open Quick Access from a game, including the external fallback for Store Sync titles.",
+      defaultButtons: ["start"],
+    },
+  ];
+
   const plugins = [
     {
       id: "settings",
@@ -1196,14 +1285,19 @@
           description: "Startup behavior and global loader options",
         },
         {
+          id: "overlay",
+          title: "Overlay",
+          description: "Choose controller buttons and hold times",
+        },
+        {
           id: "updates",
           title: "Updates",
           description: "Stable or beta releases and in-app installs",
         },
         {
           id: "splashscreen-themes",
-          title: "Splashscreen Themes",
-          description: "Wallpaper, icon, text, and splash timing",
+          title: "Splashscreen",
+          description: "Choose dynamic game artwork or your own image",
         },
         {
           id: "oem-software",
@@ -1351,13 +1445,13 @@
     },
     {
       id: "performance",
-      title: "FPS Overlay",
-      description: "Built-in TFS FPS meter and Steam-style overlay controls",
+      title: "Performance",
+      description: "RTSS overlay modes, live metrics, and per-game FPS limiting",
       pages: [
         {
           id: "overlay",
-          title: "TFS FPS Overlay",
-          description: "Built-in overlay levels and live settings",
+          title: "RTSS Performance",
+          description: "SteamOS-style overlay modes and frame limiting",
         },
       ],
     },
@@ -2938,6 +3032,94 @@
         background: rgba(255, 255, 255, 0.05);
       }
 
+      .steamloader-audio-channel-card {
+        position: relative;
+        overflow: hidden;
+        box-sizing: border-box;
+        border: 1px solid transparent;
+      }
+
+      .steamloader-audio-channel-card.is-output {
+        border-color: rgba(68, 174, 241, 0.28);
+      }
+
+      .steamloader-audio-channel-card.is-input {
+        border-color: rgba(163, 112, 232, 0.28);
+      }
+
+      .steamloader-audio-channel-card::before {
+        position: absolute;
+        top: 18px;
+        bottom: 18px;
+        left: 0;
+        width: 4px;
+        border-radius: 0 4px 4px 0;
+        content: "";
+        pointer-events: none;
+      }
+
+      .steamloader-audio-channel-card.is-output::before {
+        background: rgba(68, 174, 241, 0.88);
+        box-shadow: 0 0 14px rgba(68, 174, 241, 0.2);
+      }
+
+      .steamloader-audio-channel-card.is-input::before {
+        background: rgba(163, 112, 232, 0.86);
+        box-shadow: 0 0 14px rgba(163, 112, 232, 0.18);
+      }
+
+      .steamloader-audio-channel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+        padding: 0 2px;
+      }
+
+      .steamloader-audio-channel-status {
+        flex: 0 0 auto;
+        padding: 5px 9px;
+        border-radius: 999px;
+        color: rgba(218, 238, 251, 0.96);
+        background: rgba(52, 130, 181, 0.24);
+        font-size: clamp(10px, 1.16vw, 12px);
+        line-height: 1;
+        font-weight: 700;
+      }
+
+      .steamloader-audio-channel-card.is-input .steamloader-audio-channel-status {
+        color: rgba(238, 225, 255, 0.96);
+        background: rgba(131, 79, 196, 0.25);
+      }
+
+      .steamloader-audio-channel-status.is-muted,
+      .steamloader-audio-channel-status.is-unavailable {
+        color: rgba(213, 220, 227, 0.9);
+        background: rgba(111, 119, 128, 0.3);
+      }
+
+      .steamloader-audio-channel-selector {
+        margin-bottom: 2px;
+      }
+
+      .steamloader-audio-channel-actions {
+        margin-top: 9px;
+      }
+
+      .steamloader-audio-channel-actions .steamloader-audio-quick-button {
+        min-height: 48px;
+      }
+
+      .steamloader-audio-channel-actions .steamloader-audio-quick-shell {
+        min-height: 48px;
+      }
+
+      .steamloader-audio-mixer-card-shell .steamloader-audio-mixer-stack,
+      .steamloader-audio-mixer-card-shell .steamloader-audio-empty-state {
+        margin-top: 10px;
+      }
+
       .steamloader-audio-card-title {
         color: rgba(236, 242, 248, 0.96);
         font-size: clamp(18px, 2vw, 24px);
@@ -3039,6 +3221,7 @@
 
       .steamloader-audio-slider-button,
       .steamloader-audio-selector-button,
+      .steamloader-audio-device-option-button,
       .steamloader-audio-mixer-button {
         width: 100%;
         min-width: 0;
@@ -3106,6 +3289,11 @@
         width: 14px;
         height: 14px;
         transform: rotate(90deg);
+        transition: transform 0.14s ease;
+      }
+
+      .steamloader-audio-selector-button.is-expanded .steamloader-audio-selector-icon svg {
+        transform: rotate(-90deg);
       }
 
       .steamloader-audio-selector-copy {
@@ -3113,6 +3301,179 @@
         color: rgba(143, 156, 168, 0.82);
         font-size: clamp(10px, 1.14vw, 12px);
         line-height: 1.35;
+      }
+
+      .steamloader-audio-selector-button.is-switching .steamloader-audio-selector-copy {
+        color: rgba(151, 211, 250, 0.96);
+      }
+
+      .steamloader-audio-selector-error {
+        margin-top: 7px;
+        padding: 7px 9px;
+        border-radius: 10px;
+        color: rgba(255, 205, 205, 0.98);
+        background: rgba(176, 47, 47, 0.2);
+        box-shadow: inset 0 0 0 1px rgba(255, 115, 115, 0.22);
+        font-size: clamp(10px, 1.14vw, 12px);
+        line-height: 1.35;
+      }
+
+      .steamloader-audio-device-options {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        margin: 2px 0 3px 13px;
+        max-height: min(300px, 42vh);
+        padding: 2px 7px 2px 10px;
+        border-left: 2px solid rgba(86, 188, 255, 0.24);
+        overflow-x: hidden;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(133, 151, 168, 0.58) rgba(255, 255, 255, 0.035);
+      }
+
+      .steamloader-audio-device-options::-webkit-scrollbar {
+        width: 7px;
+      }
+
+      .steamloader-audio-device-options::-webkit-scrollbar-track {
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .steamloader-audio-device-options::-webkit-scrollbar-thumb {
+        border-radius: 999px;
+        background: rgba(133, 151, 168, 0.58);
+      }
+
+      .steamloader-audio-device-option-button {
+        padding: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+
+      .steamloader-audio-device-option-card {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 42px;
+        box-sizing: border-box;
+        padding: 9px 11px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .steamloader-audio-device-option-icon {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        border-radius: 9px;
+        color: rgba(202, 220, 235, 0.92);
+        background: rgba(255, 255, 255, 0.055);
+      }
+
+      .steamloader-audio-device-option-icon svg {
+        width: 22px;
+        height: 22px;
+      }
+
+      .steamloader-audio-device-option-copy {
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        min-width: 0;
+        gap: 3px;
+      }
+
+      .steamloader-audio-device-option-name {
+        min-width: 0;
+        color: rgba(218, 226, 234, 0.92);
+        font-size: clamp(12px, 1.4vw, 15px);
+        line-height: 1.25;
+        font-weight: 600;
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .steamloader-audio-device-option-meta {
+        min-width: 0;
+        color: rgba(145, 160, 174, 0.86);
+        font-size: clamp(9px, 1.08vw, 11px);
+        line-height: 1.25;
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .steamloader-audio-device-option-badge {
+        flex: 0 0 auto;
+        padding: 4px 7px;
+        border-radius: 999px;
+        color: rgba(219, 241, 255, 0.98);
+        background: rgba(59, 151, 214, 0.28);
+        font-size: clamp(9px, 1.05vw, 11px);
+        line-height: 1;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .steamloader-audio-device-option-button.is-switching .steamloader-audio-device-option-icon {
+        animation: steamloader-audio-device-pulse 0.9s ease-in-out infinite alternate;
+      }
+
+      .steamloader-audio-device-option-button.is-switching .steamloader-audio-device-option-badge {
+        color: rgba(236, 246, 255, 0.98);
+        background: rgba(63, 133, 184, 0.42);
+      }
+
+      @keyframes steamloader-audio-device-pulse {
+        from {
+          opacity: 0.55;
+          transform: scale(0.92);
+        }
+
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      .steamloader-audio-device-option-button.is-selected .steamloader-audio-device-option-card {
+        background: rgba(59, 151, 214, 0.16);
+        box-shadow: inset 0 0 0 1px rgba(86, 188, 255, 0.32);
+      }
+
+      .steamloader-audio-device-option-button.gpfocus .steamloader-audio-device-option-card,
+      .steamloader-audio-device-option-button:focus-visible .steamloader-audio-device-option-card {
+        background: linear-gradient(180deg, rgba(242, 247, 252, 0.96) 0%, rgba(198, 212, 225, 0.92) 100%);
+        box-shadow:
+          0 0 0 3px rgba(86, 188, 255, 0.98),
+          0 0 0 6px rgba(86, 188, 255, 0.2),
+          inset 0 0 0 2px rgba(10, 17, 26, 0.72);
+      }
+
+      .steamloader-audio-device-option-button.gpfocus .steamloader-audio-device-option-name,
+      .steamloader-audio-device-option-button:focus-visible .steamloader-audio-device-option-name,
+      .steamloader-audio-device-option-button.gpfocus .steamloader-audio-device-option-meta,
+      .steamloader-audio-device-option-button:focus-visible .steamloader-audio-device-option-meta,
+      .steamloader-audio-device-option-button.gpfocus .steamloader-audio-device-option-icon,
+      .steamloader-audio-device-option-button:focus-visible .steamloader-audio-device-option-icon {
+        color: #111824;
+      }
+
+      .steamloader-audio-device-option-button.gpfocus .steamloader-audio-device-option-badge,
+      .steamloader-audio-device-option-button:focus-visible .steamloader-audio-device-option-badge {
+        color: #f5f9fc;
+        background: rgba(20, 74, 112, 0.88);
       }
 
       .steamloader-audio-mixer-header {
@@ -4695,6 +5056,14 @@
       }
 
       if (route.pluginId === "settings") {
+        if (route.pageId?.startsWith("overlay-combination-")) {
+          const actionId = route.pageId.replace(/^overlay-combination-/, "");
+          return {
+            route: parseRoute("page:settings:overlay"),
+            fallbackSlotKey: `overlay-action-${actionId}`,
+          };
+        }
+
         if (route.pageId?.startsWith("button-mapping-button-")) {
           return {
             route: parseRoute("page:settings:button-mapping"),
@@ -4816,9 +5185,12 @@
     return null;
   }
 
-  function consumeResolvedFocus(route, autoFocusIndex) {
+  function consumeResolvedFocus(route, autoFocusIndex, resolvedSlot = null) {
     if (Number.isInteger(autoFocusIndex) && state.pendingFocusRouteKey === getRouteKey(route)) {
-      rememberCurrentRouteSelection(autoFocusIndex, state.renderedSlots?.[autoFocusIndex] || null);
+      rememberCurrentRouteSelection(
+        autoFocusIndex,
+        resolvedSlot || state.renderedSlots?.[autoFocusIndex] || null,
+      );
       state.pendingFocusRouteKey = null;
       state.pendingFocusIndex = null;
       state.pendingFocusSlotKey = null;
@@ -5167,6 +5539,41 @@
           stroke: "currentColor",
           strokeWidth: "2.2",
           strokeLinecap: "round",
+        }),
+      ),
+    );
+  }
+
+  function HeadphonesDeviceIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 36 36",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M8.5 19V17C8.5 11.7533 12.7533 7.5 18 7.5C23.2467 7.5 27.5 11.7533 27.5 17V19",
+          stroke: "currentColor",
+          strokeWidth: "2.4",
+          strokeLinecap: "round",
+        }),
+        createElement("rect", {
+          x: "7",
+          y: "17",
+          width: "6.5",
+          height: "11",
+          rx: "3.25",
+          fill: "currentColor",
+        }),
+        createElement("rect", {
+          x: "22.5",
+          y: "17",
+          width: "6.5",
+          height: "11",
+          rx: "3.25",
+          fill: "currentColor",
         }),
       ),
     );
@@ -7619,12 +8026,16 @@
   }
 
   function getAudioDashboardError() {
+    const deviceSwitchError =
+      state.audio.playbackDeviceSwitchError ||
+      state.audio.captureDeviceSwitchError;
+
     return (
       state.audio.dashboardError ||
       state.audio.volumeError ||
       state.audio.captureVolumeError ||
       state.audio.mixerError ||
-      state.audio.error ||
+      (!deviceSwitchError ? state.audio.error : "") ||
       ""
     );
   }
@@ -7895,18 +8306,11 @@
     }
 
     const dashboard = buildAudioDashboardModel();
-    const controls = [
-      dashboard?.playbackToggle,
-      dashboard?.captureToggle,
-      dashboard?.playbackSlider,
-      dashboard?.captureSlider,
-      dashboard?.playbackSelector,
-      dashboard?.captureSelector,
-      ...(Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : []),
-      dashboard?.refreshControl,
-    ];
+    const controls = getAudioDashboardControls(dashboard);
+    const indexOffset = getBackNavigation(state.route) ? 1 : 0;
+    const dashboardControlIndex = index - indexOffset;
 
-    return controls.find((control) => control?.index === index) || null;
+    return controls.find((control) => control?.index === dashboardControlIndex) || null;
   }
 
   function handleAudioDashboardKeyDown(event) {
@@ -7936,7 +8340,11 @@
     event.stopPropagation();
     event.stopImmediatePropagation?.();
 
-    rememberCurrentRouteIndex(control.index);
+    const indexOffset = getBackNavigation(state.route) ? 1 : 0;
+    rememberCurrentRouteSelection(
+      control.index + indexOffset,
+      getAudioDashboardControlSyncKey(control),
+    );
     moveHandler(event);
   }
 
@@ -8339,6 +8747,22 @@
     { value: 2, title: "Frametime" },
   ]);
 
+  const performanceFrameLimitOptions = Object.freeze([
+    { value: 0, title: "Unlimited" },
+    { value: 30, title: "30 FPS" },
+    { value: 40, title: "40 FPS" },
+    { value: 45, title: "45 FPS" },
+    { value: 50, title: "50 FPS" },
+    { value: 60, title: "60 FPS" },
+    { value: 72, title: "72 FPS" },
+    { value: 90, title: "90 FPS" },
+    { value: 120, title: "120 FPS" },
+    { value: 144, title: "144 FPS" },
+    { value: 165, title: "165 FPS" },
+    { value: 240, title: "240 FPS" },
+    { value: 360, title: "360 FPS" },
+  ]);
+
   function getPerformanceLevelDefinitions() {
     const settings = getPerformanceSettings();
     return Array.isArray(settings?.overlayLevels) ? settings.overlayLevels : [];
@@ -8391,6 +8815,11 @@
   function getPerformanceOverlayScale() {
     const value = getPerformanceSettings()?.overlayScale;
     return Number.isFinite(value) ? Number(value) : 100;
+  }
+
+  function getPerformanceFrameLimit() {
+    const value = getPerformanceSettings()?.frameLimit;
+    return Number.isInteger(value) ? value : 0;
   }
 
   function getPerformanceGraphMode() {
@@ -8466,6 +8895,8 @@
         return performanceGraphModeOptions.find((option) => option.value === value)?.title || "Off";
       case "background-theme":
         return performanceBackgroundThemeOptions.find((option) => option.value === value)?.title || "Steam Blue";
+      case "frame-limit":
+        return performanceFrameLimitOptions.find((option) => option.value === value)?.title || `${value} FPS`;
       default:
         return "";
     }
@@ -8492,6 +8923,10 @@
         break;
       case "overlay-scale":
         nextSettings.overlayScale = value;
+        break;
+      case "frame-limit":
+        nextSettings.frameLimit = value;
+        nextSettings.frameLimitTitle = getPerformanceOptionSettingTitle(key, value);
         break;
       case "graph-mode":
         nextSettings.graphMode = value;
@@ -8588,32 +9023,37 @@
   function getPerformancePanelCopy() {
     const installation = getPerformanceInstallation();
     const runtime = getPerformanceRuntime();
-    if (installation && installation.elevatedHelperReady === false) {
-      return "Elevated Helper Setup Required";
+    const level = getPerformanceDraftLevel();
+    if (level === 0) {
+      return "Off";
     }
 
-    if (installation?.running && runtime?.targetProcessName) {
+    if (!installation?.installed) {
+      return "RTSS will be installed when this mode is applied";
+    }
+
+    if (runtime?.targetProcessName) {
       return `${runtime.targetProcessName} - ${getPerformanceLevelDisplayText()}`;
     }
 
-    return installation?.running
-      ? `Running - ${getPerformanceLevelDisplayText()}`
-      : `Ready - ${getPerformanceLevelDisplayText()}`;
+    return `${installation.running ? "Active" : "Ready"} - ${getPerformanceLevelDisplayText()}`;
   }
 
   function getPerformancePanelHint() {
     if (state.performance.loading) {
-      return "Loading TFS FPS Overlay...";
+      return "Loading RTSS performance state...";
     }
 
     const installation = getPerformanceInstallation();
-    if (installation && installation.elevatedHelperReady === false) {
-      return "Press Prepare Elevated Helper once. Windows will ask for admin permission, then future starts stay silent even after a restart.";
+    if (!installation?.installed) {
+      return "Move right to choose a mode. TFS installs RTSS only when it is actually missing.";
     }
 
     return Number.isInteger(state.performance.pendingOverlayLevelCommit) || state.performance.saving
-      ? "Use Left / Right to choose a preset. TFS applies it automatically after a short pause."
-      : "Use Left / Right to switch presets. No A confirmation is needed.";
+      ? "Applying the selected RTSS mode..."
+      : getPerformanceDraftLevel() === 0
+        ? "Off. Move right to enable a SteamOS-style RTSS mode."
+        : "Active. Move left or right to switch modes; choose Off to disable the overlay.";
   }
 
   function shouldSyncLivePerformancePanel() {
@@ -10021,34 +10461,46 @@
   function createAudioDashboardButton(control, content, className, autoFocusIndex, indexOffset = 0) {
     const controlIndex = control.index + indexOffset;
     const shouldAutoFocus = Number.isInteger(autoFocusIndex) && autoFocusIndex === controlIndex;
+    const controlSlotKey = control.slotKey || `audio-dashboard-${control.index}`;
 
     return NativeDialogButton(
       content,
       () => {
-        rememberCurrentRouteIndex(controlIndex);
+        rememberCurrentRouteSelection(controlIndex, controlSlotKey);
         control.onClick?.();
       },
       {
         disabled: control.disabled,
-        slotKey: control.slotKey || `audio-dashboard-${control.index}`,
+        slotKey: controlSlotKey,
         className,
         extraProps: {
           "data-slot-button": String(controlIndex),
+          "data-slot-key": controlSlotKey,
           "data-audio-dashboard-control": getAudioDashboardControlSyncKey(control),
+          ...(typeof control.expanded === "boolean"
+            ? { "aria-expanded": control.expanded }
+            : {}),
+          ...(control.controlsId ? { "aria-controls": control.controlsId } : {}),
+          ...(typeof control.selected === "boolean"
+            ? { "aria-pressed": control.selected }
+            : {}),
+          ...(typeof control.switching === "boolean"
+            ? { "aria-busy": control.switching }
+            : {}),
           autoFocus: shouldAutoFocus,
           onGamepadFocus: () => {
-            rememberCurrentRouteIndex(controlIndex);
+            rememberCurrentRouteSelection(controlIndex, controlSlotKey);
           },
           onMoveLeft: control.onMoveLeft
             ? (event) => {
-                rememberCurrentRouteIndex(controlIndex);
+                rememberCurrentRouteSelection(controlIndex, controlSlotKey);
                 control.onMoveLeft?.(event);
                 return true;
               }
             : undefined,
           onMoveRight: control.onMoveRight
             ? (event) => {
-                rememberCurrentRouteIndex(controlIndex);
+                rememberCurrentRouteSelection(controlIndex, controlSlotKey);
                 control.onMoveRight?.(event);
                 return true;
               }
@@ -10108,6 +10560,9 @@
       notchCount: control.notchCount ?? 21,
       displayValue: control.displayValue,
       valueSuffix: control.valueSuffix || "%",
+      trackStyle: control.trackStyle,
+      fillStyle: control.fillStyle,
+      thumbStyle: control.thumbStyle,
     };
 
     return createAudioDashboardButton(
@@ -10165,36 +10620,131 @@
                 children: control.copy,
               })
             : null,
+          createElement("div", {
+            className: "steamloader-audio-selector-error",
+            children: control.error || "",
+            hidden: !control.error,
+          }),
         ),
       ),
-      "steamloader-dialog-button steamloader-audio-selector-button",
+      `steamloader-dialog-button steamloader-audio-selector-button${control.expanded ? " is-expanded" : ""}${control.switching ? " is-switching" : ""}`,
       autoFocusIndex,
       indexOffset,
     );
   }
 
-  function createAudioDashboardCommandButton(control, autoFocusIndex, indexOffset = 0) {
+  function createAudioDashboardDeviceOptionButton(control, autoFocusIndex, indexOffset = 0) {
+    const DeviceIcon = control.icon || AudioPluginIcon;
+    const badgeText = control.switching ? "Switching..." : control.selected ? "Current" : "";
+
     return createAudioDashboardButton(
       control,
       createElement(
         "div",
         withChildren(
-          { className: "steamloader-audio-selector-card" },
-          createElement("div", {
-            className: "steamloader-audio-selector-value",
-            children: control.title,
+          { className: "steamloader-audio-device-option-card" },
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-audio-device-option-icon" },
+              createElement(DeviceIcon, {}),
+            ),
+          ),
+          createElement(
+            "div",
+            withChildren(
+              { className: "steamloader-audio-device-option-copy" },
+              createElement("div", {
+                className: "steamloader-audio-device-option-name",
+                children: control.title,
+              }),
+              createElement("div", {
+                className: "steamloader-audio-device-option-meta",
+                children: control.meta || "Windows audio device",
+              }),
+            ),
+          ),
+          createElement("span", {
+            className: `steamloader-audio-device-option-badge${control.switching ? " is-switching" : ""}`,
+            children: badgeText,
+            hidden: !badgeText,
           }),
-          control.copy
-            ? createElement("div", {
-                className: "steamloader-audio-selector-copy",
-                children: control.copy,
-              })
-            : null,
         ),
       ),
-      "steamloader-dialog-button steamloader-audio-selector-button",
+      `steamloader-dialog-button steamloader-audio-device-option-button${control.selected ? " is-selected" : ""}${control.switching ? " is-switching" : ""}`,
       autoFocusIndex,
       indexOffset,
+    );
+  }
+
+  function createAudioDashboardDeviceOptions(selector, autoFocusIndex, indexOffset = 0) {
+    const options = Array.isArray(selector?.options) ? selector.options : [];
+    if (!selector?.expanded || !options.length) {
+      return null;
+    }
+
+    return createElement(
+      "div",
+      withChildren(
+        {
+          id: selector.controlsId,
+          className: "steamloader-audio-device-options",
+          role: "group",
+          "aria-label": `${selector.label} choices`,
+        },
+        ...options.map((option) =>
+          createAudioDashboardDeviceOptionButton(option, autoFocusIndex, indexOffset),
+        ),
+      ),
+    );
+  }
+
+  function createAudioDashboardChannelCard(
+    channel,
+    selector,
+    slider,
+    muteControl,
+    autoFocusIndex,
+    indexOffset = 0,
+  ) {
+    return createElement(
+      "div",
+      withChildren(
+        {
+          className: `steamloader-audio-card steamloader-audio-channel-card ${channel.className || ""}`,
+        },
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-audio-channel-header" },
+            createElement("div", {
+              className: "steamloader-audio-card-title",
+              children: channel.title,
+            }),
+            createElement("div", {
+              className: `steamloader-audio-channel-status${channel.status === "Muted" ? " is-muted" : ""}${channel.status === "Unavailable" ? " is-unavailable" : ""}`,
+              children: channel.status,
+            }),
+          ),
+        ),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-audio-selector-stack steamloader-audio-channel-selector" },
+            createAudioDashboardSelectorButton(selector, autoFocusIndex, indexOffset),
+            createAudioDashboardDeviceOptions(selector, autoFocusIndex, indexOffset),
+          ),
+        ),
+        createDivider(`audio-channel-${channel.title.toLowerCase()}-divider`),
+        createAudioDashboardSliderButton(slider, autoFocusIndex, undefined, indexOffset),
+        createElement(
+          "div",
+          withChildren(
+            { className: "steamloader-audio-channel-actions" },
+            createAudioDashboardQuickButton(muteControl, autoFocusIndex, indexOffset),
+          ),
+        ),
+      ),
     );
   }
 
@@ -10206,71 +10756,35 @@
       "div",
       withChildren(
         { className: "steamloader-audio-dashboard" },
-        createElement(
-          "div",
-          withChildren(
-            { className: "steamloader-audio-card" },
-            createElement(
-              "div",
-              withChildren(
-                { className: "steamloader-audio-quick-grid" },
-                createAudioDashboardQuickButton(dashboard.playbackToggle, autoFocusIndex, indexOffset),
-                createAudioDashboardQuickButton(dashboard.captureToggle, autoFocusIndex, indexOffset),
-              ),
-            ),
-            createDivider("audio-dashboard-quick-divider"),
-            createElement(
-              "div",
-              withChildren(
-                { className: "steamloader-audio-slider-stack" },
-                createAudioDashboardSliderButton(dashboard.playbackSlider, autoFocusIndex, undefined, indexOffset),
-                createAudioDashboardSliderButton(dashboard.captureSlider, autoFocusIndex, undefined, indexOffset),
-              ),
-            ),
-          ),
+        createAudioDashboardChannelCard(
+          dashboard.playbackChannel,
+          dashboard.playbackSelector,
+          dashboard.playbackSlider,
+          dashboard.playbackToggle,
+          autoFocusIndex,
+          indexOffset,
         ),
-        createDivider("audio-dashboard-device-divider"),
-        createElement(
-          "div",
-          withChildren(
-            { className: "steamloader-audio-card" },
-            createElement("div", {
-              className: "steamloader-audio-card-title",
-              children: "Default Devices",
-            }),
-            createElement(
-              "div",
-              withChildren(
-                { className: "steamloader-audio-selector-stack" },
-                createAudioDashboardSelectorButton(dashboard.playbackSelector, autoFocusIndex, indexOffset),
-                createAudioDashboardSelectorButton(dashboard.captureSelector, autoFocusIndex, indexOffset),
-              ),
-            ),
-          ),
+        createAudioDashboardChannelCard(
+          dashboard.captureChannel,
+          dashboard.captureSelector,
+          dashboard.captureSlider,
+          dashboard.captureToggle,
+          autoFocusIndex,
+          indexOffset,
         ),
         createElement(
           "div",
           withChildren(
-            { className: "steamloader-audio-card" },
-            createElement(
-              "div",
-              withChildren(
-                { className: "steamloader-audio-mixer-header" },
-                createElement("div", {
-                  className: "steamloader-audio-card-title",
-                  children: "Volume Mixer",
-                }),
-                createElement("div", {
-                  className: "steamloader-audio-card-copy",
-                  children: dashboard.mixerSummary,
-                }),
-              ),
-            ),
-            mixerControls.length
+            { className: "steamloader-audio-card steamloader-audio-mixer-card-shell" },
+            createAudioDashboardSelectorButton(dashboard.mixerToggle, autoFocusIndex, indexOffset),
+            dashboard.mixerToggle.expanded && mixerControls.length
               ? createElement(
                   "div",
                   withChildren(
-                    { className: "steamloader-audio-mixer-stack" },
+                    {
+                      id: dashboard.mixerToggle.controlsId,
+                      className: "steamloader-audio-mixer-stack",
+                    },
                     ...mixerControls.map((control) =>
                       createAudioDashboardSliderButton(
                         control,
@@ -10281,14 +10795,15 @@
                     ),
                   ),
                 )
-              : createElement("div", {
-                  className: "steamloader-audio-empty-state",
-                  children: dashboard.emptyMixerText,
-              }),
+              : dashboard.mixerToggle.expanded
+                ? createElement("div", {
+                    id: dashboard.mixerToggle.controlsId,
+                    className: "steamloader-audio-empty-state",
+                    children: dashboard.emptyMixerText,
+                  })
+                : null,
           ),
         ),
-        createDivider("audio-dashboard-refresh-divider"),
-        createAudioDashboardCommandButton(dashboard.refreshControl, autoFocusIndex, indexOffset),
       ),
     );
   }
@@ -10444,14 +10959,22 @@
 
   function getAudioDashboardControls(dashboard) {
     return [
-      dashboard?.playbackToggle,
-      dashboard?.captureToggle,
-      dashboard?.playbackSlider,
-      dashboard?.captureSlider,
       dashboard?.playbackSelector,
+      ...(dashboard?.playbackSelector?.expanded && Array.isArray(dashboard?.playbackSelector?.options)
+        ? dashboard.playbackSelector.options
+        : []),
+      dashboard?.playbackSlider,
+      dashboard?.playbackToggle,
       dashboard?.captureSelector,
-      ...(Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : []),
-      dashboard?.refreshControl,
+      ...(dashboard?.captureSelector?.expanded && Array.isArray(dashboard?.captureSelector?.options)
+        ? dashboard.captureSelector.options
+        : []),
+      dashboard?.captureSlider,
+      dashboard?.captureToggle,
+      dashboard?.mixerToggle,
+      ...(dashboard?.mixerToggle?.expanded && Array.isArray(dashboard?.mixerControls)
+        ? dashboard.mixerControls
+        : []),
     ].filter(Boolean);
   }
 
@@ -10482,6 +11005,9 @@
           notchCount: control.notchCount ?? 21,
           displayValue: control.displayValue,
           valueSuffix: control.valueSuffix || "%",
+          trackStyle: control.trackStyle,
+          fillStyle: control.fillStyle,
+          thumbStyle: control.thumbStyle,
         },
       );
 
@@ -10493,10 +11019,40 @@
       return true;
     }
 
+    if (button.querySelector(".steamloader-audio-device-option-card")) {
+      const nameNode = button.querySelector(".steamloader-audio-device-option-name");
+      const metaNode = button.querySelector(".steamloader-audio-device-option-meta");
+      const badgeNode = button.querySelector(".steamloader-audio-device-option-badge");
+      const selected = Boolean(control.selected);
+      const switching = Boolean(control.switching);
+      const badgeText = switching ? "Switching..." : selected ? "Current" : "";
+
+      if (nameNode instanceof HTMLElement) {
+        nameNode.textContent = control.title || "";
+      }
+
+      if (metaNode instanceof HTMLElement) {
+        metaNode.textContent = control.meta || "Windows audio device";
+      }
+
+      if (badgeNode instanceof HTMLElement) {
+        badgeNode.textContent = badgeText;
+        badgeNode.hidden = !badgeText;
+        badgeNode.classList.toggle("is-switching", switching);
+      }
+
+      button.classList.toggle("is-selected", selected);
+      button.classList.toggle("is-switching", switching);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+      button.setAttribute("aria-busy", switching ? "true" : "false");
+      return true;
+    }
+
     if (button.querySelector(".steamloader-audio-selector-card")) {
       const labelNode = button.querySelector(".steamloader-audio-selector-label");
       const valueNode = button.querySelector(".steamloader-audio-selector-value");
       const copyNode = button.querySelector(".steamloader-audio-selector-copy");
+      const errorNode = button.querySelector(".steamloader-audio-selector-error");
 
       if (labelNode instanceof HTMLElement && typeof control.label === "string") {
         labelNode.textContent = control.label;
@@ -10509,6 +11065,16 @@
       if (copyNode instanceof HTMLElement) {
         copyNode.textContent = control.copy || "";
       }
+
+      if (errorNode instanceof HTMLElement) {
+        errorNode.textContent = control.error || "";
+        errorNode.hidden = !control.error;
+      }
+
+      button.classList.toggle("is-expanded", Boolean(control.expanded));
+      button.classList.toggle("is-switching", Boolean(control.switching));
+      button.setAttribute("aria-expanded", control.expanded ? "true" : "false");
+      button.setAttribute("aria-busy", control.switching ? "true" : "false");
 
       return true;
     }
@@ -10530,14 +11096,19 @@
     const controls = getAudioDashboardControls(dashboard);
     const buttons = Array.from(document.querySelectorAll("[data-audio-dashboard-control]"));
     const mixerControls = Array.isArray(dashboard?.mixerControls) ? dashboard.mixerControls : [];
+    const visibleMixerControls = dashboard?.mixerToggle?.expanded ? mixerControls : [];
     const mixerButtons = buttons.filter((button) => button.classList.contains("steamloader-audio-mixer-button"));
     const emptyState = dashboardRoot.querySelector(".steamloader-audio-empty-state");
 
-    if (mixerButtons.length !== mixerControls.length) {
+    if (buttons.length !== controls.length) {
       return false;
     }
 
-    if (Boolean(emptyState) !== (mixerControls.length === 0)) {
+    if (mixerButtons.length !== visibleMixerControls.length) {
+      return false;
+    }
+
+    if (Boolean(emptyState) !== (Boolean(dashboard?.mixerToggle?.expanded) && mixerControls.length === 0)) {
       return false;
     }
 
@@ -10558,9 +11129,22 @@
       }
     }
 
-    const mixerSummaryNode = dashboardRoot.querySelector(".steamloader-audio-mixer-header .steamloader-audio-card-copy");
-    if (mixerSummaryNode instanceof HTMLElement) {
-      mixerSummaryNode.textContent = dashboard.mixerSummary || "";
+    const playbackStatusNode = dashboardRoot.querySelector(
+      ".steamloader-audio-channel-card.is-output .steamloader-audio-channel-status",
+    );
+    if (playbackStatusNode instanceof HTMLElement) {
+      playbackStatusNode.textContent = dashboard.playbackChannel?.status || "";
+      playbackStatusNode.classList.toggle("is-muted", dashboard.playbackChannel?.status === "Muted");
+      playbackStatusNode.classList.toggle("is-unavailable", dashboard.playbackChannel?.status === "Unavailable");
+    }
+
+    const captureStatusNode = dashboardRoot.querySelector(
+      ".steamloader-audio-channel-card.is-input .steamloader-audio-channel-status",
+    );
+    if (captureStatusNode instanceof HTMLElement) {
+      captureStatusNode.textContent = dashboard.captureChannel?.status || "";
+      captureStatusNode.classList.toggle("is-muted", dashboard.captureChannel?.status === "Muted");
+      captureStatusNode.classList.toggle("is-unavailable", dashboard.captureChannel?.status === "Unavailable");
     }
 
     if (emptyState instanceof HTMLElement) {
@@ -10632,7 +11216,16 @@
   function SteamLoaderPanelShell() {
     let model = withGlobalBackSlot(buildScreenModel());
     const forceCustomShell = isPerformanceOverlayRoute() || isAudioDashboardRoute();
-    const focusSlots = getRenderableSlots(model);
+    const topFocusSlots = Array.isArray(model.topSlots) ? model.topSlots : [];
+    const contentFocusSlots = Array.isArray(model.slots) ? model.slots : [];
+    const audioDashboardFocusSlots = model.audioDashboard
+      ? getAudioDashboardControls(model.audioDashboard)
+      : [];
+    const focusSlots = [
+      ...topFocusSlots,
+      ...audioDashboardFocusSlots,
+      ...contentFocusSlots,
+    ];
     const resolvedAutoFocusIndex = resolveAutoFocusTarget(
       state.route,
       focusSlots,
@@ -10678,7 +11271,7 @@
 
     const HeaderIcon = model.headerIcon === null ? null : model.headerIcon || SteamLoaderIcon;
     const headerActions = Array.isArray(model.headerActions) ? model.headerActions : [];
-    consumeResolvedFocus(state.route, resolvedAutoFocusIndex);
+    consumeResolvedFocus(state.route, resolvedAutoFocusIndex, focusSlots[resolvedAutoFocusIndex] || null);
     const topSlots = Array.isArray(renderedModel.topSlots) ? renderedModel.topSlots : [];
     const topSlotChildren = topSlots.flatMap((slot, index) => {
       const children = [createButtonSlot(slot, index, renderedModel.autoFocusIndex)];
@@ -10878,23 +11471,24 @@
   }
 
   function buildPerformancePanelModel() {
-    const installation = getPerformanceInstallation();
-    const settings = getPerformanceSettings();
     const levels = getPerformanceLevelDefinitions();
     const sliderEnabled = Boolean(levels.length);
-    const elevatedHelperReady = installation?.elevatedHelperReady !== false;
+    const maximumLevel = levels.reduce(
+      (maximum, level) => Math.max(maximum, Number.isInteger(level?.value) ? level.value : 0),
+      0,
+    );
 
     return {
-      title: "TFS FPS Overlay",
+      title: "RTSS Performance",
       copy: getPerformancePanelCopy(),
       error: state.performance.error,
       hint: getPerformancePanelHint(),
       slider: {
-        title: "Overlay Level",
+        title: "Overlay Mode",
         description: "",
         value: getPerformanceDraftLevel(),
         min: 0,
-        max: Math.max(1, levels.length - 1),
+        max: Math.max(1, maximumLevel),
         step: 1,
         notchCount: Math.max(2, levels.length || 3),
         notchTicksVisible: true,
@@ -10921,69 +11515,13 @@
           movePerformanceSlider(1);
         },
       },
-      actions: [
-        {
-          title: elevatedHelperReady
-            ? installation?.running ? "Restart TFS FPS Overlay" : "Start TFS FPS Overlay"
-            : "Prepare Elevated Helper",
-          icon: !elevatedHelperReady
-            ? SettingsPluginIcon
-            : installation?.running
-              ? RestartActionIcon
-              : LaunchActionIcon,
-          disabled: isPerformanceBusy(),
-          onClick: () => {
-            rememberVolumeActionFocus(1);
-            finishPerformanceSliderEditing(false);
-            if (elevatedHelperReady) {
-              void startPerformanceOverlay();
-              return;
-            }
-
-            void preparePerformanceElevatedHelper();
-          },
-        },
-        {
-          title: elevatedHelperReady ? "Stop TFS FPS Overlay" : "Repair Elevated Helper",
-          disabled: elevatedHelperReady
-            ? isPerformanceBusy() || !installation?.running
-            : isPerformanceBusy(),
-          onClick: () => {
-            rememberVolumeActionFocus(2);
-            finishPerformanceSliderEditing(false);
-            if (elevatedHelperReady) {
-              void stopPerformanceOverlay();
-              return;
-            }
-
-            void preparePerformanceElevatedHelper();
-          },
-        },
-        {
-          title: settings?.autoTargetEnabled ? "Disable Auto Target" : "Enable Auto Target",
-          disabled: isPerformanceBusy(),
-          onClick: () => {
-            rememberVolumeActionFocus(3);
-            finishPerformanceSliderEditing(false);
-            void togglePerformanceAutoTarget();
-          },
-        },
-        {
-          title: "Refresh State",
-          disabled: isPerformanceBusy(),
-          onClick: () => {
-            rememberVolumeActionFocus(4);
-            finishPerformanceSliderEditing(false);
-            void loadPerformanceState();
-          },
-        },
-      ],
+      actions: [],
     };
   }
 
   function createPerformanceSliderSlot(panel) {
     return {
-      title: panel?.title || "TFS FPS Overlay",
+      title: panel?.title || "RTSS Performance",
       copy: panel?.copy || "",
       onClick: () => {
         rememberVolumeActionFocus(0);
@@ -11117,43 +11655,285 @@
     ];
   }
 
+  function getAudioDeviceOptionSlotKey(deviceType, device, index) {
+    const deviceKey = device?.id ? encodeURIComponent(String(device.id)) : `index-${index}`;
+    return `audio-${deviceType}-device-${deviceKey}`;
+  }
+
+  function normalizeAudioDeviceText(value) {
+    return String(value || "").trim().replace(/\s+/g, " ");
+  }
+
+  function getAudioDevicePresentation(device, deviceType) {
+    const fullName = normalizeAudioDeviceText(device?.name);
+    const displayName = normalizeAudioDeviceText(device?.displayName) || fullName;
+    const interfaceName = normalizeAudioDeviceText(device?.interfaceName);
+    const lookupText = `${fullName} ${displayName} ${interfaceName}`.toLowerCase();
+    const isCapture = deviceType === "capture";
+    const isDisplayAudio = /hdmi|displayport|display audio|\bmonitor\b|\btv\b|nvidia high definition|amd high definition/.test(lookupText);
+    const isHeadset = /headphone|headset|earphone|earbud|airpods|\bbuds\b|arctis|astro|hyperx cloud/.test(lookupText);
+
+    let icon = isCapture ? MicrophoneIcon : AudioPluginIcon;
+    let typeLabel = isCapture ? "Microphone" : "Speakers";
+    if (isCapture && isHeadset) {
+      typeLabel = "Headset microphone";
+    } else if (!isCapture && isDisplayAudio) {
+      icon = DisplayPluginIcon;
+      typeLabel = "Display audio";
+    } else if (!isCapture && isHeadset) {
+      icon = HeadphonesDeviceIcon;
+      typeLabel = "Headset";
+    }
+
+    let connectionLabel = "";
+    if (/bluetooth|\bbt\b|airpods/.test(lookupText)) {
+      connectionLabel = "Bluetooth";
+    } else if (/hdmi/.test(lookupText)) {
+      connectionLabel = "HDMI";
+    } else if (/displayport|display port/.test(lookupText)) {
+      connectionLabel = "DisplayPort";
+    } else if (/\busb\b/.test(lookupText)) {
+      connectionLabel = "USB";
+    } else if (/wireless|2[.,]4\s*ghz|dongle/.test(lookupText)) {
+      connectionLabel = "Wireless";
+    } else if (/realtek|onboard|built[ -]?in|internal/.test(lookupText)) {
+      connectionLabel = "Onboard audio";
+    }
+
+    const meta = [typeLabel, connectionLabel];
+    if (
+      interfaceName &&
+      !displayName.toLowerCase().includes(interfaceName.toLowerCase()) &&
+      !/^(audio endpoint|unknown)$/i.test(interfaceName)
+    ) {
+      meta.push(interfaceName);
+    }
+
+    return {
+      title: displayName || (isCapture ? "Unnamed microphone device" : "Unnamed playback device"),
+      meta: [...new Set(meta.filter(Boolean))].join(" - "),
+      icon,
+    };
+  }
+
+  function getAudioSwitchingDevice(devices, switchingId) {
+    if (!switchingId) {
+      return null;
+    }
+
+    return (Array.isArray(devices) ? devices : []).find((device) => device?.id === switchingId) || null;
+  }
+
+  function toggleAudioDeviceSelector(sectionKey, otherSectionKey) {
+    const expanded = toggleExpandedSection(sectionKey, false);
+    if (expanded) {
+      setExpandedSection(otherSectionKey, false);
+      setExpandedSection(audioMixerSectionKey, false);
+    }
+
+    rerenderAudioDashboard();
+  }
+
+  function toggleAudioMixerSection() {
+    const expanded = toggleExpandedSection(audioMixerSectionKey, false);
+    if (expanded) {
+      setExpandedSection(audioPlaybackDeviceSectionKey, false);
+      setExpandedSection(audioCaptureDeviceSectionKey, false);
+    }
+
+    rerenderAudioDashboard();
+  }
+
+  async function chooseAudioDashboardDevice(options) {
+    const route = { ...state.route };
+    let switched = true;
+    if (!options.selected) {
+      if (options.deviceType === "capture") {
+        switched = await setDefaultCaptureDevice(options.deviceId);
+      } else {
+        switched = await setDefaultDevice(options.deviceId);
+      }
+    }
+
+    if (!switched) {
+      return;
+    }
+
+    setExpandedSection(options.sectionKey, false, route);
+    if (getRouteKey(state.route) === getRouteKey(route)) {
+      rerenderAudioDashboard({ focusSlotKey: options.selectorSlotKey });
+    }
+  }
+
   function buildAudioDashboardModel() {
     const playbackDevice = getCurrentPlaybackDevice();
     const captureDevice = getCurrentCaptureDevice();
+    const playbackDevices = getAudioPlaybackDevices();
+    const captureDevices = getAudioCaptureDevices();
+    const playbackSwitchingDevice = getAudioSwitchingDevice(
+      playbackDevices,
+      state.audio.playbackDeviceSwitchingId,
+    );
+    const captureSwitchingDevice = getAudioSwitchingDevice(
+      captureDevices,
+      state.audio.captureDeviceSwitchingId,
+    );
+    const playbackPresentation = playbackDevice
+      ? getAudioDevicePresentation(playbackDevice, "playback")
+      : null;
+    const capturePresentation = captureDevice
+      ? getAudioDevicePresentation(captureDevice, "capture")
+      : null;
+    const playbackSwitchingPresentation = playbackSwitchingDevice
+      ? getAudioDevicePresentation(playbackSwitchingDevice, "playback")
+      : null;
+    const captureSwitchingPresentation = captureSwitchingDevice
+      ? getAudioDevicePresentation(captureSwitchingDevice, "capture")
+      : null;
     const mixerSessions = getAudioMixerSessions();
     const autoFocusIndex = resolveAutoFocusIndex(state.route) ?? 0;
-    const mixerStartIndex = 6;
+    const playbackExpanded = isExpandedSection(audioPlaybackDeviceSectionKey, false);
+    const captureExpanded = isExpandedSection(audioCaptureDeviceSectionKey, false);
+    const mixerExpanded = isExpandedSection(audioMixerSectionKey, false);
+    const playbackSelectorSlotKey = "audio-playback-device-selector";
+    const captureSelectorSlotKey = "audio-capture-device-selector";
+    let nextControlIndex = 0;
+    const playbackSelectorIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const playbackOptions = playbackDevices.map((device, index) => {
+      const presentation = getAudioDevicePresentation(device, "playback");
+      return {
+        index: nextControlIndex + index,
+        slotKey: getAudioDeviceOptionSlotKey("playback", device, index),
+        title: presentation.title,
+        meta: presentation.meta,
+        icon: presentation.icon,
+        selected: Boolean(playbackDevice && device?.id === playbackDevice.id),
+        switching: Boolean(device?.id && device.id === state.audio.playbackDeviceSwitchingId),
+        disabled: !device?.id || state.audio.dashboardLoading || state.audio.loading,
+        onClick: () => {
+          void chooseAudioDashboardDevice({
+            deviceType: "playback",
+            deviceId: device?.id,
+            selected: Boolean(playbackDevice && device?.id === playbackDevice.id),
+            sectionKey: audioPlaybackDeviceSectionKey,
+            selectorSlotKey: playbackSelectorSlotKey,
+          });
+        },
+      };
+    });
+    if (playbackExpanded) {
+      nextControlIndex += playbackOptions.length;
+    }
+
+    const playbackSliderIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const playbackToggleIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const captureSelectorIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const captureOptions = captureDevices.map((device, index) => {
+      const presentation = getAudioDevicePresentation(device, "capture");
+      return {
+        index: nextControlIndex + index,
+        slotKey: getAudioDeviceOptionSlotKey("capture", device, index),
+        title: presentation.title,
+        meta: presentation.meta,
+        icon: presentation.icon,
+        selected: Boolean(captureDevice && device?.id === captureDevice.id),
+        switching: Boolean(device?.id && device.id === state.audio.captureDeviceSwitchingId),
+        disabled: !device?.id || state.audio.dashboardLoading || state.audio.loading,
+        onClick: () => {
+          void chooseAudioDashboardDevice({
+            deviceType: "capture",
+            deviceId: device?.id,
+            selected: Boolean(captureDevice && device?.id === captureDevice.id),
+            sectionKey: audioCaptureDeviceSectionKey,
+            selectorSlotKey: captureSelectorSlotKey,
+          });
+        },
+      };
+    });
+    if (captureExpanded) {
+      nextControlIndex += captureOptions.length;
+    }
+
+    const captureSliderIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const captureToggleIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const mixerToggleIndex = nextControlIndex;
+    nextControlIndex += 1;
+    const mixerStartIndex = nextControlIndex;
+    const mixerControls = mixerSessions.map((session, index) => ({
+      index: mixerStartIndex + index,
+      slotKey: `audio-mixer-${session.sessionId}`,
+      title: session.displayName,
+      value: snapAudioMixerVolumeToStep(session.volume),
+      displayValue: session.isMuted ? "Muted" : `${snapAudioMixerVolumeToStep(session.volume)}%`,
+      copy: getAudioMixerSessionCopy(session),
+      disabled: state.audio.dashboardLoading || state.audio.mixerLoading,
+      onClick: () => {
+        void toggleAudioMixerSessionMute(session.sessionId);
+      },
+      onMoveLeft: () => {
+        adjustAudioMixerSessionVolume(session.sessionId, -1, 5);
+      },
+      onMoveRight: () => {
+        adjustAudioMixerSessionVolume(session.sessionId, 1, 5);
+      },
+    }));
 
     return {
       autoFocusIndex,
-      mixerSummary: resolveAudioMixerStatusText(),
       emptyMixerText: "Start a game, browser tab, or media app and its audio session will appear here automatically.",
+      playbackChannel: {
+        title: "Output",
+        status: !state.audio.volumeInfo
+          ? "Unavailable"
+          : state.audio.volumeInfo.isMuted
+            ? "Muted"
+            : `${getVolumeValue()}%`,
+        className: "is-output",
+      },
+      captureChannel: {
+        title: "Input",
+        status: !state.audio.captureVolumeInfo
+          ? "Unavailable"
+          : state.audio.captureVolumeInfo.isMuted
+            ? "Muted"
+            : `${getCaptureVolumeValue()}%`,
+        className: "is-input",
+      },
       playbackToggle: {
-        index: 0,
-        title: state.audio.volumeInfo?.isMuted ? "Speakers Off" : "Speakers On",
-        icon: state.audio.volumeInfo?.isMuted ? AudioMuteIcon : AudioPluginIcon,
-        active: !state.audio.volumeInfo?.isMuted,
+        index: playbackToggleIndex,
+        slotKey: "audio-playback-toggle",
+        title: state.audio.volumeInfo?.isMuted ? "Unmute Output" : "Mute Output",
+        icon: AudioPluginIcon,
+        active: Boolean(state.audio.volumeInfo?.isMuted),
         disabled: !state.audio.volumeInfo || state.audio.dashboardLoading || state.audio.volumeLoading,
         onClick: () => {
           void toggleMute();
         },
       },
       captureToggle: {
-        index: 1,
-        title: state.audio.captureVolumeInfo?.isMuted ? "Microphone Off" : "Microphone On",
-        icon: state.audio.captureVolumeInfo?.isMuted ? MicrophoneMuteIcon : MicrophoneIcon,
-        active: !state.audio.captureVolumeInfo?.isMuted,
+        index: captureToggleIndex,
+        slotKey: "audio-capture-toggle",
+        title: state.audio.captureVolumeInfo?.isMuted ? "Unmute Input" : "Mute Input",
+        icon: MicrophoneIcon,
+        active: Boolean(state.audio.captureVolumeInfo?.isMuted),
         disabled: !state.audio.captureVolumeInfo || state.audio.dashboardLoading || state.audio.captureVolumeLoading,
         onClick: () => {
           void toggleCaptureMute();
         },
       },
       playbackSlider: {
-        index: 2,
-        title: "System Volume",
+        index: playbackSliderIndex,
+        slotKey: "audio-playback-volume",
+        title: "Output Volume",
         value: getVolumeValue(),
         displayValue: state.audio.volumeInfo?.isMuted ? "Muted" : `${getVolumeValue()}%`,
-        copy: playbackDevice?.name || state.audio.volumeInfo?.deviceName || "No playback device detected.",
+        copy: "Use Left / Right to adjust. Press A to toggle mute.",
         step: 10,
         notchCount: 11,
         disabled: !state.audio.volumeInfo || state.audio.dashboardLoading,
@@ -11168,13 +11948,23 @@
         },
       },
       captureSlider: {
-        index: 3,
-        title: "Microphone Volume",
+        index: captureSliderIndex,
+        slotKey: "audio-capture-volume",
+        title: "Input Volume",
         value: getCaptureVolumeValue(),
         displayValue: state.audio.captureVolumeInfo?.isMuted ? "Muted" : `${getCaptureVolumeValue()}%`,
-        copy: captureDevice?.name || state.audio.captureVolumeInfo?.deviceName || "No microphone detected.",
+        copy: "Use Left / Right to adjust. Press A to toggle mute.",
         step: 10,
         notchCount: 11,
+        trackStyle: {
+          background: "rgba(137, 102, 190, 0.2)",
+        },
+        fillStyle: {
+          background: "linear-gradient(90deg, rgba(151, 96, 224, 0.96) 0%, rgba(229, 213, 249, 0.94) 100%)",
+        },
+        thumbStyle: {
+          background: "#f0e8fa",
+        },
         disabled: !state.audio.captureVolumeInfo || state.audio.dashboardLoading,
         onClick: () => {
           void toggleCaptureMute();
@@ -11187,13 +11977,23 @@
         },
       },
       playbackSelector: {
-        index: 4,
-        label: "Output Device",
-        value: playbackDevice?.name || "No playback device",
-        copy: "Press A or Left / Right to switch the Windows default speaker device.",
-        disabled: !getAudioPlaybackDevices().length || state.audio.dashboardLoading || state.audio.loading,
+        index: playbackSelectorIndex,
+        slotKey: playbackSelectorSlotKey,
+        label: "Device",
+        value: playbackPresentation?.title || "No playback device",
+        copy: playbackSwitchingPresentation
+          ? `Switching to ${playbackSwitchingPresentation.title}...`
+          : playbackExpanded
+            ? "Choose below. Windows system and communications output switch together."
+            : "Press A to show all playback devices. Left / Right switches directly.",
+        error: state.audio.playbackDeviceSwitchError,
+        switching: Boolean(playbackSwitchingDevice),
+        expanded: playbackExpanded,
+        controlsId: "steamloader-audio-playback-device-options",
+        options: playbackOptions,
+        disabled: !playbackDevices.length || state.audio.dashboardLoading || state.audio.loading,
         onClick: () => {
-          void cyclePlaybackDevice(1);
+          toggleAudioDeviceSelector(audioPlaybackDeviceSectionKey, audioCaptureDeviceSectionKey);
         },
         onMoveLeft: () => {
           void cyclePlaybackDevice(-1);
@@ -11203,13 +12003,23 @@
         },
       },
       captureSelector: {
-        index: 5,
-        label: "Input Device",
-        value: captureDevice?.name || "No microphone device",
-        copy: "Press A or Left / Right to switch the Windows default microphone.",
-        disabled: !getAudioCaptureDevices().length || state.audio.dashboardLoading || state.audio.loading,
+        index: captureSelectorIndex,
+        slotKey: captureSelectorSlotKey,
+        label: "Device",
+        value: capturePresentation?.title || "No microphone device",
+        copy: captureSwitchingPresentation
+          ? `Switching to ${captureSwitchingPresentation.title}...`
+          : captureExpanded
+            ? "Choose below. Windows system and communications input switch together."
+            : "Press A to show all microphones. Left / Right switches directly.",
+        error: state.audio.captureDeviceSwitchError,
+        switching: Boolean(captureSwitchingDevice),
+        expanded: captureExpanded,
+        controlsId: "steamloader-audio-capture-device-options",
+        options: captureOptions,
+        disabled: !captureDevices.length || state.audio.dashboardLoading || state.audio.loading,
         onClick: () => {
-          void cycleCaptureDevice(1);
+          toggleAudioDeviceSelector(audioCaptureDeviceSectionKey, audioPlaybackDeviceSectionKey);
         },
         onMoveLeft: () => {
           void cycleCaptureDevice(-1);
@@ -11218,32 +12028,25 @@
           void cycleCaptureDevice(1);
         },
       },
-      mixerControls: mixerSessions.map((session, index) => ({
-        index: mixerStartIndex + index,
-        title: session.displayName,
-        value: snapAudioMixerVolumeToStep(session.volume),
-        displayValue: session.isMuted ? "Muted" : `${snapAudioMixerVolumeToStep(session.volume)}%`,
-        copy: getAudioMixerSessionCopy(session),
-        disabled: state.audio.dashboardLoading || state.audio.mixerLoading,
-        onClick: () => {
-          void toggleAudioMixerSessionMute(session.sessionId);
-        },
-        onMoveLeft: () => {
-          adjustAudioMixerSessionVolume(session.sessionId, -1, 5);
-        },
-        onMoveRight: () => {
-          adjustAudioMixerSessionVolume(session.sessionId, 1, 5);
-        },
-      })),
-      refreshControl: {
-        index: mixerStartIndex + mixerSessions.length,
-        title: "Refresh Audio",
-        copy: "Reload devices, microphone state, and the live mixer.",
+      mixerToggle: {
+        index: mixerToggleIndex,
+        slotKey: "audio-mixer-toggle",
+        label: `${mixerSessions.length} Active ${mixerSessions.length === 1 ? "App" : "Apps"}`,
+        value: "Volume Mixer",
+        copy: mixerExpanded
+          ? "Adjust each active app below. Press A again to collapse the mixer."
+          : mixerSessions.length
+            ? "Press A to adjust individual app volumes."
+            : "No active audio apps. Press A for details.",
+        expanded: mixerExpanded,
+        controlsId: "steamloader-audio-mixer-controls",
+        options: [],
         disabled: state.audio.dashboardLoading,
         onClick: () => {
-          void loadAudioDashboardState();
+          toggleAudioMixerSection();
         },
       },
+      mixerControls,
     };
   }
 
@@ -11264,62 +12067,75 @@
     return [];
   }
 
-  function buildPerformanceTfsSettingSlots(makeCommandSlot, makeToggleSlot, options = {}) {
+  function buildPerformanceTfsSettingSlots(makeCommandSlot, makeToggleSlot) {
     const installation = getPerformanceInstallation();
-    const settings = getPerformanceSettings();
-    const includeQuickActions = options.includeQuickActions !== false;
-    const elevatedHelperReady = installation?.elevatedHelperReady !== false;
+    const rtssReady = Boolean(installation?.installed);
 
-    const quickActionSlots = [
+    const maintenanceSlots = [
       makeCommandSlot(
-        elevatedHelperReady
-          ? installation?.running ? "Restart TFS FPS Overlay" : "Start TFS FPS Overlay"
-          : "Prepare Elevated Helper",
-        elevatedHelperReady
-          ? "Launch the built-in TFS helper and overlay."
-          : "Run the one-time Windows admin setup for the silent elevated helper.",
+        "Repair RTSS",
+        "Close all RTSS background components, repair the installation, and start RTSS again.",
         () => {
-          if (elevatedHelperReady) {
-            void startPerformanceOverlay();
-            return;
-          }
-
           void preparePerformanceElevatedHelper();
         },
         {
-          slotKey: "performance-overlay-start-stop-primary",
+          slotKey: "performance-rtss-repair",
           disabled: isPerformanceBusy(),
         },
       ),
-      makeCommandSlot(
-        elevatedHelperReady ? "Stop TFS FPS Overlay" : "Repair Elevated Helper",
-        elevatedHelperReady
-          ? "Stop the TFS overlay."
-          : "Rebuild the one-time Windows admin setup for the silent helper.",
-        () => {
-          if (elevatedHelperReady) {
-            void stopPerformanceOverlay();
-            return;
-          }
+    ];
 
-          void preparePerformanceElevatedHelper();
+    const simpleSettingSlots = [
+      createPerformanceOptionSliderSlot({
+        title: "Frame Limit",
+        copy: "Apply an RTSS frame cap only to the active game profile.",
+        hint: "Use Left / Right to choose a common handheld or desktop cap.",
+        slotKey: "performance-frame-limit",
+        options: performanceFrameLimitOptions,
+        settingKey: "frame-limit",
+        disabled: isPerformanceBusy() || !rtssReady,
+        getValue: () => getPerformanceFrameLimit(),
+      }),
+      createPerformanceOptionSliderSlot({
+        title: "Position",
+        copy: "Place the RTSS overlay in any screen corner.",
+        hint: "Use Left / Right to switch corners live.",
+        slotKey: "performance-overlay-position-simple",
+        options: performancePositionOptions,
+        settingKey: "overlay-position",
+        disabled: isPerformanceBusy() || !rtssReady,
+        getValue: () => getPerformancePosition(),
+      }),
+      createPerformanceValueSliderSlot({
+        title: "Overlay Scale",
+        copy: "Scale the RTSS overlay in native RTSS zoom steps.",
+        hint: "Use Left / Right to resize the overlay live in clear 50% steps.",
+        slotKey: "performance-overlay-scale-simple",
+        min: 50,
+        max: 200,
+        step: 50,
+        disabled: isPerformanceBusy() || !rtssReady,
+        getValue: () => getPerformanceOverlayScale(),
+        displayValue: (value) => `${value}%`,
+        onAdjust: (direction) => {
+          void adjustPerformanceNumberSetting(
+            "overlay-scale",
+            getPerformanceOverlayScale(),
+            direction,
+            50,
+            50,
+            200,
+          );
         },
-        {
-          slotKey: "performance-overlay-start-stop-secondary",
-          disabled: elevatedHelperReady
-            ? isPerformanceBusy() || !installation?.running
-            : isPerformanceBusy(),
-        },
-      ),
+      }),
       makeCommandSlot(
-        settings?.autoTargetEnabled ? "Disable Auto Target" : "Enable Auto Target",
-        "Follow the active game automatically.",
+        "Refresh State",
+        "Reload RTSS installation, game, FPS, and limiter state.",
         () => {
-          void togglePerformanceAutoTarget();
+          void loadPerformanceState();
         },
         {
-          slotKey: "performance-auto-target-toggle",
-          badge: settings?.autoTargetEnabled ? "On" : "Off",
+          slotKey: "performance-refresh-state-simple",
           disabled: isPerformanceBusy(),
         },
       ),
@@ -11360,12 +12176,12 @@
       }),
       createPerformanceValueSliderSlot({
         title: "Overlay Scale",
-        copy: "Scale up the TFS meter without changing where it sits on screen.",
-        hint: "Use Left / Right to resize the whole overlay live.",
+        copy: "Scale the TFS meter with RTSS' native font zoom.",
+        hint: "Use Left / Right to resize the whole overlay live in clear 50% steps.",
         slotKey: "performance-overlay-scale",
-        min: 80,
-        max: 160,
-        step: 10,
+        min: 50,
+        max: 200,
+        step: 50,
         disabled: isPerformanceBusy(),
         getValue: () => getPerformanceOverlayScale(),
         displayValue: (value) => `${value}%`,
@@ -11374,9 +12190,9 @@
             "overlay-scale",
             getPerformanceOverlayScale(),
             direction,
-            10,
-            80,
-            160,
+            50,
+            50,
+            200,
           );
         },
       }),
@@ -11412,7 +12228,7 @@
       ),
       createPerformanceValueSliderSlot({
         title: "Polling Rate",
-        copy: "How often the TFS Overlay polls live metrics from the API.",
+        copy: "How often the performance panel polls live RTSS metrics.",
         hint: "Use Left / Right to change the metric polling rate.",
         slotKey: "performance-polling-rate",
         min: 10,
@@ -11511,7 +12327,7 @@
       ),
     ];
 
-    return includeQuickActions ? [...quickActionSlots, ...advancedSettingSlots] : advancedSettingSlots;
+    return [...simpleSettingSlots, ...maintenanceSlots];
   }
 
   function getStoreSyncSnapshot() {
@@ -11566,14 +12382,14 @@
 
   function resolvePerformanceStatusText() {
     if (state.performance.loading) {
-      return "Loading TFS Overlay status...";
+      return "Loading RTSS performance status...";
     }
 
     if (state.performance.saving) {
       return "Applying performance changes...";
     }
 
-    return getPerformanceSnapshot()?.statusText || "TFS Overlay status is not available yet.";
+    return getPerformanceSnapshot()?.statusText || "RTSS performance status is not available yet.";
   }
 
   function getAppStartSnapshot() {
@@ -11723,6 +12539,8 @@
       state.audio.mixerError = "";
       state.audio.error = "";
       state.audio.dashboardError = "";
+      state.audio.playbackDeviceSwitchError = "";
+      state.audio.captureDeviceSwitchError = "";
     }
   }
 
@@ -11780,14 +12598,9 @@
       return;
     }
 
-    if (force || !state.generalSettings.splashWallpaperDraft) {
-      state.generalSettings.splashWallpaperDraft = splash.wallpaperPath || "";
-      state.generalSettings.splashWallpaperInputVersion += 1;
-    }
-
-    if (force || !state.generalSettings.splashIconDraft) {
-      state.generalSettings.splashIconDraft = splash.iconPath || "";
-      state.generalSettings.splashIconInputVersion += 1;
+    if (force || !state.generalSettings.splashCustomImageDraft) {
+      state.generalSettings.splashCustomImageDraft = splash.customImagePath || "";
+      state.generalSettings.splashCustomImageInputVersion += 1;
     }
   }
 
@@ -13193,27 +14006,27 @@
     const statusText = resolvePerformanceStatusText();
     const showInstallStatus =
       Boolean(statusText) &&
-      /TFS Overlay|PresentMon/i.test(statusText) &&
-      statusText !== "TFS Overlay is not installed yet.";
+      /RTSS|RivaTuner/i.test(statusText) &&
+      statusText !== "RTSS is not installed yet.";
 
     if (!installation?.installed) {
       if (showInstallStatus) {
         return {
-          title: "TFS FPS Overlay",
+          title: "RTSS Performance",
           lines: [statusText],
         };
       }
 
       return {
-        title: "TFS FPS Overlay",
-        lines: ["Not installed."],
+        title: "RTSS Performance",
+        lines: ["RTSS is not installed."],
       };
     }
 
     return {
-      title: "TFS FPS Overlay",
+      title: "RTSS Performance",
       lines: [
-        installation.version ? `Core ${installation.version}` : "Installed.",
+        installation.version ? `RTSS ${installation.version}` : "Installed.",
         installation.running ? "Running" : "Ready",
       ],
     };
@@ -13240,7 +14053,7 @@
     const runtime = getPerformanceRuntime();
 
     return {
-      title: "TFS FPS Overlay",
+      title: "RTSS Performance",
       lines: [
         installation?.running
           ? runtime?.targetProcessName
@@ -13840,6 +14653,7 @@
 
   function setExternalGameQuickAccessSnapshot(snapshot) {
     const wasActive = Boolean(state.externalGameQuickAccess.snapshot?.active);
+    const wasReady = Boolean(state.externalGameQuickAccess.snapshot?.quickAccessReady);
     state.externalGameQuickAccess.snapshot = snapshot && typeof snapshot === "object"
       ? snapshot
       : { active: false };
@@ -13854,8 +14668,13 @@
       scheduleExternalGameToolsTabOpen();
     }
 
+    if (state.externalGameQuickAccess.snapshot.quickAccessReady === true && !wasReady) {
+      state.externalGameQuickAccess.returnArmedAt = Date.now() + 750;
+    }
+
     if (!state.externalGameQuickAccess.snapshot.active) {
       state.externalGameQuickAccess.returnRequested = false;
+      state.externalGameQuickAccess.returnArmedAt = 0;
       if (state.externalGameQuickAccess.tabOpenTimer) {
         window.clearTimeout(state.externalGameQuickAccess.tabOpenTimer);
         state.externalGameQuickAccess.tabOpenTimer = 0;
@@ -13905,6 +14724,8 @@
       if (
         !surfaceHidden ||
         !state.externalGameQuickAccess.snapshot?.active ||
+        state.externalGameQuickAccess.snapshot?.quickAccessReady !== true ||
+        Date.now() < state.externalGameQuickAccess.returnArmedAt ||
         state.externalGameQuickAccess.returnRequested
       ) {
         return;
@@ -15171,23 +15992,17 @@
     }
   }
 
-  async function startPerformanceOverlay() {
-    await flushPerformanceOverlayLevelCommit();
-    return sendPerformanceRequest("api/performance/overlay/start");
-  }
-
   async function preparePerformanceElevatedHelper() {
     await flushPerformanceOverlayLevelCommit();
     return sendPerformanceRequest("api/performance/elevated-helper/prepare");
   }
 
-  async function stopPerformanceOverlay() {
-    await flushPerformanceOverlayLevelCommit();
-    return sendPerformanceRequest("api/performance/overlay/stop");
-  }
-
   async function setPerformanceOverlayLevel(level, options = {}) {
-    return sendPerformanceRequest("api/performance/settings/overlay-level", { level }, options);
+    return sendPerformanceRequest(
+      "api/performance/settings/overlay-level",
+      { level },
+      { reloadOnError: true, ...options },
+    );
   }
 
   async function setPerformanceSettingValue(key, value, options = {}) {
@@ -15694,6 +16509,19 @@
     await sendDiscordRequest("api/discord/guild/select", { id: guildId || "" });
   }
 
+  async function setDiscordGuildFavorite(guildId, favorite) {
+    await sendDiscordRequest("api/discord/guild/favorite", {
+      id: guildId || "",
+      favorite: Boolean(favorite),
+    });
+  }
+
+  async function setDiscordFriendOnlineNotifications(enabled) {
+    await sendDiscordRequest("api/discord/settings/friend-online-notifications", {
+      value: Boolean(enabled),
+    });
+  }
+
   async function openDiscordGuild(guildId) {
     await sendDiscordRequest("api/discord/guild/open", { id: guildId || "" }, { updateSnapshot: false });
   }
@@ -15943,60 +16771,50 @@
     await sendGeneralSettingsRequest("api/settings/developer-debug", { value: enabled }, { rerenderOnStart: false });
   }
 
-  async function toggleSplashScreenSetting(key) {
+  async function setSplashArtworkMode(mode) {
     const snapshot = getGeneralSettingsSnapshot();
     const splash = snapshot?.splashScreen;
-    const propertyMap = {
-      enabled: "enabled",
-      "show-text": "showText",
-    };
-    const propertyName = propertyMap[key];
-    if (!propertyName) {
+    const normalizedMode = mode === "custom" ? "custom" : "dynamic";
+    if (!splash || splash.artworkMode === normalizedMode) {
       return;
     }
 
-    const enabled = !Boolean(splash?.[propertyName]);
     if (snapshot && splash) {
       state.generalSettings.snapshot = {
         ...snapshot,
         splashScreen: {
           ...splash,
-          [propertyName]: enabled,
+          artworkMode: normalizedMode,
         },
       };
       rerenderGeneralSettingsPanel();
     }
 
-    const path = key === "enabled" ? "api/settings/splash/enabled" : "api/settings/splash/show-text";
-    await sendGeneralSettingsRequest(path, { value: enabled }, { rerenderOnStart: false });
+    await sendGeneralSettingsRequest(
+      "api/settings/splash/artwork-mode",
+      { value: normalizedMode },
+      { rerenderOnStart: false },
+    );
   }
 
-  async function saveSplashWallpaperPath() {
-    await sendGeneralSettingsRequest("api/settings/splash/wallpaper", {
-      value: state.generalSettings.splashWallpaperDraft || "",
+  async function saveSplashCustomImagePath() {
+    await sendGeneralSettingsRequest("api/settings/splash/custom-image", {
+      value: state.generalSettings.splashCustomImageDraft || "",
     });
+  }
+
+  async function selectSplashCustomImage() {
+    await sendGeneralSettingsRequest("api/settings/splash/select-custom-image");
   }
 
   async function showSplashPreview() {
     await sendGeneralSettingsRequest("api/settings/splash/preview");
   }
 
-  async function clearSplashWallpaperPath() {
-    state.generalSettings.splashWallpaperDraft = "";
-    state.generalSettings.splashWallpaperInputVersion += 1;
-    await sendGeneralSettingsRequest("api/settings/splash/wallpaper", { value: "" });
-  }
-
-  async function saveSplashIconPath() {
-    await sendGeneralSettingsRequest("api/settings/splash/icon", {
-      value: state.generalSettings.splashIconDraft || "",
-    });
-  }
-
-  async function clearSplashIconPath() {
-    state.generalSettings.splashIconDraft = "";
-    state.generalSettings.splashIconInputVersion += 1;
-    await sendGeneralSettingsRequest("api/settings/splash/icon", { value: "" });
+  async function clearSplashCustomImagePath() {
+    state.generalSettings.splashCustomImageDraft = "";
+    state.generalSettings.splashCustomImageInputVersion += 1;
+    await sendGeneralSettingsRequest("api/settings/splash/custom-image", { value: "" });
   }
 
   async function adjustWindowsShellStartDelay(delta) {
@@ -16013,17 +16831,378 @@
     await sendGeneralSettingsRequest("api/settings/windows-shell-start-delay", { value: nextValue }, { rerenderOnStart: false });
   }
 
-  async function resetWindowsShellStartDelay() {
+  function getControllerShortcutSettings() {
+    const saved = getGeneralSettingsSnapshot()?.controllerShortcuts || {};
+    const legacySteam = saved.steamButton || "back";
+    const legacyInGame = saved.inGameButton || "start";
+    const normalizeCombination = (buttons, fallback) => {
+      const normalized = [...new Set((Array.isArray(buttons) ? buttons : [])
+        .filter((buttonId) => controllerShortcutButtonOptions.some((option) => option.id === buttonId)))]
+        .slice(0, 3);
+      return normalized.length ? normalized : [fallback];
+    };
+
+    return {
+      ...saved,
+      steamHoldMilliseconds: Number(saved.steamHoldMilliseconds ?? 1050),
+      inGameOverlayHoldMilliseconds: Number(saved.inGameOverlayHoldMilliseconds ?? 1050),
+      inGameQuickAccessHoldMilliseconds: Number(saved.inGameQuickAccessHoldMilliseconds ?? 3300),
+      steamMenuButtons: normalizeCombination(saved.steamMenuButtons, legacySteam),
+      steamQuickAccessButtons: normalizeCombination(saved.steamQuickAccessButtons, legacySteam),
+      inGameOverlayButtons: normalizeCombination(saved.inGameOverlayButtons, legacyInGame),
+      inGameQuickAccessButtons: normalizeCombination(saved.inGameQuickAccessButtons, legacyInGame),
+    };
+  }
+
+  function getControllerShortcutButtonTitle(buttonId) {
+    return controllerShortcutButtonOptions.find((option) => option.id === buttonId)?.title || buttonId || "Unknown";
+  }
+
+  function formatControllerHoldTime(milliseconds) {
+    const seconds = Math.max(0, Number(milliseconds) || 0) / 1000;
+    return `${seconds.toFixed(seconds % 1 === 0 ? 1 : 2)} s`;
+  }
+
+  function getControllerShortcutAction(actionId) {
+    return controllerShortcutActionDefinitions.find((action) => action.id === actionId) || null;
+  }
+
+  function getControllerShortcutCombination(actionId) {
+    const action = getControllerShortcutAction(actionId);
+    const shortcuts = getControllerShortcutSettings();
+    return action ? shortcuts[action.property] : [];
+  }
+
+  function formatControllerShortcutCombination(buttonIds, compact = false) {
+    return (Array.isArray(buttonIds) ? buttonIds : [])
+      .map((buttonId) => {
+        const option = controllerShortcutButtonOptions.find((entry) => entry.id === buttonId);
+        return compact ? option?.shortTitle || option?.title || buttonId : option?.title || buttonId;
+      })
+      .join(" + ") || "Not assigned";
+  }
+
+  function getControllerShortcutActionIdFromRoute(route = state.route) {
+    const prefix = "overlay-combination-";
+    return route?.pluginId === "settings" && route?.pageId?.startsWith(prefix)
+      ? route.pageId.slice(prefix.length)
+      : "";
+  }
+
+  function clearControllerShortcutCommitTimer(key) {
+    const timer = state.generalSettings.overlayCommitTimersByKey[key];
+    if (timer) {
+      window.clearTimeout(timer);
+      delete state.generalSettings.overlayCommitTimersByKey[key];
+    }
+  }
+
+  function queueControllerShortcutCommit(key, path, payload) {
+    clearControllerShortcutCommitTimer(key);
+    state.generalSettings.overlayCommitTimersByKey[key] = window.setTimeout(() => {
+      delete state.generalSettings.overlayCommitTimersByKey[key];
+      if (state.generalSettings.saving) {
+        queueControllerShortcutCommit(key, path, payload);
+        return;
+      }
+
+      void sendGeneralSettingsRequest(path, payload);
+    }, 225);
+  }
+
+  function setControllerShortcutCombination(actionId, buttonIds) {
+    const action = getControllerShortcutAction(actionId);
     const snapshot = getGeneralSettingsSnapshot();
-    if (snapshot) {
+    const shortcuts = getControllerShortcutSettings();
+    const normalizedButtons = [...new Set((Array.isArray(buttonIds) ? buttonIds : []).filter(Boolean))].slice(0, 3);
+    if (!action || normalizedButtons.length < 1) {
+      return;
+    }
+
+    if (snapshot && action) {
       state.generalSettings.snapshot = {
         ...snapshot,
-        windowsShellStartDelaySeconds: 0,
+        controllerShortcuts: {
+          ...shortcuts,
+          [action.property]: normalizedButtons,
+        },
       };
       rerenderGeneralSettingsPanel();
     }
 
-    await sendGeneralSettingsRequest("api/settings/windows-shell-start-delay", { value: 0 }, { rerenderOnStart: false });
+    queueControllerShortcutCommit(
+      `combination-${actionId}`,
+      "api/settings/overlay/combination",
+      { action: actionId, buttons: normalizedButtons },
+    );
+  }
+
+  function toggleControllerShortcutCombinationButton(actionId, buttonId) {
+    const combination = [...getControllerShortcutCombination(actionId)];
+    const index = combination.indexOf(buttonId);
+    if (index >= 0) {
+      if (combination.length <= 1) {
+        return;
+      }
+      combination.splice(index, 1);
+    } else {
+      if (combination.length >= 3) {
+        return;
+      }
+      combination.push(buttonId);
+    }
+
+    setControllerShortcutCombination(actionId, combination);
+  }
+
+  function resetControllerShortcutCombination(actionId) {
+    const action = getControllerShortcutAction(actionId);
+    if (action) {
+      setControllerShortcutCombination(actionId, action.defaultButtons);
+    }
+  }
+
+  function getControllerShortcutCapture() {
+    if (!state.generalSettings.overlayCapture) {
+      state.generalSettings.overlayCapture = {
+        active: false,
+        actionId: "",
+        phase: "idle",
+        buttons: [],
+        message: "",
+        timer: 0,
+        sequence: 0,
+        catchAllInstalled: false,
+        catchAllCallback: null,
+        previousCatchAllGamepadInput: null,
+      };
+    }
+
+    return state.generalSettings.overlayCapture;
+  }
+
+  function installControllerShortcutCaptureInputGuard() {
+    const capture = getControllerShortcutCapture();
+    const focusNav = window.FocusNavController;
+    if (capture.catchAllInstalled || !focusNav?.SetCatchAllGamepadInput) {
+      return;
+    }
+
+    const callback = () => true;
+    callback.__steamLoaderOverlayCaptureCatchAll = true;
+    capture.previousCatchAllGamepadInput = focusNav.m_fnCatchAllGamepadInput || null;
+    capture.catchAllCallback = callback;
+    capture.catchAllInstalled = true;
+    focusNav.SetCatchAllGamepadInput(callback);
+  }
+
+  function uninstallControllerShortcutCaptureInputGuard() {
+    const capture = getControllerShortcutCapture();
+    if (!capture.catchAllInstalled) {
+      return;
+    }
+
+    const focusNav = window.FocusNavController;
+    if (
+      focusNav?.SetCatchAllGamepadInput &&
+      focusNav.m_fnCatchAllGamepadInput === capture.catchAllCallback
+    ) {
+      focusNav.SetCatchAllGamepadInput(capture.previousCatchAllGamepadInput || undefined);
+    }
+
+    capture.catchAllInstalled = false;
+    capture.catchAllCallback = null;
+    capture.previousCatchAllGamepadInput = null;
+  }
+
+  function clearControllerShortcutCaptureTimer() {
+    const capture = getControllerShortcutCapture();
+    if (capture.timer) {
+      window.clearTimeout(capture.timer);
+      capture.timer = 0;
+    }
+  }
+
+  function stopControllerShortcutCapture({ rerender = true } = {}) {
+    const capture = getControllerShortcutCapture();
+    clearControllerShortcutCaptureTimer();
+    uninstallControllerShortcutCaptureInputGuard();
+    capture.active = false;
+    capture.actionId = "";
+    capture.phase = "idle";
+    capture.buttons = [];
+    capture.message = "";
+    capture.sequence += 1;
+    if (rerender) {
+      rerenderGeneralSettingsPanel();
+    }
+  }
+
+  function scheduleControllerShortcutCapturePoll(sequence, delay = 65) {
+    const capture = getControllerShortcutCapture();
+    clearControllerShortcutCaptureTimer();
+    if (!capture.active || capture.sequence !== sequence) {
+      return;
+    }
+
+    capture.timer = window.setTimeout(() => {
+      capture.timer = 0;
+      void pollControllerShortcutCapture(sequence);
+    }, delay);
+  }
+
+  async function pollControllerShortcutCapture(sequence) {
+    const capture = getControllerShortcutCapture();
+    const actionId = getControllerShortcutActionIdFromRoute();
+    if (!capture.active || capture.sequence !== sequence || capture.actionId !== actionId) {
+      stopControllerShortcutCapture({ rerender: false });
+      return;
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/settings/overlay/input-state`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Controller input could not be read (${response.status}).`);
+      }
+
+      const pressedButtons = [...new Set((Array.isArray(payload?.buttons) ? payload.buttons : [])
+        .filter((buttonId) => controllerShortcutButtonOptions.some((option) => option.id === buttonId)))];
+      let shouldRerender = false;
+
+      if (capture.phase === "release") {
+        if (pressedButtons.length === 0) {
+          capture.phase = "listening";
+          capture.message = "Now hold the complete combination, then release it to save.";
+          shouldRerender = true;
+        }
+      } else if (capture.phase === "listening") {
+        if (pressedButtons.length > 3) {
+          capture.phase = "too-many";
+          capture.buttons = pressedButtons;
+          capture.message = "More than three buttons detected. Release them and try again.";
+          shouldRerender = true;
+        } else if (pressedButtons.length > 0) {
+          capture.phase = "capturing";
+          capture.buttons = pressedButtons;
+          capture.message = `Detected ${formatControllerShortcutCombination(pressedButtons)}. Release to save.`;
+          shouldRerender = true;
+        }
+      } else if (capture.phase === "capturing") {
+        if (pressedButtons.length === 0) {
+          const capturedButtons = capture.buttons.slice(0, 3);
+          const capturedActionId = capture.actionId;
+          stopControllerShortcutCapture({ rerender: false });
+          setControllerShortcutCombination(capturedActionId, capturedButtons);
+          return;
+        }
+
+        const combinedButtons = [...new Set([...capture.buttons, ...pressedButtons])];
+        if (combinedButtons.length > 3) {
+          capture.phase = "too-many";
+          capture.buttons = combinedButtons;
+          capture.message = "More than three buttons detected. Release them and try again.";
+          shouldRerender = true;
+        } else if (
+          combinedButtons.length !== capture.buttons.length ||
+          combinedButtons.some((buttonId, index) => buttonId !== capture.buttons[index])
+        ) {
+          capture.buttons = combinedButtons;
+          capture.message = `Detected ${formatControllerShortcutCombination(combinedButtons)}. Release to save.`;
+          shouldRerender = true;
+        }
+      } else if (capture.phase === "too-many" && pressedButtons.length === 0) {
+        capture.phase = "listening";
+        capture.buttons = [];
+        capture.message = "Try again: hold up to three buttons, then release them to save.";
+        shouldRerender = true;
+      }
+
+      if (shouldRerender) {
+        rerenderGeneralSettingsPanel();
+      }
+      scheduleControllerShortcutCapturePoll(sequence);
+    } catch (error) {
+      stopControllerShortcutCapture({ rerender: false });
+      state.generalSettings.error = error instanceof Error ? error.message : String(error);
+      rerenderGeneralSettingsPanel();
+    }
+  }
+
+  function startControllerShortcutCapture(actionId) {
+    if (!getControllerShortcutAction(actionId)) {
+      return;
+    }
+
+    const capture = getControllerShortcutCapture();
+    clearControllerShortcutCaptureTimer();
+    capture.active = true;
+    capture.actionId = actionId;
+    capture.phase = "release";
+    capture.buttons = [];
+    capture.message = "Release all controller buttons to arm the recorder.";
+    capture.sequence += 1;
+    state.generalSettings.error = "";
+    installControllerShortcutCaptureInputGuard();
+    rerenderGeneralSettingsPanel();
+    void pollControllerShortcutCapture(capture.sequence);
+  }
+
+  function adjustControllerShortcutHoldTime(key, direction) {
+    const snapshot = getGeneralSettingsSnapshot();
+    const shortcuts = getControllerShortcutSettings();
+    const definitions = {
+      steam: { property: "steamHoldMilliseconds", min: 250, max: 5000 },
+      "in-game-overlay": { property: "inGameOverlayHoldMilliseconds", min: 250, max: 5000 },
+      "in-game-quick-access": {
+        property: "inGameQuickAccessHoldMilliseconds",
+        min: Number(shortcuts.inGameOverlayHoldMilliseconds || 1050) + 250,
+        max: 8000,
+      },
+    };
+    const definition = definitions[key];
+    if (!definition) {
+      return;
+    }
+
+    const currentValue = Number(shortcuts[definition.property] || definition.min);
+    const nextValue = Math.max(definition.min, Math.min(definition.max, currentValue + (direction * 50)));
+    if (nextValue === currentValue) {
+      return;
+    }
+
+    const nextShortcuts = {
+      ...shortcuts,
+      [definition.property]: nextValue,
+    };
+    if (
+      key === "in-game-overlay" &&
+      Number(nextShortcuts.inGameQuickAccessHoldMilliseconds) < nextValue + 250
+    ) {
+      nextShortcuts.inGameQuickAccessHoldMilliseconds = nextValue + 250;
+    }
+
+    if (snapshot) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        controllerShortcuts: nextShortcuts,
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    queueControllerShortcutCommit(
+      `hold-${key}`,
+      "api/settings/overlay/hold-time",
+      { key, value: nextValue },
+    );
+  }
+
+  async function resetControllerShortcutSettings() {
+    Object.keys(state.generalSettings.overlayCommitTimersByKey).forEach(clearControllerShortcutCommitTimer);
+    await sendGeneralSettingsRequest("api/settings/overlay/reset");
   }
 
   async function togglePluginEnabled(pluginId, enabled) {
@@ -17451,6 +18630,17 @@
         error: getAudioDashboardError(),
         note: "",
         autoFocusIndex: null,
+        headerActions: [
+          {
+            key: "audio-refresh",
+            title: "Refresh Audio",
+            icon: RefreshActionIcon,
+            disabled: state.audio.dashboardLoading || state.audio.loading,
+            onClick: () => {
+              void loadAudioDashboardState();
+            },
+          },
+        ],
         audioDashboard: buildAudioDashboardModel(),
         slots: [],
       };
@@ -18464,22 +19654,38 @@
             },
           );
         });
-        const guildSlots = guilds.map((guild, index) => {
+        const createGuildSlot = (guild, index) => {
           const onlineCount = Number(guild?.onlineCount) || 0;
           const memberCount = Number(guild?.memberCount) || 0;
+          const isFavorite = Boolean(guild?.isFavorite);
+          const toggleFavorite = () => {
+            void setDiscordGuildFavorite(guild?.id, !isFavorite);
+            return true;
+          };
           return makeCommandSlot(
             guild?.name || `Discord Server ${index + 1}`,
-            `${onlineCount} online${memberCount > 0 ? ` - ${memberCount} members` : ""}`,
+            `${onlineCount} online${memberCount > 0 ? ` - ${memberCount} members` : ""} - Menu: ${isFavorite ? "unpin" : "pin as favorite"}`,
             () => openDiscordGuild(guild.id),
             {
               slotKey: `discord-main-guild-${guild?.id || index}`,
               disabled: isDiscordBusy(),
-              badge: `${onlineCount} online`,
+              badge: isFavorite ? "Favorite" : `${onlineCount} online`,
               leadingIcon: buildDiscordMemberIcon(guild?.iconUrl),
               trailing: "chevron",
+              buttonProps: {
+                onSecondaryButton: toggleFavorite,
+                onOptionsButton: toggleFavorite,
+                onMenuButton: toggleFavorite,
+              },
             },
           );
-        });
+        };
+        const favoriteGuildSlots = guilds
+          .filter((guild) => Boolean(guild?.isFavorite))
+          .map(createGuildSlot);
+        const regularGuildSlots = guilds
+          .filter((guild) => !guild?.isFavorite)
+          .map(createGuildSlot);
         const friendDisplaySlots = friendSlots.length
           ? friendSlots
           : [makeCommandSlot(
@@ -18492,8 +19698,8 @@
                 trailing: "none",
               },
             )];
-        const guildDisplaySlots = guildSlots.length
-          ? guildSlots
+        const emptyGuildSlots = guilds.length
+          ? []
           : [makeCommandSlot(
               "No servers available",
               snapshot?.guildsErrorMessage || "Reconnect Discord if your server list is missing.",
@@ -18529,6 +19735,86 @@
           },
           { slotKey: "discord-settings", leadingIcon: SettingsPluginIcon },
         );
+        const manageServersSlot = makeNavigationSlot(
+          "Manage Server Favorites",
+          "Pin or unpin servers and view their Discord details.",
+          () => {
+            const targetRoute = { screen: "page", pluginId: "discord", pageId: "servers" };
+            requestFreshEntryForRoute(targetRoute, 0, 0);
+            setRoute(targetRoute);
+          },
+          { slotKey: "discord-manage-server-favorites", leadingIcon: DiscordPluginIcon },
+        );
+        const favoriteServersExpanded = isExpandedSection("discord-social-favorite-servers", true);
+        const friendsExpanded = isExpandedSection("discord-social-friends", true);
+        const serversExpanded = isExpandedSection("discord-social-servers", true);
+        const manageExpanded = isExpandedSection("discord-social-manage", false);
+        const socialAccordion = (
+          sectionKey,
+          title,
+          copy,
+          expanded,
+          children,
+          defaultExpanded,
+          icon,
+        ) => [
+          makeAccordionSlot(
+            title,
+            copy,
+            expanded,
+            () => {
+              toggleExpandedSection(sectionKey, defaultExpanded);
+              rerenderDiscordPanel();
+            },
+            {
+              slotKey: `${sectionKey}-accordion`,
+              leadingIcon: icon,
+            },
+          ),
+          ...(expanded ? children : []),
+        ];
+        const socialSlots = [
+          ...(favoriteGuildSlots.length
+            ? socialAccordion(
+                "discord-social-favorite-servers",
+                "Favorite Servers",
+                `${favoriteGuildSlots.length} pinned at the top.`,
+                favoriteServersExpanded,
+                favoriteGuildSlots,
+                true,
+                DiscordPluginIcon,
+              )
+            : []),
+          ...socialAccordion(
+            "discord-social-friends",
+            "Friends",
+            `${onlineFriends.length} currently online.`,
+            friendsExpanded,
+            friendDisplaySlots,
+            true,
+            EyeActionIcon,
+          ),
+          ...((regularGuildSlots.length || emptyGuildSlots.length)
+            ? socialAccordion(
+                "discord-social-servers",
+                "Servers",
+                `${regularGuildSlots.length} not pinned as favorites.`,
+                serversExpanded,
+                [...regularGuildSlots, ...emptyGuildSlots],
+                true,
+                DiscordPluginIcon,
+              )
+            : []),
+          ...socialAccordion(
+            "discord-social-manage",
+            "Manage",
+            "Favorites, connection, privacy, refresh, and fallback options.",
+            manageExpanded,
+            [manageServersSlot, settingsSlot],
+            false,
+            SettingsPluginIcon,
+          ),
+        ];
 
         return {
           ...defaultModel,
@@ -18541,27 +19827,15 @@
             : "Discord Social SDK handles sign-in securely. Tools for Steam never receives your Discord password.",
           cards: snapshot?.authorized ? [] : [buildDiscordConnectionCard(snapshot)],
           sectionHeaders: snapshot?.authorized
-            ? [
-                createSectionHeader(0, "Friends", `${onlineFriends.length} currently online.`, {
-                  icon: EyeActionIcon,
-                }),
-                createSectionHeader(friendDisplaySlots.length, "Servers", `${guilds.length} available through Discord.`, {
-                  icon: DiscordPluginIcon,
-                }),
-                createSectionHeader(friendDisplaySlots.length + guildDisplaySlots.length, "Settings", "Connection, privacy, refresh, and fallback options.", {
-                  icon: SettingsPluginIcon,
-                }),
-              ]
+            ? []
             : [
                 createSectionHeader(0, "Discord Account", "Connect once with Discord.", {
                   icon: DiscordPluginIcon,
                 }),
               ],
-          dividerAfterIndices: snapshot?.authorized
-            ? [friendDisplaySlots.length - 1, friendDisplaySlots.length + guildDisplaySlots.length - 1]
-            : [],
+          dividerAfterIndices: [],
           slots: snapshot?.authorized
-            ? [...friendDisplaySlots, ...guildDisplaySlots, settingsSlot]
+            ? socialSlots
             : [...actionSlots, settingsSlot],
         };
       }
@@ -18819,6 +20093,19 @@
                       trailing: "chevron",
                     },
                   ),
+                  makeCommandSlot(
+                    selectedGuild.isFavorite ? "Remove from Favorites" : "Add to Favorites",
+                    selectedGuild.isFavorite
+                      ? "Keep this server in the list without pinning it at the top."
+                      : "Pin this server at the top of your Discord server lists.",
+                    () => setDiscordGuildFavorite(selectedGuild.id, !selectedGuild.isFavorite),
+                    {
+                      slotKey: `discord-social-favorite-guild-${selectedGuild.id}`,
+                      disabled: isDiscordBusy(),
+                      badge: selectedGuild.isFavorite ? "Favorite" : "",
+                      leadingIcon: DiscordPluginIcon,
+                    },
+                  ),
                 ]
               : []),
             makeCommandSlot(
@@ -18856,7 +20143,7 @@
               {
                 slotKey: `discord-social-guild-${guild?.id || index}`,
                 disabled: isDiscordBusy(),
-                badge: `${onlineCount} online`,
+                badge: guild?.isFavorite ? "Favorite" : `${onlineCount} online`,
                 leadingIcon: buildDiscordMemberIcon(guild?.iconUrl),
                 trailing: "chevron",
               },
@@ -18883,6 +20170,7 @@
                 lines: [
                   `${Number(selectedGuild.onlineCount) || 0} approximately online`,
                   `${Number(selectedGuild.memberCount) || 0} members`,
+                  selectedGuild.isFavorite ? "Pinned as a favorite." : "Not pinned as a favorite.",
                   `Last refresh: ${refreshedAt}`,
                 ],
               }]
@@ -18891,6 +20179,7 @@
                   title: "Your Servers",
                   lines: [
                     `${guilds.length} available`,
+                    `${guilds.filter((guild) => guild?.isFavorite).length} pinned favorites`,
                     "Select a server for details or to open it in Discord",
                     `Last refresh: ${refreshedAt}`,
                   ],
@@ -18963,14 +20252,17 @@
           createSectionHeader(0, "Connection", "Connect securely through Discord Social SDK.", {
             icon: DiscordPluginIcon,
           }),
-          createSectionHeader(4, "Public Fallback", "Open the optional server widget without account access.", {
+          createSectionHeader(4, "Notifications", "Choose whether Discord presence changes create TFS notifications.", {
             icon: EyeActionIcon,
           }),
-          createSectionHeader(5, "Reset", "Remove account authorization and fallback settings.", {
+          createSectionHeader(5, "Public Fallback", "Open the optional server widget without account access.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(6, "Reset", "Remove account authorization and fallback settings.", {
             icon: DeleteActionIcon,
           }),
         ],
-        dividerAfterIndices: [3, 4],
+        dividerAfterIndices: [3, 4, 5],
         slots: [
           makeCommandSlot(
             "Save Discord Settings",
@@ -19006,6 +20298,17 @@
             {
               disabled: isDiscordBusy() || !snapshot?.authorized,
               leadingIcon: RefreshActionIcon,
+            },
+          ),
+          makeSettingToggleSlot(
+            "discord",
+            "friend-online-notifications",
+            "Notify When a Friend Comes Online",
+            "Optional. Show a Tools for Steam notification after a Discord friend changes from offline to online. Current online friends do not trigger an initial alert.",
+            Boolean(snapshot?.friendOnlineNotificationsEnabled),
+            () => setDiscordFriendOnlineNotifications(!snapshot?.friendOnlineNotificationsEnabled),
+            {
+              disabled: isDiscordBusy() || !snapshot?.authorized || snapshot?.connectionMode !== "social-sdk",
             },
           ),
           makeCommandSlot(
@@ -19641,9 +20944,9 @@
       (state.route.pageId === "overlay" || state.route.pageId === "tfs-overlay")
     ) {
       const performancePanel = buildPerformancePanelModel();
-      const tfsSettingSlots = markPerformanceOverlaySlots(buildPerformanceTfsSettingSlots(makeCommandSlot, makeToggleSlot, {
-        includeQuickActions: true,
-      }));
+      const tfsSettingSlots = markPerformanceOverlaySlots(
+        buildPerformanceTfsSettingSlots(makeCommandSlot, makeToggleSlot),
+      );
       const overviewSlots = markPerformanceOverlaySlots(buildPerformanceOverviewSlots(makeCommandSlot));
       const performancePrimarySlots = [createPerformanceSliderSlot(performancePanel), ...tfsSettingSlots];
       const overlayAutoFocusIndex =
@@ -19661,14 +20964,17 @@
         cards: [],
         volumePanel: null,
         sectionHeaders: [
-          createSectionHeader(0, "Overlay Controls", "Adjust the live overlay and its built-in TFS options first.", {
+          createSectionHeader(0, "Overlay Mode", "Off is at the far left; every mode to the right starts and applies automatically.", {
             icon: PerformancePluginIcon,
           }),
-          createSectionHeader(performancePrimarySlots.length, "Readouts & Maintenance", "Review helper status and one-shot actions below.", {
-            icon: RefreshActionIcon,
+          createSectionHeader(1, "Essentials", "Cap the active game and adjust the overlay without extra start or stop controls.", {
+            icon: PerformancePluginIcon,
+          }),
+          createSectionHeader(5, "Maintenance", "Refresh state or fully repair RTSS only when needed.", {
+            icon: SettingsPluginIcon,
           }),
         ],
-        dividerAfterIndices: [0, 3, 9, 13],
+        dividerAfterIndices: [0, 4],
         slots: [...performancePrimarySlots, ...overviewSlots],
       };
     }
@@ -20441,12 +21747,254 @@
     if (
       state.route.screen === "page" &&
       state.route.pluginId === "settings" &&
+      state.route.pageId?.startsWith("overlay-combination-")
+    ) {
+      const actionId = getControllerShortcutActionIdFromRoute();
+      const action = getControllerShortcutAction(actionId);
+      const combination = getControllerShortcutCombination(actionId);
+      const busy = isGeneralSettingsBusy();
+      const capture = getControllerShortcutCapture();
+      const capturingThisAction = capture.active && capture.actionId === actionId;
+      const isDefault = Boolean(
+        action &&
+        combination.length === action.defaultButtons.length &&
+        combination.every((buttonId, index) => buttonId === action.defaultButtons[index]),
+      );
+      const buttonKindCopy = (buttonId) => {
+        if (["back", "start"].includes(buttonId)) return "System button";
+        if (["left-bumper", "right-bumper", "left-stick", "right-stick"].includes(buttonId)) return "Shoulder or stick button";
+        if (["a", "b", "x", "y"].includes(buttonId)) return "Face button";
+        return "Directional button";
+      };
+
+      return {
+        ...defaultModel,
+        title: "Overlay Combination",
+        subtitle: action?.title || "Controller Action",
+        status: capturingThisAction
+          ? capture.message
+          : `${combination.length} of 3 buttons selected`,
+        error: state.generalSettings.error,
+        note: "Use Record Combination and press the real buttons, or adjust them individually below. TFS does not block those buttons from Steam or the game.",
+        sectionHeaders: [
+          createSectionHeader(0, "Live Recorder", "Release the confirm button, then hold the complete combination.", {
+            icon: RefreshRateActionIcon,
+          }),
+          createSectionHeader(1, "System Buttons", "View / Back and Menu / Start.", {
+            icon: SettingsPluginIcon,
+          }),
+          createSectionHeader(3, "Shoulders and Sticks", "Bumpers and stick clicks.", {
+            icon: SteamLoaderIcon,
+          }),
+          createSectionHeader(7, "Face Buttons", "A, B, X, and Y remain visible to the game.", {
+            icon: SteamLoaderIcon,
+          }),
+          createSectionHeader(11, "D-Pad", "Directions remain visible to Steam and the game.", {
+            icon: SteamLoaderIcon,
+          }),
+          createSectionHeader(15, "Recommended", "Return only this action to its default combination.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: action
+          ? [{
+              title: "Combination Preview",
+              lines: [
+                `${formatControllerShortcutCombination(combination)} = ${action.title}`,
+                `Context: ${action.context}`,
+                `Trigger: ${action.trigger}`,
+                ...(capturingThisAction && capture.buttons.length
+                  ? [`Live: ${formatControllerShortcutCombination(capture.buttons)}`]
+                  : []),
+                action.description,
+              ],
+            }]
+          : [],
+        slots: [
+          makeCommandSlot(
+            capturingThisAction ? "Cancel Recording" : "Record Combination",
+            capturingThisAction
+              ? capture.message
+              : "Press this once, release A, then hold up to three controller buttons together and release to save.",
+            () => capturingThisAction
+              ? stopControllerShortcutCapture()
+              : startControllerShortcutCapture(actionId),
+            {
+              slotKey: "overlay-combination-record",
+              badge: capturingThisAction ? "Listening" : "",
+              disabled: busy || !action,
+            },
+          ),
+          ...controllerShortcutButtonOptions.map((button) => {
+            const selected = combination.includes(button.id);
+            const cannotRemoveLast = selected && combination.length <= 1;
+            const maximumReached = !selected && combination.length >= 3;
+            return makeChoiceSlot(
+              button.title,
+              selected
+                ? cannotRemoveLast
+                  ? "Selected - every action needs at least one button."
+                  : "Selected - press again to remove it from the combination."
+                : maximumReached
+                  ? "Three buttons are already selected. Remove one first."
+                  : `${buttonKindCopy(button.id)} - add it to the combination.`,
+              () => toggleControllerShortcutCombinationButton(actionId, button.id),
+              {
+                slotKey: `overlay-combination-button-${button.id}`,
+                selected,
+                badge: selected ? "Selected" : "",
+                trailing: "none",
+                disabled: busy || capturingThisAction || cannotRemoveLast || maximumReached || !action,
+              },
+            );
+          }),
+          makeCommandSlot(
+            "Use Recommended Combination",
+            `Restore ${formatControllerShortcutCombination(action?.defaultButtons || [])} for this action only.`,
+            () => resetControllerShortcutCombination(actionId),
+            {
+              slotKey: "overlay-combination-reset",
+              disabled: busy || capturingThisAction || !action || isDefault,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "overlay"
+    ) {
+      const shortcuts = getControllerShortcutSettings();
+      const busy = isGeneralSettingsBusy();
+      const holdSlider = (key, property, title, copy, min, max) => createPerformanceValueSliderSlot({
+        title,
+        copy,
+        hint: "Use Left / Right to change the hold time in 0.05 second steps.",
+        slotKey: `overlay-${key}-hold`,
+        min,
+        max,
+        step: 50,
+        disabled: busy,
+        getValue: () => Number(getControllerShortcutSettings()?.[property] || min),
+        displayValue: (value) => formatControllerHoldTime(value),
+        onAdjust: (direction) => void adjustControllerShortcutHoldTime(key, direction),
+      });
+
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "Overlay",
+        status: resolveGeneralSettingsStatusText(),
+        error: state.generalSettings.error,
+        note: "Open any action to combine up to three buttons. TFS requires the complete combination on one controller and keeps the current single-button behavior as the default.",
+        sectionHeaders: [
+          createSectionHeader(0, "Steam Window", "Separate combinations for the left and right Steam menus.", {
+            icon: SettingsPluginIcon,
+          }),
+          createSectionHeader(2, "In Game", "Separate combinations for the overlay and Quick Access.", {
+            icon: SteamLoaderIcon,
+          }),
+          createSectionHeader(4, "Hold Times", "Set when each held combination fires.", {
+            icon: RefreshRateActionIcon,
+          }),
+          createSectionHeader(7, "Defaults", "Restore every original TFS overlay control.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Current Mapping",
+            lines: [
+              `${formatControllerShortcutCombination(shortcuts.steamMenuButtons)} = Steam Menu`,
+              `${formatControllerShortcutCombination(shortcuts.steamQuickAccessButtons)} = Steam Quick Access (${formatControllerHoldTime(shortcuts.steamHoldMilliseconds)})`,
+              `${formatControllerShortcutCombination(shortcuts.inGameOverlayButtons)} = In-Game Overlay (${formatControllerHoldTime(shortcuts.inGameOverlayHoldMilliseconds)})`,
+              `${formatControllerShortcutCombination(shortcuts.inGameQuickAccessButtons)} = In-Game Quick Access (${formatControllerHoldTime(shortcuts.inGameQuickAccessHoldMilliseconds)})`,
+            ],
+          },
+        ],
+        slots: [
+          ...controllerShortcutActionDefinitions.map((action, actionIndex) => {
+            const combination = shortcuts[action.property];
+            const triggerCopy = action.id === "steam-menu"
+              ? `Tap and release before ${formatControllerHoldTime(shortcuts.steamHoldMilliseconds)}.`
+              : action.id === "steam-quick-access"
+                ? `Hold for ${formatControllerHoldTime(shortcuts.steamHoldMilliseconds)}.`
+                : action.id === "in-game-overlay"
+                  ? `Hold for ${formatControllerHoldTime(shortcuts.inGameOverlayHoldMilliseconds)}.`
+                  : `Hold for ${formatControllerHoldTime(shortcuts.inGameQuickAccessHoldMilliseconds)}.`;
+            return makeNavigationSlot(
+              action.title,
+              `${formatControllerShortcutCombination(combination)} - ${triggerCopy}`,
+              () => {
+                rememberCurrentRouteIndex(actionIndex);
+                const targetRoute = {
+                  screen: "page",
+                  pluginId: "settings",
+                  pageId: `overlay-combination-${action.id}`,
+                };
+                const selectedButtonIndex = controllerShortcutButtonOptions.findIndex(
+                  (button) => combination.includes(button.id),
+                );
+                requestFreshEntryForRoute(targetRoute, Math.max(0, selectedButtonIndex), 0);
+                setRoute(targetRoute);
+              },
+              {
+                slotKey: `overlay-action-${action.id}`,
+                badge: formatControllerShortcutCombination(combination, true),
+                disabled: busy,
+                leadingIcon: action.context === "Steam Window" ? SettingsPluginIcon : SteamLoaderIcon,
+              },
+            );
+          }),
+          holdSlider(
+            "steam",
+            "steamHoldMilliseconds",
+            "Steam Quick Access Hold",
+            `Quick Access opens after ${formatControllerHoldTime(shortcuts.steamHoldMilliseconds)} in the Steam window.`,
+            250,
+            5000,
+          ),
+          holdSlider(
+            "in-game-overlay",
+            "inGameOverlayHoldMilliseconds",
+            "In-Game Overlay Hold",
+            `The regular Steam overlay opens after ${formatControllerHoldTime(shortcuts.inGameOverlayHoldMilliseconds)}.`,
+            250,
+            5000,
+          ),
+          holdSlider(
+            "in-game-quick-access",
+            "inGameQuickAccessHoldMilliseconds",
+            "In-Game Quick Access Hold",
+            `Quick Access opens after ${formatControllerHoldTime(shortcuts.inGameQuickAccessHoldMilliseconds)}.`,
+            Number(shortcuts.inGameOverlayHoldMilliseconds || 1050) + 250,
+            8000,
+          ),
+          makeCommandSlot(
+            "Restore Overlay Defaults",
+            "Use View / Back for both Steam actions, Menu / Start for both in-game actions, and restore the 1.05 s / 3.30 s hold times.",
+            () => void resetControllerShortcutSettings(),
+            {
+              slotKey: "overlay-reset-defaults",
+              disabled: busy,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
       state.route.pageId === "general"
     ) {
       const settings = getGeneralSettingsSnapshot();
       const pluginSettings = getGeneralPluginSettings();
       const startupMode = settings?.startupMode || "shell";
       const shellHideAvailable = startupMode === "shell";
+      const windowsShellStartDelaySeconds = Number(settings?.windowsShellStartDelaySeconds || 0);
       const xboxModeSupported = settings?.xboxModeSupported === true;
       const startupModeSlotCount = xboxModeSupported ? 3 : 2;
       const xboxModeSupportNote = xboxModeSupported
@@ -20464,14 +22012,14 @@
           createSectionHeader(0, "Startup Mode", "Choose how TFS enters Windows and Steam on sign-in.", {
             icon: SettingsPluginIcon,
           }),
-          createSectionHeader(startupModeSlotCount, "Behavior", "Fine-tune shell hiding and debug visibility.", {
+          createSectionHeader(startupModeSlotCount, "Behavior", "Fine-tune Shell Takeover hand-off and debug visibility.", {
             icon: DesktopActionIcon,
           }),
-          createSectionHeader(startupModeSlotCount + 2, "Built-In Plugins", "Show or hide modules and block their background routes.", {
+          createSectionHeader(startupModeSlotCount + 3, "Built-In Plugins", "Show or hide modules and block their background routes.", {
             icon: SteamLoaderIcon,
           }),
         ],
-        dividerAfterIndex: startupModeSlotCount + 1,
+        dividerAfterIndex: startupModeSlotCount + 2,
         slots: [
           makeChoiceSlot(
             "Shell Takeover",
@@ -20524,6 +22072,19 @@
               disabled: isGeneralSettingsBusy() || !shellHideAvailable,
             },
           ),
+          makeInlineStepperSlot(
+            "Windows Hand-Off Delay",
+            `${windowsShellStartDelaySeconds}s additional wait before Windows returns behind Steam. Shell Takeover only.`,
+            () => adjustWindowsShellStartDelay(-1),
+            () => adjustWindowsShellStartDelay(1),
+            {
+              disabled: isGeneralSettingsBusy() || !shellHideAvailable,
+              leftDisabled: windowsShellStartDelaySeconds <= 0,
+              rightDisabled: windowsShellStartDelaySeconds >= 30,
+              value: `${windowsShellStartDelaySeconds}s`,
+              leadingIcon: RefreshRateActionIcon,
+            },
+          ),
           makeSettingToggleSlot(
             "tfs",
             "developer-debug",
@@ -20557,31 +22118,29 @@
       state.route.pluginId === "settings" &&
       state.route.pageId === "splashscreen-themes"
     ) {
-      const settings = getGeneralSettingsSnapshot();
       const splash = getSplashScreenSettings();
-      const shellTakeoverMode = settings?.startupMode === "shell";
-      const wallpaperPath = splash?.wallpaperPath || "";
-      const iconPath = splash?.iconPath || "";
-      const windowsShellStartDelaySeconds = Number(settings?.windowsShellStartDelaySeconds || 0);
+      const artworkMode = splash?.artworkMode === "custom" ? "custom" : "dynamic";
+      const customImagePath = splash?.customImagePath || "";
+      const customImageAvailable = Boolean(splash?.customImageExists);
 
       return {
         ...defaultModel,
         title: "Settings",
-        subtitle: "Splashscreen Themes",
+        subtitle: "Splashscreen",
         status: resolveGeneralSettingsStatusText(),
         error: state.generalSettings.error,
-        note: "Use full local image paths. Missing files fall back safely. The enabled startup splash appears for 10 seconds in Shell Takeover, Xbox Mode, and eTray.",
+        note: "One splashscreen setting is shared by Shell Takeover, eTray, and Xbox Mode. Dynamic uses artwork from your Steam library; Custom uses the local image below.",
         sectionHeaders: [
-          createSectionHeader(0, "Preview", "Open the splash briefly without running the full startup flow.", {
-            icon: EyeActionIcon,
+          createSectionHeader(0, "Artwork Source", "Choose the look used in every startup mode.", {
+            icon: SettingsPluginIcon,
           }),
-          createSectionHeader(2, "Artwork Paths", "Save or clear the wallpaper and icon used during startup.", {
+          createSectionHeader(2, "Custom Image", "Save or clear one full-screen splash image.", {
             icon: FolderActionIcon,
           }),
-          createSectionHeader(6, "Windows Hand-Off Delay", "Tune how long Windows waits before restoring behind Big Picture.", {
-            icon: RefreshRateActionIcon,
+          createSectionHeader(5, "Preview", "Open the selected splash without running the startup flow.", {
+            icon: EyeActionIcon,
           }),
-          createSectionHeader(9, "Maintenance", "Reload splash settings from the current TFS configuration.", {
+          createSectionHeader(6, "Maintenance", "Reload the current splash selection.", {
             icon: RefreshActionIcon,
           }),
         ],
@@ -20589,53 +22148,76 @@
           {
             title: "Current Splash",
             lines: [
-              "Splashscreen: Shown for 10 seconds in every startup mode",
-              `Text: ${splash?.showText === false ? "Hidden" : "Shown"}`,
-              wallpaperPath
-                ? `Wallpaper: ${splash?.wallpaperExists ? wallpaperPath : `Missing - ${wallpaperPath}`}`
-                : "Wallpaper: default background",
-              iconPath
-                ? `Icon: ${splash?.iconExists ? iconPath : `Missing - ${iconPath}`}`
-                : "Icon: default Tools for Steam icon",
-              `Additional Windows hand-off delay: ${windowsShellStartDelaySeconds}s`,
-              `Total Windows hand-off delay: ${5 + windowsShellStartDelaySeconds}s after Big Picture is visible`,
+              `Source: ${artworkMode === "custom" ? "Custom image" : "Dynamic Steam library artwork"}`,
+              "Applies to: Shell Takeover, eTray, and Xbox Mode",
+              artworkMode === "custom"
+                ? `Image: ${customImageAvailable ? customImagePath : "No valid custom image selected"}`
+                : "Image: selected automatically from your Steam library",
             ],
           },
         ],
         editors: [
           {
-            label: "Wallpaper Path",
-            help: "PNG, JPG, JPEG, or WebP image shown behind the startup splash.",
-            value: state.generalSettings.splashWallpaperDraft,
-            placeholder: "C:\\Path\\To\\splash-wallpaper.png",
+            label: "Custom Splash Image",
+            help: "Enter the full path to an existing PNG, JPG, JPEG, or WebP image.",
+            value: state.generalSettings.splashCustomImageDraft,
+            placeholder: "C:\\Path\\To\\my-splash.png",
             rows: 2,
-            inputKey: `splash-wallpaper-${state.generalSettings.splashWallpaperInputVersion}`,
+            inputKey: `splash-custom-image-${state.generalSettings.splashCustomImageInputVersion}`,
             onInput: (value) => {
-              state.generalSettings.splashWallpaperDraft = value;
-            },
-          },
-          {
-            label: "Icon Path",
-            help: "PNG, JPG, JPEG, or WebP image used instead of the default splash icon.",
-            value: state.generalSettings.splashIconDraft,
-            placeholder: "C:\\Path\\To\\splash-icon.png",
-            rows: 2,
-            inputKey: `splash-icon-${state.generalSettings.splashIconInputVersion}`,
-            onInput: (value) => {
-              state.generalSettings.splashIconDraft = value;
+              state.generalSettings.splashCustomImageDraft = value;
             },
           },
         ],
         slots: [
-          makeSettingToggleSlot(
-            "tfs-splash",
-            "show-text",
-            "Show Splash Text",
-            "Show startup status text on top of the splash artwork in every startup mode.",
-            splash?.showText !== false,
-            () => toggleSplashScreenSetting("show-text"),
+          makeChoiceSlot(
+            "Dynamic Library Artwork",
+            "Build the splash automatically from cover images in your Steam library.",
+            () => setSplashArtworkMode("dynamic"),
+            {
+              disabled: isGeneralSettingsBusy() || artworkMode === "dynamic",
+              selected: artworkMode === "dynamic",
+              badge: artworkMode === "dynamic" ? "Current" : "",
+              trailing: artworkMode === "dynamic" ? "none" : "chevron",
+              leadingIcon: SteamLoaderIcon,
+            },
+          ),
+          makeChoiceSlot(
+            "Custom Image",
+            customImageAvailable
+              ? "Use your saved image in every startup mode."
+              : "Save an existing image path below to enable this option.",
+            () => setSplashArtworkMode("custom"),
+            {
+              disabled: isGeneralSettingsBusy() || !customImageAvailable || artworkMode === "custom",
+              selected: artworkMode === "custom",
+              badge: artworkMode === "custom" ? "Current" : "",
+              trailing: artworkMode === "custom" ? "none" : "chevron",
+              leadingIcon: FolderActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            "Choose Custom Image",
+            "Open the Windows image picker and immediately use the selected photo in every startup mode.",
+            () => selectSplashCustomImage(),
             {
               disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeCommandSlot(
+            "Save and Use Custom Image",
+            "Validate a path entered manually above and use that image for all future startup splashes.",
+            () => saveSplashCustomImagePath(),
+            {
+              disabled: isGeneralSettingsBusy() || !state.generalSettings.splashCustomImageDraft.trim(),
+            },
+          ),
+          makeCommandSlot(
+            "Remove Custom Image",
+            "Clear the saved image and return to dynamic Steam library artwork.",
+            () => clearSplashCustomImagePath(),
+            {
+              disabled: isGeneralSettingsBusy() || !customImagePath,
             },
           ),
           makeCommandSlot(
@@ -20647,67 +22229,8 @@
             },
           ),
           makeCommandSlot(
-            "Save Wallpaper",
-            "Use the wallpaper path above for future startup splashes.",
-            () => saveSplashWallpaperPath(),
-            {
-              disabled: isGeneralSettingsBusy(),
-            },
-          ),
-          makeCommandSlot(
-            "Clear Wallpaper",
-            "Return to the default splash background.",
-            () => clearSplashWallpaperPath(),
-            {
-              disabled: isGeneralSettingsBusy() || !wallpaperPath,
-            },
-          ),
-          makeCommandSlot(
-            "Save Icon",
-            "Use the icon path above for future startup splashes.",
-            () => saveSplashIconPath(),
-            {
-              disabled: isGeneralSettingsBusy(),
-            },
-          ),
-          makeCommandSlot(
-            "Clear Icon",
-            "Return to the default Tools for Steam splash icon.",
-            () => clearSplashIconPath(),
-            {
-              disabled: isGeneralSettingsBusy() || !iconPath,
-            },
-          ),
-          makeCommandSlot(
-            "Shorter Delay",
-            "Start Windows one second sooner after Big Picture is visible.",
-            () => adjustWindowsShellStartDelay(-1),
-            {
-              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds <= 0,
-              leadingIcon: RefreshRateActionIcon,
-            },
-          ),
-          makeCommandSlot(
-            "Longer Delay",
-            "Wait one extra second before Windows starts in the background.",
-            () => adjustWindowsShellStartDelay(1),
-            {
-              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds >= 30,
-              leadingIcon: RefreshRateActionIcon,
-            },
-          ),
-          makeCommandSlot(
-            "Reset Delay",
-            "Use only the default 5 second Windows hand-off delay.",
-            () => resetWindowsShellStartDelay(),
-            {
-              disabled: isGeneralSettingsBusy() || windowsShellStartDelaySeconds <= 0,
-              leadingIcon: RefreshRateActionIcon,
-            },
-          ),
-          makeCommandSlot(
             "Refresh Settings",
-            "Reload the current splashscreen settings from Tools for Steam.",
+            "Reload the shared splashscreen setting from Tools for Steam.",
             () => loadGeneralSettingsState(),
             {
               disabled: isGeneralSettingsBusy(),
@@ -23465,8 +24988,12 @@
   }
 
   async function setDefaultDevice(deviceId) {
+    const switchingId = String(deviceId || "");
+    let switched = false;
     state.audio.loading = true;
     state.audio.error = "";
+    state.audio.playbackDeviceSwitchingId = switchingId;
+    state.audio.playbackDeviceSwitchError = "";
     if (isAudioDashboardRoute()) {
       rerenderAudioDashboard();
     } else {
@@ -23489,13 +25016,19 @@
       }
 
       state.audio.devices = Array.isArray(payload) ? payload : [];
+      switched = true;
       if (!hasConnectedLiveUpdates()) {
         await loadAudioDashboardState({ showLoading: false });
       }
     } catch (error) {
-      state.audio.error = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      state.audio.error = message;
+      state.audio.playbackDeviceSwitchError = message;
     } finally {
       state.audio.loading = false;
+      if (state.audio.playbackDeviceSwitchingId === switchingId) {
+        state.audio.playbackDeviceSwitchingId = "";
+      }
       if (isAudioDashboardRoute()) {
         rerenderAudioDashboard();
       } else {
@@ -23503,11 +25036,17 @@
         refreshQuickAccessPanel();
       }
     }
+
+    return switched;
   }
 
   async function setDefaultCaptureDevice(deviceId) {
+    const switchingId = String(deviceId || "");
+    let switched = false;
     state.audio.loading = true;
     state.audio.error = "";
+    state.audio.captureDeviceSwitchingId = switchingId;
+    state.audio.captureDeviceSwitchError = "";
     if (isAudioDashboardRoute()) {
       rerenderAudioDashboard();
     } else {
@@ -23530,13 +25069,19 @@
       }
 
       state.audio.captureDevices = Array.isArray(payload) ? payload : [];
+      switched = true;
       if (!hasConnectedLiveUpdates()) {
         await loadAudioDashboardState({ showLoading: false });
       }
     } catch (error) {
-      state.audio.error = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      state.audio.error = message;
+      state.audio.captureDeviceSwitchError = message;
     } finally {
       state.audio.loading = false;
+      if (state.audio.captureDeviceSwitchingId === switchingId) {
+        state.audio.captureDeviceSwitchingId = "";
+      }
       if (isAudioDashboardRoute()) {
         rerenderAudioDashboard();
       } else {
@@ -23544,6 +25089,8 @@
         refreshQuickAccessPanel();
       }
     }
+
+    return switched;
   }
 
   async function performVolumeAction(path, bodyPayload = null) {
@@ -23712,8 +25259,15 @@
     await performCaptureVolumeAction("api/audio/capture/volume/toggle-mute");
   }
 
-  function rerenderAudioDashboard() {
+  function rerenderAudioDashboard(options = {}) {
     if (isAudioDashboardRoute()) {
+      if (options.focusSlotKey) {
+        requestFocusForRoute(state.route, null, options.focusSlotKey);
+        state.renderRevision += 1;
+        renderPanelState();
+        return;
+      }
+
       renderPanelDataRefresh();
       return;
     }
@@ -24329,6 +25883,20 @@
           rerenderSmartHomePanel();
         }
         return true;
+      case "discord.state":
+        state.discord.snapshot = payload;
+        if (!hasRouteTextInputFocus()) {
+          syncDiscordDrafts(false);
+        }
+        if (
+          state.panelVisible &&
+          state.route?.pluginId === "discord" &&
+          !isDiscordBusy() &&
+          !hasRouteTextInputFocus()
+        ) {
+          rerenderDiscordPanel();
+        }
+        return true;
       default:
         return false;
     }
@@ -24345,6 +25913,9 @@
     }
 
     switch (topic) {
+      case "notifications.show":
+        window.STFrontendLib?.showPluginNotification?.(message?.payload || {});
+        return;
       case "audio.dashboard":
       case "audio.mixer":
       case "processes.state":
@@ -24355,6 +25926,7 @@
       case "performance.state":
       case "app-start.state":
       case "smart-home.state":
+      case "discord.state":
       case "plugin-store.state":
       case "handheld-performance.state":
         refreshCurrentLiveRouteState();

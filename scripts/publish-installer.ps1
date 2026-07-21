@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "XboxHostPayloadSnapshot.ps1")
 $projectPath = Join-Path $projectRoot "src\SteamLoader.App\SteamLoader.App.csproj"
 $innoCandidates = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
@@ -55,39 +56,86 @@ $xboxHostPassword = if ($env:TFS_XBOX_HOST_PFX_PASSWORD) {
 if (-not (Test-Path -LiteralPath $xboxHostPfxPath) -or [string]::IsNullOrWhiteSpace($xboxHostPassword)) {
     throw "Xbox host signing requires TFS_XBOX_HOST_PFX and TFS_XBOX_HOST_PFX_PASSWORD."
 }
+$defaultSignedSccdPath = Join-Path $projectRoot "dist\signing\ToolsForSteam.XboxHost.sccd"
+$configuredSignedSccdPath = if ($env:TFS_XBOX_HOST_SCCD) {
+    $env:TFS_XBOX_HOST_SCCD
+} elseif (Test-Path -LiteralPath $defaultSignedSccdPath -PathType Leaf) {
+    $defaultSignedSccdPath
+}
+$xboxHostRequiresDeveloperMode = [string]::IsNullOrWhiteSpace($configuredSignedSccdPath)
+$xboxHostSccdPath = if ($xboxHostRequiresDeveloperMode) {
+    Join-Path $projectRoot "src\ToolsForSteam.XboxHost\Package\CustomCapability.DeveloperMode.SCCD"
+} else {
+    $configuredSignedSccdPath
+}
 
-& (Join-Path $projectRoot "tools\Build-XboxHost.ps1") `
-    -PfxPath $xboxHostPfxPath `
-    -PfxPassword $xboxHostPassword `
-    -PackageVersion $xboxHostPackageVersion
+$xboxHostBuildParameters = @{
+    PfxPath = $xboxHostPfxPath
+    PfxPassword = $xboxHostPassword
+    SccdPath = $xboxHostSccdPath
+    PackageVersion = $xboxHostPackageVersion
+}
+if ($xboxHostRequiresDeveloperMode) {
+    $xboxHostBuildParameters.AllowDeveloperModeSccd = $true
+    Write-Host "No Microsoft-signed Gaming Home SCCD was configured; building the disclosed Developer Mode fallback."
+}
+
+& (Join-Path $projectRoot "tools\Build-XboxHost.ps1") @xboxHostBuildParameters
 if ($LASTEXITCODE -ne 0) {
     throw "Xbox Mode host package build failed."
 }
 
-$installerDirectory = Split-Path -Parent $installerOutput
-if (Test-Path $installerOutput) {
-    Remove-Item -LiteralPath $installerOutput -Force
+$xboxHostPackagePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.msix"
+$xboxHostCertificatePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.cer"
+$xboxHostSnapshot = New-XboxHostPayloadSnapshot `
+    -ProjectRoot $projectRoot `
+    -PackagePath $xboxHostPackagePath `
+    -CertificatePath $xboxHostCertificatePath
+
+try {
+    $snapshotMetadata = Get-XboxHostPayloadMetadata -PackagePath $xboxHostSnapshot.PackagePath
+    if ($snapshotMetadata.Version -ne $xboxHostPackageVersion) {
+        throw (
+            "Xbox Mode host payload changed before it could be snapshotted. " +
+            "Expected $xboxHostPackageVersion, captured $($snapshotMetadata.Version).")
+    }
+    if ($snapshotMetadata.RequiresDeveloperMode -ne $xboxHostRequiresDeveloperMode) {
+        throw "Xbox Mode host SCCD policy changed before it could be snapshotted."
+    }
+
+    $installerDirectory = Split-Path -Parent $installerOutput
+    if (Test-Path $installerOutput) {
+        Remove-Item -LiteralPath $installerOutput -Force
+    }
+
+    if (Test-Path $versionedInstallerOutput) {
+        Remove-Item -LiteralPath $versionedInstallerOutput -Force
+    }
+
+    Remove-Item -LiteralPath (Join-Path $projectRoot "dist\install-toolsforsteam.ps1") -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $projectRoot "dist\uninstall-toolsforsteam.ps1") -Force -ErrorAction SilentlyContinue
+
+    New-Item -ItemType Directory -Path $installerDirectory -Force | Out-Null
+
+    $xboxHostDeveloperModeDefine = if ($xboxHostRequiresDeveloperMode) { 1 } else { 0 }
+    & $innoPath `
+        "/DXboxHostBuildVersion=$xboxHostPackageVersion" `
+        "/DXboxHostRequiresDeveloperMode=$xboxHostDeveloperModeDefine" `
+        "/DXboxHostPayloadDir=$($xboxHostSnapshot.Directory)" `
+        $issPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inno Setup build failed."
+    }
+
+    if (-not (Test-Path $installerOutput)) {
+        throw "Installer output was not created: $installerOutput"
+    }
+
+    Copy-Item -LiteralPath $installerOutput -Destination $versionedInstallerOutput -Force
 }
-
-if (Test-Path $versionedInstallerOutput) {
-    Remove-Item -LiteralPath $versionedInstallerOutput -Force
+finally {
+    Remove-XboxHostPayloadSnapshot -ProjectRoot $projectRoot -Snapshot $xboxHostSnapshot
 }
-
-Remove-Item -LiteralPath (Join-Path $projectRoot "dist\install-toolsforsteam.ps1") -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath (Join-Path $projectRoot "dist\uninstall-toolsforsteam.ps1") -Force -ErrorAction SilentlyContinue
-
-New-Item -ItemType Directory -Path $installerDirectory -Force | Out-Null
-
-& $innoPath "/DXboxHostBuildVersion=$xboxHostPackageVersion" $issPath
-if ($LASTEXITCODE -ne 0) {
-    throw "Inno Setup build failed."
-}
-
-if (-not (Test-Path $installerOutput)) {
-    throw "Installer output was not created: $installerOutput"
-}
-
-Copy-Item -LiteralPath $installerOutput -Destination $versionedInstallerOutput -Force
 
 Write-Host ""
 Write-Host "Installer created:"

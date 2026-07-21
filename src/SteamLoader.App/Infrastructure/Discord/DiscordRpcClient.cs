@@ -404,7 +404,7 @@ internal sealed class DiscordRpcClient : IDiscordRpcClient
         };
         request.Headers.TryAddWithoutValidation(
             "User-Agent",
-            "ToolsForSteam/0.3.9 (+https://github.com/toonymak1993/tools-for-steam)");
+            "ToolsForSteam/0.4.0 (+https://github.com/toonymak1993/tools-for-steam)");
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         var token = await JsonSerializer.DeserializeAsync<DiscordOAuthTokenResponse>(stream, JsonOptions, cancellationToken);

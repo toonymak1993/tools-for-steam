@@ -206,8 +206,10 @@ export interface TfsAppStartShortcut {
 }
 
 export interface TfsPerformanceRuntimeState {
+  /** RTSS does not require the legacy elevated ETW helper. Always false. */
   elevated: boolean;
   overlayVisible: boolean;
+  /** RTSS.exe process id; kept under the legacy property name for compatibility. */
   helperProcessId: number;
   targetProcessId: number;
   targetProcessName: string;
@@ -223,11 +225,28 @@ export interface TfsPerformanceRuntimeState {
   updatedAt: string;
 }
 
+export interface TfsPerformanceInstallationState {
+  installed: boolean;
+  running: boolean;
+  /** True when RTSS is installed; kept under the legacy property name for compatibility. */
+  elevatedHelperReady: boolean;
+  version: string;
+  installPath: string;
+  executablePath: string;
+  preferencesPath: string;
+}
+
 export interface TfsPerformanceState {
-  installation: Record<string, unknown>;
+  installation: TfsPerformanceInstallationState;
   settings: Record<string, unknown> & {
     overlayLevel: number;
+    overlayLevelTitle: string;
     autoTargetEnabled: boolean;
+    overlayPosition: number;
+    overlayScale: number;
+    /** Zero disables the per-game RTSS limiter. */
+    frameLimit: number;
+    frameLimitTitle: string;
   };
   runtime: TfsPerformanceRuntimeState;
   vendorOverlays: Array<Record<string, unknown>>;
@@ -535,8 +554,11 @@ export interface TfsPluginSdk {
     setOverlayLevel(level: number): Promise<TfsPerformanceState>;
     toggleAutoTarget(): Promise<TfsPerformanceState>;
     setSettingValue(key: string, value: number): Promise<TfsPerformanceState>;
+    /** @deprecated Set an overlay level from 1 to 4; changing the level starts RTSS automatically. */
     startOverlay(): Promise<TfsPerformanceState>;
+    /** @deprecated Set overlay level 0 to switch the Tools for Steam OSD off. */
     stopOverlay(): Promise<TfsPerformanceState>;
+    /** Closes RTSS components, repairs RTSS, and restarts it. The legacy name is retained for compatibility. */
     prepareElevatedHelper(): Promise<TfsPerformanceState>;
   };
   power: {

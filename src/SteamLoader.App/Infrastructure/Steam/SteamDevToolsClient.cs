@@ -334,6 +334,92 @@ public sealed class SteamDevToolsClient
             cancellationToken);
     }
 
+    public Task<bool> TryOpenInGameOverlayAsync(
+        bool quickAccess,
+        CancellationToken cancellationToken)
+    {
+        var quickAccessJson = JsonSerializer.Serialize(quickAccess, JsonOptions);
+        return TryInvokeSteamSurfaceActionAsync(
+            $$"""
+(async () => {
+  const store = window.SteamUIStore;
+  const overlayApi = window.SteamClient?.Overlay;
+  const windowStore = store?.WindowStore;
+  if (!store || !windowStore || typeof overlayApi?.SetOverlayState !== "function") {
+    return false;
+  }
+
+  const runningAppsSource = store.RunningApps;
+  const runningApps = runningAppsSource instanceof Map
+    ? Array.from(runningAppsSource.values())
+    : runningAppsSource
+      ? Array.from(runningAppsSource)
+      : [];
+  const mainAppId = store.MainRunningAppID;
+  const runningApp = store.MainRunningApp ||
+    runningApps.find((app) => app?.appid === mainAppId) ||
+    runningApps.find((app) => app?.is_active) ||
+    runningApps[0];
+  const appId = mainAppId || runningApp?.appid;
+  if (!appId) {
+    return false;
+  }
+
+  const getOverlayInstance = () => {
+    try {
+      return windowStore.GetOverlayInstanceWithFallback?.(appId, 0) ||
+        windowStore.GetOverlayInstance?.(appId, 0) ||
+        windowStore.GetOverlayInstances?.(appId)?.[0] ||
+        null;
+    } catch {
+      return null;
+    }
+  };
+
+  let overlayInstance = getOverlayInstance();
+  const gameId = runningApp?.gameid ||
+    overlayInstance?.gameid ||
+    overlayInstance?.params?.gameid;
+  if (!gameId) {
+    return false;
+  }
+
+  try {
+    // Composition state 2 is Steam's native controller overlay. This avoids
+    // Shift+Tab becoming the last input device and keeps controller glyphs.
+    overlayApi.SetOverlayState(String(gameId), 2);
+  } catch {
+    return false;
+  }
+
+  if (!{{quickAccessJson}}) {
+    return true;
+  }
+
+  // The held shortcut opens the regular overlay first. Give Steam a moment
+  // to materialize its overlay window, then use the same native handler as a
+  // physical Quick Access button instead of injecting Ctrl+2.
+  await new Promise((resolve) => window.setTimeout(resolve, 120));
+  overlayInstance = getOverlayInstance();
+  try {
+    if (typeof overlayInstance?.OnQuickAccessButtonPressed === "function") {
+      overlayInstance.OnQuickAccessButtonPressed();
+      return true;
+    }
+
+    if (typeof overlayInstance?.MenuStore?.OpenQuickAccessMenu === "function") {
+      overlayInstance.MenuStore.OpenQuickAccessMenu();
+      return true;
+    }
+  } catch {
+  }
+
+  return false;
+})()
+""",
+            cancellationToken);
+    }
+
     public async Task<bool?> TryGetQuickAccessMenuVisibilityAsync(CancellationToken cancellationToken)
     {
         try

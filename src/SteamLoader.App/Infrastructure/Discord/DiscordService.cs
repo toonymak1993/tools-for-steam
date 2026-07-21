@@ -73,10 +73,14 @@ public sealed class DiscordService : IAsyncDisposable
             {
                 if (_socialClient is not null)
                 {
-                    return await FetchSocialSnapshotAsync(configuration, applicationId, cancellationToken);
+                    return ApplyConfiguration(
+                        await FetchSocialSnapshotAsync(configuration, applicationId, cancellationToken),
+                        configuration);
                 }
 
-                return await FetchRpcSnapshotAsync(configuration, applicationId, cancellationToken);
+                return ApplyConfiguration(
+                    await FetchRpcSnapshotAsync(configuration, applicationId, cancellationToken),
+                    configuration);
             }
 
             if (!forceRefresh &&
@@ -88,7 +92,9 @@ public sealed class DiscordService : IAsyncDisposable
                 return _cachedSnapshot;
             }
 
-            var snapshot = await FetchSnapshotAsync(configuration, cancellationToken);
+            var snapshot = ApplyConfiguration(
+                await FetchSnapshotAsync(configuration, cancellationToken),
+                configuration);
             _cachedSnapshot = snapshot;
             _cachedAtUtc = DateTimeOffset.UtcNow;
             return snapshot;
@@ -104,7 +110,10 @@ public sealed class DiscordService : IAsyncDisposable
         await _refreshGate.WaitAsync(cancellationToken);
         try
         {
-            return await FetchSnapshotAsync(_settingsStore.Load(), cancellationToken);
+            var configuration = _settingsStore.Load();
+            return ApplyConfiguration(
+                await FetchSnapshotAsync(configuration, cancellationToken),
+                configuration);
         }
         finally
         {
@@ -136,7 +145,9 @@ public sealed class DiscordService : IAsyncDisposable
             TokenExpiresAtUtc = applicationChanged ? null : existing.TokenExpiresAtUtc,
             SelectedGuildId = applicationChanged ? string.Empty : existing.SelectedGuildId,
             TokenProvider = applicationChanged ? string.Empty : existing.TokenProvider,
-            TokenScopes = applicationChanged ? string.Empty : existing.TokenScopes
+            TokenScopes = applicationChanged ? string.Empty : existing.TokenScopes,
+            FavoriteGuildIds = [.. existing.FavoriteGuildIds],
+            FriendOnlineNotificationsEnabled = existing.FriendOnlineNotificationsEnabled
         });
         if (applicationChanged)
         {
@@ -218,6 +229,50 @@ public sealed class DiscordService : IAsyncDisposable
         _settingsStore.Save(configuration);
         InvalidateCache();
         return await GetSnapshotAsync(forceRefresh: true, cancellationToken);
+    }
+
+    public async Task<DiscordSnapshot> SetGuildFavoriteAsync(
+        string? guildId,
+        bool favorite,
+        CancellationToken cancellationToken)
+    {
+        var normalizedGuildId = NormalizeOptionalSnowflake(guildId, "Discord server ID");
+        if (string.IsNullOrWhiteSpace(normalizedGuildId))
+        {
+            throw new InvalidOperationException("A Discord server is required.");
+        }
+
+        var configuration = _settingsStore.Load();
+        var favoriteGuildIds = configuration.FavoriteGuildIds.ToHashSet(StringComparer.Ordinal);
+        if (favorite)
+        {
+            favoriteGuildIds.Add(normalizedGuildId);
+        }
+        else
+        {
+            favoriteGuildIds.Remove(normalizedGuildId);
+        }
+
+        configuration.FavoriteGuildIds = [.. favoriteGuildIds];
+        _settingsStore.Save(configuration);
+        InvalidateCache();
+        return await GetSnapshotAsync(forceRefresh: true, cancellationToken);
+    }
+
+    public async Task<DiscordSnapshot> SetFriendOnlineNotificationsAsync(
+        bool enabled,
+        CancellationToken cancellationToken)
+    {
+        var configuration = _settingsStore.Load();
+        configuration.FriendOnlineNotificationsEnabled = enabled;
+        _settingsStore.Save(configuration);
+        InvalidateCache();
+        return await GetSnapshotAsync(forceRefresh: true, cancellationToken);
+    }
+
+    public bool AreFriendOnlineNotificationsEnabled()
+    {
+        return _settingsStore.Load().FriendOnlineNotificationsEnabled;
     }
 
     public async Task<DiscordSnapshot> JoinVoiceChannelAsync(
@@ -382,6 +437,24 @@ public sealed class DiscordService : IAsyncDisposable
         return $"https://discord.gg/{code}";
     }
 
+    private static DiscordSnapshot ApplyConfiguration(
+        DiscordSnapshot snapshot,
+        DiscordConfiguration configuration)
+    {
+        var favoriteGuildIds = configuration.FavoriteGuildIds.ToHashSet(StringComparer.Ordinal);
+        var guilds = snapshot.Guilds?
+            .Select(guild => guild with { IsFavorite = favoriteGuildIds.Contains(guild.Id) })
+            .OrderByDescending(guild => guild.IsFavorite)
+            .ThenBy(guild => guild.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return snapshot with
+        {
+            Guilds = guilds,
+            FriendOnlineNotificationsEnabled = configuration.FriendOnlineNotificationsEnabled
+        };
+    }
+
     private async Task<DiscordSnapshot> FetchSnapshotAsync(
         DiscordConfiguration configuration,
         CancellationToken cancellationToken)
@@ -411,7 +484,7 @@ public sealed class DiscordService : IAsyncDisposable
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
             request.Headers.TryAddWithoutValidation(
                 "User-Agent",
-                "ToolsForSteam/0.3.9 (+https://github.com/toonymak1993/tools-for-steam)");
+                "ToolsForSteam/0.4.0 (+https://github.com/toonymak1993/tools-for-steam)");
 
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             var discordError = response.IsSuccessStatusCode
@@ -687,7 +760,7 @@ public sealed class DiscordService : IAsyncDisposable
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
         request.Headers.TryAddWithoutValidation(
             "User-Agent",
-            "ToolsForSteam/0.3.9 (+https://github.com/toonymak1993/tools-for-steam)");
+            "ToolsForSteam/0.4.0 (+https://github.com/toonymak1993/tools-for-steam)");
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)

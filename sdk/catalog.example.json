@@ -13,6 +13,7 @@
       "permissions": ["frontend"],
       "packagePath": "./packages/example-plugin.zip",
       "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "publishedAtUtc": "2026-07-21T00:00:00.0000000+00:00",
       "images": [
         "./images/example-plugin.png"
       ],
@@ -36,6 +37,7 @@
       "networkHosts": ["<local>"],
       "packagePath": "./packages/home-assistant.zip",
       "packageSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "publishedAtUtc": "2026-07-01T00:00:00.0000000+00:00",
       "images": [
         "./images/home-assistant.png"
       ],

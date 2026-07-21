@@ -1,5 +1,6 @@
 using SteamLoader.App.Infrastructure.Performance;
 using SteamLoader.App.Infrastructure.Handheld;
+using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Hosting;
 using SteamLoader.App.Models;
@@ -72,6 +73,7 @@ public sealed class TfsGamepadHelperHost
             };
 
             Log("hid-monitor-ready");
+            var settingsPath = Path.Combine(AppContext.BaseDirectory, "data", "tfs.json");
             var controllerShortcutService = new ControllerShortcutService(
                 isEnabled: () => true,
                 isBigPictureForeground: SteamBigPictureForegroundDetector.IsBigPictureForeground,
@@ -84,7 +86,13 @@ public sealed class TfsGamepadHelperHost
                 sendControlDigitAsync: digit => ControllerShortcutService.SendControlDigitKeyboardAsync(digit, Log),
                 diagnosticLog: Log,
                 isHidBackButtonDown: () => hidMenuButtonMonitor.IsBackDown,
-                tryOpenExternalGameQuickAccessAsync: () => TryOpenExternalGameQuickAccessAsync(controllerApiClient));
+                tryOpenExternalGameQuickAccessAsync: () => TryOpenExternalGameQuickAccessAsync(controllerApiClient),
+                settingsProvider: () => SteamLoaderSettingsService.ReadControllerShortcutSettingsFile(settingsPath),
+                hidControllerButtonMasksProvider: () => hidMenuButtonMonitor.ControllerButtonMasks,
+                openInGameOverlayAsync: () =>
+                    TryOpenSteamPanelAsync(controllerApiClient, "api/control/game-overlay"),
+                openInGameQuickAccessAsync: () =>
+                    TryOpenSteamPanelAsync(controllerApiClient, "api/control/game-quick-access"));
 
             var hardwareCommandProcessor = new HandheldHardwareCommandProcessor(
                 Path.Combine(AppContext.BaseDirectory, "data"),

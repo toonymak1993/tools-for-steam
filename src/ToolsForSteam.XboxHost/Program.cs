@@ -42,23 +42,15 @@ internal static class Program
             }
 
             var splashSettings = LoadSplashSettings(executablePath);
-            if (splashSettings.Enabled)
-            {
-                System.Windows.Forms.Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
-                System.Windows.Forms.Application.EnableVisualStyles();
-                System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
-            }
+            System.Windows.Forms.Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+            System.Windows.Forms.Application.EnableVisualStyles();
+            System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
 
-            using var splashWindow = splashSettings.Enabled
-                ? CreateSplashWindow(executablePath, splashSettings)
-                : null;
-            if (splashWindow is not null)
-            {
-                splashWindow.Show();
-                splashWindow.Activate();
-                System.Windows.Forms.Application.DoEvents();
-                Log("packaged Xbox host splash window is visible");
-            }
+            using var splashWindow = CreateSplashWindow(executablePath, splashSettings);
+            splashWindow.Show();
+            splashWindow.Activate();
+            System.Windows.Forms.Application.DoEvents();
+            Log("packaged Xbox host splash window is visible");
 
             using var process = Process.Start(new ProcessStartInfo
             {
@@ -192,13 +184,13 @@ internal static class Program
     private static Form CreateSplashWindow(string executablePath, XboxSplashSettings settings)
     {
         var installDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory;
-        var wallpaperPath = File.Exists(settings.WallpaperPath) ? settings.WallpaperPath : string.Empty;
-        var iconPath = File.Exists(settings.IconPath) ? settings.IconPath : string.Empty;
+        var customImagePath =
+            settings.ArtworkMode == StartupSplashArtworkMode.Custom && File.Exists(settings.CustomImagePath)
+                ? settings.CustomImagePath
+                : string.Empty;
         var splashView = new StartupSplashView
         {
-            WallpaperPath = wallpaperPath,
-            IconPath = iconPath,
-            ShowText = settings.ShowText,
+            CustomImagePath = customImagePath,
             DetailText = "Starting the background service and preparing the fast Steam hand-off.",
             StateText = "Steam is loading behind this screen."
         };
@@ -220,7 +212,10 @@ internal static class Program
             Child = splashView
         };
         window.Controls.Add(elementHost);
-        _ = PopulateSplashCoversAsync(splashView, ResolveSteamRoot(executablePath));
+        if (string.IsNullOrWhiteSpace(customImagePath))
+        {
+            _ = PopulateSplashCoversAsync(splashView, ResolveSteamRoot(executablePath));
+        }
 
         Log($"created packaged splash settings={settings} installDirectory={installDirectory}");
         return window;
@@ -314,25 +309,21 @@ internal static class Program
                 return XboxSplashSettings.Default;
             }
 
+            var customImagePath = GetString(splash, "customImagePath");
+            if (string.IsNullOrWhiteSpace(customImagePath))
+            {
+                customImagePath = GetString(splash, "wallpaperPath");
+            }
+
             return new XboxSplashSettings(
-                GetBoolean(splash, "enabled", defaultValue: true),
-                GetBoolean(splash, "showText", defaultValue: true),
-                GetString(splash, "wallpaperPath"),
-                GetString(splash, "iconPath"));
+                StartupSplashArtworkMode.Normalize(GetString(splash, "artworkMode"), customImagePath),
+                customImagePath);
         }
         catch (Exception exception)
         {
             Log($"splash settings could not be read; using defaults: {exception.Message}");
             return XboxSplashSettings.Default;
         }
-    }
-
-    private static bool GetBoolean(JsonElement element, string propertyName, bool defaultValue)
-    {
-        return element.TryGetProperty(propertyName, out var property) &&
-            (property.ValueKind == JsonValueKind.True || property.ValueKind == JsonValueKind.False)
-                ? property.GetBoolean()
-                : defaultValue;
     }
 
     private static string GetString(JsonElement element, string propertyName)
@@ -447,12 +438,8 @@ internal static class Program
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsGamingFullScreenExperienceActive();
 
-    private sealed record XboxSplashSettings(
-        bool Enabled,
-        bool ShowText,
-        string WallpaperPath,
-        string IconPath)
+    private sealed record XboxSplashSettings(string ArtworkMode, string CustomImagePath)
     {
-        public static XboxSplashSettings Default { get; } = new(true, true, string.Empty, string.Empty);
+        public static XboxSplashSettings Default { get; } = new(StartupSplashArtworkMode.Dynamic, string.Empty);
     }
 }

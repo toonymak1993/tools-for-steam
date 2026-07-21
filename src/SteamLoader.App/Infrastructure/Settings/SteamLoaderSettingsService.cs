@@ -4,6 +4,8 @@ using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using ToolsForSteam.Splash;
 
 namespace SteamLoader.App.Infrastructure.Settings;
 
@@ -295,48 +297,44 @@ public sealed class SteamLoaderSettingsService
         return normalizedChannel;
     }
 
-    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenEnabled(bool enabled)
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenArtworkMode(string mode)
     {
         var settings = LoadSettings();
-        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
+        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen);
+        var normalizedMode = (mode ?? string.Empty).Trim().ToLowerInvariant();
+        if (normalizedMode is not StartupSplashArtworkMode.Dynamic and not StartupSplashArtworkMode.Custom)
         {
-            Enabled = enabled
-        };
+            throw new InvalidOperationException("Splash artwork mode must be dynamic or custom.");
+        }
 
-        SaveSettings(settings with { SplashScreen = splashScreen });
+        if (normalizedMode == StartupSplashArtworkMode.Custom &&
+            !IsSupportedCustomSplashImage(splashScreen.CustomImagePath))
+        {
+            throw new InvalidOperationException("Choose an existing PNG, JPG, JPEG, or WebP image before enabling the custom splash.");
+        }
+
+        SaveSettings(settings with
+        {
+            SplashScreen = splashScreen with { ArtworkMode = normalizedMode }
+        });
         return GetSnapshot();
     }
 
-    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenShowText(bool enabled)
+    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenCustomImagePath(string? path)
     {
         var settings = LoadSettings();
+        var normalizedPath = NormalizeOptionalPath(path);
+        if (!string.IsNullOrWhiteSpace(normalizedPath) && !IsSupportedCustomSplashImage(normalizedPath))
+        {
+            throw new InvalidOperationException("The custom splash must be an existing PNG, JPG, JPEG, or WebP image.");
+        }
+
         var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
         {
-            ShowText = enabled
-        };
-
-        SaveSettings(settings with { SplashScreen = splashScreen });
-        return GetSnapshot();
-    }
-
-    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenWallpaperPath(string? path)
-    {
-        var settings = LoadSettings();
-        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
-        {
-            WallpaperPath = NormalizeOptionalPath(path)
-        };
-
-        SaveSettings(settings with { SplashScreen = splashScreen });
-        return GetSnapshot();
-    }
-
-    public SteamLoaderGeneralSettingsSnapshot SetSplashScreenIconPath(string? path)
-    {
-        var settings = LoadSettings();
-        var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen) with
-        {
-            IconPath = NormalizeOptionalPath(path)
+            ArtworkMode = string.IsNullOrWhiteSpace(normalizedPath)
+                ? StartupSplashArtworkMode.Dynamic
+                : StartupSplashArtworkMode.Custom,
+            CustomImagePath = normalizedPath
         };
 
         SaveSettings(settings with { SplashScreen = splashScreen });
@@ -352,6 +350,150 @@ public sealed class SteamLoaderSettingsService
 
         SaveSettings(settings);
         return GetSnapshot();
+    }
+
+    public ControllerShortcutSettingsSnapshot GetControllerShortcutSettings()
+    {
+        lock (_gate)
+        {
+            return BuildControllerShortcutSettings(LoadSettings());
+        }
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetControllerShortcutButton(string key, string buttonId)
+    {
+        lock (_gate)
+        {
+            if (!ControllerShortcutSettingsSnapshot.IsSupportedButton(buttonId))
+            {
+                throw new InvalidOperationException("Choose a supported controller button.");
+            }
+
+            var settings = LoadSettings();
+            var shortcuts = BuildControllerShortcutSettings(settings);
+            var combination = new[] { ControllerShortcutSettingsSnapshot.NormalizeButton(
+                buttonId,
+                key?.Trim().Equals("in-game", StringComparison.OrdinalIgnoreCase) == true
+                    ? ControllerShortcutSettingsSnapshot.DefaultInGameButton
+                    : ControllerShortcutSettingsSnapshot.DefaultSteamButton) };
+            shortcuts = key?.Trim().ToLowerInvariant() switch
+            {
+                "steam" => shortcuts with
+                {
+                    SteamMenuButtons = combination,
+                    SteamQuickAccessButtons = combination
+                },
+                "in-game" => shortcuts with
+                {
+                    InGameOverlayButtons = combination,
+                    InGameQuickAccessButtons = combination
+                },
+                _ => throw new InvalidOperationException("The overlay button setting is unknown.")
+            };
+
+            SaveSettings(settings with { ControllerShortcuts = ToData(shortcuts) });
+            return GetSnapshot();
+        }
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetControllerShortcutCombination(
+        string action,
+        IReadOnlyList<string>? buttonIds)
+    {
+        lock (_gate)
+        {
+            var suppliedButtons = (buttonIds ?? [])
+                .Where(buttonId => !string.IsNullOrWhiteSpace(buttonId))
+                .ToArray();
+            if (suppliedButtons.Length is < 1 or > ControllerShortcutSettingsSnapshot.MaximumButtonsPerCombination ||
+                suppliedButtons.Any(buttonId => !ControllerShortcutSettingsSnapshot.IsSupportedButton(buttonId)) ||
+                suppliedButtons.Distinct(StringComparer.OrdinalIgnoreCase).Count() != suppliedButtons.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Choose between 1 and {ControllerShortcutSettingsSnapshot.MaximumButtonsPerCombination} different supported controller buttons.");
+            }
+
+            var settings = LoadSettings();
+            var shortcuts = BuildControllerShortcutSettings(settings);
+            var normalizedAction = (action ?? string.Empty).Trim().ToLowerInvariant();
+            var fallback = normalizedAction.StartsWith("in-game", StringComparison.Ordinal)
+                ? new[] { ControllerShortcutSettingsSnapshot.DefaultInGameButton }
+                : new[] { ControllerShortcutSettingsSnapshot.DefaultSteamButton };
+            var combination = ControllerShortcutSettingsSnapshot.NormalizeCombination(suppliedButtons, fallback);
+            shortcuts = normalizedAction switch
+            {
+                "steam-menu" => shortcuts with { SteamMenuButtons = combination },
+                "steam-quick-access" => shortcuts with { SteamQuickAccessButtons = combination },
+                "in-game-overlay" => shortcuts with { InGameOverlayButtons = combination },
+                "in-game-quick-access" => shortcuts with { InGameQuickAccessButtons = combination },
+                _ => throw new InvalidOperationException("The overlay action is unknown.")
+            };
+
+            SaveSettings(settings with { ControllerShortcuts = ToData(shortcuts) });
+            return GetSnapshot();
+        }
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetControllerShortcutHoldMilliseconds(string key, int milliseconds)
+    {
+        lock (_gate)
+        {
+            var settings = LoadSettings();
+            var shortcuts = BuildControllerShortcutSettings(settings);
+            shortcuts = key?.Trim().ToLowerInvariant() switch
+            {
+                "steam" => shortcuts with { SteamHoldMilliseconds = milliseconds },
+                "in-game-overlay" => shortcuts with { InGameOverlayHoldMilliseconds = milliseconds },
+                "in-game-quick-access" => shortcuts with { InGameQuickAccessHoldMilliseconds = milliseconds },
+                _ => throw new InvalidOperationException("The overlay hold-time setting is unknown.")
+            };
+            shortcuts = ControllerShortcutSettingsSnapshot.Normalize(
+                shortcuts.SteamMenuButtons,
+                shortcuts.SteamQuickAccessButtons,
+                shortcuts.InGameOverlayButtons,
+                shortcuts.InGameQuickAccessButtons,
+                legacySteamButton: null,
+                legacyInGameButton: null,
+                steamHoldMilliseconds: shortcuts.SteamHoldMilliseconds,
+                inGameOverlayHoldMilliseconds: shortcuts.InGameOverlayHoldMilliseconds,
+                inGameQuickAccessHoldMilliseconds: shortcuts.InGameQuickAccessHoldMilliseconds);
+
+            SaveSettings(settings with { ControllerShortcuts = ToData(shortcuts) });
+            return GetSnapshot();
+        }
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot ResetControllerShortcutSettings()
+    {
+        lock (_gate)
+        {
+            var settings = LoadSettings() with
+            {
+                ControllerShortcuts = ToData(ControllerShortcutSettingsSnapshot.Default)
+            };
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
+    }
+
+    internal static ControllerShortcutSettingsSnapshot ReadControllerShortcutSettingsFile(string settingsPath)
+    {
+        try
+        {
+            if (!File.Exists(settingsPath))
+            {
+                return ControllerShortcutSettingsSnapshot.Default;
+            }
+
+            var json = File.ReadAllText(settingsPath);
+            var settings = JsonSerializer.Deserialize<SteamLoaderSettingsData>(json, JsonOptions)
+                ?? new SteamLoaderSettingsData();
+            return BuildControllerShortcutSettings(settings);
+        }
+        catch
+        {
+            return ControllerShortcutSettingsSnapshot.Default;
+        }
     }
 
     public SteamLoaderSplashScreenSettingsSnapshot GetSplashScreenSettings()
@@ -440,11 +582,6 @@ public sealed class SteamLoaderSettingsService
         }
     }
 
-    public bool ShouldShowSplashScreen()
-    {
-        return NormalizeSplashScreenSettings(LoadSettings().SplashScreen).Enabled == true;
-    }
-
     private SteamLoaderSettingsData LoadSettings()
     {
         lock (_gate)
@@ -510,28 +647,66 @@ public sealed class SteamLoaderSettingsService
     private static SteamLoaderSplashScreenSettingsSnapshot BuildSplashScreenSettings(SteamLoaderSettingsData settings)
     {
         var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen);
-        var wallpaperPath = splashScreen.WallpaperPath ?? string.Empty;
-        var iconPath = splashScreen.IconPath ?? string.Empty;
+        var customImagePath = splashScreen.CustomImagePath ?? string.Empty;
 
         return new SteamLoaderSplashScreenSettingsSnapshot(
-            splashScreen.Enabled ?? true,
-            splashScreen.ShowText ?? true,
-            wallpaperPath,
-            !string.IsNullOrWhiteSpace(wallpaperPath) && File.Exists(wallpaperPath),
-            iconPath,
-            !string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath));
+            splashScreen.ArtworkMode ?? StartupSplashArtworkMode.Dynamic,
+            customImagePath,
+            IsSupportedCustomSplashImage(customImagePath));
+    }
+
+    private static ControllerShortcutSettingsSnapshot BuildControllerShortcutSettings(
+        SteamLoaderSettingsData settings)
+    {
+        var shortcuts = settings.ControllerShortcuts;
+        return ControllerShortcutSettingsSnapshot.Normalize(
+            shortcuts?.SteamMenuButtons,
+            shortcuts?.SteamQuickAccessButtons,
+            shortcuts?.InGameOverlayButtons,
+            shortcuts?.InGameQuickAccessButtons,
+            shortcuts?.SteamButton,
+            shortcuts?.InGameButton,
+            shortcuts?.SteamHoldMilliseconds,
+            shortcuts?.InGameOverlayHoldMilliseconds,
+            shortcuts?.InGameQuickAccessHoldMilliseconds);
+    }
+
+    private static SteamLoaderControllerShortcutSettingsData ToData(
+        ControllerShortcutSettingsSnapshot settings)
+    {
+        return new SteamLoaderControllerShortcutSettingsData
+        {
+            SteamMenuButtons = settings.SteamMenuButtons.ToArray(),
+            SteamQuickAccessButtons = settings.SteamQuickAccessButtons.ToArray(),
+            InGameOverlayButtons = settings.InGameOverlayButtons.ToArray(),
+            InGameQuickAccessButtons = settings.InGameQuickAccessButtons.ToArray(),
+            SteamHoldMilliseconds = settings.SteamHoldMilliseconds,
+            InGameOverlayHoldMilliseconds = settings.InGameOverlayHoldMilliseconds,
+            InGameQuickAccessHoldMilliseconds = settings.InGameQuickAccessHoldMilliseconds
+        };
     }
 
     private static SteamLoaderSplashScreenSettingsData NormalizeSplashScreenSettings(
         SteamLoaderSplashScreenSettingsData? settings)
     {
+        var customImagePath = NormalizeOptionalPath(
+            settings?.CustomImagePath ?? settings?.WallpaperPath ?? string.Empty);
+
         return new SteamLoaderSplashScreenSettingsData
         {
-            Enabled = settings?.Enabled ?? true,
-            ShowText = settings?.ShowText ?? true,
-            WallpaperPath = NormalizeOptionalPath(settings?.WallpaperPath ?? string.Empty),
-            IconPath = NormalizeOptionalPath(settings?.IconPath ?? string.Empty)
+            ArtworkMode = StartupSplashArtworkMode.Normalize(settings?.ArtworkMode, customImagePath),
+            CustomImagePath = customImagePath
         };
+    }
+
+    private static bool IsSupportedCustomSplashImage(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return false;
+        }
+
+        return Path.GetExtension(path).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg" or ".webp";
     }
 
     private static int GetWindowsShellStartDelaySeconds(SteamLoaderSettingsData settings)
@@ -560,6 +735,7 @@ public sealed class SteamLoaderSettingsService
             FirstRunCompleted: settings.FirstRunCompleted == true,
             ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
             SplashScreen: BuildSplashScreenSettings(settings),
+            ControllerShortcuts: BuildControllerShortcutSettings(settings),
             WindowsShellStartDelaySeconds: GetWindowsShellStartDelaySeconds(settings),
             ProductVersion: GetProductVersion(),
             InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
@@ -712,17 +888,55 @@ public sealed class SteamLoaderSettingsService
         public int? WindowsShellStartDelaySeconds { get; init; }
 
         public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
+
+        public SteamLoaderControllerShortcutSettingsData? ControllerShortcuts { get; init; }
+    }
+
+    private sealed record SteamLoaderControllerShortcutSettingsData
+    {
+        public string[]? SteamMenuButtons { get; init; }
+
+        public string[]? SteamQuickAccessButtons { get; init; }
+
+        public string[]? InGameOverlayButtons { get; init; }
+
+        public string[]? InGameQuickAccessButtons { get; init; }
+
+        // Legacy single-button fields are read for automatic migration.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? SteamButton { get; init; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? InGameButton { get; init; }
+
+        public int? SteamHoldMilliseconds { get; init; }
+
+        public int? InGameOverlayHoldMilliseconds { get; init; }
+
+        public int? InGameQuickAccessHoldMilliseconds { get; init; }
     }
 
     private sealed record SteamLoaderSplashScreenSettingsData
     {
+        public string? ArtworkMode { get; init; }
+
+        public string? CustomImagePath { get; init; }
+
+        // Legacy fields are read for a seamless migration and are omitted as
+        // soon as the splash configuration is saved in the new format.
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? Enabled { get; init; }
 
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public bool? ShowText { get; init; }
 
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string? WallpaperPath { get; init; }
 
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string? IconPath { get; init; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public int? ExtraCloseDelaySeconds { get; init; }
     }
 }

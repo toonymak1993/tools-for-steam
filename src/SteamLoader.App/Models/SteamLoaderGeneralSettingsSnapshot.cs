@@ -7,6 +7,7 @@ public sealed record SteamLoaderGeneralSettingsSnapshot(
     bool FirstRunCompleted,
     bool ConsoleModeDefaultApplied,
     SteamLoaderSplashScreenSettingsSnapshot SplashScreen,
+    ControllerShortcutSettingsSnapshot ControllerShortcuts,
     int WindowsShellStartDelaySeconds,
     string ProductVersion,
     string InstallPath,
@@ -27,9 +28,6 @@ public sealed record SteamLoaderPluginSettingsState(
     bool CanDisable);
 
 public sealed record SteamLoaderSplashScreenSettingsSnapshot(
-    bool Enabled,
-    bool ShowText,
-    string WallpaperPath,
-    bool WallpaperExists,
-    string IconPath,
-    bool IconExists);
+    string ArtworkMode,
+    string CustomImagePath,
+    bool CustomImageExists);

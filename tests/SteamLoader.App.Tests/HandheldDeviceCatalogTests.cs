@@ -115,12 +115,12 @@ public sealed class HandheldDeviceCatalogTests
     }
 
     [Fact]
-    public void PluginCatalog_KeepsFpsOverlaySeparateFromHandheldPerformance()
+    public void PluginCatalog_KeepsRtssPerformanceSeparateFromHandheldPerformance()
     {
         var definitions = SteamLoaderPluginCatalog.BuildDefinitions();
         var plugin = Assert.Single(definitions, candidate => candidate.Id == "performance");
 
-        Assert.Equal("FPS Overlay", plugin.Title);
+        Assert.Equal("Performance", plugin.Title);
         Assert.DoesNotContain(definitions, candidate => candidate.Id == "handheld-performance");
     }
 

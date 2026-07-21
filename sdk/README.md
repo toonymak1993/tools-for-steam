@@ -57,7 +57,7 @@ Available helpers:
 - `sdk.ui` exposes shared controller-friendly screen and slot factories.
 - `sdk.ui.createSliderSlot()` and `sdk.ui.createProgressSlot()` provide controller-native value and progress widgets.
 - `sdk.ui.createSecretEditor(options)` creates a password-style editor model for tokens or passwords. The entered value should be saved with `sdk.secrets.set()`.
-- `sdk.performance` exposes the managed TFS FPS/frametime service when `native.performance` is declared.
+- `sdk.performance` exposes RTSS FPS/frametime telemetry, SteamOS-style modes, and the per-game limiter when `native.performance` is declared.
 - `sdk.power` exposes explicitly confirmed Steam and Windows power actions when `native.power` is declared.
 - `sdk.backend` starts a bundled executable, PowerShell, Python, or Node backend and provides lifecycle-managed JSON RPC.
 - `sdk.system` runs commands, manages long-lived processes, opens shell targets, injects protected secrets into backend environments, and exposes system paths/information.
@@ -111,7 +111,7 @@ Permissions are declared in `tfs-plugin.json` and enforced by the core SDK route
 - `native.app-start`: The plugin may manage and launch curated App Start shortcuts.
 - `native.store-sync`: The plugin may manage launcher discovery and Steam shortcut synchronization.
 - `native.automation`: The plugin may configure reviewed TFS automation integrations such as Auto SISR.
-- `native.performance`: The plugin may read TFS FPS, frametime, process, CPU, and memory telemetry and control the TFS overlay.
+- `native.performance`: The plugin may read RTSS FPS, frametime, 1% low, process, CPU, and memory telemetry and control the RTSS overlay and per-game limiter.
 - `native.power`: The plugin may invoke confirmed Steam, sleep, restart, and shutdown actions.
 - `native.full-trust`: The plugin may run arbitrary trusted native code, access arbitrary files, open shell targets, and inject into Steam surfaces. This is a Store warning and not a sandbox.
 
@@ -250,6 +250,8 @@ See these files for the store-side registry format:
 - `tfs-catalog.schema.json`: JSON schema for catalog validation.
 
 The catalog is display and delivery metadata. Its `sdkVersion` and `permissions` fields must match the package manifest exactly, allowing the Store to explain capabilities before download. The manifest inside the package remains the enforced runtime contract.
+
+Use `packageUrl` for plugins published online and `packagePath` for local development builds. The Store exposes those sources as **Online** and **Local** badges. `publishedAtUtc` records the first publication time; entries from the last 30 days receive a **New** badge. The bundled publishing and sideload scripts preserve an existing timestamp and otherwise derive it from the plugin's first Git commit (the same history visible on GitHub), falling back to the current UTC time for an uncommitted plugin. For older GitHub Raw catalog entries without this field, the Store resolves the first package commit once through GitHub and caches the result locally.
 
 Community catalog images are recommended but not required. Entries without images still appear in the local store and use the built-in fallback preview card.
 

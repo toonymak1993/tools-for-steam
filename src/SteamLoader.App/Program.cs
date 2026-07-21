@@ -102,9 +102,11 @@ public static class Program
             return RunGamepadHelper();
         }
 
-        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.FpsHelperArgument, StringComparison.OrdinalIgnoreCase)))
+        // A pre-RTSS scheduled task may fire once before the installer removes it.
+        // Never let that legacy argument start the normal app elevated.
+        if (args.Any(argument => string.Equals(argument, "--fps-helper", StringComparison.OrdinalIgnoreCase)))
         {
-            return RunFpsHelper();
+            return 0;
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterInstalledHelperTasksArgument, StringComparison.OrdinalIgnoreCase)))
@@ -117,19 +119,9 @@ public static class Program
             return RegisterGamepadHelperTask();
         }
 
-        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RegisterFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
-        {
-            return RegisterFpsHelperTask();
-        }
-
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckGamepadHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return CheckGamepadHelperTask();
-        }
-
-        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckFpsHelperTaskArgument, StringComparison.OrdinalIgnoreCase)))
-        {
-            return CheckFpsHelperTask();
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.SanitizeSteamAutostartArgument, StringComparison.OrdinalIgnoreCase)))
@@ -220,7 +212,7 @@ public static class Program
 
         var runStartupSync = shellBootstrapMode || xboxBootstrapMode || args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleStartupMode = settingsSnapshot.SplashScreen.Enabled && !xboxHostedSplash;
+        var consoleStartupMode = !xboxHostedSplash;
 
         var startHiddenInTray = true;
 
@@ -464,36 +456,6 @@ public static class Program
         return support.IsSupported ? 0 : 1;
     }
 
-    private static int RunFpsHelper()
-    {
-        try
-        {
-            var dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
-            var settingsStore = new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json"));
-            var statusStore = new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json"));
-            var steamInstallationService = new SteamInstallationService(
-                new SteamInstallPathSettingsStore(Path.Combine(dataDirectory, "steam-install-path.json")),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
-            var steamRootPath = steamInstallationService.ResolveSteamRootPath();
-            var steamGameMonitor = string.IsNullOrWhiteSpace(steamRootPath)
-                ? null
-                : new SteamGameProcessMonitor(steamRootPath);
-            var storeSyncGameMonitor = new StoreSyncGameProcessMonitor(
-                new StoreSyncSettingsStore(Path.Combine(dataDirectory, "store-sync.json")));
-            var helperHost = new TfsFpsHelperHost(
-                settingsStore,
-                statusStore,
-                steamGameMonitor,
-                storeSyncGameMonitor);
-            return helperHost.Run();
-        }
-        catch (Exception exception)
-        {
-            Console.Error.WriteLine(exception);
-            return 1;
-        }
-    }
-
     private static int RunGamepadHelper()
     {
         try
@@ -666,50 +628,6 @@ public static class Program
         }
     }
 
-    private static int RegisterFpsHelperTask()
-    {
-        var logPath = Path.Combine(AppContext.BaseDirectory, "data", "fps-helper-task.log");
-
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
-            if (File.Exists(logPath))
-            {
-                File.Delete(logPath);
-            }
-
-            var executablePath =
-                Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
-            var taskService = new FpsHelperScheduledTaskService(
-                executablePath,
-                SteamLoaderRuntime.FpsHelperArgument,
-                AppContext.BaseDirectory);
-            taskService.EnsureRegistered();
-
-            if (File.Exists(logPath))
-            {
-                File.Delete(logPath);
-            }
-
-            return 0;
-        }
-        catch (Exception exception)
-        {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
-                File.WriteAllText(logPath, exception.Message);
-            }
-            catch
-            {
-            }
-
-            Console.Error.WriteLine(exception.Message);
-            return 1;
-        }
-    }
-
     private static int RegisterGamepadHelperTask()
     {
         var logPath = Path.Combine(AppContext.BaseDirectory, "data", "gamepad-helper-task.log");
@@ -757,7 +675,7 @@ public static class Program
     {
         try
         {
-            if (!FpsHelperScheduledTaskService.IsCurrentProcessElevated())
+            if (!ElevatedHelperTaskService.IsCurrentProcessElevated())
             {
                 throw new InvalidOperationException("Admin rights are required to register the elevated TFS helper tasks.");
             }
@@ -765,16 +683,11 @@ public static class Program
             var executablePath =
                 Environment.ProcessPath
                 ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
-            var fpsTaskService = new FpsHelperScheduledTaskService(
-                executablePath,
-                SteamLoaderRuntime.FpsHelperArgument,
-                AppContext.BaseDirectory);
             var gamepadTaskService = new GamepadHelperScheduledTaskService(
                 executablePath,
                 AppContext.BaseDirectory);
 
             gamepadTaskService.EnsureRegistered();
-            fpsTaskService.EnsureRegistered();
 
             var autostartService = new WindowsAutostartService(
                 SteamLoaderRuntime.AutostartValueName,
@@ -800,25 +713,6 @@ public static class Program
                 ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
             var taskService = new GamepadHelperScheduledTaskService(
                 executablePath,
-                AppContext.BaseDirectory);
-            return taskService.IsRegistered() ? 0 : 1;
-        }
-        catch
-        {
-            return 1;
-        }
-    }
-
-    private static int CheckFpsHelperTask()
-    {
-        try
-        {
-            var executablePath =
-                Environment.ProcessPath
-                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
-            var taskService = new FpsHelperScheduledTaskService(
-                executablePath,
-                SteamLoaderRuntime.FpsHelperArgument,
                 AppContext.BaseDirectory);
             return taskService.IsRegistered() ? 0 : 1;
         }

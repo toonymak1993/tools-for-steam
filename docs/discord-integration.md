@@ -6,6 +6,8 @@ The Discord core plugin uses the official Discord Social SDK. Its normal user fl
 2. Sign in in the browser window opened by Discord.
 3. Review and approve friends, presence, and server-list access.
 4. Return to Tools for Steam to browse currently online friends and Discord servers.
+5. Pin frequently used servers from **Manage Server Favorites**, or use the controller Menu/Options button on a server row. The Discord overview keeps favorites in its first collapsible section, followed by collapsible friends, other servers, and management sections.
+6. Optionally enable **Notify When a Friend Comes Online** in Discord Settings.
 
 Discord Desktop is optional for sign-in. The Social SDK can use the browser flow directly.
 
@@ -42,6 +44,8 @@ publish output, so the installer and Store package receive the runtime with the 
 - OAuth access and refresh tokens are encrypted with Windows DPAPI for the current Windows user.
 - Tokens are never exposed through the local Quick Access API response.
 - **Disconnect Discord Account** removes local authorization tokens.
+- Favorite server IDs and the friend-online notification preference are stored in the local Discord settings.
+- Friend-online notifications are disabled by default. When enabled, presence is checked in the background and only later offline-to-online transitions create an in-Steam TFS notification; the initial online list is treated as a silent baseline.
 - The plugin requests friends, presence, and server-list access, not messaging or communication access.
 
 ## Server presence limitations

@@ -8,6 +8,10 @@ namespace SteamLoader.App.Infrastructure.Processes;
 
 public sealed class ProcessWindowService
 {
+    private static readonly TimeSpan LaunchedAppFocusTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan LaunchedAppPollInterval = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan ExistingNameMatchDelay = TimeSpan.FromMilliseconds(750);
+
     private static readonly HashSet<string> IgnoredClassNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "Shell_TrayWnd",
@@ -30,6 +34,20 @@ public sealed class ProcessWindowService
         "SearchHost",
         "LockApp",
     };
+
+    private static readonly HashSet<string> GenericLaunchHostProcessNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "cmd",
+        "cscript",
+        "explorer",
+        "msiexec",
+        "powershell",
+        "pwsh",
+        "rundll32",
+        "wscript",
+    };
+
+    private int _launchedAppFocusGeneration;
 
     public ProcessesSnapshot GetSnapshot()
     {
@@ -73,6 +91,208 @@ public sealed class ProcessWindowService
         TryParseHandle(handle, out var windowHandle) &&
         IsWindow(windowHandle) &&
         GetForegroundWindow() == windowHandle;
+
+    public void ActivateLaunchedAppWhenReady(
+        string appName,
+        string? expectedProcessName,
+        int? launchedProcessId,
+        IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch)
+    {
+        var generation = Interlocked.Increment(ref _launchedAppFocusGeneration);
+        _ = ActivateLaunchedAppWhenReadyAsync(
+            appName,
+            expectedProcessName,
+            launchedProcessId,
+            windowsBeforeLaunch,
+            generation);
+    }
+
+    private async Task ActivateLaunchedAppWhenReadyAsync(
+        string appName,
+        string? expectedProcessName,
+        int? launchedProcessId,
+        IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch,
+        int generation)
+    {
+        try
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            var deadline = startedAt + LaunchedAppFocusTimeout;
+            while (DateTimeOffset.UtcNow < deadline &&
+                   Volatile.Read(ref _launchedAppFocusGeneration) == generation)
+            {
+                var windows = GetSnapshot().Windows;
+                var candidate = SelectLaunchedAppWindow(
+                    appName,
+                    expectedProcessName,
+                    launchedProcessId,
+                    windowsBeforeLaunch,
+                    windows,
+                    allowExistingNameMatch: DateTimeOffset.UtcNow - startedAt >= ExistingNameMatchDelay);
+                if (candidate is not null)
+                {
+                    if (candidate.IsForeground)
+                    {
+                        return;
+                    }
+
+                    if (Volatile.Read(ref _launchedAppFocusGeneration) != generation)
+                    {
+                        return;
+                    }
+
+                    try
+                    {
+                        ActivateWindow(candidate.Handle);
+                        return;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Splash and launcher windows can disappear while they
+                        // hand off to the real app. Keep polling for its window.
+                    }
+                }
+
+                await Task.Delay(LaunchedAppPollInterval).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // Starting an app must remain successful even when it deliberately
+            // has no visible window or Windows refuses the foreground handoff.
+        }
+    }
+
+    internal static ProcessWindowInfo? SelectLaunchedAppWindow(
+        string appName,
+        string? expectedProcessName,
+        int? launchedProcessId,
+        IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch,
+        IReadOnlyList<ProcessWindowInfo> currentWindows,
+        bool allowExistingNameMatch = true)
+    {
+        if (launchedProcessId is > 0)
+        {
+            var launchedProcessWindow = currentWindows
+                .Where(window =>
+                    window.ProcessId == launchedProcessId.Value &&
+                    !IsGenericLaunchHostProcess(window.ProcessName))
+                .OrderByDescending(window => window.IsForeground)
+                .FirstOrDefault();
+            if (launchedProcessWindow is not null)
+            {
+                return launchedProcessWindow;
+            }
+        }
+
+        var normalizedExpectedProcessName = NormalizeAppIdentifier(expectedProcessName);
+        if (normalizedExpectedProcessName.Length >= 3)
+        {
+            var expectedProcessWindow = currentWindows
+                .Where(window =>
+                    !IsGenericLaunchHostProcess(window.ProcessName) &&
+                    ProcessNameMatches(window.ProcessName, normalizedExpectedProcessName))
+                .OrderByDescending(window => window.IsForeground)
+                .FirstOrDefault();
+            if (expectedProcessWindow is not null)
+            {
+                return expectedProcessWindow;
+            }
+        }
+
+        var previousHandles = windowsBeforeLaunch
+            .Select(window => window.Handle)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var newWindow = currentWindows
+            .Where(window => !previousHandles.Contains(window.Handle))
+            .Select(window => new { Window = window, Score = ScoreAppNameMatch(appName, window) })
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenByDescending(candidate => candidate.Window.IsForeground)
+            .Select(candidate => candidate.Window)
+            .FirstOrDefault();
+        if (newWindow is not null)
+        {
+            return newWindow;
+        }
+
+        var previousForegroundHandles = windowsBeforeLaunch
+            .Where(window => window.IsForeground)
+            .Select(window => window.Handle)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var changedForegroundWindow = currentWindows.FirstOrDefault(window =>
+            window.IsForeground &&
+            !previousForegroundHandles.Contains(window.Handle) &&
+            !IsTfsOrSteamProcess(window.ProcessName));
+        if (changedForegroundWindow is not null || !allowExistingNameMatch)
+        {
+            return changedForegroundWindow;
+        }
+
+        return currentWindows
+            .Select(window => new { Window = window, Score = ScoreAppNameMatch(appName, window) })
+            .Where(candidate => candidate.Score > 0)
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenByDescending(candidate => candidate.Window.IsForeground)
+            .Select(candidate => candidate.Window)
+            .FirstOrDefault();
+    }
+
+    private static bool ProcessNameMatches(string processName, string normalizedExpectedProcessName)
+    {
+        var normalizedProcessName = NormalizeAppIdentifier(processName);
+        return normalizedProcessName.Equals(normalizedExpectedProcessName, StringComparison.OrdinalIgnoreCase) ||
+               normalizedProcessName.Length >= 4 &&
+               normalizedExpectedProcessName.Length >= 4 &&
+               (normalizedProcessName.Contains(normalizedExpectedProcessName, StringComparison.OrdinalIgnoreCase) ||
+                normalizedExpectedProcessName.Contains(normalizedProcessName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static int ScoreAppNameMatch(string appName, ProcessWindowInfo window)
+    {
+        var normalizedAppName = NormalizeAppIdentifier(appName);
+        if (normalizedAppName.Length < 3)
+        {
+            return 0;
+        }
+
+        var normalizedTitle = NormalizeAppIdentifier(window.Title);
+        var normalizedProcessName = NormalizeAppIdentifier(window.ProcessName);
+        if (normalizedProcessName.Equals(normalizedAppName, StringComparison.OrdinalIgnoreCase))
+        {
+            return 600;
+        }
+
+        if (normalizedTitle.Equals(normalizedAppName, StringComparison.OrdinalIgnoreCase))
+        {
+            return 550;
+        }
+
+        if (normalizedTitle.Contains(normalizedAppName, StringComparison.OrdinalIgnoreCase))
+        {
+            return 500;
+        }
+
+        if (normalizedProcessName.Length >= 4 &&
+            (normalizedProcessName.Contains(normalizedAppName, StringComparison.OrdinalIgnoreCase) ||
+             normalizedAppName.Contains(normalizedProcessName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return 450;
+        }
+
+        return 0;
+    }
+
+    private static string NormalizeAppIdentifier(string? value) =>
+        string.Concat((value ?? string.Empty).Where(char.IsLetterOrDigit)).ToLowerInvariant();
+
+    private static bool IsTfsOrSteamProcess(string processName) =>
+        processName.Equals("ToolsForSteam", StringComparison.OrdinalIgnoreCase) ||
+        processName.Equals("SteamLoader", StringComparison.OrdinalIgnoreCase) ||
+        processName.Equals("steam", StringComparison.OrdinalIgnoreCase) ||
+        processName.Equals("steamwebhelper", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsGenericLaunchHostProcess(string processName) =>
+        GenericLaunchHostProcessNames.Contains(NormalizeAppIdentifier(processName));
 
     private static IReadOnlyList<ProcessWindowInfo> EnumerateWindows()
     {

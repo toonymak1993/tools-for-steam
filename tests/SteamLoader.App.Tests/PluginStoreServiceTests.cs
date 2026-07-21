@@ -103,6 +103,118 @@ public sealed class PluginStoreServiceTests
     }
 
     [Fact]
+    public async Task GetSnapshotAsync_CommunityPluginsExposeOnlineLocalAndNewState()
+    {
+        var root = CreateTempRoot();
+        var recentPublishedAtUtc = DateTimeOffset.UtcNow.AddDays(-10);
+        var oldPublishedAtUtc = DateTimeOffset.UtcNow.AddDays(-45);
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            File.WriteAllText(
+                Path.Combine(storeRoot, "catalog.json"),
+                $$"""
+                {
+                  "title": "TFS Community + Local",
+                  "description": "Availability test catalog",
+                  "plugins": [
+                    {
+                      "id": "online-plugin",
+                      "title": "Online Plugin",
+                      "description": "Published online",
+                      "version": "1.0.0",
+                      "packageUrl": "https://example.test/packages/online-plugin.zip",
+                      "packageSha256": "{{new string('A', 64)}}",
+                      "publishedAtUtc": "{{recentPublishedAtUtc:O}}"
+                    },
+                    {
+                      "id": "local-plugin",
+                      "title": "Local Plugin",
+                      "description": "Local development build",
+                      "version": "1.0.0",
+                      "packagePath": "./packages/local-plugin.zip",
+                      "packageSha256": "{{new string('B', 64)}}",
+                      "publishedAtUtc": "{{oldPublishedAtUtc:O}}"
+                    }
+                  ]
+                }
+                """);
+
+            var snapshot = await CreatePluginStoreService(root).GetSnapshotAsync(CancellationToken.None);
+
+            var online = Assert.Single(snapshot.CommunityPlugins, plugin => plugin.Id == "online-plugin");
+            Assert.True(online.IsAvailableOnline);
+            Assert.False(online.IsLocalDevelopment);
+            Assert.True(online.IsNew);
+            Assert.NotNull(online.PublishedAtUtc);
+            Assert.Contains("online", online.StatusText, StringComparison.OrdinalIgnoreCase);
+
+            var local = Assert.Single(snapshot.CommunityPlugins, plugin => plugin.Id == "local-plugin");
+            Assert.False(local.IsAvailableOnline);
+            Assert.True(local.IsLocalDevelopment);
+            Assert.False(local.IsNew);
+            Assert.NotNull(local.PublishedAtUtc);
+            Assert.Contains("local development", local.StatusText, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task GetSnapshotAsync_OnlineGithubPluginBackfillsAndCachesFirstPublicationDate()
+    {
+        var root = CreateTempRoot();
+        var publishedAtUtc = DateTimeOffset.UtcNow.AddDays(-12);
+        var handler = new GithubPublicationHandler(publishedAtUtc);
+
+        try
+        {
+            var storeRoot = Path.Combine(root, "plugin-store");
+            Directory.CreateDirectory(storeRoot);
+            File.WriteAllText(
+                Path.Combine(storeRoot, "catalog.json"),
+                $$"""
+                {
+                  "title": "TFS Community",
+                  "description": "GitHub publication test catalog",
+                  "plugins": [
+                    {
+                      "id": "github-plugin",
+                      "title": "GitHub Plugin",
+                      "description": "Published from GitHub",
+                      "version": "1.0.0",
+                      "packageUrl": "https://raw.githubusercontent.com/example/tools/main/packages/github-plugin.zip",
+                      "packageSha256": "{{new string('C', 64)}}"
+                    }
+                  ]
+                }
+                """);
+            var service = CreatePluginStoreService(root, new HttpClient(handler));
+
+            var firstSnapshot = await service.GetSnapshotAsync(CancellationToken.None);
+            var secondSnapshot = await service.GetSnapshotAsync(CancellationToken.None);
+
+            var firstPlugin = Assert.Single(firstSnapshot.CommunityPlugins);
+            var secondPlugin = Assert.Single(secondSnapshot.CommunityPlugins);
+            Assert.True(firstPlugin.IsAvailableOnline);
+            Assert.True(firstPlugin.IsNew);
+            Assert.Equal(publishedAtUtc, firstPlugin.PublishedAtUtc);
+            Assert.Equal(firstPlugin.PublishedAtUtc, secondPlugin.PublishedAtUtc);
+            Assert.Equal(1, handler.RequestCount);
+            Assert.Contains("api.github.com/repos/example/tools/commits", handler.RequestUri?.ToString());
+            Assert.True(File.Exists(Path.Combine(storeRoot, "publication-dates.json")));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public async Task GetSnapshotAsync_WithoutCatalog_AutoDownloadsCommunityCatalogWhenEnabled()
     {
         var root = CreateTempRoot();
@@ -1349,6 +1461,48 @@ public sealed class PluginStoreServiceTests
                 : await request.Content.ReadAsStringAsync(cancellationToken);
 
             return _responseFactory();
+        }
+    }
+
+    private sealed class GithubPublicationHandler : HttpMessageHandler
+    {
+        private readonly DateTimeOffset _publishedAtUtc;
+
+        public GithubPublicationHandler(DateTimeOffset publishedAtUtc)
+        {
+            _publishedAtUtc = publishedAtUtc;
+        }
+
+        public int RequestCount { get; private set; }
+
+        public Uri? RequestUri { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            RequestUri = request.RequestUri;
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new[]
+                    {
+                        new
+                        {
+                            commit = new
+                            {
+                                committer = new
+                                {
+                                    date = _publishedAtUtc
+                                }
+                            }
+                        }
+                    }),
+                    Encoding.UTF8,
+                    "application/json")
+            };
+            return Task.FromResult(response);
         }
     }
 }

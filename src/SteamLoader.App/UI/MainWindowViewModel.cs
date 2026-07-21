@@ -56,10 +56,8 @@ public sealed class MainWindowViewModel : BindableBase
     private string _updateStateText = "Updates have not been checked yet.";
     private string _supportBundleText = "No support bundle has been exported yet.";
     private string _errorText = string.Empty;
-    private bool _showStartupSplashText = true;
     private double _splashOverlayOpacity = 1.0;
-    private string _splashWallpaperPath = string.Empty;
-    private string _splashIconPath = string.Empty;
+    private string _splashCustomImagePath = string.Empty;
     private IReadOnlyList<BitmapSource> _splashGameCovers = [];
     private string _splashDebugText = string.Empty;
     private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
@@ -95,7 +93,9 @@ public sealed class MainWindowViewModel : BindableBase
         _showStartupSplash = consoleStartupMode;
         if (consoleStartupMode)
         {
-            _splashCoversTask = LoadSplashGameCoversAsync();
+            _splashCoversTask = string.IsNullOrWhiteSpace(SplashCustomImagePath)
+                ? LoadSplashGameCoversAsync()
+                : Task.CompletedTask;
             _serviceStateText = "Preparing Tools for Steam";
             _serviceDetailText = "Starting the background service and preparing the fast Steam hand-off.";
             _steamStateText = "Startup sync runs first, then Steam opens as soon as shortcuts are ready.";
@@ -245,45 +245,17 @@ public sealed class MainWindowViewModel : BindableBase
         private set => SetProperty(ref _showStartupSplash, value);
     }
 
-    public bool ShowStartupSplashText
-    {
-        get => _showStartupSplashText;
-        private set => SetProperty(ref _showStartupSplashText, value);
-    }
-
     public double SplashOverlayOpacity
     {
         get => _splashOverlayOpacity;
         private set => SetProperty(ref _splashOverlayOpacity, value);
     }
 
-    public string SplashWallpaperPath
+    public string SplashCustomImagePath
     {
-        get => _splashWallpaperPath;
-        private set
-        {
-            if (SetProperty(ref _splashWallpaperPath, value))
-            {
-                RaisePropertyChanged(nameof(HasSplashWallpaper));
-            }
-        }
+        get => _splashCustomImagePath;
+        private set => SetProperty(ref _splashCustomImagePath, value);
     }
-
-    public bool HasSplashWallpaper => !string.IsNullOrWhiteSpace(SplashWallpaperPath);
-
-    public string SplashIconPath
-    {
-        get => _splashIconPath;
-        private set
-        {
-            if (SetProperty(ref _splashIconPath, value))
-            {
-                RaisePropertyChanged(nameof(HasCustomSplashIcon));
-            }
-        }
-    }
-
-    public bool HasCustomSplashIcon => !string.IsNullOrWhiteSpace(SplashIconPath);
 
     public IReadOnlyList<BitmapSource> SplashGameCovers
     {
@@ -374,16 +346,15 @@ public sealed class MainWindowViewModel : BindableBase
         // startup fast (Steam is already launched first).
         _ = _runStartupSyncOnInitialize;
 
-        if (_consoleStartupMode)
-        {
-            EnsureShellBootstrapMonitor();
-        }
+        EnsureShellBootstrapMonitor();
     }
 
     public void StartSplashPreview(TimeSpan duration)
     {
         ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
-        _splashCoversTask = LoadSplashGameCoversAsync();
+        _splashCoversTask = string.IsNullOrWhiteSpace(SplashCustomImagePath)
+            ? LoadSplashGameCoversAsync()
+            : Task.CompletedTask;
         ShowStartupSplash = true;
         ShowFirstRunSetup = false;
         ServiceStateText = "Splash preview";
@@ -688,10 +659,7 @@ public sealed class MainWindowViewModel : BindableBase
             await RefreshAsync();
         }
 
-        if (_consoleStartupMode)
-        {
-            EnsureShellBootstrapMonitor();
-        }
+        EnsureShellBootstrapMonitor();
     }
 
     private string ResolveSteamState(SteamLoaderHostStatus status)
@@ -785,7 +753,10 @@ public sealed class MainWindowViewModel : BindableBase
 
     private void EnsureShellBootstrapMonitor()
     {
-        if (!_consoleStartupMode || _shellBootstrapMonitorTask is not null)
+        if (!SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
+                _shellBootstrapMode,
+                _consoleStartupMode) ||
+            _shellBootstrapMonitorTask is not null)
         {
             return;
         }
@@ -1081,9 +1052,10 @@ public sealed class MainWindowViewModel : BindableBase
     private void ApplyGeneralSettingsSnapshot(SteamLoaderGeneralSettingsSnapshot settings)
     {
         var splashScreen = settings.SplashScreen;
-        ShowStartupSplashText = splashScreen.ShowText;
-        SplashWallpaperPath = splashScreen.WallpaperExists ? splashScreen.WallpaperPath : string.Empty;
-        SplashIconPath = splashScreen.IconExists ? splashScreen.IconPath : string.Empty;
+        SplashCustomImagePath =
+            splashScreen.ArtworkMode == StartupSplashArtworkMode.Custom && splashScreen.CustomImageExists
+                ? splashScreen.CustomImagePath
+                : string.Empty;
         WindowsShellStartDelaySeconds = settings.WindowsShellStartDelaySeconds;
     }
 

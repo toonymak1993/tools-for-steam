@@ -358,9 +358,7 @@
                                   Opacity="{Binding SplashOverlayOpacity}"
                                   Visibility="{Binding ShowStartupSplash, Converter={StaticResource BooleanToVisibilityConverter}}"
                                   GameCovers="{Binding SplashGameCovers}"
-                                  WallpaperPath="{Binding SplashWallpaperPath}"
-                                  IconPath="{Binding SplashIconPath}"
-                                  ShowText="{Binding ShowStartupSplashText}"
+                                  CustomImagePath="{Binding SplashCustomImagePath}"
                                   DetailText="{Binding ServiceDetailText}"
                                   StateText="{Binding SteamStateText}" />
     </Grid>

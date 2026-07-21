@@ -1,12 +1,17 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$innoPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+. (Join-Path $PSScriptRoot "XboxHostPayloadSnapshot.ps1")
+$innoCandidates = @(
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+)
+$innoPath = $innoCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 $issPath = Join-Path $projectRoot "installer\ToolsForSteam.iss"
 $variantOutputDir = Join-Path $projectRoot "dist\installer\variants"
 
-if (-not (Test-Path $innoPath)) {
-    throw "Inno Setup compiler was not found at $innoPath."
+if (-not $innoPath) {
+    throw "Inno Setup 6 compiler was not found."
 }
 
 if (-not (Test-Path $issPath)) {
@@ -24,34 +29,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $xboxHostPackagePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.msix"
-if (-not (Test-Path -LiteralPath $xboxHostPackagePath)) {
-    throw "Xbox Mode host package was not found at $xboxHostPackagePath."
-}
+$xboxHostCertificatePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.cer"
+$xboxHostSnapshot = New-XboxHostPayloadSnapshot `
+    -ProjectRoot $projectRoot `
+    -PackagePath $xboxHostPackagePath `
+    -CertificatePath $xboxHostCertificatePath
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$packageArchive = [System.IO.Compression.ZipFile]::OpenRead($xboxHostPackagePath)
 try {
-    $manifestEntry = $packageArchive.GetEntry("AppxManifest.xml")
-    if (-not $manifestEntry) {
-        throw "Xbox Mode host package does not contain AppxManifest.xml."
-    }
-
-    $manifestReader = [System.IO.StreamReader]::new($manifestEntry.Open())
-    try {
-        [xml]$packageManifest = $manifestReader.ReadToEnd()
-    }
-    finally {
-        $manifestReader.Dispose()
-    }
-}
-finally {
-    $packageArchive.Dispose()
-}
-
-$xboxHostPackageVersion = [string]$packageManifest.Package.Identity.Version
-if ($xboxHostPackageVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
-    throw "Xbox Mode host package has an invalid manifest version: $xboxHostPackageVersion"
-}
+    $snapshotMetadata = Get-XboxHostPayloadMetadata -PackagePath $xboxHostSnapshot.PackagePath
+    $xboxHostPackageVersion = $snapshotMetadata.Version
+    $xboxHostRequiresDeveloperMode = $snapshotMetadata.RequiresDeveloperMode
+    $xboxHostDeveloperModeDefine = if ($xboxHostRequiresDeveloperMode) { 1 } else { 0 }
 
 New-Item -ItemType Directory -Path $variantOutputDir -Force | Out-Null
 Get-ChildItem -LiteralPath $variantOutputDir -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -63,8 +51,7 @@ $variants = @(
         OutputBase = "ToolsForSteamSetup-Test1"
         WizardStyle = "modern"
         CustomPages = 1
-        FpsHelperPrep = 1
-        Description = "Full installer, modern wizard, custom pages on, helper prep on."
+        Description = "Full installer, modern wizard, custom pages on, RTSS bootstrap when missing."
     }
     [pscustomobject]@{
         Number = 2
@@ -72,8 +59,7 @@ $variants = @(
         OutputBase = "ToolsForSteamSetup-Test2"
         WizardStyle = "classic"
         CustomPages = 1
-        FpsHelperPrep = 1
-        Description = "Full installer, classic wizard, custom pages on, helper prep on."
+        Description = "Full installer, classic wizard, custom pages on, RTSS bootstrap when missing."
     }
     [pscustomobject]@{
         Number = 3
@@ -81,8 +67,7 @@ $variants = @(
         OutputBase = "ToolsForSteamSetup-Test3"
         WizardStyle = "modern"
         CustomPages = 0
-        FpsHelperPrep = 1
-        Description = "Modern wizard, no custom pages, shell-mode fallback, helper prep on."
+        Description = "Modern wizard, no custom pages, shell-mode fallback, RTSS bootstrap when missing."
     }
     [pscustomobject]@{
         Number = 4
@@ -90,8 +75,7 @@ $variants = @(
         OutputBase = "ToolsForSteamSetup-Test4"
         WizardStyle = "classic"
         CustomPages = 0
-        FpsHelperPrep = 1
-        Description = "Classic wizard, no custom pages, shell-mode fallback, helper prep on."
+        Description = "Classic wizard, no custom pages, shell-mode fallback, RTSS bootstrap when missing."
     }
     [pscustomobject]@{
         Number = 5
@@ -99,8 +83,7 @@ $variants = @(
         OutputBase = "ToolsForSteamSetup-Test5"
         WizardStyle = "classic"
         CustomPages = 0
-        FpsHelperPrep = 0
-        Description = "Minimal installer: classic wizard, no custom pages, no helper prep."
+        Description = "Minimal UI installer: classic wizard, no custom pages, RTSS bootstrap when missing."
     }
 )
 
@@ -116,8 +99,9 @@ foreach ($variant in $variants) {
         "/DVariantOutputBaseFilename=$($variant.OutputBase)"
         "/DVariantWizardStyle=$($variant.WizardStyle)"
         "/DVariantCustomPages=$($variant.CustomPages)"
-        "/DVariantFpsHelperPrep=$($variant.FpsHelperPrep)"
         "/DXboxHostBuildVersion=$xboxHostPackageVersion"
+        "/DXboxHostRequiresDeveloperMode=$xboxHostDeveloperModeDefine"
+        "/DXboxHostPayloadDir=$($xboxHostSnapshot.Directory)"
         $issPath
     )
 
@@ -147,3 +131,7 @@ foreach ($variant in $variants) {
     Write-Host ("  {0}" -f (Join-Path $variantOutputDir $variant.FileName))
 }
 Write-Host ("Notes: {0}" -f $notesPath)
+}
+finally {
+    Remove-XboxHostPayloadSnapshot -ProjectRoot $projectRoot -Snapshot $xboxHostSnapshot
+}

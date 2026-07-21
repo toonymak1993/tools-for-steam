@@ -49,6 +49,26 @@ function Assert-Value {
     }
 }
 
+function Get-CertificateSha256 {
+    param([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return -join ($sha256.ComputeHash($Certificate.RawData) | ForEach-Object { $_.ToString("x2") })
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Test-XboxDeveloperModeEnabled {
+    $developerMode = Get-ItemProperty `
+        -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
+        -Name "AllowDevelopmentWithoutDevLicense" `
+        -ErrorAction SilentlyContinue
+    return $null -ne $developerMode -and $developerMode.AllowDevelopmentWithoutDevLicense -eq 1
+}
+
 function Get-PackageManifestXml {
     param([string]$Path)
 
@@ -86,6 +106,110 @@ function Assert-Manifest {
     $gamingExtension = $Manifest.SelectSingleNode(
         "//*[local-name()='Extension' and @Category='windows.appExtension']/*[local-name()='AppExtension' and @Name='windows.gamingApp']")
     Assert-Value ($null -ne $gamingExtension) "The windows.gamingApp extension is missing."
+
+    $gamingCapability = $Manifest.SelectSingleNode(
+        "//*[local-name()='CustomCapability' and @Name='Microsoft.appCategory.gamingHome_8wekyb3d8bbwe']")
+    Assert-Value ($null -ne $gamingCapability) "The Xbox Gaming Home custom capability is missing."
+}
+
+function Assert-Sccd {
+    param(
+        [string]$Path,
+        [Security.Cryptography.X509Certificates.X509Certificate2]$PackageCertificate
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $sccdEntries = @($archive.Entries | Where-Object {
+            $_.FullName -notmatch '[/\\]' -and $_.FullName -match '(?i)\.sccd$'
+        })
+        Assert-Value ($sccdEntries.Count -eq 1) "The MSIX must contain exactly one root-level SCCD file."
+
+        $reader = [System.IO.StreamReader]::new($sccdEntries[0].Open())
+        try {
+            [xml]$sccd = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    $capabilityName = "Microsoft.appCategory.gamingHome_8wekyb3d8bbwe"
+    $capability = $sccd.SelectSingleNode(
+        "/*[local-name()='CustomCapabilityDescriptor']/*[local-name()='CustomCapabilities']/*[local-name()='CustomCapability' and @Name='$capabilityName']")
+    Assert-Value ($null -ne $capability) "The SCCD does not grant the Xbox Gaming Home capability."
+
+    $developerModeOnly = $sccd.SelectSingleNode(
+        "/*[local-name()='CustomCapabilityDescriptor']/*[local-name()='DeveloperModeOnly' and translate(@Value, 'TRUE', 'true')='true']")
+    Assert-Value ($null -eq $developerModeOnly) "The SCCD only authorizes Developer Mode devices."
+
+    $authorizedEntities = $sccd.SelectSingleNode(
+        "/*[local-name()='CustomCapabilityDescriptor']/*[local-name()='AuthorizedEntities']")
+    Assert-Value ($null -ne $authorizedEntities) "The SCCD does not contain AuthorizedEntities."
+    $allowAny = [string]$authorizedEntities.AllowAny -eq "true"
+    if (-not $allowAny) {
+        $matchingEntities = @($authorizedEntities.SelectNodes(
+            "*[local-name()='AuthorizedEntity' and @AppPackageFamilyName='$ExpectedPackageFamilyName']"))
+        Assert-Value ($matchingEntities.Count -gt 0) "The SCCD does not authorize the Xbox host package family."
+
+        $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $null = $chain.Build($PackageCertificate)
+            $signingHashes = @(
+                $PackageCertificate
+                $chain.ChainElements | ForEach-Object { $_.Certificate }
+            ) | ForEach-Object { Get-CertificateSha256 $_ } | Select-Object -Unique
+        }
+        finally {
+            $chain.Dispose()
+        }
+        $authorizedHashes = @($matchingEntities | ForEach-Object {
+            ([string]$_.CertificateSignatureHash).Trim().ToLowerInvariant()
+        })
+        Assert-Value (@($signingHashes | Where-Object { $authorizedHashes -contains $_ }).Count -gt 0) (
+            "The SCCD does not authorize the certificate chain used to sign the Xbox host package.")
+    }
+
+    $catalogNode = $sccd.SelectSingleNode(
+        "/*[local-name()='CustomCapabilityDescriptor']/*[local-name()='Catalog']")
+    $catalog = if ($null -eq $catalogNode) { "" } else { $catalogNode.InnerText.Trim() }
+    Assert-Value (-not [string]::IsNullOrWhiteSpace($catalog)) "The SCCD catalog is missing."
+    $isPlaceholderCatalog = $catalog -match '^(?:0+|F+)$'
+    if ($isPlaceholderCatalog) {
+        Assert-Value $allowAny "The Developer Mode SCCD must use AuthorizedEntities AllowAny=true."
+        Assert-Value (Test-XboxDeveloperModeEnabled) (
+            "The Xbox host uses a Developer Mode SCCD, but Windows Developer Mode is disabled. " +
+            "Enable AllowDevelopmentWithoutDevLicense before package registration.")
+        Write-XboxLog "Developer Mode SCCD accepted because Windows Developer Mode is enabled."
+        return
+    }
+
+    try {
+        $catalogBytes = [Convert]::FromBase64String($catalog)
+    }
+    catch {
+        throw "The SCCD catalog is not valid base64: $($_.Exception.Message)"
+    }
+    Assert-Value ($catalogBytes.Length -ge 256) "The SCCD catalog is too short to contain a production signature."
+
+    try {
+        try {
+            Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction Stop
+        }
+        catch {
+            Add-Type -AssemblyName System.Security -ErrorAction Stop
+        }
+        $signedCatalog = [Security.Cryptography.Pkcs.SignedCms]::new()
+        $signedCatalog.Decode($catalogBytes)
+        $signedCatalog.CheckSignature($true)
+    }
+    catch {
+        throw "The SCCD catalog signature is invalid: $($_.Exception.Message)"
+    }
 }
 
 function Assert-Payload {
@@ -107,6 +231,7 @@ function Assert-Payload {
     Assert-Value ($null -ne $signature.SignerCertificate) "The Xbox Mode MSIX has no readable signer certificate."
     Assert-Value ($signature.SignerCertificate.Thumbprint -eq $ExpectedThumbprint) "The Xbox Mode MSIX signer does not match the bundled certificate."
     Assert-Manifest (Get-PackageManifestXml $PackagePath)
+    Assert-Sccd $PackagePath $signature.SignerCertificate
 }
 
 function Assert-InstalledPackage {

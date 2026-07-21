@@ -59,6 +59,42 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Value, $encoding)
 }
 
+function Get-PluginPublishedAtUtc {
+    param(
+        [object]$ExistingEntry,
+        [string]$RepoRoot,
+        [string]$PluginManifestPath
+    )
+
+    $existingValue = [string]$ExistingEntry.publishedAtUtc
+    $existingTimestamp = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($existingValue, [ref]$existingTimestamp)) {
+        return $existingTimestamp.ToUniversalTime().ToString("o")
+    }
+
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitCommand) {
+        $relativeManifestPath = [System.IO.Path]::GetRelativePath($RepoRoot, $PluginManifestPath).Replace("\", "/")
+        $gitDates = @(& $gitCommand.Source -C $RepoRoot log --diff-filter=A --format=%aI -- $relativeManifestPath 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $oldestGitTimestamp = $gitDates |
+                ForEach-Object {
+                    $gitTimestamp = [DateTimeOffset]::MinValue
+                    if ([DateTimeOffset]::TryParse(([string]$_).Trim(), [ref]$gitTimestamp)) {
+                        $gitTimestamp
+                    }
+                } |
+                Sort-Object |
+                Select-Object -First 1
+            if ($oldestGitTimestamp) {
+                return $oldestGitTimestamp.ToUniversalTime().ToString("o")
+            }
+        }
+    }
+
+    return [DateTimeOffset]::UtcNow.ToString("o")
+}
+
 function Remove-DirectoryIfSafe {
     param(
         [string]$Path,
@@ -242,15 +278,22 @@ $sha256 = Get-FileSha256 -Path $packagePath
 Copy-Item -LiteralPath $packagePath -Destination $storePackagePath -Force
 
 $localCatalogPlugins = @()
+$existingLocalPlugin = $null
 if (Test-Path -LiteralPath $catalogPath -PathType Leaf) {
     try {
         $existingLocalCatalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+        $existingLocalPlugin = @($existingLocalCatalog.plugins | Where-Object { $_.id -eq $manifest.id }) |
+            Select-Object -First 1
         $localCatalogPlugins = @($existingLocalCatalog.plugins | Where-Object { $_.id -ne $manifest.id })
     }
     catch {
         $localCatalogPlugins = @()
     }
 }
+$localPublishedAtUtc = Get-PluginPublishedAtUtc `
+    -ExistingEntry $existingLocalPlugin `
+    -RepoRoot $RepositoryRoot `
+    -PluginManifestPath $manifestPath
 $localCatalogPlugins += [pscustomobject][ordered]@{
     id = $manifest.id
     title = $manifest.name
@@ -263,6 +306,7 @@ $localCatalogPlugins += [pscustomobject][ordered]@{
     networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     packagePath = "./packages/$PluginId.zip"
     packageSha256 = $sha256
+    publishedAtUtc = $localPublishedAtUtc
     images = @("api/plugin-store/images/catalog/$storeImageFileName")
     tags = @($catalogTags)
     homepageUrl = $catalogHomepageUrl
@@ -293,15 +337,22 @@ if (-not [string]::IsNullOrWhiteSpace($PluginDatabaseRoot)) {
     $pluginDatabaseRawBaseUrl = $PluginDatabaseRawBaseUrl.TrimEnd("/")
     $pluginDatabaseCatalogPath = Join-Path $pluginDatabaseRootPath "catalog.json"
     $onlineCatalogPlugins = @()
+    $existingOnlinePlugin = $null
     if (Test-Path -LiteralPath $pluginDatabaseCatalogPath -PathType Leaf) {
         try {
             $existingOnlineCatalog = Get-Content -LiteralPath $pluginDatabaseCatalogPath -Raw | ConvertFrom-Json
+            $existingOnlinePlugin = @($existingOnlineCatalog.plugins | Where-Object { $_.id -eq $manifest.id }) |
+                Select-Object -First 1
             $onlineCatalogPlugins = @($existingOnlineCatalog.plugins | Where-Object { $_.id -ne $manifest.id })
         }
         catch {
             throw "Existing plugin database catalog is invalid: $pluginDatabaseCatalogPath"
         }
     }
+    $onlinePublishedAtUtc = Get-PluginPublishedAtUtc `
+        -ExistingEntry $existingOnlinePlugin `
+        -RepoRoot $RepositoryRoot `
+        -PluginManifestPath $manifestPath
     $onlineCatalogPlugins += [pscustomobject][ordered]@{
         id = $manifest.id
         title = $manifest.name
@@ -314,6 +365,7 @@ if (-not [string]::IsNullOrWhiteSpace($PluginDatabaseRoot)) {
         networkHosts = @($manifest.networkHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
         packageUrl = "$pluginDatabaseRawBaseUrl/packages/$PluginId.zip"
         packageSha256 = $sha256
+        publishedAtUtc = $onlinePublishedAtUtc
         images = @("$pluginDatabaseRawBaseUrl/images/$sdkImageFileName")
         tags = @($catalogTags)
         homepageUrl = $catalogHomepageUrl

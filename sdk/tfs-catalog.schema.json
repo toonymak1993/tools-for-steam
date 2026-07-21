@@ -120,6 +120,11 @@
             "type": "string",
             "pattern": "^[A-Fa-f0-9]{64}$"
           },
+          "publishedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "description": "First publication time. The Store shows the plugin as new for 30 days."
+          },
           "images": {
             "type": "array",
             "items": {

@@ -29,7 +29,8 @@ public sealed record DiscordGuildState(
     string Name,
     string IconUrl,
     int OnlineCount = 0,
-    int MemberCount = 0);
+    int MemberCount = 0,
+    bool IsFavorite = false);
 
 public sealed record DiscordVoiceParticipantState(
     string Id,
@@ -71,4 +72,5 @@ public sealed record DiscordSnapshot(
     string ApplicationId = "",
     IReadOnlyList<DiscordFriendState>? Friends = null,
     string SdkVersion = "",
-    string GuildsErrorMessage = "");
+    string GuildsErrorMessage = "",
+    bool FriendOnlineNotificationsEnabled = false);

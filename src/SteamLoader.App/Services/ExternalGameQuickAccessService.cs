@@ -118,7 +118,8 @@ public sealed class ExternalGameQuickAccessService
             managedGame.StoreId,
             processId,
             windowHandle,
-            SuppressGameRestore: false);
+            SuppressGameRestore: false,
+            QuickAccessReady: false);
 
         lock (_gate)
         {
@@ -259,7 +260,7 @@ public sealed class ExternalGameQuickAccessService
     private async Task MonitorQuickAccessAsync(Guid sessionId, CancellationToken cancellationToken)
     {
         var openDeadline = DateTimeOffset.UtcNow + QuickAccessOpenTimeout;
-        var observedOpen = false;
+        var observation = new ExternalGameQuickAccessObservation();
 
         try
         {
@@ -278,23 +279,26 @@ public sealed class ExternalGameQuickAccessService
                 }
 
                 var visible = await _devToolsClient.TryGetQuickAccessMenuVisibilityAsync(cancellationToken);
-                if (visible == true)
+                var returnedToGame = observation.Observe(
+                    visible,
+                    _processWindowService.IsForegroundWindow(session.GameWindowHandle));
+                if (observation.QuickAccessReady && !session.QuickAccessReady)
                 {
-                    observedOpen = true;
+                    MarkQuickAccessReady(sessionId);
                 }
-                else if (observedOpen && visible == false)
+
+                if (observation.QuickAccessReady && visible == false)
                 {
                     ClearSession(sessionId, restoreGame: true, "quick-access-closed");
                     return;
                 }
-                else if (!observedOpen && DateTimeOffset.UtcNow >= openDeadline)
+                else if (!observation.QuickAccessReady && DateTimeOffset.UtcNow >= openDeadline)
                 {
                     ClearSession(sessionId, restoreGame: true, "quick-access-not-observed");
                     return;
                 }
 
-                var foregroundTarget = PerformanceForegroundTargetResolver.TryResolve();
-                if (foregroundTarget?.ProcessId == session.ProcessId)
+                if (returnedToGame)
                 {
                     ClearSession(sessionId, restoreGame: false, "game-already-foreground");
                     return;
@@ -320,6 +324,22 @@ public sealed class ExternalGameQuickAccessService
         {
             return _activeSession?.Id == sessionId ? _activeSession : null;
         }
+    }
+
+    private void MarkQuickAccessReady(Guid sessionId)
+    {
+        lock (_gate)
+        {
+            if (_activeSession?.Id != sessionId || _activeSession.QuickAccessReady)
+            {
+                return;
+            }
+
+            _activeSession = _activeSession with { QuickAccessReady = true };
+        }
+
+        Log($"fallback-ready session={sessionId}");
+        PublishState();
     }
 
     private void ClearSession(Guid sessionId, bool restoreGame, string reason)
@@ -369,6 +389,7 @@ public sealed class ExternalGameQuickAccessService
         return session is null
             ? new ExternalGameQuickAccessState(
                 Active: false,
+                QuickAccessReady: false,
                 GameTitle: string.Empty,
                 StoreId: string.Empty,
                 ProcessId: 0,
@@ -376,11 +397,14 @@ public sealed class ExternalGameQuickAccessService
                 StatusText: string.Empty)
             : new ExternalGameQuickAccessState(
                 Active: true,
+                QuickAccessReady: session.QuickAccessReady,
                 GameTitle: session.GameTitle,
                 StoreId: session.StoreId,
                 ProcessId: session.ProcessId,
                 CanCloseCurrentGame: true,
-                StatusText: $"Quick Access is open for {session.GameTitle} without the in-game Steam overlay.");
+                StatusText: session.QuickAccessReady
+                    ? $"Quick Access is open for {session.GameTitle} without the in-game Steam overlay."
+                    : $"Opening Quick Access for {session.GameTitle}...");
     }
 
     private void Log(string message)
@@ -403,5 +427,30 @@ public sealed class ExternalGameQuickAccessService
         string StoreId,
         int ProcessId,
         string GameWindowHandle,
-        bool SuppressGameRestore);
+        bool SuppressGameRestore,
+        bool QuickAccessReady);
+}
+
+internal sealed class ExternalGameQuickAccessObservation
+{
+    public bool GameLostForeground { get; private set; }
+
+    public bool QuickAccessReady { get; private set; }
+
+    public bool Observe(bool? quickAccessVisible, bool gameIsForeground)
+    {
+        if (!gameIsForeground)
+        {
+            GameLostForeground = true;
+        }
+
+        // Visibility alone is not enough during the first invocation: Steam can
+        // report the panel before Windows has completed the foreground hand-off.
+        if (quickAccessVisible == true && GameLostForeground)
+        {
+            QuickAccessReady = true;
+        }
+
+        return QuickAccessReady && gameIsForeground;
+    }
 }

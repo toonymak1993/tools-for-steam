@@ -49,6 +49,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly DiscordService _discordService;
     private readonly PluginFullTrustRuntime _pluginFullTrustRuntime;
     private readonly ExternalGameQuickAccessService _externalGameQuickAccessService;
+    private readonly Func<IReadOnlyList<string>> _pressedControllerButtonsProvider;
     private readonly SteamLoaderHostState _hostState;
     private readonly QuickAccessLiveUpdateHub _liveUpdateHub;
     private readonly HttpListener _listener;
@@ -89,6 +90,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         DiscordService discordService,
         PluginFullTrustRuntime pluginFullTrustRuntime,
         ExternalGameQuickAccessService externalGameQuickAccessService,
+        Func<IReadOnlyList<string>> pressedControllerButtonsProvider,
         Uri baseUri,
         string apiSessionToken,
         SteamLoaderHostState hostState,
@@ -116,6 +118,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _discordService = discordService;
         _pluginFullTrustRuntime = pluginFullTrustRuntime;
         _externalGameQuickAccessService = externalGameQuickAccessService;
+        _pressedControllerButtonsProvider = pressedControllerButtonsProvider;
         _apiSessionToken = apiSessionToken;
         _hostState = hostState;
         _liveUpdateHub = liveUpdateHub;
@@ -308,6 +311,24 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath is "/api/control/game-overlay" or "/api/control/game-quick-access")
+            {
+                var quickAccess = request.Url.AbsolutePath.EndsWith(
+                    "/game-quick-access",
+                    StringComparison.OrdinalIgnoreCase);
+                var openedDirectly = await _devToolsClient.TryOpenInGameOverlayAsync(
+                    quickAccess,
+                    cancellationToken);
+
+                await WriteJsonAsync(
+                    response,
+                    openedDirectly ? HttpStatusCode.OK : HttpStatusCode.Conflict,
+                    new { handled = openedDirectly, openedDirectly },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/steam/keyboard/show")
             {
                 var payload = await JsonSerializer.DeserializeAsync<ShowSteamKeyboardRequest>(
@@ -487,6 +508,61 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     await _discordService.SelectGuildAsync(payload?.Id, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/guild/favorite")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetDiscordGuildFavoriteRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Discord server favorite setting is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.SetGuildFavoriteAsync(
+                        payload.Id,
+                        payload.Favorite,
+                        cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/discord/settings/friend-online-notifications")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A friend-online notification setting is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _discordService.SetFriendOnlineNotificationsAsync(
+                        payload.Value,
+                        cancellationToken),
                     cancellationToken);
                 return;
             }
@@ -2018,24 +2094,24 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/settings/splash/enabled")
+                request.Url?.AbsolutePath == "/api/settings/splash/artwork-mode")
             {
-                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
                     request.InputStream,
                     JsonOptions,
                     cancellationToken);
 
-                if (payload is null)
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
                 {
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A boolean value is required." },
+                        new { message = "A splash artwork mode is required." },
                         cancellationToken);
                     return;
                 }
 
-                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenEnabled(payload.Value);
+                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenArtworkMode(payload.Value);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -2046,35 +2122,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/settings/splash/show-text")
-            {
-                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
-                    request.InputStream,
-                    JsonOptions,
-                    cancellationToken);
-
-                if (payload is null)
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.BadRequest,
-                        new { message = "A boolean value is required." },
-                        cancellationToken);
-                    return;
-                }
-
-                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenShowText(payload.Value);
-                await WriteJsonAndPublishAsync(
-                    response,
-                    HttpStatusCode.OK,
-                    settingsSnapshot,
-                    "settings.state",
-                    cancellationToken);
-                return;
-            }
-
-            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/settings/splash/wallpaper")
+                request.Url?.AbsolutePath == "/api/settings/splash/custom-image")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
                     request.InputStream,
@@ -2086,12 +2134,54 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A wallpaper path is required." },
+                        new { message = "A custom image path is required." },
                         cancellationToken);
                     return;
                 }
 
-                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenWallpaperPath(payload.Value);
+                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenCustomImagePath(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/overlay/input-state")
+            {
+                var pressedButtons = _pressedControllerButtonsProvider();
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new { buttons = pressedButtons },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/overlay/button")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetOverlayButtonRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Key) || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An overlay context and controller button are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetControllerShortcutButton(
+                    payload.Key,
+                    payload.Value);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -2102,24 +2192,100 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/settings/splash/icon")
+                request.Url?.AbsolutePath == "/api/settings/overlay/combination")
             {
-                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                var payload = await JsonSerializer.DeserializeAsync<SetOverlayCombinationRequest>(
                     request.InputStream,
                     JsonOptions,
                     cancellationToken);
 
-                if (payload is null)
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Action) || payload.Buttons is null)
                 {
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "An icon path is required." },
+                        new { message = "An overlay action and its controller-button combination are required." },
                         cancellationToken);
                     return;
                 }
 
-                var settingsSnapshot = _steamLoaderSettingsService.SetSplashScreenIconPath(payload.Value);
+                var settingsSnapshot = _steamLoaderSettingsService.SetControllerShortcutCombination(
+                    payload.Action,
+                    payload.Buttons);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/overlay/hold-time")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetOverlayHoldTimeRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Key))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An overlay action and hold time are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetControllerShortcutHoldMilliseconds(
+                    payload.Key,
+                    payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/overlay/reset")
+            {
+                var settingsSnapshot = _steamLoaderSettingsService.ResetControllerShortcutSettings();
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/splash/select-custom-image")
+            {
+                var selectedPath = await StaThread.RunAsync(
+                    () =>
+                    {
+                        var dialog = new Microsoft.Win32.OpenFileDialog
+                        {
+                            Title = "Choose a custom splash image",
+                            Filter = "Image files (*.png;*.jpg;*.jpeg;*.webp)|*.png;*.jpg;*.jpeg;*.webp",
+                            CheckFileExists = true,
+                            DereferenceLinks = true,
+                            Multiselect = false
+                        };
+
+                        return dialog.ShowDialog() == true ? dialog.FileName : string.Empty;
+                    },
+                    cancellationToken);
+
+                var settingsSnapshot = string.IsNullOrWhiteSpace(selectedPath)
+                    ? _steamLoaderSettingsService.GetSnapshot()
+                    : _steamLoaderSettingsService.SetSplashScreenCustomImagePath(selectedPath);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -5499,7 +5665,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record DiscordIdRequest(string Id);
 
+    private sealed record SetDiscordGuildFavoriteRequest(string Id, bool Favorite);
+
     private sealed record SetIntegerValueRequest(int Value);
+    private sealed record SetOverlayButtonRequest(string Key, string Value);
+    private sealed record SetOverlayCombinationRequest(string Action, IReadOnlyList<string>? Buttons);
+    private sealed record SetOverlayHoldTimeRequest(string Key, int Value);
     private sealed record SetDisplayModeRequest(string Resolution, int RefreshRate);
     private sealed record SetHandheldCpuBoostRequest(string PowerSource, bool Enabled);
 

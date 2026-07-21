@@ -52,6 +52,7 @@ public sealed class HidMenuButtonMonitor : IDisposable
     private bool _disposed;
     private volatile bool _isBackDown;
     private volatile bool _isMenuDown;
+    private volatile ushort[] _controllerButtonMasks = [];
 
     public static ushort ExpectedMenuButtonUsage => XboxMenuButtonUsage;
 
@@ -72,6 +73,8 @@ public sealed class HidMenuButtonMonitor : IDisposable
     public bool IsMenuDown => _isMenuDown;
 
     public bool IsBackDown => _isBackDown;
+
+    public IReadOnlyList<ushort> ControllerButtonMasks => _controllerButtonMasks;
 
     public void Dispose()
     {
@@ -509,12 +512,45 @@ public sealed class HidMenuButtonMonitor : IDisposable
         _lastRawReports.Clear();
         _isBackDown = false;
         _isMenuDown = false;
+        _controllerButtonMasks = [];
     }
 
     private void UpdateAggregateButtonStates()
     {
         _isBackDown = _deviceStates.Values.Any(value => value.IsBackDown);
         _isMenuDown = _deviceStates.Values.Any(value => value.IsMenuDown);
+        _controllerButtonMasks = _lastButtonUsages
+            .Where(entry =>
+                _devices.TryGetValue(entry.Key, out var metadata) &&
+                metadata.UsagePage == GenericDesktopUsagePage &&
+                CanContributeToShortcutState(metadata.DeviceName))
+            .Select(entry => ConvertButtonUsagesToXInputMask(entry.Value))
+            .Where(mask => mask != 0)
+            .ToArray();
+    }
+
+    internal static ushort ConvertButtonUsagesToXInputMask(IReadOnlyList<ushort> buttonUsages)
+    {
+        ushort mask = 0;
+        foreach (var usage in buttonUsages)
+        {
+            mask |= usage switch
+            {
+                1 => (ushort)0x1000,  // A
+                2 => (ushort)0x2000,  // B
+                3 => (ushort)0x4000,  // X
+                4 => (ushort)0x8000,  // Y
+                5 => (ushort)0x0100,  // LB
+                6 => (ushort)0x0200,  // RB
+                7 => (ushort)0x0020,  // View / Back
+                8 => (ushort)0x0010,  // Menu / Start
+                9 => (ushort)0x0040,  // Left stick click
+                10 => (ushort)0x0080, // Right stick click
+                _ => (ushort)0
+            };
+        }
+
+        return mask;
     }
 
     private static void RegisterRawInputTargets(nint targetWindowHandle)

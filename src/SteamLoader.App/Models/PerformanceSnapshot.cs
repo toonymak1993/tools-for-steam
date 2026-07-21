@@ -62,6 +62,8 @@ public sealed record PerformanceSettingsState(
     int TelemetrySamplingPeriodMs,
     int MetricsWindow,
     int OverlayDrawRate,
+    int FrameLimit,
+    string FrameLimitTitle,
     IReadOnlyList<PerformanceOverlayLevelState> OverlayLevels);
 
 public sealed record PerformanceSnapshot(

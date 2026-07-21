@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Buffers.Binary;
 using SteamLoader.App.Infrastructure.Discord;
+using SteamLoader.App.Models;
 using Xunit;
 
 namespace SteamLoader.App.Tests;
@@ -216,6 +217,89 @@ public sealed class DiscordServiceTests
     }
 
     [Fact]
+    public async Task GuildFavorites_ArePersistedDecoratedAndSortedFirst()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var settingsStore = new DiscordSettingsStore(Path.Combine(root, "discord.json"));
+            settingsStore.Save(new DiscordConfiguration
+            {
+                ApplicationId = "123456789012345678",
+                AccessToken = "social-access-token",
+                RefreshToken = "social-refresh-token",
+                TokenExpiresAtUtc = DateTimeOffset.UtcNow.AddHours(2),
+                TokenProvider = "social-sdk",
+                TokenScopes = DiscordSocialSdkClient.RequiredScopes
+            });
+            var handler = new StubHttpMessageHandler(
+                HttpStatusCode.OK,
+                """
+                [
+                  {
+                    "id": "223456789012345678",
+                    "name": "Alpha Server",
+                    "approximate_presence_count": 4,
+                    "approximate_member_count": 20
+                  },
+                  {
+                    "id": "323456789012345678",
+                    "name": "Zulu Server",
+                    "approximate_presence_count": 8,
+                    "approximate_member_count": 30
+                  }
+                ]
+                """);
+            using var httpClient = new HttpClient(handler);
+            await using var service = new DiscordService(
+                httpClient,
+                settingsStore,
+                new StubDiscordRpcClient(),
+                new StubDiscordSocialSdkClient());
+
+            var snapshot = await service.SetGuildFavoriteAsync(
+                "323456789012345678",
+                favorite: true,
+                CancellationToken.None);
+
+            Assert.Equal("Zulu Server", snapshot.Guilds![0].Name);
+            Assert.True(snapshot.Guilds[0].IsFavorite);
+            Assert.False(snapshot.Guilds[1].IsFavorite);
+            Assert.Contains("323456789012345678", settingsStore.Load().FavoriteGuildIds);
+
+            snapshot = await service.SetFriendOnlineNotificationsAsync(
+                enabled: true,
+                CancellationToken.None);
+
+            Assert.True(snapshot.FriendOnlineNotificationsEnabled);
+            Assert.True(settingsStore.Load().FriendOnlineNotificationsEnabled);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void FriendPresenceTracker_NotifiesOnlyAfterOfflineToOnlineTransition()
+    {
+        var tracker = new DiscordFriendPresenceTracker();
+        var offline = new DiscordFriendState(
+            "723456789012345678",
+            "player",
+            "Player",
+            string.Empty,
+            "offline");
+        var online = offline with { Status = "online" };
+
+        Assert.Empty(tracker.Observe([offline], enabled: true));
+        Assert.Single(tracker.Observe([online], enabled: true));
+        Assert.Empty(tracker.Observe([online], enabled: true));
+        Assert.Empty(tracker.Observe([online], enabled: false));
+        Assert.Empty(tracker.Observe([online], enabled: true));
+    }
+
+    [Fact]
     public void SettingsStore_EncryptsDiscordTokensForCurrentWindowsUser()
     {
         var root = CreateTemporaryDirectory();
@@ -227,7 +311,9 @@ public sealed class DiscordServiceTests
             {
                 ApplicationId = "123456789012345678",
                 AccessToken = "private-access-token",
-                RefreshToken = "private-refresh-token"
+                RefreshToken = "private-refresh-token",
+                FavoriteGuildIds = ["223456789012345678"],
+                FriendOnlineNotificationsEnabled = true
             });
 
             var persisted = File.ReadAllText(path);
@@ -235,6 +321,8 @@ public sealed class DiscordServiceTests
             Assert.DoesNotContain("private-refresh-token", persisted);
             Assert.Equal("private-access-token", store.Load().AccessToken);
             Assert.Equal("private-refresh-token", store.Load().RefreshToken);
+            Assert.Contains("223456789012345678", store.Load().FavoriteGuildIds);
+            Assert.True(store.Load().FriendOnlineNotificationsEnabled);
         }
         finally
         {

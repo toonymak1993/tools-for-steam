@@ -30,4 +30,26 @@ public sealed class SteamLoaderRuntimeTests
             shellBootstrapRequested: false,
             startupMode: SteamLoaderRuntime.StartupModeShell));
     }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ShouldStartShellHandOffMonitor_ReturnsTrue_InShellMode_RegardlessOfSplash(
+        bool startupSplashVisible)
+    {
+        Assert.True(SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
+            shellBootstrapMode: true,
+            startupSplashVisible: startupSplashVisible));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ShouldStartShellHandOffMonitor_ReturnsFalse_OutsideShellMode(
+        bool startupSplashVisible)
+    {
+        Assert.False(SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
+            shellBootstrapMode: false,
+            startupSplashVisible: startupSplashVisible));
+    }
 }

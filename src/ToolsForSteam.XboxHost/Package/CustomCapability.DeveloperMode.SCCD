@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  This unsigned SCCD is accepted by Windows only while Developer Mode is enabled.
+  The installer must disclose and enable that system-wide requirement before
+  registering the MSIX. Use a Microsoft-signed SCCD for production without it.
+-->
 <CustomCapabilityDescriptor xmlns="http://schemas.microsoft.com/appx/2018/sccd" xmlns:s="http://schemas.microsoft.com/appx/2018/sccd">
   <CustomCapabilities>
     <CustomCapability Name="Microsoft.appCategory.gamingHome_8wekyb3d8bbwe" />

@@ -79,9 +79,8 @@ public sealed class SteamLoaderBackgroundHost
             steamInstallationService,
             new ArtworkSettingsStore(Path.Combine(dataDirectory, "artwork.json")));
         var themesService = new ThemesService(httpClient, CssLoaderApiUri);
-        var performanceService = new TfsPerformanceService(
-            new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json")),
-            new PerformanceStatusStore(Path.Combine(dataDirectory, "performance-runtime.json")));
+        using var performanceService = new TfsPerformanceService(
+            new PerformanceSettingsStore(Path.Combine(dataDirectory, "performance.json")));
         performanceService.RestoreOverlayOnStartup();
         var handheldProfileNotificationService = new WindowsProfileNotificationService(dataDirectory);
         var handheldPerformanceService = new HandheldPerformanceService(
@@ -165,7 +164,9 @@ public sealed class SteamLoaderBackgroundHost
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
             EmbeddedAssetReader.ReadText("Assets/unifystore-overlay.js"));
 
-        var appStartService = new AppStartService(Path.Combine(dataDirectory, "app-start.json"));
+        var appStartService = new AppStartService(
+            Path.Combine(dataDirectory, "app-start.json"),
+            processWindowService);
         var autoSisirService = new AutoSisirService(
             new AutoSisirSettingsStore(Path.Combine(dataDirectory, "auto-sisr.json")),
             storeSyncService,
@@ -181,7 +182,9 @@ public sealed class SteamLoaderBackgroundHost
             storeSyncService,
             smartHomeService,
             handheldPerformanceService,
-            () => steamLoaderSettingsService.IsPluginEnabled("smart-home"));
+            () => steamLoaderSettingsService.IsPluginEnabled("smart-home"),
+            discordService,
+            () => steamLoaderSettingsService.IsPluginEnabled("discord"));
         using var hidMenuButtonMonitor = new HidMenuButtonMonitor();
         hidMenuButtonMonitor.ReportObserved += handheldPerformanceService.ObserveOemInput;
         var controllerShortcutService = new ControllerShortcutService(
@@ -199,7 +202,13 @@ public sealed class SteamLoaderBackgroundHost
                 message),
             isHidBackButtonDown: () => hidMenuButtonMonitor.IsBackDown,
             tryOpenExternalGameQuickAccessAsync: () =>
-                externalGameQuickAccessService.TryOpenForForegroundGameAsync(cancellationToken));
+                externalGameQuickAccessService.TryOpenForForegroundGameAsync(cancellationToken),
+            settingsProvider: steamLoaderSettingsService.GetControllerShortcutSettings,
+            hidControllerButtonMasksProvider: () => hidMenuButtonMonitor.ControllerButtonMasks,
+            openInGameOverlayAsync: () =>
+                devToolsClient.TryOpenInGameOverlayAsync(quickAccess: false, cancellationToken),
+            openInGameQuickAccessAsync: () =>
+                devToolsClient.TryOpenInGameOverlayAsync(quickAccess: true, cancellationToken));
 
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
@@ -223,6 +232,13 @@ public sealed class SteamLoaderBackgroundHost
             discordService,
             pluginFullTrustRuntime,
             externalGameQuickAccessService,
+            () => ControllerShortcutService.ReadPressedButtonIds(
+                ControllerShortcutService.ReadConnectedControllerButtonMasks()
+                    .Concat(hidMenuButtonMonitor.ControllerButtonMasks)
+                    .Distinct()
+                    .ToArray(),
+                hidMenuButtonMonitor.IsBackDown,
+                hidMenuButtonMonitor.IsMenuDown),
             ApiBaseUri,
             apiSessionToken,
             _hostState,

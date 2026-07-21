@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Models;
 
 namespace SteamLoader.App.Infrastructure.AppStart;
@@ -40,18 +42,25 @@ public sealed class AppStartService
     private readonly string _catalogPath;
     private readonly Func<AppStartDiscoveryResult> _discoverApps;
     private readonly Func<DateTimeOffset> _utcNow;
+    private readonly ProcessWindowService? _processWindowService;
     private readonly object _gate = new();
     private AppStartCatalogData? _catalog;
 
     public AppStartService(string settingsPath)
-        : this(settingsPath, DiscoverInstalledApps, () => DateTimeOffset.UtcNow)
+        : this(settingsPath, DiscoverInstalledApps, () => DateTimeOffset.UtcNow, null)
+    {
+    }
+
+    public AppStartService(string settingsPath, ProcessWindowService processWindowService)
+        : this(settingsPath, DiscoverInstalledApps, () => DateTimeOffset.UtcNow, processWindowService)
     {
     }
 
     internal AppStartService(
         string settingsPath,
         Func<AppStartDiscoveryResult> discoverApps,
-        Func<DateTimeOffset>? utcNow = null)
+        Func<DateTimeOffset>? utcNow = null,
+        ProcessWindowService? processWindowService = null)
     {
         _settingsPath = settingsPath;
         _catalogPath = Path.Combine(
@@ -59,6 +68,7 @@ public sealed class AppStartService
             $"{Path.GetFileNameWithoutExtension(settingsPath)}-catalog.json");
         _discoverApps = discoverApps;
         _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        _processWindowService = processWindowService;
     }
 
     public AppStartSnapshot GetSnapshot()
@@ -166,6 +176,22 @@ public sealed class AppStartService
             app = EnsureAppExistsNoLock(shortcutId);
         }
 
+        IReadOnlyList<ProcessWindowInfo>? windowsBeforeLaunch = null;
+        if (_processWindowService is not null)
+        {
+            try
+            {
+                windowsBeforeLaunch = _processWindowService.GetSnapshot().Windows;
+            }
+            catch
+            {
+                // Window discovery must never prevent the actual app launch.
+            }
+        }
+
+        var expectedProcessName = TryResolveExpectedProcessName(app);
+        Process? launchedProcess;
+
         if (string.Equals(app.SourceKind, AppStartSourceKinds.Packaged, StringComparison.OrdinalIgnoreCase))
         {
             var startInfo = new ProcessStartInfo
@@ -174,7 +200,7 @@ public sealed class AppStartService
                 UseShellExecute = true
             };
             startInfo.ArgumentList.Add($"shell:AppsFolder\\{app.SourcePath}");
-            Process.Start(startInfo)?.Dispose();
+            launchedProcess = Process.Start(startInfo);
         }
         else
         {
@@ -183,14 +209,114 @@ public sealed class AppStartService
                 throw new InvalidOperationException("The selected app shortcut no longer exists. Refresh the app index.");
             }
 
-            Process.Start(new ProcessStartInfo
+            launchedProcess = Process.Start(new ProcessStartInfo
             {
                 FileName = app.SourcePath,
                 UseShellExecute = true
-            })?.Dispose();
+            });
+        }
+
+        int? launchedProcessId = null;
+        if (launchedProcess is not null)
+        {
+            try
+            {
+                launchedProcessId = launchedProcess.Id;
+            }
+            catch
+            {
+                // Shell launches do not always expose the target process ID.
+            }
+            finally
+            {
+                launchedProcess.Dispose();
+            }
+        }
+
+        if (_processWindowService is not null && windowsBeforeLaunch is not null)
+        {
+            _processWindowService.ActivateLaunchedAppWhenReady(
+                app.Name,
+                expectedProcessName,
+                launchedProcessId,
+                windowsBeforeLaunch);
         }
 
         return GetSnapshot();
+    }
+
+    private static string? TryResolveExpectedProcessName(AppStartCatalogConfiguration app)
+    {
+        if (!string.Equals(app.SourceKind, AppStartSourceKinds.Desktop, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var targetPath = TryResolveShortcutTargetPath(app.SourcePath);
+        return string.IsNullOrWhiteSpace(targetPath)
+            ? null
+            : Path.GetFileNameWithoutExtension(targetPath);
+    }
+
+    private static string? TryResolveShortcutTargetPath(string shortcutPath)
+    {
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null)
+            {
+                return null;
+            }
+
+            shell = Activator.CreateInstance(shellType);
+            if (shell is null)
+            {
+                return null;
+            }
+
+            shortcut = shellType.InvokeMember(
+                "CreateShortcut",
+                BindingFlags.InvokeMethod,
+                null,
+                shell,
+                [shortcutPath]);
+            var targetPath = shortcut?.GetType().InvokeMember(
+                "TargetPath",
+                BindingFlags.GetProperty,
+                null,
+                shortcut,
+                null) as string;
+            return string.IsNullOrWhiteSpace(targetPath)
+                ? null
+                : Environment.ExpandEnvironmentVariables(targetPath.Trim());
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            ReleaseComObject(shortcut);
+            ReleaseComObject(shell);
+        }
+    }
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is null || !Marshal.IsComObject(value))
+        {
+            return;
+        }
+
+        try
+        {
+            Marshal.FinalReleaseComObject(value);
+        }
+        catch
+        {
+        }
     }
 
     private AppStartCatalogSnapshot BuildCatalogSnapshotNoLock(AppStartCatalogData catalog)

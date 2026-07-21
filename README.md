@@ -4,7 +4,7 @@
 
 ### A controller-first Windows console layer for Steam Big Picture
 
-[![Beta](https://img.shields.io/badge/release-0.3.9_beta-6f42c1?style=for-the-badge)](https://github.com/toonymak1993/tools-for-steam/releases)
+[![Release](https://img.shields.io/badge/release-0.4.0-2ea44f?style=for-the-badge)](https://github.com/toonymak1993/tools-for-steam/releases)
 [![Windows](https://img.shields.io/badge/platform-Windows_10%2F11-0078d4?style=for-the-badge&logo=windows)](#requirements)
 [![SDK](https://img.shields.io/badge/plugin_SDK-1.0.0-2ea44f?style=for-the-badge)](sdk/QUICKSTART.md)
 [![Xbox Mode](https://img.shields.io/badge/Xbox_Mode-controller_first-107c10?style=for-the-badge&logo=xbox)](#three-startup-modes)
@@ -65,7 +65,7 @@ The plugin stays hidden on unverified devices instead of applying unknown hardwa
 
 | Tool | Purpose |
 |---|---|
-| **FPS Overlay** | FPS, frametime, process, CPU, and memory telemetry with Steam-style overlay controls |
+| **Performance** | Automatically installed RTSS with SteamOS-style modes, FPS/frametime/1% low telemetry, graphs, and per-game frame limiting |
 | **Processes** | List visible windows and bring an app to the foreground |
 | **App Start** | Curate and launch installed Windows apps with a controller |
 | **Store Sync** | Discover launcher libraries, create Steam shortcuts and collections, and refresh artwork |
@@ -74,12 +74,14 @@ The plugin stays hidden on unverified devices instead of applying unknown hardwa
 | **Display** | Switch displays, resolutions, and refresh rates |
 | **CSSLoader** | Control local themes, profiles, presets, and backend tools |
 | **HLTB** | Show HowLongToBeat estimates on supported game pages |
-| **Discord** | See online friends and browse servers with approximate presence counts |
+| **Discord** | See online friends, pin favorite servers, browse approximate presence counts, and optionally get friend-online notifications |
 | **Auto SISR** | Optional marker-mode automation for selected non-Steam games |
 | **Homey** | Optional rooms, lights, moods, colors, and flows integration |
 | **Power** | Restart Steam, recover Explorer, sleep, restart, or shut down safely |
 
 Most tools can be hidden from TFS Settings. Safety and recovery actions remain available.
+
+The Performance tool reuses existing RTSS binaries and settings without reinstalling them. Setup only grants the installing user write access to RTSS' data-only `Profiles` folder so per-game frame limits can be saved without an elevated TFS service. Only when RTSS is missing does Setup install the tested 7.3.7 WinGet package; Tools for Steam then uses the RTSS shared-memory and profile APIs. It owns one isolated OSD slot, writes only per-game profiles, leaves other RTSS clients untouched, and does not uninstall RTSS because another application may still use it. RTSS is third-party freeware by Unwinder/Guru3D and is downloaded separately rather than bundled into Tools for Steam.
 
 ### Discord setup
 
@@ -87,8 +89,10 @@ Most tools can be hidden from TFS Settings. Safety and recovery actions remain a
 2. Open **Discord > Friends** in Quick Access and select **Connect Discord**.
 3. Sign in in Discord's browser window and approve the friends/presence permission.
 4. Return to Tools for Steam to see currently online friends and browse your Discord servers.
+5. Use **Manage Server Favorites** to pin frequently used servers. Pinned servers appear in the first, collapsible section above friends and all other servers. You can also press the controller Menu/Options button on a server row to pin or unpin it directly.
+6. Optional: enable **Notify When a Friend Comes Online** in Discord Settings to receive a Tools for Steam notification after a friend changes from offline to online.
 
-The primary integration uses the official Discord Social SDK and requests `openid sdk.social_layer_presence guilds`. Discord handles browser sign-in and consent; Tools for Steam never requests a password or bot token. OAuth access and refresh tokens are protected with Windows DPAPI for the current Windows account and are removed when the user disconnects. Discord's supported user API exposes an approximate online count per server, but not the identities of individual online server members.
+The primary integration uses the official Discord Social SDK and requests `openid sdk.social_layer_presence guilds`. Discord handles browser sign-in and consent; Tools for Steam never requests a password or bot token. OAuth access and refresh tokens are protected with Windows DPAPI for the current Windows account and are removed when the user disconnects. Favorite server IDs and the optional notification preference are stored locally. When friend-online notifications are enabled, TFS checks presence in the background and suppresses alerts for friends who were already online when monitoring started. Discord's supported user API exposes an approximate online count per server, but not the identities of individual online server members.
 
 The former [public server widget](https://docs.discord.com/developers/resources/guild#get-guild-widget) remains available as an optional fallback. It still requires the server owner to enable **Server Settings > Engagement > Server Widget**, and it can show only data that Discord exposes publicly.
 
@@ -140,7 +144,7 @@ TFS starts before Explorer, prepares Steam Big Picture and the local bridge, the
 
 ### Xbox Mode
 
-On compatible Windows 11 systems with Gaming FSE support, TFS installs a signed Gaming Home package and becomes the controller-first gaming home while Explorer remains the Windows shell. The installer hides this option when the platform capability is unavailable.
+On compatible Windows 11 systems with Gaming FSE support, TFS installs a signed Gaming Home package and becomes the controller-first gaming home while Explorer remains the Windows shell. The installer hides this option when the platform capability is unavailable. Public sideloaded builds use Windows Developer Mode for the protected Gaming Home capability and disclose that system-wide change on the startup-mode page.
 
 ### Tray Mode
 
@@ -208,7 +212,7 @@ Outputs:
 - `dist\installer\ToolsForSteamSetup-<version>.exe` — versioned copy;
 - `dist\portable\ToolsForSteam.exe` — internal installer payload.
 
-The Xbox Host build requires the configured TFS signing certificate. The outer installer should also be Authenticode-signed for broad public distribution.
+The Xbox Host build requires the configured TFS signing certificate. If `TFS_XBOX_HOST_SCCD` points to a Microsoft-signed descriptor (or one is placed at `dist\signing\ToolsForSteam.XboxHost.sccd`), the build validates that it authorizes `GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j` and the MSIX certificate chain. Otherwise it deliberately uses `CustomCapability.DeveloperMode.SCCD`; the installer then discloses and enables Windows Developer Mode only when Xbox Mode is selected. The unsigned Microsoft-submission template remains at `src\ToolsForSteam.XboxHost\Package\CustomCapability.request.xml`. The outer installer should also be Authenticode-signed for broad public distribution.
 
 ## Repository map
 

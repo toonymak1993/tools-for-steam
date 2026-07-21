@@ -152,7 +152,9 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
             .Select(device => new AudioOutputDeviceInfo(
                 device.Id.ToString(),
                 device.FullName,
-                device.IsDefaultDevice))
+                device.IsDefaultDevice,
+                device.Name ?? string.Empty,
+                device.InterfaceName ?? string.Empty))
             .OrderByDescending(device => device.IsDefault)
             .ThenBy(device => device.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();

@@ -43,6 +43,42 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Value, $encoding)
 }
 
+function Get-PluginPublishedAtUtc {
+    param(
+        [object]$ExistingEntry,
+        [string]$RepoRoot,
+        [string]$PluginManifestPath
+    )
+
+    $existingValue = [string]$ExistingEntry.publishedAtUtc
+    $existingTimestamp = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($existingValue, [ref]$existingTimestamp)) {
+        return $existingTimestamp.ToUniversalTime().ToString("o")
+    }
+
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitCommand) {
+        $relativeManifestPath = [System.IO.Path]::GetRelativePath($RepoRoot, $PluginManifestPath).Replace("\", "/")
+        $gitDates = @(& $gitCommand.Source -C $RepoRoot log --diff-filter=A --format=%aI -- $relativeManifestPath 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $oldestGitTimestamp = $gitDates |
+                ForEach-Object {
+                    $gitTimestamp = [DateTimeOffset]::MinValue
+                    if ([DateTimeOffset]::TryParse(([string]$_).Trim(), [ref]$gitTimestamp)) {
+                        $gitTimestamp
+                    }
+                } |
+                Sort-Object |
+                Select-Object -First 1
+            if ($oldestGitTimestamp) {
+                return $oldestGitTimestamp.ToUniversalTime().ToString("o")
+            }
+        }
+    }
+
+    return [DateTimeOffset]::UtcNow.ToString("o")
+}
+
 function Test-NetworkHost([string]$HostName) {
     if ($HostName -eq "<local>") {
         return $true
@@ -230,10 +266,13 @@ switch ($Command) {
         $catalogPath = Join-Path $storeRoot "catalog.json"
         $existingCatalog = $null
         $existingPlugins = @()
+        $existingPlugin = $null
         if (Test-Path -LiteralPath $catalogPath) {
             try {
                 $existingCatalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
                 $existingPlugins = @($existingCatalog.plugins)
+                $existingPlugin = @($existingPlugins | Where-Object { $_.id -eq $manifest.id }) |
+                    Select-Object -First 1
             } catch {
                 $existingCatalog = $null
                 $existingPlugins = @()
@@ -310,6 +349,10 @@ switch ($Command) {
         if (-not [string]::IsNullOrWhiteSpace($imageUrl)) {
             $catalogImages = @($imageUrl)
         }
+        $publishedAtUtc = Get-PluginPublishedAtUtc `
+            -ExistingEntry $existingPlugin `
+            -RepoRoot $root `
+            -PluginManifestPath (Join-Path $root "tfs-plugin.json")
 
         $entry = [ordered]@{
             id = $manifest.id
@@ -323,6 +366,7 @@ switch ($Command) {
             networkHosts = $manifestNetworkHosts
             packagePath = "./packages/$packageFileName"
             packageSha256 = $hash
+            publishedAtUtc = $publishedAtUtc
             images = $catalogImages
             tags = @($catalogTags)
             changelog = $catalogChangelog

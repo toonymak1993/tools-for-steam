@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installer = fs.readFileSync(path.join(root, "installer", "ToolsForSteam.iss"), "utf8");
 const preparation = fs.readFileSync(path.join(root, "scripts", "prepare-handheld-runtime.ps1"), "utf8");
+const publisher = fs.readFileSync(path.join(root, "scripts", "publish-installer.ps1"), "utf8");
 const variants = fs.readFileSync(path.join(root, "scripts", "publish-installer-variants.ps1"), "utf8");
+const xboxSnapshot = fs.readFileSync(path.join(root, "scripts", "XboxHostPayloadSnapshot.ps1"), "utf8");
 const systemControl = fs.readFileSync(
   path.join(root, "src", "SteamLoader.App", "Infrastructure", "Handheld", "HandheldSystemControlService.cs"),
   "utf8",
@@ -45,8 +47,16 @@ test("installer and preparation script pin the same handheld driver hashes", () 
 test("installer builds must bind verification to the packaged Xbox host version", () => {
   assert.doesNotMatch(installer, /#define\s+XboxHostBuildVersion\s+"[^"]+"/i);
   assert.match(installer, /#error\s+XboxHostBuildVersion\s+must match/i);
-  assert.match(variants, /AppxManifest\.xml/i);
+  assert.match(installer, /#error\s+XboxHostRequiresDeveloperMode\s+must match/i);
+  assert.match(installer, /#error\s+XboxHostPayloadDir\s+must point to the immutable/i);
+  assert.match(xboxSnapshot, /AppxManifest\.xml/i);
+  assert.match(xboxSnapshot, /Guid.*NewGuid/i);
+  assert.match(publisher, /New-XboxHostPayloadSnapshot/i);
+  assert.match(publisher, /\/DXboxHostPayloadDir=\$\(\$xboxHostSnapshot\.Directory\)/i);
+  assert.match(variants, /New-XboxHostPayloadSnapshot/i);
   assert.match(variants, /\/DXboxHostBuildVersion=\$xboxHostPackageVersion/i);
+  assert.match(variants, /\/DXboxHostRequiresDeveloperMode=\$xboxHostDeveloperModeDefine/i);
+  assert.match(variants, /\/DXboxHostPayloadDir=\$\(\$xboxHostSnapshot\.Directory\)/i);
 });
 
 test("MSI OEM takeover leaves the installed Store package intact", () => {

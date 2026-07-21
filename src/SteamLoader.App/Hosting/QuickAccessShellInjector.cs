@@ -116,42 +116,6 @@ public sealed class QuickAccessShellInjector
             _hostState.UpdateSharedContext(true, "SharedJSContext attached.");
         }
 
-        var quickAccessTarget = await _devToolsClient.GetQuickAccessTargetAsync(cancellationToken);
-        if (quickAccessTarget is null)
-        {
-            _popupReadyLogged = false;
-            _quickAccessTargetId = null;
-            _hostState.UpdateQuickAccess(false, "Waiting for the Quick Access popup.");
-        }
-        else if (
-            !_popupReadyLogged ||
-            !string.Equals(_quickAccessTargetId, quickAccessTarget.Id, StringComparison.Ordinal) ||
-            !await IsTargetScriptCurrentAsync(
-                quickAccessTarget,
-                "__steamLoaderPopupScriptVersion",
-                _popupScriptVersion,
-                cancellationToken))
-        {
-            _popupReadyLogged = await InjectIntoTargetAsync(
-                quickAccessTarget,
-                _popupScriptTemplate,
-                "__steamLoaderPopupScriptVersion",
-                _popupScriptVersion,
-                "Quick Access attached.",
-                _popupReadyLogged,
-                (message) => _hostState.UpdateQuickAccess(true, message),
-                cancellationToken);
-
-            if (_popupReadyLogged)
-            {
-                _quickAccessTargetId = quickAccessTarget.Id;
-            }
-        }
-        else
-        {
-            _hostState.UpdateQuickAccess(true, "Quick Access attached.");
-        }
-
         var themeSurfaceTargets = await _devToolsClient.GetThemeSurfaceTargetsAsync(cancellationToken);
         if (themeSurfaceTargets.Count == 0)
         {
@@ -194,6 +158,45 @@ public sealed class QuickAccessShellInjector
                     _themeSurfaceTargetIds.Add(themeSurfaceTarget.Id);
                 }
             }
+        }
+
+        // Prepare the stable full-screen hosts before exposing the Quick Access
+        // controls that can open an overlay. This avoids a first-click race where
+        // the popup closes before the Store has been injected into the main surface.
+        var quickAccessTarget = await _devToolsClient.GetQuickAccessTargetAsync(cancellationToken);
+        if (quickAccessTarget is null)
+        {
+            _popupReadyLogged = false;
+            _quickAccessTargetId = null;
+            _hostState.UpdateQuickAccess(false, "Waiting for the Quick Access popup.");
+        }
+        else if (
+            !_popupReadyLogged ||
+            !string.Equals(_quickAccessTargetId, quickAccessTarget.Id, StringComparison.Ordinal) ||
+            !await IsTargetScriptCurrentAsync(
+                quickAccessTarget,
+                "__steamLoaderPopupScriptVersion",
+                _popupScriptVersion,
+                cancellationToken))
+        {
+            _popupReadyLogged = await InjectIntoTargetAsync(
+                quickAccessTarget,
+                _popupScriptTemplate,
+                "__steamLoaderPopupScriptVersion",
+                _popupScriptVersion,
+                "Quick Access attached.",
+                _popupReadyLogged,
+                (message) => _hostState.UpdateQuickAccess(true, message),
+                cancellationToken);
+
+            if (_popupReadyLogged)
+            {
+                _quickAccessTargetId = quickAccessTarget.Id;
+            }
+        }
+        else
+        {
+            _hostState.UpdateQuickAccess(true, "Quick Access attached.");
         }
     }
 

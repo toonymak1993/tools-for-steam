@@ -16,7 +16,7 @@ public static class SteamLoaderPluginCatalog
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),
         new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),
-        new("performance", "FPS Overlay", "Built-in TFS FPS meter and Steam-style overlay controls.", true),
+        new("performance", "Performance", "RTSS overlay modes, live metrics, and per-game FPS limiting.", true),
         new("hltb", "HLTB", "HowLongToBeat game page estimates.", true),
         new("discord", "Discord", "See online friends and browse servers with presence counts.", true, false),
         new("themes", "CSSLoader", "Controller for local CSSLoader themes, presets, and backend tools.", true),

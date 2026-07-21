@@ -60,16 +60,16 @@ const moduleData = {
     footnote: "A small module with a big quality-of-life payoff for shared screens and hybrid desk setups."
   },
   performance: {
-    tag: "Overlay tuning",
-    badge: "Readability focused",
+    tag: "RTSS performance",
+    badge: "SteamOS-style",
     title: "Performance",
-    description: "Adjust Steam's FPS overlay and related readability settings so status data works better at TV distance.",
+    description: "Use automatically configured RTSS overlay modes and per-game frame limiting from Quick Access.",
     points: [
-      "Tune position, detail level, contrast, and scale",
-      "Make overlay data more useful from the couch",
-      "Keep adjustments close during test and play sessions"
+      "Switch between FPS, strip, full, and frame-pacing modes",
+      "See FPS, frametime, 1% low, CPU, RAM, battery, and a live graph",
+      "Set common per-game frame caps without leaving Steam"
     ],
-    footnote: "Useful when the built-in overlay exists, but its defaults are not comfortable from the room."
+    footnote: "RTSS is installed by setup and controlled through isolated OSD slots and per-game profiles."
   },
   hltb: {
     tag: "Game page context",

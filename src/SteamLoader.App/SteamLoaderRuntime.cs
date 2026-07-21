@@ -17,12 +17,9 @@ internal static class SteamLoaderRuntime
     public const string PreviewSplashDurationArgument = "--preview-duration";
     public const string HidDebugArgument = "--hid-debug";
     public const string GamepadHelperArgument = "--gamepad-helper";
-    public const string FpsHelperArgument = "--fps-helper";
     public const string RegisterInstalledHelperTasksArgument = "--register-installed-helper-tasks";
     public const string RegisterGamepadHelperTaskArgument = "--register-gamepad-helper-task";
-    public const string RegisterFpsHelperTaskArgument = "--register-fps-helper-task";
     public const string CheckGamepadHelperTaskArgument = "--check-gamepad-helper-task";
-    public const string CheckFpsHelperTaskArgument = "--check-fps-helper-task";
     public const string SanitizeSteamAutostartArgument = "--sanitize-steam-autostart";
     public const string RequestSteamAttentionArgument = "--request-steam-attention";
     public const string RepairSteamStartupArgument = "--repair-steam-startup";
@@ -49,7 +46,6 @@ internal static class SteamLoaderRuntime
     public const string UpdateChannelStable = "stable";
     public const string UpdateChannelBeta = "beta";
     public const string GamepadHelperMutexName = "ToolsForSteam.GamepadHelper";
-    public const string FpsHelperMutexName = "ToolsForSteam.FpsHelper";
 
     public static string AutostartArguments => TrayArgument;
 
@@ -59,5 +55,15 @@ internal static class SteamLoaderRuntime
     {
         return shellBootstrapRequested &&
             string.Equals(startupMode, StartupModeShell, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool ShouldStartShellHandOffMonitor(
+        bool shellBootstrapMode,
+        bool startupSplashVisible)
+    {
+        // Restoring Explorer is a Shell Mode safety requirement. The splash is
+        // presentation only and must never suppress the Windows shell hand-off.
+        _ = startupSplashVisible;
+        return shellBootstrapMode;
     }
 }

@@ -1,8 +1,9 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 18;
+  const stateVersion = 19;
   const closedPollMs = 700;
   const openPollMs = 2200;
+  const overlayOpenInputGraceMs = 360;
   const inputStorageKey = "ToolsForSteamPluginStoreInput";
   const overlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
   const storeChannelName = "ToolsForSteamPluginStoreChannel";
@@ -317,10 +318,20 @@
     return opened;
   }
 
+  function isQuickAccessSurface() {
+    const surfaceIdentity = `${document.title || ""} ${window.location?.href || ""}`;
+    return Boolean(
+      document.getElementById("QuickAccess-NA") ||
+      document.querySelector("[id^='QuickAccess']") ||
+      /quick[\s_-]*access/i.test(surfaceIdentity),
+    );
+  }
+
   function canHostPluginStoreOverlay() {
     return Boolean(
       document.body &&
-      !document.getElementById("QuickAccess-NA") &&
+      document.visibilityState !== "hidden" &&
+      !isQuickAccessSurface() &&
       window.innerWidth >= 900 &&
       window.innerHeight >= 500,
     );
@@ -824,6 +835,21 @@
         color: var(--store-blue-strong);
       }
 
+      .steamloader-plugin-store-badge.is-online {
+        background: rgba(102, 192, 244, 0.16);
+        color: #8ed6ff;
+      }
+
+      .steamloader-plugin-store-badge.is-local {
+        background: rgba(245, 158, 11, 0.17);
+        color: #fbc56a;
+      }
+
+      .steamloader-plugin-store-badge.is-new {
+        background: rgba(52, 211, 153, 0.17);
+        color: #72e6bd;
+      }
+
       .steamloader-plugin-store-badge.is-update {
         background: rgba(102, 192, 244, 0.12);
         color: rgba(199, 213, 224, 0.92);
@@ -1318,9 +1344,22 @@
       }
 
       .steamloader-plugin-store-badge.is-built-in,
+      .steamloader-plugin-store-badge.is-online,
+      .steamloader-plugin-store-badge.is-local,
+      .steamloader-plugin-store-badge.is-new,
       .steamloader-plugin-store-badge.is-update {
         color: rgba(238, 243, 248, 0.88);
         background: rgba(255, 255, 255, 0.1);
+      }
+
+      .steamloader-plugin-store-badge.is-local {
+        color: #f3c976;
+        background: rgba(214, 156, 56, 0.14);
+      }
+
+      .steamloader-plugin-store-badge.is-new {
+        color: #8ce3c2;
+        background: rgba(70, 188, 143, 0.14);
       }
 
       .steamloader-plugin-store-card-footer {
@@ -3313,6 +3352,9 @@
         plugin?.author,
         plugin?.source,
         plugin?.category,
+        plugin?.isLocalDevelopment ? "local development" : "",
+        plugin?.isAvailableOnline ? "online" : "",
+        plugin?.isNew ? "new" : "",
         Array.isArray(plugin?.tags) ? plugin.tags.join(" ") : "",
       ]
         .filter(Boolean)
@@ -3673,7 +3715,20 @@
       badgeKeys.add(key);
       badges.append(buildBadge(value, extraClass));
     };
-    appendUniqueBadge(plugin?.isBuiltIn ? "Built-In" : "Community", plugin?.isBuiltIn ? "is-built-in" : "");
+    if (plugin?.isBuiltIn) {
+      appendUniqueBadge("Built-In", "is-built-in");
+    } else if (plugin?.isLocalDevelopment) {
+      appendUniqueBadge("Local", "is-local");
+    } else if (plugin?.isAvailableOnline) {
+      appendUniqueBadge("Online", "is-online");
+    } else {
+      appendUniqueBadge("Community");
+    }
+
+    if (plugin?.isNew) {
+      appendUniqueBadge("New", "is-new");
+    }
+
     if (plugin?.hasUpdate) {
       appendUniqueBadge("Update", "is-update");
     }
@@ -3840,12 +3895,22 @@
       panel.append(reviewNotice);
     }
     const facts = createNode("div", "steamloader-plugin-store-context-facts");
+    const publishedAtDate = plugin.publishedAtUtc ? new Date(plugin.publishedAtUtc) : null;
+    const publishedAtText = publishedAtDate && Number.isFinite(publishedAtDate.getTime())
+      ? publishedAtDate.toLocaleDateString()
+      : "Unknown";
     const factValues = [
       ["Available", plugin.version || "Built-in"],
       ["Installed", plugin.installedVersion || (plugin.isBuiltIn ? "Included" : "Not installed")],
       ["SDK", plugin.sdkVersion || (plugin.isBuiltIn ? "Core" : "Unknown")],
       ["Author", plugin.author || plugin.source || "Tools for Steam"],
     ];
+    if (!plugin.isBuiltIn) {
+      factValues.push(
+        ["Source", plugin.isLocalDevelopment ? "Local development" : plugin.isAvailableOnline ? "Online catalog" : "Catalog only"],
+        ["Published", publishedAtText],
+      );
+    }
     for (const [label, value] of factValues) {
       const fact = createNode("div", "steamloader-plugin-store-context-fact");
       fact.append(
@@ -4019,6 +4084,12 @@
       if (shouldOpen && !state.open) {
         setRemoteStoreOverlayActive(true);
         state.open = true;
+        // Closing Quick Access can emit a final Back/B input while the full-screen
+        // host is appearing. Do not let that transition immediately close the Store.
+        state.ignoreOverlayInputUntil = Math.max(
+          state.ignoreOverlayInputUntil || 0,
+          Date.now() + overlayOpenInputGraceMs,
+        );
         requestStoreFocus(state.selectedPluginId ? `card:${state.selectedPluginId}` : `section:${state.activeSection}`);
         render();
         await loadSnapshot(false);

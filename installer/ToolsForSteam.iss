@@ -1,6 +1,6 @@
 #define MyAppName "Tools for Steam"
 #define MyAppShortName "TFS"
-#define MyAppVersion "0.3.9"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "GCM - Gaming Console Mode"
 #define MyAppExeName "ToolsForSteam.exe"
 #define MyAppId "{{9A9F0B7E-4C79-4C7D-8E4B-0E0D766E0B72}"
@@ -14,11 +14,14 @@
 #ifndef VariantCustomPages
   #define VariantCustomPages "1"
 #endif
-#ifndef VariantFpsHelperPrep
-  #define VariantFpsHelperPrep "1"
-#endif
 #ifndef XboxHostBuildVersion
   #error XboxHostBuildVersion must match the signed MSIX manifest and be supplied by the build script.
+#endif
+#ifndef XboxHostRequiresDeveloperMode
+  #error XboxHostRequiresDeveloperMode must match the SCCD policy selected by the build script.
+#endif
+#ifndef XboxHostPayloadDir
+  #error XboxHostPayloadDir must point to the immutable Xbox host payload snapshot selected by the build script.
 #endif
 
 [Setup]
@@ -58,8 +61,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#PayloadDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "{#PayloadDir}\{#MyAppExeName}"; DestName: "ToolsForSteamUpdateHelper.exe"; Flags: dontcopy noencryption
-Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.msix"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
-Source: "..\dist\xbox-host\ToolsForSteam.XboxHost.cer"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
+Source: "{#XboxHostPayloadDir}\ToolsForSteam.XboxHost.msix"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
+Source: "{#XboxHostPayloadDir}\ToolsForSteam.XboxHost.cer"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
 Source: "XboxModePackage.ps1"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
 Source: "XboxModeSession.ps1"; Flags: dontcopy
 Source: "XboxModeDiagnostics.ps1"; Flags: dontcopy
@@ -85,6 +88,7 @@ Type: files; Name: "{app}\SteamLoader.deps.json"
 Type: files; Name: "{app}\SteamLoader.runtimeconfig.json"
 Type: files; Name: "{app}\install-toolsforsteam.ps1"
 Type: files; Name: "{app}\uninstall-toolsforsteam.ps1"
+Type: files; Name: "{app}\data\performance-runtime.json"
 Type: files; Name: "{app}\data\viiper-runtime.log"
 Type: filesandordirs; Name: "{app}\data\viiper-profile"
 Type: filesandordirs; Name: "{app}\data\oem-shortcut-quarantine"
@@ -105,8 +109,9 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-handheld-replacement";
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--remove-owned-handheld-drivers"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveOwnedHandheldDrivers"
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--restore-xbox-mode"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreXboxModeSettings"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""Get-AppxPackage -Name 'GCM.ToolsForSteam.XboxHost' | Remove-AppxPackage"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModePackage"
-Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople E38C2E0BDF195C5F4329102504002F4E0766FF99"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModeCertificate"
-Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveLegacyXboxModeCertificate"
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople F12969BBD718F0BDAE024A02C716BEBF39141CA7"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveXboxModeCertificate"
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople E38C2E0BDF195C5F4329102504002F4E0766FF99"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveLegacyXboxModeCertificate"
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore TrustedPeople B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveOlderXboxModeCertificate"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\GamepadHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveGamepadHelperTask"
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\ToolsForSteam\FpsHelper"" /F"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveFpsHelperTask"
 
@@ -115,12 +120,16 @@ const
   XboxHostPackageName = 'GCM.ToolsForSteam.XboxHost';
   XboxHostPackageFamilyName = 'GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j';
   XboxHostPackageVersion = '{#XboxHostBuildVersion}';
+  XboxHostRequiresDeveloperMode = {#XboxHostRequiresDeveloperMode};
   XboxHostPublisher = 'CN=GCM Gaming Console Mode';
-  XboxHostCertificateThumbprint = 'E38C2E0BDF195C5F4329102504002F4E0766FF99';
-  LegacyXboxHostCertificateThumbprint = 'B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251';
+  XboxHostCertificateThumbprint = 'F12969BBD718F0BDAE024A02C716BEBF39141CA7';
+  LegacyXboxHostCertificateThumbprint = 'E38C2E0BDF195C5F4329102504002F4E0766FF99';
+  OlderXboxHostCertificateThumbprint = 'B9FB8BD316D7A0FB2AC6AC10F204D562F9F8E251';
   PawnIOSetupSha256 = '1f519a22e47187f70a1379a48ca604981c4fcf694f4e65b734aaa74a9fba3032';
   UsbIpSetupSha256 = '44451fe06f4186125c2a5ecd25b099c5560a61a60b1e56f5a0758e77a60afa44';
   HidHideSetupSha256 = 'f4bbbcb82e6258641b887c74bc81c4c5f66e4aa811808dfc304347687b7605f6';
+  RtssPackageId = 'Guru3D.RTSS';
+  RtssRequiredVersion = '7.3.7';
 
 var
   SystemCheckPage: TWizardPage;
@@ -158,11 +167,15 @@ var
   StartupModeFinalized: Boolean;
   FinalizedStartupMode: string;
   XboxModeFailureReason: string;
+  XboxDeveloperModeChangedThisRun: Boolean;
+  XboxDeveloperModeValueExisted: Boolean;
+  XboxDeveloperModePreviousValue: Cardinal;
   DiagnosticFailureReason: string;
   HandheldDriversInstalledThisRun: Boolean;
   ElevatedHelperTasksSuspended: Boolean;
 
 function IsMsiClawA8: Boolean; forward;
+function SelectedStartupMode: string; forward;
 
 function GetRegistryStringValue(RootKey: Integer; SubKey: string; ValueName: string): string;
 begin
@@ -208,9 +221,6 @@ begin
   XboxModeFailureReason := Message;
   RecordDiagnosticFailure(Message);
 end;
-
-function SelectedStartupMode: string;
-forward;
 
 function IsXboxModePlatformSupported: Boolean;
 forward;
@@ -351,7 +361,7 @@ begin
   Log('Xbox Mode package installed by this setup run was rolled back.');
 end;
 
-function MigrateLegacyXboxSigningCertificate: Boolean;
+function MigrateXboxSigningCertificate(Thumbprint: string): Boolean;
 var
   LegacyCertificateKeyPath: string;
   ResultCode: Integer;
@@ -359,7 +369,7 @@ begin
   Result := True;
   LegacyCertificateKeyPath :=
     'SOFTWARE\Microsoft\SystemCertificates\TrustedPeople\Certificates\' +
-    LegacyXboxHostCertificateThumbprint;
+    Thumbprint;
   if not RegKeyExists(HKLM64, LegacyCertificateKeyPath) then
   begin
     Exit;
@@ -385,7 +395,7 @@ begin
 
   if not Exec(
       ExpandConstant('{sys}\certutil.exe'),
-      '-delstore TrustedPeople "' + LegacyXboxHostCertificateThumbprint + '"',
+      '-delstore TrustedPeople "' + Thumbprint + '"',
       ExpandConstant('{app}\XboxMode'),
       SW_HIDE,
       ewWaitUntilTerminated,
@@ -399,6 +409,97 @@ begin
   Log('The retired Xbox Mode signing certificate was removed successfully.');
 end;
 
+function MigrateLegacyXboxSigningCertificates: Boolean;
+begin
+  Result := MigrateXboxSigningCertificate(LegacyXboxHostCertificateThumbprint);
+  if Result then
+  begin
+    Result := MigrateXboxSigningCertificate(OlderXboxHostCertificateThumbprint);
+  end;
+end;
+
+function IsXboxDeveloperModeEnabled: Boolean;
+var
+  DeveloperModeValue: Cardinal;
+begin
+  Result :=
+    RegQueryDWordValue(
+      HKLM64,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock',
+      'AllowDevelopmentWithoutDevLicense',
+      DeveloperModeValue) and
+    (DeveloperModeValue = 1);
+end;
+
+function EnsureXboxDeveloperMode: Boolean;
+begin
+  Result := True;
+  if XboxHostRequiresDeveloperMode = 0 then
+  begin
+    Exit;
+  end;
+
+  if IsXboxDeveloperModeEnabled then
+  begin
+    Log('Windows Developer Mode is already enabled for the Xbox Mode SCCD.');
+    Exit;
+  end;
+
+  XboxDeveloperModeValueExisted := RegQueryDWordValue(
+    HKLM64,
+    'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock',
+    'AllowDevelopmentWithoutDevLicense',
+    XboxDeveloperModePreviousValue);
+  UpdateSetupStatus('Enabling Windows Developer Mode required by the Xbox Mode package...');
+  if not RegWriteDWordValue(
+      HKLM64,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock',
+      'AllowDevelopmentWithoutDevLicense',
+      1) then
+  begin
+    RecordXboxModeFailure('Windows Developer Mode could not be enabled for the Xbox Mode package.');
+    Result := False;
+    Exit;
+  end;
+
+  XboxDeveloperModeChangedThisRun := True;
+  Result := IsXboxDeveloperModeEnabled;
+  if Result then
+  begin
+    Log('Windows Developer Mode was enabled because the selected Xbox Mode package uses a development SCCD.');
+  end
+  else
+  begin
+    RecordXboxModeFailure('Windows did not confirm Developer Mode after the installer enabled it.');
+  end;
+end;
+
+procedure RollBackXboxDeveloperModeEnabledThisRun;
+begin
+  if not XboxDeveloperModeChangedThisRun then
+  begin
+    Exit;
+  end;
+
+  if XboxDeveloperModeValueExisted then
+  begin
+    RegWriteDWordValue(
+      HKLM64,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock',
+      'AllowDevelopmentWithoutDevLicense',
+      XboxDeveloperModePreviousValue);
+  end
+  else
+  begin
+    RegDeleteValue(
+      HKLM64,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock',
+      'AllowDevelopmentWithoutDevLicense');
+  end;
+  XboxDeveloperModeChangedThisRun := False;
+  Log('Windows Developer Mode was restored after the Xbox Mode installation failed.');
+end;
+
 procedure InstallXboxModeSupport;
 var
   CertificatePath: string;
@@ -409,7 +510,17 @@ begin
   XboxModeSupportReady := False;
   XboxModeFailureReason := '';
   XboxCertificateInstalledThisRun := False;
+  XboxDeveloperModeChangedThisRun := False;
+  XboxDeveloperModeValueExisted := False;
+  XboxDeveloperModePreviousValue := 0;
   XboxPackageExistedBeforeInstall := IsXboxPackageInstalled;
+
+  if (XboxHostRequiresDeveloperMode = 1) and
+     (SelectedStartupMode <> 'xbox') then
+  begin
+    Log('Xbox Mode package installation skipped because the Developer Mode fallback was not selected.');
+    Exit;
+  end;
 
   if not IsXboxModePlatformSupported then
   begin
@@ -431,17 +542,25 @@ begin
     Exit;
   end;
 
-  UpdateSetupStatus('Verifying the signed Xbox Mode package...');
-  if not RunXboxPackageTool('VerifyPayload', CertificatePath, PackagePath) then
+  if not EnsureXboxDeveloperMode then
   begin
-    RecordXboxModeFailure('The signed Xbox Mode payload failed verification.');
-    Log('Xbox Mode payload verification failed before certificate installation.');
+    RollBackXboxDeveloperModeEnabledThisRun;
     Exit;
   end;
 
-  if not MigrateLegacyXboxSigningCertificate then
+  UpdateSetupStatus('Verifying the Xbox Mode package and capability policy...');
+  if not RunXboxPackageTool('VerifyPayload', CertificatePath, PackagePath) then
+  begin
+    RecordXboxModeFailure('The Xbox Mode payload or its capability policy failed verification.');
+    Log('Xbox Mode payload verification failed before certificate installation.');
+    RollBackXboxDeveloperModeEnabledThisRun;
+    Exit;
+  end;
+
+  if not MigrateLegacyXboxSigningCertificates then
   begin
     Log('Xbox Mode signing certificate migration failed.');
+    RollBackXboxDeveloperModeEnabledThisRun;
     Exit;
   end;
 
@@ -458,6 +577,7 @@ begin
     begin
       RecordXboxModeFailure('The Xbox Mode certificate could not be installed into LocalMachine TrustedPeople. Result code: ' + IntToStr(ResultCode) + '.');
       Log('Xbox Mode certificate installation failed or was cancelled.');
+      RollBackXboxDeveloperModeEnabledThisRun;
       Exit;
     end;
     XboxCertificateInstalledThisRun := True;
@@ -470,6 +590,7 @@ begin
     Log('Xbox Mode package registration or extension verification failed.');
     RollBackXboxPackageInstalledThisRun;
     RollBackXboxCertificateInstalledThisRun;
+    RollBackXboxDeveloperModeEnabledThisRun;
     Exit;
   end;
 
@@ -486,6 +607,7 @@ begin
     Log('The installed TFS runtime did not confirm Xbox Mode compatibility.');
     RollBackXboxPackageInstalledThisRun;
     RollBackXboxCertificateInstalledThisRun;
+    RollBackXboxDeveloperModeEnabledThisRun;
     Exit;
   end;
 
@@ -751,13 +873,6 @@ begin
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode);
-  Exec(
-    ExpandConstant('{sys}\schtasks.exe'),
-    '/Change /TN "\ToolsForSteam\FpsHelper" /Enable',
-    '',
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode);
   ElevatedHelperTasksSuspended := False;
 end;
 
@@ -891,16 +1006,14 @@ end;
 procedure ShowElevatedHelperInstallWarning(Message: string);
 var
   GamepadLogPath: string;
-  FpsLogPath: string;
 begin
   if not WizardSilent then
   begin
     GamepadLogPath := ExpandConstant('{app}\data\gamepad-helper-task.log');
-    FpsLogPath := ExpandConstant('{app}\data\fps-helper-task.log');
     MsgBox(
       Message + #13#10#13#10 +
-      'You can still repair the elevated helpers later after installation.' + #13#10#13#10 +
-      'Details were written to:' + #13#10 + GamepadLogPath + #13#10 + FpsLogPath,
+      'You can still repair the elevated Xbox Mode helper later after installation.' + #13#10#13#10 +
+      'Details were written to:' + #13#10 + GamepadLogPath,
       mbInformation,
       MB_OK);
   end;
@@ -929,35 +1042,6 @@ begin
   Result := Exec(
     ExePath,
     '--check-gamepad-helper-task',
-    InstallRoot,
-    SW_HIDE,
-    ewWaitUntilTerminated,
-    ResultCode) and (ResultCode = 0);
-end;
-
-function IsFpsHelperTaskInstalled: Boolean;
-var
-  InstallRoot: string;
-  ExePath: string;
-  ResultCode: Integer;
-begin
-  InstallRoot := GetResolvedInstallRootForChecks;
-  if InstallRoot = '' then
-  begin
-    Result := False;
-    Exit;
-  end;
-
-  ExePath := AddBackslash(InstallRoot) + '{#MyAppExeName}';
-  if not FileExists(ExePath) then
-  begin
-    Result := False;
-    Exit;
-  end;
-
-  Result := Exec(
-    ExePath,
-    '--check-fps-helper-task',
     InstallRoot,
     SW_HIDE,
     ewWaitUntilTerminated,
@@ -1002,12 +1086,12 @@ begin
 
   ForceDirectories(ExpandConstant('{app}\data'));
 
-  if IsGamepadHelperTaskInstalled and IsFpsHelperTaskInstalled then
+  if IsGamepadHelperTaskInstalled then
   begin
-    Log('Elevated helper tasks are already installed; refreshing them and sanitizing conflicting startup tasks.');
+    Log('The elevated Xbox Mode helper is already installed; refreshing it and sanitizing conflicting startup tasks.');
   end;
 
-  UpdateSetupStatus('Installing helpers: elevated Xbox Mode and FPS helpers...');
+  UpdateSetupStatus('Installing the elevated Xbox Mode helper...');
 
   if not Exec(
     ExpandConstant('{app}\{#MyAppExeName}'),
@@ -1018,15 +1102,271 @@ begin
     ResultCode) then
   begin
     Log('Elevated helper task registration was skipped or cancelled.');
-    ShowElevatedHelperInstallWarning('The elevated TFS helper tasks were not prepared during installation because the Windows admin prompt was cancelled or blocked.');
+    ShowElevatedHelperInstallWarning('The elevated Xbox Mode helper was not prepared during installation.');
     Exit;
   end;
 
-  if not (IsGamepadHelperTaskInstalled and IsFpsHelperTaskInstalled) then
+  if not IsGamepadHelperTaskInstalled then
   begin
-    Log('Elevated helper task registration did not complete successfully.');
-    ShowElevatedHelperInstallWarning('One or more elevated TFS helper tasks could not be prepared during installation.');
+    Log('Elevated Xbox Mode helper registration did not complete successfully.');
+    ShowElevatedHelperInstallWarning('The elevated Xbox Mode helper could not be prepared during installation.');
   end;
+end;
+
+function GetRtssInstalledVersion: string;
+begin
+  Result := '';
+  RegQueryStringValue(
+    HKLM32,
+    'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RTSS',
+    'DisplayVersion',
+    Result);
+end;
+
+function TryGetRtssExecutablePathFromRegistry(RootKey: Integer; var ExecutablePath: string): Boolean;
+var
+  UninstallString: string;
+  InstallLocation: string;
+begin
+  Result := False;
+  ExecutablePath := '';
+  InstallLocation := '';
+  if RegQueryStringValue(
+      RootKey,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RTSS',
+      'InstallLocation',
+      InstallLocation) and (InstallLocation <> '') then
+  begin
+    ExecutablePath := AddBackslash(InstallLocation) + 'RTSS.exe';
+    if FileExists(ExecutablePath) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+
+  UninstallString := '';
+  if RegQueryStringValue(
+      RootKey,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RTSS',
+      'UninstallString',
+      UninstallString) then
+  begin
+    RemoveQuotes(UninstallString);
+    if ExtractFileDir(UninstallString) <> '' then
+    begin
+      ExecutablePath := AddBackslash(ExtractFileDir(UninstallString)) + 'RTSS.exe';
+      Result := FileExists(ExecutablePath);
+    end;
+  end;
+end;
+
+function GetRtssExecutablePath: string;
+begin
+  if TryGetRtssExecutablePathFromRegistry(HKLM32, Result) then
+    Exit;
+  if TryGetRtssExecutablePathFromRegistry(HKLM64, Result) then
+    Exit;
+  if TryGetRtssExecutablePathFromRegistry(HKCU, Result) then
+    Exit;
+
+  Result := ExpandConstant('{pf32}\RivaTuner Statistics Server\RTSS.exe');
+  if FileExists(Result) then
+    Exit;
+  Result := ExpandConstant('{pf64}\RivaTuner Statistics Server\RTSS.exe');
+  if FileExists(Result) then
+    Exit;
+  Result := ExpandConstant('{localappdata}\Programs\RivaTuner Statistics Server\RTSS.exe');
+  if not FileExists(Result) then
+  begin
+    Result := '';
+  end;
+end;
+
+function IsRtssInstalled: Boolean;
+begin
+  { RTSS' package and executable versions can legitimately differ. The installed
+    executable is the compatibility signal used by the TFS RTSS API bridge. }
+  Result := FileExists(GetRtssExecutablePath);
+end;
+
+function StopRtssProcessesForMaintenance: Boolean;
+var
+  ScriptPath: string;
+  Script: string;
+  ResultCode: Integer;
+begin
+  ScriptPath := ExpandConstant('{tmp}\tools-for-steam-stop-rtss.ps1');
+  Script :=
+    '$ErrorActionPreference = "SilentlyContinue"' + #13#10 +
+    '$names = @("RTSS", "EncoderServer", "EncoderServer64", "RTSSHooksLoader", "RTSSHooksLoader64", "DesktopOverlayHost", "DesktopOverlayHost64", "DesktopOverlayHostLoader")' + #13#10 +
+    'Get-Process -Name $names | ForEach-Object { [void]$_.CloseMainWindow() }' + #13#10 +
+    'Start-Sleep -Milliseconds 700' + #13#10 +
+    'Get-Process -Name $names | Stop-Process -Force' + #13#10 +
+    '$deadline = [DateTime]::UtcNow.AddSeconds(8)' + #13#10 +
+    'while ((Get-Process -Name $names) -and [DateTime]::UtcNow -lt $deadline) {' + #13#10 +
+    '  Start-Sleep -Milliseconds 200' + #13#10 +
+    '}' + #13#10 +
+    'if (Get-Process -Name $names) { exit 1 }' + #13#10 +
+    'exit 0' + #13#10;
+
+  Result :=
+    SaveStringToFile(ScriptPath, Script, False) and
+    Exec(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+  DeleteFile(ScriptPath);
+end;
+
+procedure InstallRtssIfNeeded;
+var
+  WingetPath: string;
+  Parameters: string;
+  ResultCode: Integer;
+begin
+  if IsRtssInstalled then
+  begin
+    Log('An existing RTSS installation was detected; its binaries and settings will be reused without reinstalling it.');
+    Exit;
+  end;
+
+  UpdateSetupStatus('Closing RTSS background processes before installation...');
+  if not StopRtssProcessesForMaintenance then
+  begin
+    RaiseException('Setup could not close all RTSS background processes before installation.');
+  end;
+
+  WingetPath := ExpandConstant('{localappdata}\Microsoft\WindowsApps\winget.exe');
+  if not FileExists(WingetPath) then
+  begin
+    WingetPath := 'winget.exe';
+  end;
+
+  UpdateSetupStatus('Installing RivaTuner Statistics Server 7.3.7...');
+  Parameters :=
+    'install --id ' + RtssPackageId + ' --exact --version ' + RtssRequiredVersion +
+    ' --source winget --scope machine --silent --accept-package-agreements' +
+    ' --accept-source-agreements --disable-interactivity';
+
+  if not Exec(WingetPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    RaiseException('Windows Package Manager could not be started. RTSS is a required Tools for Steam component.');
+  end;
+
+  if (ResultCode <> 0) or (not IsRtssInstalled) then
+  begin
+    RaiseException(
+      'RTSS installation failed (winget code ' + IntToStr(ResultCode) + '). ' +
+      'Setup was stopped because the performance overlay requires RTSS.');
+  end;
+
+  Log('RTSS ' + GetRtssInstalledVersion + ' was installed successfully.');
+end;
+
+procedure ConfigureRtssProfileAccess;
+var
+  RtssExecutablePath: string;
+  ProfilesPath: string;
+  ScriptPath: string;
+  Script: string;
+  ResultCode: Integer;
+begin
+  RtssExecutablePath := GetRtssExecutablePath;
+  if RtssExecutablePath = '' then
+  begin
+    RaiseException('RTSS profile access could not be configured because RTSS.exe was not found.');
+  end;
+
+  ProfilesPath := AddBackslash(ExtractFileDir(RtssExecutablePath)) + 'Profiles';
+  ScriptPath := ExpandConstant('{tmp}\tools-for-steam-configure-rtss-profiles.ps1');
+  Script :=
+    '$ErrorActionPreference = "Stop"' + #13#10 +
+    '$profilesPath = ''' + EscapePowerShellSingleQuoted(ProfilesPath) + '''' + #13#10 +
+    '$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User' + #13#10 +
+    'if (-not (Test-Path -LiteralPath $profilesPath)) { New-Item -ItemType Directory -Path $profilesPath -Force | Out-Null }' + #13#10 +
+    '$acl = Get-Acl -LiteralPath $profilesPath' + #13#10 +
+    '$rights = [System.Security.AccessControl.FileSystemRights]::Modify' + #13#10 +
+    '$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit' + #13#10 +
+    '$propagation = [System.Security.AccessControl.PropagationFlags]::None' + #13#10 +
+    '$allow = [System.Security.AccessControl.AccessControlType]::Allow' + #13#10 +
+    '$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($userSid, $rights, $inheritance, $propagation, $allow)' + #13#10 +
+    '$acl.SetAccessRule($rule)' + #13#10 +
+    'Set-Acl -LiteralPath $profilesPath -AclObject $acl' + #13#10 +
+    '$probe = Join-Path $profilesPath (''.tfs-write-probe-'' + [Guid]::NewGuid().ToString(''N'') + ''.tmp'')' + #13#10 +
+    'try { [IO.File]::WriteAllText($probe, ''TFS''); Remove-Item -LiteralPath $probe -Force } finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }' + #13#10 +
+    'exit 0' + #13#10;
+
+  UpdateSetupStatus('Configuring secure RTSS game-profile access...');
+  ResultCode := -1;
+  if (not SaveStringToFile(ScriptPath, Script, False)) or
+     (not Exec(
+       ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"',
+       '',
+       SW_HIDE,
+       ewWaitUntilTerminated,
+       ResultCode)) or
+     (ResultCode <> 0) then
+  begin
+    DeleteFile(ScriptPath);
+    RaiseException(
+      'Setup could not grant the signed-in user access to RTSS game profiles. ' +
+      'Installation was stopped because the frame limiter would not work reliably.');
+  end;
+
+  DeleteFile(ScriptPath);
+  Log('Configured per-user write access for the RTSS Profiles folder.');
+end;
+
+function LegacyFpsHelperTaskExists: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result :=
+    Exec(
+      ExpandConstant('{sys}\schtasks.exe'),
+      '/Query /TN "\ToolsForSteam\FpsHelper"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) and
+    (ResultCode = 0);
+end;
+
+procedure RemoveLegacyFpsHelperTask;
+var
+  ResultCode: Integer;
+begin
+  if not LegacyFpsHelperTaskExists then
+  begin
+    Log('Legacy elevated FPS helper task is not present.');
+    Exit;
+  end;
+
+  if not Exec(
+    ExpandConstant('{sys}\schtasks.exe'),
+    '/Delete /TN "\ToolsForSteam\FpsHelper" /F',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode) or (ResultCode <> 0) then
+  begin
+    RaiseException(
+      'Setup could not remove the obsolete elevated FPS helper task (schtasks code ' +
+      IntToStr(ResultCode) + ').');
+  end;
+
+  if LegacyFpsHelperTaskExists then
+  begin
+    RaiseException('Setup removed the obsolete FPS helper task, but Windows still reports it as installed.');
+  end;
+
+  Log('Removed the obsolete elevated FPS helper task.');
 end;
 
 procedure SanitizeSteamAutostartSources;
@@ -1427,7 +1767,7 @@ begin
   end;
 
   SystemCheckHelperLabel.Caption :=
-    'Helper: the installer can prepare the elevated Xbox Mode and FPS helpers after files are copied. ' +
+    'Performance: existing RTSS binaries and settings are reused; Setup only configures per-user game-profile access, and downloads RTSS 7.3.7 when missing. The elevated helper is only used for Xbox Mode. ' +
     'This check is deferred so the setup window always opens cleanly on fresh Windows installs.';
 
   SystemCheckRollbackLabel.Caption := 'Rollback: a snapshot and rollback script will be written before startup settings are changed.';
@@ -1653,11 +1993,19 @@ begin
   ExternalModeDescriptionLabel.Left := ScaleX(20);
   ExternalModeDescriptionLabel.Top := ScaleY(218);
   ExternalModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
-  ExternalModeDescriptionLabel.Height := ScaleY(48);
+  ExternalModeDescriptionLabel.Height := ScaleY(60);
   ExternalModeDescriptionLabel.AutoSize := False;
   ExternalModeDescriptionLabel.WordWrap := True;
-  ExternalModeDescriptionLabel.Caption :=
-    'Use the signed TFS Gaming Home package. Explorer remains the Windows shell and eTray startup is disabled.';
+  if XboxHostRequiresDeveloperMode = 1 then
+  begin
+    ExternalModeDescriptionLabel.Caption :=
+      'Use the TFS Gaming Home package. This enables Windows Developer Mode system-wide, as required for the custom Xbox Home capability. Explorer remains the shell.';
+  end
+  else
+  begin
+    ExternalModeDescriptionLabel.Caption :=
+      'Use the Microsoft-authorized TFS Gaming Home package. Explorer remains the Windows shell and eTray startup is disabled.';
+  end;
 
   GuidePage := CreateCustomPage(
     wpSelectDir,
@@ -1944,10 +2292,11 @@ begin
     InstallXboxModeSupport;
     InstallPawnIOIfNeeded;
     InstallMandatoryHandheldReplacement;
-#if VariantFpsHelperPrep == "1"
+    InstallRtssIfNeeded;
+    ConfigureRtssProfileAccess;
+    RemoveLegacyFpsHelperTask;
     RegisterElevatedHelperTaskSupport;
     ResumeElevatedHelperTasks;
-#endif
     SanitizeSteamAutostartSources;
     { Startup mode finalization is deliberately deferred until setup teardown.
       Xbox Mode must not relaunch TFS or Steam while package and helper work is active. }
