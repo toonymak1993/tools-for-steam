@@ -1,3 +1,6 @@
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -173,6 +176,384 @@ internal sealed class SteamGridDbArtworkDownloader
         return new StoreSyncArtworkSummary(updatedTitleCount, updatedFileCount, updatedTitleIds);
     }
 
+    /// <summary>
+    /// Fills every Steam library artwork slot progressively. Public Steam CDN
+    /// assets are preferred; SteamGridDB supplies only the slots Steam does not
+    /// expose for a title.
+    /// </summary>
+    public async Task<StoreSyncArtworkSummary> DownloadSteamFirstAsync(
+        string gridDirectory,
+        IReadOnlyList<StoreSyncArtworkTarget> targets,
+        string apiKey,
+        CancellationToken cancellationToken,
+        Action<int, int>? progress = null)
+    {
+        if (targets.Count == 0)
+        {
+            return new StoreSyncArtworkSummary(0, 0, []);
+        }
+
+        Directory.CreateDirectory(gridDirectory);
+        using var steamClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(20),
+        };
+        steamClient.DefaultRequestHeaders.UserAgent.ParseAdd("ToolsForSteam-OmniLibrary/1.0");
+
+        using var steamGridDbClient = new HttpClient
+        {
+            BaseAddress = new Uri("https://www.steamgriddb.com/api/v2/"),
+            Timeout = TimeSpan.FromSeconds(20),
+        };
+        if (!string.IsNullOrWhiteSpace(apiKey))
+        {
+            steamGridDbClient.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", apiKey);
+        }
+
+        var steamSearchCache = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
+        var steamGridDbSearchCache = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
+        var updatedTitleIds = new List<string>();
+        var updatedFileCount = 0;
+
+        var uniqueTargets = targets
+            .GroupBy(target => target.AppId)
+            .Select(group => group.First())
+            .ToArray();
+        var completedTargetCount = 0;
+
+        // Deliberately sequential per store: images appear one title at a time without a
+        // large first-sync bandwidth or CPU spike in Big Picture.
+        foreach (var target in uniqueTargets)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var updatedForTitle = 0;
+            try
+            {
+                var steamAppId = await ResolvePublicSteamAppIdAsync(
+                    steamClient,
+                    target.Title,
+                    target.SearchHints,
+                    steamSearchCache,
+                    cancellationToken).ConfigureAwait(false);
+                if (steamAppId.HasValue)
+                {
+                    updatedForTitle += await DownloadPublicSteamArtworkSetAsync(
+                        steamClient,
+                        gridDirectory,
+                        SteamShortcutIds.BuildGridId(target.AppId),
+                        steamAppId.Value,
+                        target.StoreId,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    var match = target.CachedGameId.HasValue && target.CachedGameId.Value > 0
+                        ? new StoreSyncArtworkMatch(target.CachedGameId.Value, target.CachedMatchName)
+                        : await FindGameMatchAsync(
+                            steamGridDbClient,
+                            target.Title,
+                            target.SearchHints,
+                            steamGridDbSearchCache,
+                            cancellationToken).ConfigureAwait(false);
+                    if (match is not null)
+                    {
+                        updatedForTitle += await DownloadArtworkSetAsync(
+                            steamGridDbClient,
+                            gridDirectory,
+                            SteamShortcutIds.BuildGridId(target.AppId),
+                            match.GameId,
+                            target.StoreId,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                }
+
+                // Store-owned catalog images are the final safety net only.
+                // Public Steam remains first and SteamGridDB remains second.
+                updatedForTitle += await DownloadStoreFallbackArtworkSetAsync(
+                    steamClient,
+                    gridDirectory,
+                    SteamShortcutIds.BuildGridId(target.AppId),
+                    target,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // One missing/broken source must not stop the progressive queue.
+            }
+
+            if (updatedForTitle > 0)
+            {
+                updatedFileCount += updatedForTitle;
+                updatedTitleIds.Add(target.TitleId);
+            }
+
+            completedTargetCount++;
+            progress?.Invoke(completedTargetCount, uniqueTargets.Length);
+        }
+
+        return new StoreSyncArtworkSummary(
+            updatedTitleIds.Count,
+            updatedFileCount,
+            updatedTitleIds);
+    }
+
+    private static async Task<int?> ResolvePublicSteamAppIdAsync(
+        HttpClient httpClient,
+        string title,
+        IReadOnlyList<string> searchHints,
+        IDictionary<string, int?> cache,
+        CancellationToken cancellationToken)
+    {
+        var requestedTitles = BuildSearchTerms(title, searchHints)
+            .Select(NormalizeTitle)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        foreach (var searchTerm in BuildSearchTerms(title, searchHints).Take(3))
+        {
+            if (cache.TryGetValue(searchTerm, out var cached))
+            {
+                if (cached.HasValue)
+                {
+                    return cached;
+                }
+                continue;
+            }
+
+            try
+            {
+                var uri =
+                    $"https://store.steampowered.com/api/storesearch/?term={Uri.EscapeDataString(searchTerm)}&l=english&cc=US";
+                using var response = await httpClient.GetAsync(uri, cancellationToken).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    cache[searchTerm] = null;
+                    continue;
+                }
+
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (!document.RootElement.TryGetProperty("items", out var items) ||
+                    items.ValueKind != JsonValueKind.Array)
+                {
+                    cache[searchTerm] = null;
+                    continue;
+                }
+
+                var selected = items.EnumerateArray()
+                    .Select(item => new
+                    {
+                        Id = item.TryGetProperty("id", out var idNode) && idNode.TryGetInt32(out var id) ? id : 0,
+                        Name = item.TryGetProperty("name", out var nameNode) ? nameNode.GetString() ?? string.Empty : string.Empty,
+                    })
+                    .Where(item => item.Id > 0 && !string.IsNullOrWhiteSpace(item.Name))
+                    .Select(item => new
+                    {
+                        item.Id,
+                        Score = requestedTitles
+                            .Select(requested => ScoreMatch(requested, NormalizeTitle(item.Name)))
+                            .DefaultIfEmpty(3)
+                            .Min(),
+                    })
+                    .OrderBy(item => item.Score)
+                    .FirstOrDefault();
+                cache[searchTerm] = selected?.Score <= 1 ? selected.Id : null;
+                if (cache[searchTerm].HasValue)
+                {
+                    return cache[searchTerm];
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                cache[searchTerm] = null;
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task<int> DownloadPublicSteamArtworkSetAsync(
+        HttpClient httpClient,
+        string gridDirectory,
+        string gridId,
+        int steamAppId,
+        string? storeId,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new Dictionary<string, string[]>(StringComparer.Ordinal)
+        {
+            [gridId] =
+            [
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/header.jpg",
+            ],
+            [$"{gridId}p"] =
+            [
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/library_600x900_2x.jpg",
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/library_600x900.jpg",
+            ],
+            [$"{gridId}_hero"] =
+            [
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/library_hero.jpg",
+            ],
+            [$"{gridId}_logo"] =
+            [
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/logo_2x.png",
+                $"https://cdn.cloudflare.steamstatic.com/steam/apps/{steamAppId}/logo.png",
+            ],
+        };
+
+        var updated = 0;
+        foreach (var slot in ArtworkSlots.Where(slot =>
+                     candidates.ContainsKey(slot.FileStemBuilder(gridId))))
+        {
+            var fileStem = slot.FileStemBuilder(gridId);
+            if (HasArtworkVariant(gridDirectory, fileStem))
+            {
+                continue;
+            }
+
+            foreach (var url in candidates[fileStem])
+            {
+                try
+                {
+                    var downloaded = await DownloadAssetToTemporaryFileAsync(
+                        httpClient,
+                        url,
+                        cancellationToken).ConfigureAwait(false);
+                    if (downloaded is null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var length = new FileInfo(downloaded.TempPath).Length;
+                        if (length < 1024 ||
+                            !PromoteDownloadedArtwork(gridDirectory, fileStem, downloaded))
+                        {
+                            continue;
+                        }
+
+                        updated++;
+                        await TryApplyStoreBadgeAsync(
+                            gridDirectory,
+                            gridId,
+                            slot,
+                            storeId,
+                            cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+                    finally
+                    {
+                        DeleteFileIfExists(downloaded.TempPath);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return updated;
+    }
+
+    private static async Task<int> DownloadStoreFallbackArtworkSetAsync(
+        HttpClient httpClient,
+        string gridDirectory,
+        string gridId,
+        StoreSyncArtworkTarget target,
+        CancellationToken cancellationToken)
+    {
+        var portraitUrl = target.FallbackPortraitUrl?.Trim() ?? string.Empty;
+        var heroUrl = target.FallbackHeroUrl?.Trim() ?? string.Empty;
+        var wideFallbackUrl = !string.IsNullOrWhiteSpace(heroUrl)
+            ? heroUrl
+            : portraitUrl;
+        var portraitFallbackUrl = !string.IsNullOrWhiteSpace(portraitUrl)
+            ? portraitUrl
+            : heroUrl;
+        var candidates = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [gridId] = wideFallbackUrl,
+            [$"{gridId}p"] = portraitFallbackUrl,
+            [$"{gridId}_hero"] = wideFallbackUrl,
+        };
+
+        var updated = 0;
+        foreach (var slot in ArtworkSlots.Where(slot =>
+                     candidates.ContainsKey(slot.FileStemBuilder(gridId))))
+        {
+            var fileStem = slot.FileStemBuilder(gridId);
+            var url = candidates[fileStem];
+            if (string.IsNullOrWhiteSpace(url) ||
+                HasArtworkVariant(gridDirectory, fileStem))
+            {
+                continue;
+            }
+
+            try
+            {
+                var downloaded = await DownloadAssetToTemporaryFileAsync(
+                    httpClient,
+                    url,
+                    cancellationToken).ConfigureAwait(false);
+                if (downloaded is null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var length = new FileInfo(downloaded.TempPath).Length;
+                    if (length < 1024 ||
+                        !PromoteStoreFallbackArtwork(
+                            gridDirectory,
+                            fileStem,
+                            downloaded,
+                            slot))
+                    {
+                        continue;
+                    }
+
+                    updated++;
+                    await TryApplyStoreBadgeAsync(
+                        gridDirectory,
+                        gridId,
+                        slot,
+                        target.StoreId,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    DeleteFileIfExists(downloaded.TempPath);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+            }
+        }
+
+        return updated;
+    }
+
     public async Task<StoreSyncArtworkMatch?> ResolveMatchAsync(
         string title,
         IReadOnlyList<string> searchHints,
@@ -296,7 +677,7 @@ internal sealed class SteamGridDbArtworkDownloader
                 continue;
             }
 
-            var response = await httpClient.GetAsync(
+            using var response = await httpClient.GetAsync(
                 $"search/autocomplete/{Uri.EscapeDataString(term)}",
                 cancellationToken);
 
@@ -478,7 +859,7 @@ internal sealed class SteamGridDbArtworkDownloader
     {
         foreach (var requestPath in slot.RequestPaths)
         {
-            var response = await httpClient.GetAsync(
+            using var response = await httpClient.GetAsync(
                 string.Format(requestPath, gameId),
                 cancellationToken);
 
@@ -605,6 +986,78 @@ internal sealed class SteamGridDbArtworkDownloader
         RemoveSlotVariantsExcept(gridDirectory, fileStem, targetPath);
         File.Copy(asset.TempPath, targetPath, overwrite: true);
         return true;
+    }
+
+    private static bool PromoteStoreFallbackArtwork(
+        string gridDirectory,
+        string fileStem,
+        DownloadedArtworkFile asset,
+        ArtworkSlot slot)
+    {
+        if (!slot.PreferredWidth.HasValue || !slot.PreferredHeight.HasValue)
+        {
+            return PromoteDownloadedArtwork(gridDirectory, fileStem, asset);
+        }
+
+        var outputExtension = asset.Extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                              asset.Extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+            ? ".jpg"
+            : ".png";
+        var resizedPath = Path.Combine(
+            Path.GetTempPath(),
+            $"steamloader-grid-fallback-{Guid.NewGuid():N}{outputExtension}");
+        try
+        {
+            using var inputStream = new FileStream(
+                asset.TempPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+            using var source = Image.FromStream(inputStream);
+            var targetWidth = slot.PreferredWidth.Value;
+            var targetHeight = slot.PreferredHeight.Value;
+            using var output = new Bitmap(
+                targetWidth,
+                targetHeight,
+                PixelFormat.Format24bppRgb);
+            using (var graphics = Graphics.FromImage(output))
+            {
+                graphics.Clear(Color.Black);
+                graphics.CompositingQuality = CompositingQuality.HighQuality;
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                graphics.SmoothingMode = SmoothingMode.HighQuality;
+
+                var scale = Math.Max(
+                    (double)targetWidth / Math.Max(1, source.Width),
+                    (double)targetHeight / Math.Max(1, source.Height));
+                var scaledWidth = Math.Max(1, (int)Math.Ceiling(source.Width * scale));
+                var scaledHeight = Math.Max(1, (int)Math.Ceiling(source.Height * scale));
+                var x = (targetWidth - scaledWidth) / 2;
+                var y = (targetHeight - scaledHeight) / 2;
+                graphics.DrawImage(source, x, y, scaledWidth, scaledHeight);
+            }
+
+            output.Save(
+                resizedPath,
+                outputExtension.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+                    ? ImageFormat.Jpeg
+                    : ImageFormat.Png);
+            return PromoteDownloadedArtwork(
+                gridDirectory,
+                fileStem,
+                new DownloadedArtworkFile(resizedPath, outputExtension));
+        }
+        catch
+        {
+            // A catalog image is still preferable to an empty Steam slot if the
+            // platform image decoder cannot resize a particular source format.
+            return PromoteDownloadedArtwork(gridDirectory, fileStem, asset);
+        }
+        finally
+        {
+            DeleteFileIfExists(resizedPath);
+        }
     }
 
     private static SteamGridDbGameMatch? SelectBestMatch(
@@ -956,6 +1409,33 @@ internal sealed class SteamGridDbArtworkDownloader
         }
     }
 
+    internal static bool HasPrimaryArtworkSet(string gridDirectory, uint appId)
+    {
+        return GetMissingPrimaryArtworkSlots(gridDirectory, appId).Count == 0;
+    }
+
+    internal static IReadOnlyList<string> GetMissingPrimaryArtworkSlots(
+        string gridDirectory,
+        uint appId)
+    {
+        var gridId = SteamShortcutIds.BuildGridId(appId);
+        var missing = new List<string>(3);
+        if (!HasArtworkVariant(gridDirectory, gridId))
+        {
+            missing.Add("library capsule");
+        }
+        if (!HasArtworkVariant(gridDirectory, $"{gridId}p"))
+        {
+            missing.Add("portrait");
+        }
+        if (!HasArtworkVariant(gridDirectory, $"{gridId}_hero"))
+        {
+            missing.Add("hero");
+        }
+
+        return missing;
+    }
+
     private static bool HasArtworkVariant(string gridDirectory, string fileStem)
     {
         foreach (var extension in new[] { ".png", ".jpg", ".jpeg", ".webp", ".ico" })
@@ -1006,7 +1486,9 @@ internal sealed record StoreSyncArtworkTarget(
     IReadOnlyList<string> SearchHints,
     int? CachedGameId,
     string CachedMatchName,
-    string StoreId = "");
+    string StoreId = "",
+    string FallbackPortraitUrl = "",
+    string FallbackHeroUrl = "");
 
 internal sealed record StoreSyncArtworkSummary(
     int UpdatedTitleCount,

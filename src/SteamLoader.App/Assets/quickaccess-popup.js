@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 116;
+  const stateVersion = 137;
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
   const smartHomeSliderCommitSettleDelayMs = 1000;
@@ -14,9 +14,16 @@
   const pluginStoreInputStorageKey = "ToolsForSteamPluginStoreInput";
   const pluginStoreOverlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
   const pluginStoreChannelName = "ToolsForSteamPluginStoreChannel";
-  const storefrontEnabled = false;
+  const omniLibraryStoreStorageKey = "ToolsForSteamOmniLibraryStoresChanged";
+  const omniLibraryStoreChannelName = "ToolsForSteamOmniLibraryStores";
+  const storefrontEnabled = true;
 
   window.__steamLoaderApiBase = apiBase;
+
+  if (window.__steamLoaderPopupInstallRetryTimer) {
+    window.clearTimeout(window.__steamLoaderPopupInstallRetryTimer);
+    window.__steamLoaderPopupInstallRetryTimer = null;
+  }
 
   if (window.__steamLoaderPopupTimer) {
     window.clearInterval(window.__steamLoaderPopupTimer);
@@ -38,6 +45,11 @@
     window.__steamToolsStoreSyncPollTimer = null;
   }
 
+  if (window.__steamToolsOmniDownloadsPollTimer) {
+    window.clearTimeout(window.__steamToolsOmniDownloadsPollTimer);
+    window.__steamToolsOmniDownloadsPollTimer = null;
+  }
+
   if (window.__steamToolsUpdatesPollTimer) {
     window.clearInterval(window.__steamToolsUpdatesPollTimer);
     window.__steamToolsUpdatesPollTimer = null;
@@ -46,6 +58,11 @@
   if (window.__steamToolsSmartHomePollTimer) {
     window.clearInterval(window.__steamToolsSmartHomePollTimer);
     window.__steamToolsSmartHomePollTimer = null;
+  }
+
+  if (window.__steamToolsBluetoothPollTimer) {
+    window.clearInterval(window.__steamToolsBluetoothPollTimer);
+    window.__steamToolsBluetoothPollTimer = null;
   }
 
   if (window.__steamLoaderFocusRepairTimer) {
@@ -91,8 +108,24 @@
       window.clearTimeout(previousState.externalGameQuickAccess.tabOpenTimer);
     }
 
+    if (previousState?.storeSync?.cancelDownloadArmTimer) {
+      window.clearTimeout(previousState.storeSync.cancelDownloadArmTimer);
+    }
+
+    if (previousState?.storeSync?.downloadCenterNoticeTimer) {
+      window.clearTimeout(previousState.storeSync.downloadCenterNoticeTimer);
+    }
+
     if (previousState?.generalSettings?.overlayCapture?.timer) {
       window.clearTimeout(previousState.generalSettings.overlayCapture.timer);
+    }
+
+    if (previousState?.systemWindowsUpdates?.runArmTimer) {
+      window.clearTimeout(previousState.systemWindowsUpdates.runArmTimer);
+    }
+
+    if (previousState?.systemTools?.silentGameReadyArmTimer) {
+      window.clearTimeout(previousState.systemTools.silentGameReadyArmTimer);
     }
 
     if (
@@ -309,6 +342,34 @@
             excludedDraftById: {},
             unifySteamAuthDraftByStoreId: {},
             unifySteamAuthInputVersionByStoreId: {},
+            unifySteamInstallPathDraftByStoreId: {},
+            unifySteamInstallPathDirtyByStoreId: {},
+            unifySteamInstallPathVersionByStoreId: {},
+            unifySteamDownloadWorkersDraftByStoreId: {},
+            unifySteamDownloadTimeoutDraftByStoreId: {},
+            unifySteamDownloadOptionsDirtyByStoreId: {},
+            unifySteamDownloadOptionsVersionByStoreId: {},
+            xboxInstallPathDraft: "",
+            xboxInstallPathDraftDirty: false,
+            xboxInstallPathInputVersion: 0,
+            epicInstallPathDraft: "",
+            epicInstallPathDraftDirty: false,
+            epicInstallPathInputVersion: 0,
+            epicDownloadWorkersDraft: "",
+            epicDownloadTimeoutDraft: "",
+            epicDownloadOptionsDirty: false,
+            epicDownloadOptionsInputVersion: 0,
+            disconnectStoreArmedId: "",
+            downloadCenter: null,
+            downloadCenterUiSignature: "",
+            downloadCenterLoading: false,
+            downloadCenterRefreshQueued: false,
+            downloadCenterError: "",
+            downloadCenterNotice: "",
+            downloadCenterNoticeTimer: 0,
+            downloadActionKeys: {},
+            cancelDownloadArmedKey: "",
+            cancelDownloadArmTimer: 0,
             artworkPreviewByTitleId: {},
             artworkPreviewLoadingByTitleId: {},
             pinnedTitleIds: readStoreSyncPinnedTitleIds(),
@@ -359,6 +420,34 @@
             error: "",
             snapshot: null,
           },
+          systemTools: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            silentGameReadyArmedUntil: 0,
+            silentGameReadyArmTimer: 0,
+          },
+          systemHdr: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+          },
+          systemWindowsUpdates: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+            runArmedUntil: 0,
+            runArmTimer: 0,
+          },
+          systemBluetooth: {
+            loading: false,
+            saving: false,
+            error: "",
+            snapshot: null,
+          },
           developerDebug: {
             messages: {},
           },
@@ -381,6 +470,7 @@
             previousCatchAllGamepadInput: null,
             catchAllButtonState: {},
           },
+          homeHeaderFocusKey: "header-action:wishlist",
           autoSisir: {
             loading: false,
             saving: false,
@@ -565,6 +655,7 @@
 
   function getPluginStoreActionFromSteamButton(button) {
     const namedButton = String(button || "").toUpperCase();
+    const wishlistOverlayActive = state.pluginStoreBridge.activeOverlaySource === "store";
     if (/(DPAD|GAMEPAD|ARROW).*UP|\bUP\b/.test(namedButton)) {
       return "up";
     }
@@ -583,6 +674,15 @@
     if (/\b(B|BACK|CANCEL)\b/.test(namedButton)) {
       return "b";
     }
+    if (/\b(X|BUTTON_X|GAMEPADX|XBUTTON)\b/.test(namedButton)) {
+      return "search-back";
+    }
+    if (/\b(Y|REFRESH)\b/.test(namedButton)) {
+      return wishlistOverlayActive ? "keyboard-space" : "refresh";
+    }
+    if (/\b(START|MENU|GAMEPADSTART|GAMEPADMENU)\b/.test(namedButton)) {
+      return wishlistOverlayActive ? "keyboard-done" : "";
+    }
     if (/(LEFT|L).*(BUMPER|SHOULDER|TRIGGER)|\b(LB|L1)\b/.test(namedButton)) {
       return "previous-section";
     }
@@ -595,6 +695,10 @@
         return "a";
       case 2:
         return "b";
+      case 3:
+        return "search-back";
+      case 4:
+        return wishlistOverlayActive ? "keyboard-space" : "refresh";
       case 5:
       case 7:
         return "previous-section";
@@ -609,6 +713,8 @@
         return "left";
       case 12:
         return "right";
+      case 14:
+        return wishlistOverlayActive ? "keyboard-done" : "";
       default:
         return "";
     }
@@ -617,6 +723,7 @@
   function getPluginStoreActionFromKeyEvent(event) {
     const key = event.key || event.code || "";
     const lowerKey = key.toLowerCase?.() || "";
+    const wishlistOverlayActive = state.pluginStoreBridge.activeOverlaySource === "store";
     if (key === "ArrowUp" || key === "GamepadUp" || key === "GamepadDPadUp") {
       return "up";
     }
@@ -634,6 +741,15 @@
     }
     if (key === "Escape" || key === "Backspace" || key === "GamepadB") {
       return "b";
+    }
+    if (key === "GamepadX") {
+      return "search-back";
+    }
+    if (key === "F5" || key === "GamepadY") {
+      return wishlistOverlayActive && key === "GamepadY" ? "keyboard-space" : "refresh";
+    }
+    if (key === "GamepadStart" || key === "GamepadMenu" || key === "Start" || key === "Menu") {
+      return wishlistOverlayActive ? "keyboard-done" : "";
     }
     if (
       key === "PageUp" ||
@@ -1285,6 +1401,11 @@
           description: "Startup behavior and global loader options",
         },
         {
+          id: "system",
+          title: "System",
+          description: "Windows Update, HDR, Bluetooth, and drivers",
+        },
+        {
           id: "overlay",
           title: "Overlay",
           description: "Choose controller buttons and hold times",
@@ -1321,7 +1442,7 @@
     },
     {
       id: "app-start",
-      title: "App Start",
+      title: "Apps",
       description: "Launch selected Windows apps",
       pages: [
         {
@@ -1359,9 +1480,9 @@
       ],
     },
     {
-      id: "unifystore",
-      title: "Storefront",
-      description: "Fullscreen launcher for Epic and GOG libraries",
+      id: "omnilibrary",
+      title: "OmniLibrary",
+      description: "Xbox games in a native Steam library tab",
       pages: [],
     },
     {
@@ -1546,7 +1667,7 @@
         },
       ],
     },
-  ].filter((plugin) => storefrontEnabled || plugin.id !== "unifystore");
+  ];
 
   function getPluginSettings() {
     const entries = state.generalSettings.snapshot?.plugins;
@@ -4156,6 +4277,23 @@
       if (pendingSlotKey.startsWith("header-action:")) {
         return null;
       }
+
+      // Download actions are transient: Pause can become Resume, Manage can
+      // become Play, and completion removes Cancel. Falling back to the same
+      // numeric row could focus a different or destructive command. Return to
+      // the stable game accordion whenever the semantic action disappeared.
+      const downloadActionMatch = pendingSlotKey.match(
+        /^(omnilibrary-download-.+)-(pause|resume|manage|play|cancel|dismiss|retry-uninstall)$/,
+      );
+      if (downloadActionMatch) {
+        const parentIndex = slots.findIndex(
+          (slot, index) =>
+            resolveSlotFocusKey(slot, index) === downloadActionMatch[1],
+        );
+        if (parentIndex >= 0) {
+          return parentIndex;
+        }
+      }
     }
 
     if (hasPendingFocus && Number.isInteger(state.pendingFocusIndex)) {
@@ -4623,6 +4761,107 @@
     return null;
   }
 
+  function consumeHomeDirectionalFocus(event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
+    return true;
+  }
+
+  function focusHomeControlElement(target, event, options = {}) {
+    consumeHomeDirectionalFocus(event);
+    const panel = getPanelScrollContainer();
+    if (
+      state.route.screen !== "root" ||
+      !(panel instanceof HTMLElement) ||
+      !isFocusableSlotElement(target)
+    ) {
+      return true;
+    }
+
+    try {
+      target.focus({ preventScroll: true });
+    } catch {
+      try {
+        target.focus();
+      } catch {
+        return true;
+      }
+    }
+
+    const focusKey = normalizeFocusSlotKey(target.getAttribute("data-slot-key"));
+    if (focusKey?.startsWith("header-action:")) {
+      state.homeHeaderFocusKey = focusKey;
+    }
+    rememberSlotElementFocus(target);
+
+    if (options.alignTop === true && panel.scrollTop > 1) {
+      try {
+        panel.scrollTo({ top: 0, behavior: "smooth" });
+      } catch {
+        panel.scrollTop = 0;
+      }
+    }
+
+    return true;
+  }
+
+  function getFocusableHomeHeaderActions() {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement)) {
+      return [];
+    }
+
+    return Array.from(panel.querySelectorAll('[data-header-action="true"]'))
+      .filter((element) => isFocusableSlotElement(element));
+  }
+
+  function moveHomeHeaderActionFocus(currentFocusKey, direction, event) {
+    const actions = getFocusableHomeHeaderActions();
+    const currentIndex = actions.findIndex(
+      (element) => normalizeFocusSlotKey(element.getAttribute("data-slot-key")) === currentFocusKey,
+    );
+    const nextIndex = currentIndex + direction;
+    if (currentIndex < 0 || nextIndex < 0 || nextIndex >= actions.length) {
+      return consumeHomeDirectionalFocus(event);
+    }
+
+    return focusHomeControlElement(actions[nextIndex], event, { alignTop: true });
+  }
+
+  function moveHomeHeaderToContent(event) {
+    const panel = getPanelScrollContainer();
+    return focusHomeControlElement(findFirstFocusableSlotElement(panel), event);
+  }
+
+  function moveHomeContentToHeader(event) {
+    const actions = getFocusableHomeHeaderActions();
+    const rememberedFocusKey = normalizeFocusSlotKey(state.homeHeaderFocusKey);
+    const target =
+      actions.find(
+        (element) => normalizeFocusSlotKey(element.getAttribute("data-slot-key")) === rememberedFocusKey,
+      ) ||
+      actions.find(
+        (element) => element.getAttribute("data-slot-key") === "header-action:wishlist",
+      ) ||
+      actions[0] ||
+      null;
+    return focusHomeControlElement(target, event, { alignTop: true });
+  }
+
+  function getHomeHeaderNavigationProps(key) {
+    const focusKey = `header-action:${normalizeFocusSlotKey(key)}`;
+    return {
+      onGamepadFocus: () => {
+        state.homeHeaderFocusKey = focusKey;
+      },
+      onMoveLeft: (event) => moveHomeHeaderActionFocus(focusKey, -1, event),
+      onMoveRight: (event) => moveHomeHeaderActionFocus(focusKey, 1, event),
+      onMoveUp: (event) => consumeHomeDirectionalFocus(event),
+      onMoveDown: (event) => moveHomeHeaderToContent(event),
+    };
+  }
+
   function getFocusRestoreTarget(route = state.route) {
     const panel = getPanelScrollContainer();
     if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
@@ -5056,6 +5295,20 @@
       }
 
       if (route.pluginId === "settings") {
+        if (route.pageId === "system-windows-update") {
+          return {
+            route: parseRoute("page:settings:system"),
+            fallbackSlotKey: "system-windows-update",
+          };
+        }
+
+        if (route.pageId === "system-bluetooth") {
+          return {
+            route: parseRoute("page:settings:system"),
+            fallbackSlotKey: "system-bluetooth",
+          };
+        }
+
         if (route.pageId?.startsWith("overlay-combination-")) {
           const actionId = route.pageId.replace(/^overlay-combination-/, "");
           return {
@@ -6036,6 +6289,53 @@
     );
   }
 
+  function HeaderWishlistIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        {
+          xmlns: "http://www.w3.org/2000/svg",
+          viewBox: "0 0 24 24",
+          fill: "none",
+        },
+        createElement("path", {
+          d: "M4.35 10.15L10.2 4.3C10.63 3.87 11.22 3.62 11.83 3.62H17.7C19.18 3.62 20.38 4.82 20.38 6.3V12.17C20.38 12.78 20.13 13.37 19.7 13.8L13.85 19.65C12.95 20.55 11.49 20.55 10.59 19.65L4.35 13.41C3.45 12.51 3.45 11.05 4.35 10.15Z",
+          stroke: "currentColor",
+          strokeWidth: "1.8",
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+        }),
+        createElement("circle", {
+          cx: "16.35",
+          cy: "7.65",
+          r: "1.25",
+          stroke: "currentColor",
+          strokeWidth: "1.65",
+        }),
+        createElement("path", {
+          d: "M8.15 16.15L15.15 9.15",
+          stroke: "currentColor",
+          strokeWidth: "1.75",
+          strokeLinecap: "round",
+        }),
+        createElement("circle", {
+          cx: "9.05",
+          cy: "10.3",
+          r: "1.35",
+          stroke: "currentColor",
+          strokeWidth: "1.55",
+        }),
+        createElement("circle", {
+          cx: "14.25",
+          cy: "15.05",
+          r: "1.35",
+          stroke: "currentColor",
+          strokeWidth: "1.55",
+        }),
+      ),
+    );
+  }
+
   function HeaderUpdateIcon() {
     return createElement(
       "svg",
@@ -6261,7 +6561,7 @@
       case "discord":
         return DiscordPluginIcon;
       case "store-sync":
-      case "unifystore":
+      case "omnilibrary":
         return StoreSyncPluginIcon;
       case "auto-sisr":
         return AutoSisirPluginIcon;
@@ -7338,6 +7638,10 @@
             rememberCurrentRouteSelection(null, focusKey);
             action.onGamepadFocus?.();
           },
+          onMoveLeft: action.onMoveLeft,
+          onMoveRight: action.onMoveRight,
+          onMoveUp: action.onMoveUp,
+          onMoveDown: action.onMoveDown,
         },
       },
     );
@@ -9348,7 +9652,7 @@
   }
 
   function rerenderStoreSyncPanel() {
-    if (isCurrentPluginRoute("store-sync")) {
+    if (isCurrentPluginRoute("store-sync") || isCurrentPluginRoute("omnilibrary")) {
       renderPanelDataRefresh();
       return;
     }
@@ -9442,6 +9746,20 @@
 
   function rerenderGeneralSettingsPanel() {
     if (state.route.pluginId === "settings" || state.route.screen === "root") {
+      renderPanelDataRefresh();
+      return;
+    }
+
+    state.renderRevision += 1;
+    renderPanelState();
+  }
+
+  function rerenderSystemToolsPanel() {
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      (state.route.pageId === "system" || state.route.pageId?.startsWith("system-"))
+    ) {
       renderPanelDataRefresh();
       return;
     }
@@ -12433,6 +12751,66 @@
     return state.updates.snapshot;
   }
 
+  function getNvidiaDriverUpdateSnapshot() {
+    return state.systemTools.snapshot;
+  }
+
+  function getHdrDisplaySnapshot() {
+    return state.systemHdr.snapshot;
+  }
+
+  function getWindowsSystemUpdateSnapshot() {
+    return state.systemWindowsUpdates.snapshot;
+  }
+
+  function getBluetoothDeviceSnapshot() {
+    return state.systemBluetooth.snapshot;
+  }
+
+  function formatSystemUpdateSize(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) {
+      return bytes > 0 ? `${Math.round(bytes)} B` : "Size unavailable";
+    }
+
+    const units = ["KB", "MB", "GB", "TB"];
+    let scaled = bytes / 1024;
+    let unitIndex = 0;
+    while (scaled >= 1024 && unitIndex < units.length - 1) {
+      scaled /= 1024;
+      unitIndex += 1;
+    }
+
+    return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  function formatSystemUpdateCheckedAt(value) {
+    if (!value) {
+      return "Not checked yet";
+    }
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime())
+      ? "Checked recently"
+      : date.toLocaleString(undefined, {
+          dateStyle: "short",
+          timeStyle: "short",
+        });
+  }
+
+  function getBluetoothDeviceCopy(device) {
+    return [
+      device?.transport || "Bluetooth",
+      device?.isConnected ? "Connected" : null,
+      device?.address || null,
+      device?.signalStrength !== null &&
+      device?.signalStrength !== undefined &&
+      Number.isFinite(Number(device.signalStrength))
+        ? `${device.signalStrength} dBm`
+        : null,
+    ].filter(Boolean).join(" · ");
+  }
+
   function isSnapshotObject(snapshot) {
     return Boolean(snapshot && typeof snapshot === "object");
   }
@@ -13382,11 +13760,23 @@
     const stores = Array.isArray(snapshot?.stores) ? snapshot.stores : [];
     const installedCount = stores.reduce((total, store) => total + (Number(store.installedCount) || 0), 0);
     const libraryCount = stores.reduce((total, store) => total + (Number(store.availableCount) || 0), 0);
+    const preparationLines = stores
+      .filter((store) => store?.enabled === true && store?.readyForLibraryTab !== true)
+      .map((store) => {
+        if (store?.steamRestartRequired === true) {
+          return `${store.title}: ready - restart Steam`;
+        }
+        if (String(store?.preparationStatus || "").toLowerCase() === "artwork") {
+          return `${store.title}: artwork ${store.preparationCompletedCount || 0}/${store.preparationTotalCount || 0}`;
+        }
+        return `${store.title}: ${store.statusText || "preparing"}`;
+      });
 
     return {
-      title: "Storefront",
+      title: "OmniLibrary",
       lines: [
         `${installedCount} installed / ${libraryCount} in library`,
+        ...preparationLines,
         snapshot?.statusText || "Waiting for setup.",
         snapshot?.detailText || "Sign in and refresh Epic or GOG to build the cached library.",
       ].filter(Boolean),
@@ -13395,12 +13785,13 @@
 
   function buildUnifySteamStoreCopy(store) {
     if (!store) {
-      return "Storefront store unavailable.";
+      return "OmniLibrary store unavailable.";
     }
 
     return [
       `${store.installedCount || 0} installed / ${store.availableCount || 0} total`,
       store.accountName ? `Signed in as ${store.accountName}` : store.statusText || "",
+      store.steamRestartRequired ? "Restart Steam once to activate this store tab." : "",
       store.detailText || "",
     ]
       .filter(Boolean)
@@ -13435,6 +13826,443 @@
     }
 
     return "Available";
+  }
+
+  function getOmniLibraryDownloadEntries() {
+    const entries = state.storeSync.downloadCenter?.entries;
+    return Array.isArray(entries) ? entries : [];
+  }
+
+  function buildOmniLibraryDownloadCenterUiSignature(snapshot) {
+    const now = Date.now();
+    const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+    return entries.map((entry) => {
+      const updatedAt = Date.parse(String(entry?.updatedAtUtc || ""));
+      const ageBucket = Number.isFinite(updatedAt)
+        ? Math.max(0, Math.floor((now - updatedAt) / 60000))
+        : -1;
+      return [
+        entry?.storeId,
+        entry?.gameId,
+        entry?.status,
+        entry?.progressPercent,
+        entry?.isStalled === true ? 1 : 0,
+        entry?.catalogEntryAvailable === false ? 0 : 1,
+        ageBucket,
+      ].join(":");
+    }).join("|");
+  }
+
+  function hasOmniLibraryStoreDisconnectBlocker(storeId) {
+    return getOmniLibraryDownloadEntries().some(
+      (entry) =>
+        entry?.storeId === storeId &&
+        [
+          "preparing",
+          "queued",
+          "downloading",
+          "reconnecting",
+          "finalizing",
+          "paused",
+          "canceling",
+          "action-required",
+          "uninstalling",
+          "uninstall-action-required",
+        ].includes(String(entry?.status || "").toLowerCase()),
+    );
+  }
+
+  function isOmniLibraryDownloadActive(status) {
+    return [
+      "preparing",
+      "queued",
+      "downloading",
+      "reconnecting",
+      "finalizing",
+      "canceling",
+      "uninstalling",
+      "uninstall-action-required",
+    ].includes(String(status || "").toLowerCase());
+  }
+
+  function formatOmniLibraryBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes >= 1024 ** 3) {
+      return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+    }
+    if (bytes >= 1024 ** 2) {
+      return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+    }
+    if (bytes >= 1024) {
+      return `${(bytes / 1024).toFixed(1)} KiB`;
+    }
+    return `${Math.round(bytes)} B`;
+  }
+
+  function formatOmniLibraryRemaining(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 60) {
+      return `${total}s remaining`;
+    }
+    const minutes = Math.floor(total / 60);
+    if (minutes < 60) {
+      return `${minutes}m remaining`;
+    }
+    return `${Math.floor(minutes / 60)}h ${minutes % 60}m remaining`;
+  }
+
+  function formatOmniLibraryUpdatedAge(updatedAtUtc) {
+    const updatedAt = Date.parse(String(updatedAtUtc || ""));
+    if (!Number.isFinite(updatedAt)) {
+      return "";
+    }
+
+    const seconds = Math.max(0, Math.floor((Date.now() - updatedAt) / 1000));
+    if (seconds < 5) {
+      return "updated now";
+    }
+    if (seconds < 60) {
+      return `updated ${seconds}s ago`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+      return `updated ${minutes}m ago`;
+    }
+    const hours = Math.floor(minutes / 60);
+    return `updated ${hours}h ago`;
+  }
+
+  function getOmniLibraryDownloadStage(status, entry = null) {
+    if (entry?.isStalled === true) {
+      return "Checking download";
+    }
+
+    return {
+      preparing: "Preparing",
+      queued: "Queued",
+      downloading: "Downloading",
+      reconnecting: "Reconnecting",
+      paused: "Paused",
+      finalizing: "Finalizing",
+      canceling: "Removing partial files",
+      uninstalling: "Uninstalling",
+      "uninstall-action-required": "Finish uninstall in store",
+      "uninstall-failed": "Uninstall needs attention",
+      "action-required": "Action required",
+      failed: "Failed",
+      "cancel-failed": "Cleanup needs attention",
+      canceled: "Canceled",
+      completed: "Completed",
+    }[String(status || "").toLowerCase()] || "Download";
+  }
+
+  function getOmniLibraryDownloadBadge(entry) {
+    const status = String(entry?.status || "").toLowerCase();
+    const progress = Math.max(0, Math.min(100, Number(entry?.progressPercent) || 0));
+    if (entry?.isStalled === true) {
+      return "Check";
+    }
+    if (isOmniLibraryDownloadActive(status) && progress > 0) {
+      return `${progress}%`;
+    }
+    return {
+      paused: "Paused",
+      failed: "Retry",
+      "cancel-failed": "Check",
+      canceled: "Canceled",
+      completed: "Done",
+      "action-required": "Open",
+      uninstalling: "Removing",
+      "uninstall-action-required": "Open",
+      "uninstall-failed": "Retry",
+    }[status] || getOmniLibraryDownloadStage(status, entry);
+  }
+
+  function buildOmniLibraryDownloadCopy(entry) {
+    const status = String(entry?.status || "").toLowerCase();
+    const progress = Math.max(0, Math.min(100, Number(entry?.progressPercent) || 0));
+    const downloaded = Math.max(0, Number(entry?.downloadedBytes) || 0);
+    const total = Math.max(0, Number(entry?.totalBytes) || 0);
+    const speed = Math.max(0, Number(entry?.downloadBytesPerSecond) || 0);
+    const parts = [
+      entry?.storeTitle || "OmniLibrary",
+      `${getOmniLibraryDownloadStage(status, entry)}${progress > 0 && !["completed", "canceled"].includes(status) ? ` ${progress}%` : ""}`,
+    ];
+    if (downloaded > 0 && total > 0) {
+      parts.push(`${formatOmniLibraryBytes(downloaded)} / ${formatOmniLibraryBytes(total)}`);
+    }
+    if (speed > 0 && entry?.isStalled !== true) {
+      parts.push(`${formatOmniLibraryBytes(speed)}/s`);
+      if (total > downloaded) {
+        parts.push(formatOmniLibraryRemaining((total - downloaded) / speed));
+      }
+    }
+    const updatedAge = formatOmniLibraryUpdatedAge(entry?.updatedAtUtc);
+    if (updatedAge) {
+      parts.push(updatedAge);
+    }
+    if (entry?.catalogEntryAvailable === false) {
+      parts.push("library entry unavailable");
+    }
+    return parts.filter(Boolean).join(" · ");
+  }
+
+  function createOmniLibraryDownloadProgressSlot(entry) {
+    const progress = Math.max(0, Math.min(100, Number(entry?.progressPercent) || 0));
+    const detail = String(entry?.detailText || "").trim() ||
+      "Waiting for the store to report its next step.";
+    const key = `omnilibrary-download-progress-${entry.storeId}-${entry.gameId}`;
+    return {
+      title: entry.gameTitle,
+      copy: detail,
+      disabled: true,
+      slotKey: key,
+      onClick: () => {},
+      customRenderer: () =>
+        createElement(
+          "div",
+          withChildren(
+            {
+              className: "steamloader-section-slot",
+              key,
+            },
+            createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-progress-title" },
+                `${getOmniLibraryDownloadStage(entry.status, entry)}${progress > 0 ? ` · ${progress}%` : ""}`,
+              ),
+            ),
+            createElement(
+              "div",
+              withChildren(
+                {
+                  className: "steamloader-progress-track",
+                  "aria-label": `${progress}%`,
+                },
+                createElement("span", {
+                  className: "steamloader-progress-fill",
+                  style: { width: `${progress}%` },
+                }),
+              ),
+            ),
+            createElement("div", {
+              className: "steamloader-progress-copy",
+              children: detail,
+            }),
+          ),
+          key,
+        ),
+    };
+  }
+
+  function buildOmniLibraryDownloadCenterSlots(
+    makeAccordionSlot,
+    makeCommandSlot,
+  ) {
+    const entries = getOmniLibraryDownloadEntries();
+    const activeCount = entries.filter((entry) =>
+      isOmniLibraryDownloadActive(entry?.status)).length;
+    const attentionCount = entries.filter((entry) =>
+      entry?.isStalled === true ||
+      [
+        "paused",
+        "failed",
+        "cancel-failed",
+        "action-required",
+        "uninstall-action-required",
+        "uninstall-failed",
+      ].includes(String(entry?.status || "").toLowerCase())).length;
+    const centerKey = "omnilibrary-download-center";
+    const expanded = isExpandedSection(centerKey, true);
+    const summary = state.storeSync.downloadCenterLoading && !state.storeSync.downloadCenter
+      ? "Loading downloads..."
+      : entries.length === 0
+        ? "No active or recent downloads."
+        : [
+            activeCount ? `${activeCount} active` : "",
+            attentionCount ? `${attentionCount} needs attention` : "",
+            `${entries.length} total`,
+          ].filter(Boolean).join(" · ");
+    const slots = [
+      makeAccordionSlot(
+        "Download Center",
+        summary,
+        expanded,
+        () => {
+          toggleExpandedSection(centerKey, true);
+          rerenderStoreSyncPanel();
+        },
+        {
+          slotKey: centerKey,
+          badge: activeCount > 0 ? `${activeCount} Active` : entries.length ? `${entries.length}` : "Ready",
+          leadingIcon: RefreshActionIcon,
+        },
+      ),
+    ];
+
+    if (!expanded) {
+      return slots;
+    }
+
+    if (state.storeSync.downloadCenterError) {
+      slots.push(makeCommandSlot(
+        "Refresh Download Center",
+        state.storeSync.downloadCenterError,
+        () => loadOmniLibraryDownloadCenter({ showLoading: true }),
+        {
+          slotKey: "omnilibrary-download-center-retry",
+          leadingIcon: RefreshActionIcon,
+        },
+      ));
+    }
+
+    if (state.storeSync.downloadCenterNotice) {
+      slots.push(createSectionSlot(
+        "Download Center",
+        state.storeSync.downloadCenterNotice,
+        "omnilibrary-download-center-notice",
+      ));
+    }
+
+    if (!entries.length) {
+      slots.push(createSectionSlot(
+        "Downloads appear here",
+        "Start a game download from its Steam library page. Active, paused, failed, canceled, and recently completed transfers stay visible here.",
+        "omnilibrary-download-center-empty",
+      ));
+      return slots;
+    }
+
+    for (const entry of entries) {
+      const entryKey = `${entry.storeId}:${entry.gameId}`;
+      const sectionKey = `omnilibrary-download-${entryKey}`;
+      const entryExpanded = isExpandedSection(sectionKey, false);
+      const actionBusy = state.storeSync.downloadActionKeys?.[entryKey] === true;
+      slots.push(makeAccordionSlot(
+        entry.gameTitle || entry.gameId,
+        buildOmniLibraryDownloadCopy(entry),
+        entryExpanded,
+        () => {
+          toggleExpandedSection(sectionKey, true);
+          rerenderStoreSyncPanel();
+        },
+        {
+          slotKey: sectionKey,
+          badge: getOmniLibraryDownloadBadge(entry),
+          leadingIcon: StoreSyncPluginIcon,
+        },
+      ));
+      if (!entryExpanded) {
+        continue;
+      }
+
+      slots.push(createOmniLibraryDownloadProgressSlot(entry));
+      if (entry.canPause) {
+        slots.push(makeCommandSlot(
+          "Pause Download",
+          "Stop the managed worker and keep all checkpointed files for Resume.",
+          () => requestOmniLibraryDownloadAction(entry, "pause"),
+          {
+            slotKey: `${sectionKey}-pause`,
+            disabled: actionBusy,
+          },
+        ));
+      }
+      if (entry.canResume) {
+        slots.push(makeCommandSlot(
+          String(entry.status).toLowerCase() === "canceled"
+            ? "Download Again"
+            : "Resume Download",
+          "Continue from saved files when available.",
+          () => requestOmniLibraryDownloadAction(entry, "resume"),
+          {
+            slotKey: `${sectionKey}-resume`,
+            disabled: actionBusy,
+            leadingIcon: RefreshActionIcon,
+          },
+        ));
+      }
+      if (entry.canManageExternally) {
+        const uninstallStatus = [
+          "uninstall-action-required",
+          "uninstall-failed",
+        ].includes(String(entry.status || "").toLowerCase());
+        slots.push(makeCommandSlot(
+          entry.storeId === "xbox-game-pass" ? "Manage in Xbox" : `Open ${entry.storeTitle}`,
+          uninstallStatus
+            ? `Open ${entry.storeTitle} to finish or retry uninstalling this game.`
+            : entry.storeId === "xbox-game-pass"
+            ? "Open this exact Xbox product page to pause, resume, or cancel the native Windows download."
+            : "Open the official store page required to continue this operation.",
+          () => requestOmniLibraryDownloadAction(entry, "manage"),
+          {
+            slotKey: `${sectionKey}-manage`,
+            disabled: actionBusy,
+            leadingIcon: StoreSyncPluginIcon,
+          },
+        ));
+      }
+      if (entry.canRetryUninstall) {
+        slots.push(makeCommandSlot(
+          "Retry Uninstall",
+          `Try removing ${entry.gameTitle} again through ${entry.storeTitle}.`,
+          () => requestOmniLibraryDownloadAction(entry, "retry-uninstall"),
+          {
+            slotKey: `${sectionKey}-retry-uninstall`,
+            disabled: actionBusy,
+            leadingIcon: DeleteActionIcon,
+          },
+        ));
+      }
+      if (entry.canPlay) {
+        slots.push(makeCommandSlot(
+          "Play",
+          `Launch ${entry.gameTitle} through its connected store.`,
+          () => requestOmniLibraryDownloadAction(entry, "play"),
+          {
+            slotKey: `${sectionKey}-play`,
+            disabled: actionBusy,
+          },
+        ));
+      }
+      if (entry.canCancel) {
+        const armed = state.storeSync.cancelDownloadArmedKey === entryKey;
+        slots.push(makeCommandSlot(
+          armed ? "Confirm Cancel & Delete" : "Cancel & Delete Partial Files",
+          armed
+            ? "Press once more to stop this download and permanently remove its partial files."
+            : "Cancel this transfer. A second confirmation is required before any files are removed.",
+          () => requestOmniLibraryDownloadAction(entry, "cancel"),
+          {
+            slotKey: `${sectionKey}-cancel`,
+            disabled: actionBusy,
+            badge: armed ? "Confirm" : "",
+            leadingIcon: DeleteActionIcon,
+          },
+        ));
+      }
+      if (entry.canDismiss) {
+        const failedStatus = [
+          "failed",
+          "cancel-failed",
+          "uninstall-failed",
+        ].includes(String(entry.status || "").toLowerCase());
+        slots.push(makeCommandSlot(
+          "Remove from Download Center",
+          failedStatus
+            ? "Dismiss this saved failure after reviewing it. No installed or partial game files are removed."
+            : "Hide this recent history entry. No installed game files are removed.",
+          () => requestOmniLibraryDownloadAction(entry, "dismiss"),
+          {
+            slotKey: `${sectionKey}-dismiss`,
+            disabled: actionBusy,
+          },
+        ));
+      }
+    }
+
+    return slots;
   }
 
   function buildStoreSyncPreviewBadge(entry) {
@@ -13705,6 +14533,22 @@
 
   function isUpdatesBusy() {
     return state.updates.loading || state.updates.saving || Boolean(getUpdateSnapshot()?.installInProgress);
+  }
+
+  function isSystemToolsBusy() {
+    return state.systemTools.loading || state.systemTools.saving;
+  }
+
+  function isHdrDisplayBusy() {
+    return state.systemHdr.loading || state.systemHdr.saving;
+  }
+
+  function isWindowsSystemUpdateBusy() {
+    return state.systemWindowsUpdates.loading || state.systemWindowsUpdates.saving;
+  }
+
+  function isBluetoothDeviceBusy() {
+    return state.systemBluetooth.loading || state.systemBluetooth.saving;
   }
 
   function isAutoSisirBusy() {
@@ -14166,6 +15010,56 @@
     return getUpdateHeadline();
   }
 
+  function resolveSystemToolsStatusText() {
+    if (state.systemTools.saving) {
+      return "Downloading or opening the GPU update tool...";
+    }
+
+    if (state.systemTools.loading) {
+      return "Checking the GPU update tool...";
+    }
+
+    return getNvidiaDriverUpdateSnapshot()?.statusText || "";
+  }
+
+  function resolveHdrDisplayStatusText() {
+    if (state.systemHdr.saving) {
+      return "Applying the HDR setting...";
+    }
+
+    if (state.systemHdr.loading) {
+      return "Reading active display HDR support...";
+    }
+
+    return getHdrDisplaySnapshot()?.statusText || "";
+  }
+
+  function resolveWindowsSystemUpdateStatusText() {
+    if (state.systemWindowsUpdates.saving) {
+      return "Opening the Windows Update workflow...";
+    }
+
+    if (state.systemWindowsUpdates.loading) {
+      return "Checking Windows Update...";
+    }
+
+    return getWindowsSystemUpdateSnapshot()?.statusText || "Windows Update has not been checked yet.";
+  }
+
+  function resolveBluetoothDeviceStatusText() {
+    if (state.systemBluetooth.saving) {
+      return getBluetoothDeviceSnapshot()?.pairingDeviceId
+        ? "Pairing the Bluetooth device..."
+        : "Starting the Bluetooth scan...";
+    }
+
+    if (state.systemBluetooth.loading) {
+      return "Reading Bluetooth devices...";
+    }
+
+    return getBluetoothDeviceSnapshot()?.statusText || "Bluetooth devices have not been loaded yet.";
+  }
+
   function getThemesSnapshot() {
     return state.themes.snapshot;
   }
@@ -14588,6 +15482,9 @@
   async function loadStoreSyncState(options = {}) {
     const showLoading = options.showLoading !== false;
     const preserveDrafts = options.preserveDrafts === true;
+    const statePath = state.route?.pluginId === "omnilibrary"
+      ? "api/unifystore/settings-state"
+      : "api/store-sync/state";
     state.storeSync.error = "";
 
     if (showLoading) {
@@ -14596,7 +15493,7 @@
     }
 
     try {
-      const response = await fetch(`${apiBase}api/store-sync/state`, { cache: "no-store" });
+      const response = await fetch(`${apiBase}${statePath}`, { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.message || `Store Sync could not be loaded (${response.status}).`);
@@ -14648,6 +15545,129 @@
     } finally {
       state.generalSettings.loading = false;
       rerenderGeneralSettingsPanel();
+    }
+  }
+
+  async function loadSystemToolsState(options = {}) {
+    const showLoading = options.showLoading !== false;
+    state.systemTools.loading = true;
+    state.systemTools.error = "";
+    if (showLoading) {
+      rerenderSystemToolsPanel();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/system/driver/nvidia/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `System tools could not be loaded (${response.status}).`);
+      }
+
+      state.systemTools.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemTools.error = error instanceof Error ? error.message : String(error);
+      state.systemTools.snapshot = null;
+    } finally {
+      state.systemTools.loading = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function loadHdrDisplayState(options = {}) {
+    const showLoading = options.showLoading !== false;
+    if (showLoading) {
+      state.systemHdr.loading = true;
+    }
+    state.systemHdr.error = "";
+    if (showLoading) {
+      rerenderSystemToolsPanel();
+    }
+
+    try {
+      const response = await fetch(`${apiBase}api/system/hdr/state`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `HDR state could not be loaded (${response.status}).`);
+      }
+
+      state.systemHdr.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemHdr.error = error instanceof Error ? error.message : String(error);
+      state.systemHdr.snapshot = null;
+    } finally {
+      state.systemHdr.loading = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function loadWindowsSystemUpdates(options = {}) {
+    const force = options.force === true;
+    const showLoading = options.showLoading !== false;
+    if (showLoading) {
+      state.systemWindowsUpdates.loading = true;
+    }
+    state.systemWindowsUpdates.error = "";
+    if (showLoading) {
+      rerenderSystemToolsPanel();
+    }
+
+    try {
+      const response = await fetch(
+        `${apiBase}api/system/windows-update/${force ? "scan" : "state"}`,
+        {
+          method: force ? "POST" : "GET",
+          headers: force ? { "Content-Type": "application/json" } : undefined,
+          body: force ? "{}" : undefined,
+          cache: "no-store",
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Windows Update could not be loaded (${response.status}).`);
+      }
+
+      state.systemWindowsUpdates.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemWindowsUpdates.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemWindowsUpdates.loading = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function loadBluetoothDeviceState(options = {}) {
+    const refresh = options.refresh === true;
+    const showLoading = options.showLoading !== false;
+    if (showLoading) {
+      state.systemBluetooth.loading = true;
+    }
+    state.systemBluetooth.error = "";
+    if (showLoading) {
+      rerenderSystemToolsPanel();
+    }
+
+    try {
+      const response = await fetch(
+        `${apiBase}api/system/bluetooth/${refresh ? "refresh" : "state"}`,
+        {
+          method: refresh ? "POST" : "GET",
+          headers: refresh ? { "Content-Type": "application/json" } : undefined,
+          body: refresh ? "{}" : undefined,
+          cache: "no-store",
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Bluetooth devices could not be loaded (${response.status}).`);
+      }
+
+      state.systemBluetooth.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemBluetooth.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemBluetooth.loading = false;
+      updateBluetoothPolling();
+      rerenderSystemToolsPanel();
     }
   }
 
@@ -15759,7 +16779,7 @@
       const response = await fetch(`${apiBase}api/app-start/state`, { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload.message || `App Start could not be loaded (${response.status}).`);
+        throw new Error(payload.message || `Apps could not be loaded (${response.status}).`);
       }
 
       setAppStartSnapshot(payload);
@@ -16246,6 +17266,265 @@
     return succeeded;
   }
 
+  async function launchNvidiaDriverUpdate() {
+    state.systemTools.saving = true;
+    state.systemTools.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/driver/nvidia/update`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The GPU update tool could not be opened (${response.status}).`);
+      }
+
+      state.systemTools.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemTools.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemTools.saving = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  function isSilentNvidiaGameReadyArmed() {
+    return state.systemTools.silentGameReadyArmedUntil > Date.now();
+  }
+
+  function resetSilentNvidiaGameReadyArm() {
+    state.systemTools.silentGameReadyArmedUntil = 0;
+    if (state.systemTools.silentGameReadyArmTimer) {
+      window.clearTimeout(state.systemTools.silentGameReadyArmTimer);
+      state.systemTools.silentGameReadyArmTimer = 0;
+    }
+  }
+
+  function armOrLaunchSilentNvidiaGameReadyUpdate() {
+    if (isSilentNvidiaGameReadyArmed()) {
+      resetSilentNvidiaGameReadyArm();
+      void launchSilentNvidiaGameReadyUpdate();
+      return;
+    }
+
+    state.systemTools.silentGameReadyArmedUntil = Date.now() + 5000;
+    if (state.systemTools.silentGameReadyArmTimer) {
+      window.clearTimeout(state.systemTools.silentGameReadyArmTimer);
+    }
+    state.systemTools.silentGameReadyArmTimer = window.setTimeout(() => {
+      state.systemTools.silentGameReadyArmTimer = 0;
+      state.systemTools.silentGameReadyArmedUntil = 0;
+      rerenderSystemToolsPanel();
+    }, 5100);
+    rerenderSystemToolsPanel();
+  }
+
+  async function launchSilentNvidiaGameReadyUpdate() {
+    resetSilentNvidiaGameReadyArm();
+    state.systemTools.saving = true;
+    state.systemTools.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(
+        `${apiBase}api/system/driver/nvidia/game-ready/silent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: "{}",
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          payload.message || `The silent Game Ready update could not be started (${response.status}).`,
+        );
+      }
+
+      state.systemTools.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemTools.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemTools.saving = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function setHdrDisplayEnabled(enabled) {
+    state.systemHdr.saving = true;
+    state.systemHdr.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/hdr/enabled`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ value: Boolean(enabled) }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `HDR could not be changed (${response.status}).`);
+      }
+
+      state.systemHdr.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemHdr.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemHdr.saving = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  function isWindowsSystemUpdateRunArmed() {
+    return state.systemWindowsUpdates.runArmedUntil > Date.now();
+  }
+
+  function resetWindowsSystemUpdateRunArm() {
+    state.systemWindowsUpdates.runArmedUntil = 0;
+    if (state.systemWindowsUpdates.runArmTimer) {
+      window.clearTimeout(state.systemWindowsUpdates.runArmTimer);
+      state.systemWindowsUpdates.runArmTimer = 0;
+    }
+  }
+
+  function armOrRunWindowsSystemUpdates() {
+    if (isWindowsSystemUpdateRunArmed()) {
+      resetWindowsSystemUpdateRunArm();
+      void runWindowsSystemUpdates();
+      return;
+    }
+
+    state.systemWindowsUpdates.runArmedUntil = Date.now() + 5000;
+    if (state.systemWindowsUpdates.runArmTimer) {
+      window.clearTimeout(state.systemWindowsUpdates.runArmTimer);
+    }
+    state.systemWindowsUpdates.runArmTimer = window.setTimeout(() => {
+      state.systemWindowsUpdates.runArmTimer = 0;
+      state.systemWindowsUpdates.runArmedUntil = 0;
+      rerenderSystemToolsPanel();
+    }, 5100);
+    rerenderSystemToolsPanel();
+  }
+
+  async function runWindowsSystemUpdates() {
+    state.systemWindowsUpdates.saving = true;
+    state.systemWindowsUpdates.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/windows-update/run`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Windows Update could not be started (${response.status}).`);
+      }
+
+      state.systemWindowsUpdates.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemWindowsUpdates.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemWindowsUpdates.saving = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function scanBluetoothDevices() {
+    state.systemBluetooth.saving = true;
+    state.systemBluetooth.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/bluetooth/scan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Bluetooth scanning could not be started (${response.status}).`);
+      }
+
+      state.systemBluetooth.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemBluetooth.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemBluetooth.saving = false;
+      updateBluetoothPolling();
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function pairBluetoothDevice(deviceId) {
+    state.systemBluetooth.saving = true;
+    state.systemBluetooth.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/bluetooth/pair`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ deviceId }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `The Bluetooth device could not be paired (${response.status}).`);
+      }
+
+      state.systemBluetooth.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemBluetooth.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemBluetooth.saving = false;
+      updateBluetoothPolling();
+      rerenderSystemToolsPanel();
+    }
+  }
+
+  async function openBluetoothSettings() {
+    state.systemBluetooth.saving = true;
+    state.systemBluetooth.error = "";
+    rerenderSystemToolsPanel();
+
+    try {
+      const response = await fetch(`${apiBase}api/system/bluetooth/settings`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Bluetooth settings could not be opened (${response.status}).`);
+      }
+
+      state.systemBluetooth.snapshot = payload && typeof payload === "object" ? payload : null;
+    } catch (error) {
+      state.systemBluetooth.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.systemBluetooth.saving = false;
+      rerenderSystemToolsPanel();
+    }
+  }
+
   async function openPluginStoreOverlay() {
     setupPluginStoreBridge();
     setPluginStoreRemoteActive(true, { source: "plugin-store" });
@@ -16285,11 +17564,33 @@
       });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload.message || `Storefront could not be opened (${response.status}).`);
+        throw new Error(payload.message || `OmniLibrary could not be opened (${response.status}).`);
       }
     } catch (error) {
       setPluginStoreRemoteActive(false);
       state.storeSync.error = error instanceof Error ? error.message : String(error);
+      rerenderHomePanel();
+    }
+  }
+
+  async function openStoreOverlay() {
+    setupPluginStoreBridge();
+    setPluginStoreRemoteActive(true, { source: "store" });
+    closeQuickAccessMenuForPluginStoreSession();
+
+    try {
+      const response = await fetch(`${apiBase}api/store/overlay/open`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.message || "Store could not be opened.");
+      }
+    } catch (error) {
+      setPluginStoreRemoteActive(false);
+      state.generalSettings.error = error instanceof Error ? error.message : String(error);
       rerenderHomePanel();
     }
   }
@@ -17208,19 +18509,36 @@
   async function togglePluginEnabled(pluginId, enabled) {
     const snapshot = getGeneralSettingsSnapshot();
     if (snapshot?.plugins) {
+      const alternativeLibraryPluginId =
+        pluginId === "store-sync"
+          ? "omnilibrary"
+          : pluginId === "omnilibrary"
+            ? "store-sync"
+            : "";
+      const nextPlugins = snapshot.plugins.map((plugin) => {
+        if (plugin.id === pluginId) {
+          return {
+            ...plugin,
+            enabled,
+          };
+        }
+
+        if (alternativeLibraryPluginId && plugin.id === alternativeLibraryPluginId) {
+          return {
+            ...plugin,
+            enabled: !enabled,
+          };
+        }
+
+        return plugin;
+      });
       state.generalSettings.snapshot = {
         ...snapshot,
-        plugins: snapshot.plugins.map((plugin) =>
-          plugin.id === pluginId
-            ? {
-                ...plugin,
-                enabled,
-              }
-            : plugin,
-        ),
+        plugins: nextPlugins,
       };
 
-      if (!enabled && state.route.pluginId === pluginId) {
+      const routePluginEnabled = nextPlugins.find((plugin) => plugin.id === state.route.pluginId)?.enabled;
+      if (state.route.pluginId && routePluginEnabled === false) {
         requestFocusForRoute(parseRoute("root"), 0);
         state.route = parseRoute("root");
       }
@@ -17299,6 +18617,21 @@
     }
 
     if (saved) {
+      if (pluginId === "omnilibrary" || pluginId === "store-sync") {
+        try {
+          const channel = typeof window.BroadcastChannel === "function"
+            ? new window.BroadcastChannel("ToolsForSteamOmniLibraryStores")
+            : null;
+          channel?.postMessage({ type: "stores-changed" });
+          channel?.close();
+          window.localStorage?.setItem(
+            "ToolsForSteamOmniLibraryStoresChanged",
+            `${Date.now()}:${pluginId}:${enabled}`,
+          );
+        } catch (_) {
+        }
+      }
+
       if (state.route.screen === "root") {
         rerenderHomePanel();
       }
@@ -17798,34 +19131,33 @@
     );
   }
 
-  async function toggleUnifySteamStoreEnabled(storeId, enabled) {
-    const snapshot = getStoreSyncSnapshot();
-    if (snapshot?.unifySteam?.stores) {
-      state.storeSync.snapshot = {
-        ...snapshot,
-        unifySteam: {
-          ...snapshot.unifySteam,
-          stores: snapshot.unifySteam.stores.map((store) =>
-            store.id === storeId
-              ? {
-                  ...store,
-                  enabled,
-                }
-              : store,
-          ),
-        },
-      };
-      rerenderStoreSyncPanel();
-    }
+  function notifyOmniLibraryStoreStateChanged() {
+    const changedAt = Date.now();
+    try {
+      if (typeof window.BroadcastChannel === "function") {
+        const channel = new window.BroadcastChannel(omniLibraryStoreChannelName);
+        channel.postMessage({ type: "stores-changed", changedAt });
+        channel.close();
+      }
+    } catch (_) {}
 
-    await sendStoreSyncRequest(
-      "api/store-sync/unifysteam/stores/enabled",
+    try {
+      window.localStorage?.setItem(omniLibraryStoreStorageKey, String(changedAt));
+    } catch (_) {}
+  }
+
+  async function toggleUnifyStoreEnabled(storeId, enabled) {
+    const succeeded = await sendStoreSyncRequest(
+      "api/unifystore/stores/enabled",
       {
         storeId,
         enabled,
       },
       { rerenderOnStart: false },
     );
+    if (succeeded) {
+      notifyOmniLibraryStoreStateChanged();
+    }
   }
 
   async function refreshUnifySteam(storeId = "") {
@@ -17841,15 +19173,513 @@
   }
 
   async function refreshUnifyStore(storeId = "") {
-    await sendStoreSyncRequest("api/unifystore/stores/refresh", {
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/refresh", {
+      value: storeId,
+    });
+    if (succeeded) {
+      notifyOmniLibraryStoreStateChanged();
+    }
+  }
+
+  async function restartSteamForOmniLibrary() {
+    state.power.actioning = true;
+    state.storeSync.error = "";
+    rerenderStoreSyncPanel();
+    try {
+      const response = await fetch(`${apiBase}api/unifystore/restart-steam`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Steam could not be restarted (${response.status}).`);
+      }
+    } catch (error) {
+      state.storeSync.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.power.actioning = false;
+      rerenderStoreSyncPanel();
+    }
+  }
+
+  async function fetchOmniLibraryDownloadCenterRequest(
+    path,
+    options = {},
+    timeoutMs = 12000,
+  ) {
+    if (typeof window.AbortController !== "function") {
+      return fetch(`${apiBase}${path}`, options);
+    }
+
+    const controller = new window.AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(`${apiBase}${path}`, {
+        ...options,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("The local TFS service did not answer in time.");
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
+  function setOmniLibraryDownloadCenterNotice(message, durationMs = 8000) {
+    if (state.storeSync.downloadCenterNoticeTimer) {
+      window.clearTimeout(state.storeSync.downloadCenterNoticeTimer);
+      state.storeSync.downloadCenterNoticeTimer = 0;
+    }
+
+    state.storeSync.downloadCenterNotice = String(message || "").trim();
+    if (!state.storeSync.downloadCenterNotice) {
+      return;
+    }
+
+    state.storeSync.downloadCenterNoticeTimer = window.setTimeout(() => {
+      state.storeSync.downloadCenterNoticeTimer = 0;
+      state.storeSync.downloadCenterNotice = "";
+      rerenderStoreSyncPanel();
+    }, durationMs);
+  }
+
+  function publishOmniLibraryDownloadStatusChanged(entry, statusOverride = null) {
+    const appId = Number(entry?.steamAppId || 0);
+    try {
+      window.__steamToolsOmniDownloadsChannel?.postMessage?.({
+        type: "download-status-changed",
+        appId,
+        storeId: String(entry?.storeId || ""),
+        gameId: String(entry?.gameId || ""),
+        status: String(statusOverride ?? entry?.status ?? ""),
+      });
+    } catch (_) {}
+  }
+
+  function ensureOmniLibraryDownloadStatusChannel() {
+    const existing = window.__steamToolsOmniDownloadsChannel;
+    if (
+      existing?.__steamToolsVersion === stateVersion ||
+      typeof window.BroadcastChannel !== "function"
+    ) {
+      return;
+    }
+
+    try {
+      existing?.close?.();
+    } catch (_) {}
+
+    try {
+      const channel = new window.BroadcastChannel(omniLibraryStoreChannelName);
+      channel.__steamToolsVersion = stateVersion;
+      channel.addEventListener("message", (event) => {
+        if (
+          event?.data?.type !== "download-status-changed" ||
+          state.route?.pluginId !== "omnilibrary" ||
+          !state.panelVisible
+        ) {
+          return;
+        }
+
+        if (state.storeSync.downloadCenterLoading) {
+          state.storeSync.downloadCenterRefreshQueued = true;
+          return;
+        }
+
+        void loadOmniLibraryDownloadCenter();
+      });
+      window.__steamToolsOmniDownloadsChannel = channel;
+    } catch (_) {
+      window.__steamToolsOmniDownloadsChannel = null;
+    }
+  }
+
+  async function loadOmniLibraryDownloadCenter(options = {}) {
+    if (state.route?.pluginId !== "omnilibrary") {
+      return;
+    }
+
+    const showLoading = options.showLoading === true;
+    if (state.storeSync.downloadCenterLoading) {
+      state.storeSync.downloadCenterRefreshQueued = true;
+      return;
+    }
+
+    state.storeSync.downloadCenterLoading = true;
+    state.storeSync.downloadCenterRefreshQueued = false;
+    if (showLoading) {
+      rerenderStoreSyncPanel();
+    }
+    try {
+      const response = await fetchOmniLibraryDownloadCenterRequest(
+        "api/unifystore/downloads",
+        { cache: "no-store" },
+      );
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload) {
+        throw new Error(
+          payload?.message ||
+          `Download Center could not be loaded (${response.status}).`,
+        );
+      }
+
+      const previousRevision = Number(
+        state.storeSync.downloadCenter?.revision ?? -1,
+      );
+      const nextRevision = Number(payload.revision ?? -2);
+      const previousUiSignature =
+        state.storeSync.downloadCenterUiSignature || "";
+      const nextUiSignature =
+        buildOmniLibraryDownloadCenterUiSignature(payload);
+      state.storeSync.downloadCenter = payload;
+      state.storeSync.downloadCenterUiSignature = nextUiSignature;
+      state.storeSync.downloadCenterError = "";
+      if (
+        showLoading ||
+        previousRevision !== nextRevision ||
+        previousUiSignature !== nextUiSignature
+      ) {
+        rerenderStoreSyncPanel();
+      }
+    } catch (error) {
+      const previousError = state.storeSync.downloadCenterError;
+      state.storeSync.downloadCenterError =
+        error instanceof Error ? error.message : String(error);
+      if (
+        showLoading ||
+        !state.storeSync.downloadCenter ||
+        previousError !== state.storeSync.downloadCenterError
+      ) {
+        rerenderStoreSyncPanel();
+      }
+    } finally {
+      state.storeSync.downloadCenterLoading = false;
+      const refreshQueued = state.storeSync.downloadCenterRefreshQueued;
+      state.storeSync.downloadCenterRefreshQueued = false;
+      if (
+        refreshQueued &&
+        state.panelVisible &&
+        state.route?.pluginId === "omnilibrary"
+      ) {
+        window.setTimeout(() => {
+          void loadOmniLibraryDownloadCenter();
+        }, 0);
+      } else {
+        scheduleOmniLibraryDownloadCenterRefresh();
+      }
+    }
+  }
+
+  function scheduleOmniLibraryDownloadCenterRefresh() {
+    if (window.__steamToolsOmniDownloadsPollTimer) {
+      window.clearTimeout(window.__steamToolsOmniDownloadsPollTimer);
+      window.__steamToolsOmniDownloadsPollTimer = null;
+    }
+
+    if (
+      !state.panelVisible ||
+      state.route?.pluginId !== "omnilibrary"
+    ) {
+      return;
+    }
+
+    const hasActiveDownload = getOmniLibraryDownloadEntries().some((entry) =>
+      isOmniLibraryDownloadActive(entry?.status));
+    window.__steamToolsOmniDownloadsPollTimer = window.setTimeout(() => {
+      window.__steamToolsOmniDownloadsPollTimer = null;
+      void loadOmniLibraryDownloadCenter();
+    }, hasActiveDownload ? 2000 : 10000);
+  }
+
+  function resetOmniLibraryCancelConfirmation() {
+    if (state.storeSync.cancelDownloadArmTimer) {
+      window.clearTimeout(state.storeSync.cancelDownloadArmTimer);
+      state.storeSync.cancelDownloadArmTimer = 0;
+    }
+    state.storeSync.cancelDownloadArmedKey = "";
+  }
+
+  async function requestOmniLibraryDownloadAction(entry, action) {
+    const entryKey = `${entry?.storeId || ""}:${entry?.gameId || ""}`;
+    if (!entry?.storeId || !entry?.gameId || !action ||
+        state.storeSync.downloadActionKeys?.[entryKey] === true) {
+      return;
+    }
+
+    if (
+      action === "cancel" &&
+      state.storeSync.cancelDownloadArmedKey !== entryKey
+    ) {
+      resetOmniLibraryCancelConfirmation();
+      state.storeSync.cancelDownloadArmedKey = entryKey;
+      state.storeSync.cancelDownloadArmTimer = window.setTimeout(() => {
+        state.storeSync.cancelDownloadArmTimer = 0;
+        if (state.storeSync.cancelDownloadArmedKey === entryKey) {
+          state.storeSync.cancelDownloadArmedKey = "";
+          rerenderStoreSyncPanel();
+        }
+      }, 10000);
+      rerenderStoreSyncPanel();
+      return;
+    }
+
+    resetOmniLibraryCancelConfirmation();
+    state.storeSync.downloadActionKeys = {
+      ...(state.storeSync.downloadActionKeys || {}),
+      [entryKey]: true,
+    };
+    state.storeSync.downloadCenterError = "";
+    setOmniLibraryDownloadCenterNotice("");
+    rerenderStoreSyncPanel();
+    try {
+      const response = await fetchOmniLibraryDownloadCenterRequest(
+        "api/unifystore/downloads/action",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            storeId: entry.storeId,
+            gameId: entry.gameId,
+            action,
+          }),
+        },
+        20000,
+      );
+      const payload = await response.json().catch(() => null);
+      if (payload?.downloads) {
+        state.storeSync.downloadCenter = payload.downloads;
+      }
+      if (!response.ok) {
+        throw new Error(
+          payload?.message ||
+          `The download action failed (${response.status}).`,
+        );
+      }
+      state.storeSync.downloadCenterError = "";
+      setOmniLibraryDownloadCenterNotice(payload?.message || "Download action completed.");
+      const updatedEntry = payload?.downloads?.entries?.find(
+        (candidate) =>
+          candidate?.storeId === entry.storeId &&
+          candidate?.gameId === entry.gameId,
+      );
+      publishOmniLibraryDownloadStatusChanged(
+        updatedEntry || entry,
+        updatedEntry?.status || (action === "dismiss" ? "idle" : entry.status),
+      );
+    } catch (error) {
+      state.storeSync.downloadCenterError =
+        `${entry.gameTitle || entry.gameId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+    } finally {
+      const nextActionKeys = {
+        ...(state.storeSync.downloadActionKeys || {}),
+      };
+      delete nextActionKeys[entryKey];
+      state.storeSync.downloadActionKeys = nextActionKeys;
+      rerenderStoreSyncPanel();
+      void loadOmniLibraryDownloadCenter();
+    }
+  }
+
+  async function startUnifyStoreLogin(storeId) {
+    state.storeSync.disconnectStoreArmedId = "";
+    await sendStoreSyncRequest("api/unifystore/stores/login", {
       value: storeId,
     });
   }
 
-  async function startUnifyStoreLogin(storeId) {
-    await sendStoreSyncRequest("api/unifystore/stores/login", {
+  async function disconnectUnifyStore(storeId) {
+    if (state.storeSync.disconnectStoreArmedId !== storeId) {
+      state.storeSync.disconnectStoreArmedId = storeId;
+      state.storeSync.error = "";
+      rerenderStoreSyncPanel();
+      return;
+    }
+
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/disconnect", {
       value: storeId,
     });
+    state.storeSync.disconnectStoreArmedId = "";
+    if (succeeded) {
+      notifyOmniLibraryStoreStateChanged();
+    }
+  }
+
+  async function saveXboxInstallPath() {
+    const store = getUnifySteamStore("xbox-game-pass");
+    const value = String(
+      state.storeSync.xboxInstallPathDraftDirty
+        ? state.storeSync.xboxInstallPathDraft
+        : store?.installPath || "",
+    ).trim();
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/install-path", {
+      storeId: "xbox-game-pass",
+      value,
+    });
+
+    if (succeeded) {
+      state.storeSync.xboxInstallPathDraft = value;
+      state.storeSync.xboxInstallPathDraftDirty = false;
+      state.storeSync.xboxInstallPathInputVersion += 1;
+    }
+  }
+
+  async function toggleXboxLibrarySource(sourceId, enabled) {
+    const succeeded = await sendStoreSyncRequest(
+      "api/unifystore/stores/xbox-source",
+      {
+        sourceId,
+        enabled,
+      },
+      { rerenderOnStart: false },
+    );
+    if (succeeded) {
+      notifyOmniLibraryStoreStateChanged();
+    }
+  }
+
+  async function saveEpicInstallPath() {
+    const store = getUnifySteamStore("epic-games");
+    const value = String(
+      state.storeSync.epicInstallPathDraftDirty
+        ? state.storeSync.epicInstallPathDraft
+        : store?.installPath || "",
+    ).trim();
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/install-path", {
+      storeId: "epic-games",
+      value,
+    });
+
+    if (succeeded) {
+      state.storeSync.epicInstallPathDraft = value;
+      state.storeSync.epicInstallPathDraftDirty = false;
+      state.storeSync.epicInstallPathInputVersion += 1;
+    }
+  }
+
+  async function saveEpicDownloadOptions() {
+    const epic = getUnifySteamStore("epic-games");
+    const workers = Math.max(
+      1,
+      Math.min(
+        32,
+        Number.parseInt(
+          state.storeSync.epicDownloadOptionsDirty
+            ? state.storeSync.epicDownloadWorkersDraft
+            : epic?.downloadWorkers || 16,
+          10,
+        ) || 16,
+      ),
+    );
+    const timeoutSeconds = Math.max(
+      15,
+      Math.min(
+        300,
+        Number.parseInt(
+          state.storeSync.epicDownloadOptionsDirty
+            ? state.storeSync.epicDownloadTimeoutDraft
+            : epic?.downloadTimeoutSeconds || 60,
+          10,
+        ) || 60,
+      ),
+    );
+    const succeeded = await sendStoreSyncRequest(
+      "api/unifystore/stores/download-options",
+      {
+        storeId: "epic-games",
+        downloadWorkers: workers,
+        downloadTimeoutSeconds: timeoutSeconds,
+      },
+    );
+    if (succeeded) {
+      state.storeSync.epicDownloadWorkersDraft = String(workers);
+      state.storeSync.epicDownloadTimeoutDraft = String(timeoutSeconds);
+      state.storeSync.epicDownloadOptionsDirty = false;
+      state.storeSync.epicDownloadOptionsInputVersion += 1;
+    }
+  }
+
+  async function saveGenericUnifyStoreInstallPath(storeId) {
+    const store = getUnifySteamStore(storeId);
+    const value = String(
+      state.storeSync.unifySteamInstallPathDirtyByStoreId[storeId]
+        ? state.storeSync.unifySteamInstallPathDraftByStoreId[storeId]
+        : store?.installPath || "",
+    ).trim();
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/install-path", {
+      storeId,
+      value,
+    });
+    if (succeeded) {
+      state.storeSync.unifySteamInstallPathDraftByStoreId[storeId] = value;
+      state.storeSync.unifySteamInstallPathDirtyByStoreId[storeId] = false;
+      state.storeSync.unifySteamInstallPathVersionByStoreId[storeId] =
+        (state.storeSync.unifySteamInstallPathVersionByStoreId[storeId] || 0) + 1;
+    }
+  }
+
+  async function saveGogOptions(includeDlc, preferGalaxyForLaunch) {
+    const succeeded = await sendStoreSyncRequest(
+      "api/unifystore/stores/gog-options",
+      {
+        includeDlc: includeDlc === true,
+        preferGalaxyForLaunch: preferGalaxyForLaunch === true,
+      },
+      { rerenderOnStart: false },
+    );
+    if (succeeded) {
+      notifyOmniLibraryStoreStateChanged();
+    }
+  }
+
+  async function saveGenericDownloadOptions(storeId) {
+    const store = getUnifySteamStore(storeId);
+    const dirty =
+      state.storeSync.unifySteamDownloadOptionsDirtyByStoreId[storeId] === true;
+    const workers = Math.max(
+      1,
+      Math.min(
+        32,
+        Number.parseInt(
+          dirty
+            ? state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId]
+            : store?.downloadWorkers || 16,
+          10,
+        ) || 16,
+      ),
+    );
+    const timeoutSeconds = Math.max(
+      15,
+      Math.min(
+        300,
+        Number.parseInt(
+          dirty
+            ? state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId]
+            : store?.downloadTimeoutSeconds || 60,
+          10,
+        ) || 60,
+      ),
+    );
+    const succeeded = await sendStoreSyncRequest(
+      "api/unifystore/stores/download-options",
+      {
+        storeId,
+        downloadWorkers: workers,
+        downloadTimeoutSeconds: timeoutSeconds,
+      },
+    );
+    if (succeeded) {
+      state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId] =
+        String(workers);
+      state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId] =
+        String(timeoutSeconds);
+      state.storeSync.unifySteamDownloadOptionsDirtyByStoreId[storeId] = false;
+      state.storeSync.unifySteamDownloadOptionsVersionByStoreId[storeId] =
+        (state.storeSync.unifySteamDownloadOptionsVersionByStoreId[storeId] || 0) + 1;
+    }
   }
 
   async function submitUnifySteamAuthCode(storeId) {
@@ -17860,7 +19690,7 @@
       return;
     }
 
-    const succeeded = await sendStoreSyncRequest("api/store-sync/unifysteam/stores/auth-code", {
+    const succeeded = await sendStoreSyncRequest("api/unifystore/stores/auth-code", {
       storeId,
       value: draft,
     });
@@ -17869,6 +19699,7 @@
       state.storeSync.unifySteamAuthDraftByStoreId[storeId] = "";
       state.storeSync.unifySteamAuthInputVersionByStoreId[storeId] =
         (state.storeSync.unifySteamAuthInputVersionByStoreId[storeId] || 0) + 1;
+      notifyOmniLibraryStoreStateChanged();
     }
   }
 
@@ -19404,7 +21235,7 @@
 
       return {
         ...defaultModel,
-        title: "App Start",
+        title: "Apps",
         subtitle: "All Windows apps",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
@@ -19492,7 +21323,7 @@
 
       return {
         ...defaultModel,
-        title: "App Start",
+        title: "Apps",
         subtitle: "Manage Apps",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
@@ -19552,7 +21383,7 @@
 
       return {
         ...defaultModel,
-        title: "App Start",
+        title: "Apps",
         subtitle: shortcut?.name || "App",
         status: resolveAppStartStatusText(),
         error: state.appStart.error,
@@ -19570,7 +21401,7 @@
               {
                 title: shortcut.name,
                 lines: [
-                  isHidden ? "Hidden from the App Start launcher." : "Visible in the App Start launcher.",
+                  isHidden ? "Hidden from the Apps launcher." : "Visible in the Apps launcher.",
                   isFavorite ? "Pinned as a favorite." : "Not pinned as a favorite.",
                 ],
               },
@@ -19589,7 +21420,7 @@
           ),
           makeCommandSlot(
             isFavorite ? "Remove from Favorites" : "Add to Favorites",
-            isFavorite ? "Keep the app in the launcher without pinning it." : "Pin the app at the top of App Start.",
+            isFavorite ? "Keep the app in the launcher without pinning it." : "Pin the app at the top of Apps.",
             () => toggleAppStartFavorite(shortcutId),
             {
               disabled: isAppStartBusy() || !shortcut,
@@ -19601,7 +21432,7 @@
             isHidden ? "Restore to Launcher" : "Hide from Launcher",
             isHidden
               ? "Show this app in the main one-click launcher again."
-              : "Remove only this entry from App Start. The Windows app stays installed.",
+              : "Remove only this entry from Apps. The Windows app stays installed.",
             () => isHidden ? addAppStartShortcut(shortcutId) : removeAppStartShortcut(shortcutId),
             {
               disabled: isAppStartBusy() || !shortcut,
@@ -20985,6 +22816,8 @@
     if (state.route.screen === "plugin" && state.route.pluginId === "store-sync") {
       const previewItemCount = Array.isArray(storeSyncSnapshot?.preview?.items) ? storeSyncSnapshot.preview.items.length : 0;
       const enabledStoreCount = getStoreSyncEnabledStoreCount(storeSyncSnapshot);
+      const omniLibraryPlugin = getPluginSettingsEntry("omnilibrary");
+      const omniLibraryEnabled = omniLibraryPlugin?.enabled === true;
 
       return {
         ...defaultModel,
@@ -20996,20 +22829,35 @@
         cards: [buildStoreSyncCompactCard(storeSyncSnapshot, "Overview")],
         autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
         sectionHeaders: [
-          createSectionHeader(0, "Main Areas", "Jump into preview, logs, stores, or detailed settings.", {
+          createSectionHeader(0, "Library Mode", "Choose exactly one library integration. The inactive plugin is hidden and stopped.", {
             icon: StoreSyncPluginIcon,
           }),
-          createSectionHeader(4, "Maintenance", "Reload store state and rebuild the current sync plan.", {
+          createSectionHeader(1, "Main Areas", "Jump into preview, logs, stores, or detailed settings.", {
+            icon: StoreSyncPluginIcon,
+          }),
+          createSectionHeader(5, "Maintenance", "Reload store state and rebuild the current sync plan.", {
             icon: RefreshActionIcon,
           }),
         ],
-        dividerAfterIndices: [1],
+        dividerAfterIndices: [0, 4],
         slots: [
+          makeSettingToggleSlot(
+            "library-mode",
+            "use-omnilibrary",
+            "Use OmniLibrary instead of Store Sync",
+            "Enabling OmniLibrary disables and hides Store Sync, including its background sync. Turning it off switches back to Store Sync.",
+            omniLibraryEnabled,
+            () => togglePluginEnabled(omniLibraryEnabled ? "store-sync" : "omnilibrary", true),
+            {
+              slotKey: "library-mode-use-omnilibrary",
+              disabled: isGeneralSettingsBusy() || !omniLibraryPlugin,
+            },
+          ),
           makeNavigationSlot(
             "Preview",
             "Review detected games, direct actions, and the exact sync plan before it is written.",
             () => {
-              rememberCurrentRouteIndex(0);
+              rememberCurrentRouteIndex(1);
               const targetRoute = { screen: "page", pluginId: "store-sync", pageId: "preview" };
               requestFreshEntryForRoute(targetRoute, 0, 0);
               setRoute(targetRoute);
@@ -21024,7 +22872,7 @@
             "Journal",
             "Read the latest auto-sync, cleanup, repair, and watcher events.",
             () => {
-              rememberCurrentRouteIndex(1);
+              rememberCurrentRouteIndex(2);
               const targetRoute = { screen: "page", pluginId: "store-sync", pageId: "journal" };
               requestFreshEntryForRoute(targetRoute, 0, 0);
               setRoute(targetRoute);
@@ -21039,7 +22887,7 @@
             "Stores",
             "Check launcher health, primary folders, and extra scan folders per store.",
             () => {
-              rememberCurrentRouteIndex(2);
+              rememberCurrentRouteIndex(3);
               const targetRoute = { screen: "page", pluginId: "store-sync", pageId: "stores" };
               requestFreshEntryForRoute(targetRoute, 0, 0);
               setRoute(targetRoute);
@@ -21054,7 +22902,7 @@
             "Settings",
             "Control artwork, takeover, cleanup, backup, and startup behavior.",
             () => {
-              rememberCurrentRouteIndex(3);
+              rememberCurrentRouteIndex(4);
               const targetRoute = { screen: "page", pluginId: "store-sync", pageId: "settings" };
               requestFreshEntryForRoute(targetRoute, 0, 0);
               setRoute(targetRoute);
@@ -21500,6 +23348,402 @@
               disabled: isStoreSyncBusy(),
             },
           ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "system"
+    ) {
+      const gpuUpdate = getNvidiaDriverUpdateSnapshot();
+      const hdr = getHdrDisplaySnapshot();
+      const windowsUpdates = getWindowsSystemUpdateSnapshot();
+      const bluetooth = getBluetoothDeviceSnapshot();
+      const nvidiaGpuDetected = gpuUpdate?.nvidiaGpuDetected === true;
+      const installed = Boolean(gpuUpdate?.installed);
+      const running = Boolean(gpuUpdate?.running);
+      const silentGameReadyArmed = isSilentNvidiaGameReadyArmed();
+      const toolVersion = gpuUpdate?.version || "1.25.2";
+      const windowsUpdateCount = Array.isArray(windowsUpdates?.updates)
+        ? windowsUpdates.updates.length
+        : null;
+      const bluetoothDevices = Array.isArray(bluetooth?.devices) ? bluetooth.devices : [];
+      const connectedBluetoothCount = bluetoothDevices.filter((device) => device.isConnected).length;
+      const slots = [
+        makeNavigationSlot(
+          "Windows Update",
+          windowsUpdateCount === null
+            ? "View available Windows and driver updates."
+            : windowsUpdateCount === 0
+              ? "Windows was up to date at the last check."
+              : `Review ${windowsUpdateCount} available update${windowsUpdateCount === 1 ? "" : "s"}.`,
+          () => {
+            rememberCurrentRouteIndex(0);
+            const targetRoute = {
+              screen: "page",
+              pluginId: "settings",
+              pageId: "system-windows-update",
+            };
+            requestFreshEntryForRoute(targetRoute, 0, 0);
+            setRoute(targetRoute);
+          },
+          {
+            slotKey: "system-windows-update",
+            badge: windowsUpdateCount === null
+              ? "Open"
+              : windowsUpdateCount === 0
+                ? "Up to date"
+                : String(windowsUpdateCount),
+            leadingIcon: HeaderUpdateIcon,
+          },
+        ),
+        makeSettingToggleSlot(
+          "system",
+          "hdr",
+          "HDR",
+          hdr?.supported === true
+            ? hdr.mixed
+              ? "HDR is enabled on some active displays. The switch applies to every compatible display."
+              : "Enable or disable HDR on active compatible displays."
+            : hdr
+              ? "No active HDR-compatible display was detected."
+              : "Reading active display capabilities...",
+          hdr?.enabled === true,
+          () => void setHdrDisplayEnabled(hdr?.enabled !== true),
+          {
+            slotKey: "system-hdr",
+            disabled: isHdrDisplayBusy() || hdr?.supported !== true,
+            leadingIcon: DisplayPluginIcon,
+          },
+        ),
+        makeNavigationSlot(
+          "Bluetooth",
+          bluetooth?.scanning
+            ? "A time-limited nearby-device scan is running."
+            : connectedBluetoothCount > 0
+              ? `${connectedBluetoothCount} Bluetooth device${connectedBluetoothCount === 1 ? " is" : "s are"} connected.`
+              : "View paired devices, scan nearby hardware, and pair.",
+          () => {
+            rememberCurrentRouteIndex(2);
+            const targetRoute = {
+              screen: "page",
+              pluginId: "settings",
+              pageId: "system-bluetooth",
+            };
+            requestFreshEntryForRoute(targetRoute, 0, 0);
+            setRoute(targetRoute);
+          },
+          {
+            slotKey: "system-bluetooth",
+            badge: bluetooth?.scanning
+              ? "Scanning"
+              : connectedBluetoothCount > 0
+                ? `${connectedBluetoothCount} connected`
+                : "Open",
+            leadingIcon: AudioPluginIcon,
+          },
+        ),
+      ];
+
+      if (nvidiaGpuDetected) {
+        slots.push(
+          makeCommandSlot(
+            "GPU Update",
+            running
+              ? "TinyNvidiaUpdateChecker is already running."
+              : installed
+                ? "Open TinyNvidiaUpdateChecker and check the installed NVIDIA driver."
+                : "Download the verified official TinyNvidiaUpdateChecker release, then open it.",
+            () => launchNvidiaDriverUpdate(),
+            {
+              slotKey: "system-driver-gpu-update",
+              badge: running ? "Running" : installed ? "Ready" : "First use",
+              disabled: isSystemToolsBusy(),
+              leadingIcon: HeaderUpdateIcon,
+            },
+          ),
+          makeCommandSlot(
+            silentGameReadyArmed
+              ? "Confirm Silent Game Ready Update"
+              : "Silent Game Ready Update",
+            running
+              ? "TinyNvidiaUpdateChecker is already running."
+              : silentGameReadyArmed
+                ? "Press again within five seconds. Close games first; the display may flicker during installation."
+                : "Check for a newer NVIDIA Game Ready Driver and install it without installer clicks. Windows may request administrator approval once.",
+            () => armOrLaunchSilentNvidiaGameReadyUpdate(),
+            {
+              slotKey: "system-driver-gpu-update-silent-game-ready",
+              badge: running ? "Running" : silentGameReadyArmed ? "Confirm" : "Game Ready",
+              disabled: isSystemToolsBusy() || running,
+              leadingIcon: InstallActionIcon,
+            },
+          ),
+        );
+      }
+
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "System",
+        status: resolveHdrDisplayStatusText() || resolveSystemToolsStatusText(),
+        error: [state.systemHdr.error, state.systemTools.error].filter(Boolean).join(" "),
+        note: "System pages load expensive data only when opened. HDR uses active display paths; Bluetooth scans stop automatically.",
+        sectionHeaders: [
+          createSectionHeader(0, "Windows", "Review and run Windows Update.", {
+            icon: HeaderUpdateIcon,
+          }),
+          createSectionHeader(1, "Display", "Control HDR on compatible active displays.", {
+            icon: DisplayPluginIcon,
+          }),
+          createSectionHeader(2, "Bluetooth", "Manage nearby and paired Bluetooth devices.", {
+            icon: AudioPluginIcon,
+          }),
+          ...(nvidiaGpuDetected
+            ? [
+                createSectionHeader(3, "Driver", "Check and update supported GPU drivers.", {
+                  icon: HeaderUpdateIcon,
+                }),
+              ]
+            : []),
+        ],
+        cards: nvidiaGpuDetected
+          ? [{
+              title: "NVIDIA Driver Tool",
+              lines: [
+                `TinyNvidiaUpdateChecker ${toolVersion}`,
+                installed ? "Ready locally" : "Verified download on first use",
+                "Silent mode installs Game Ready updates without restarting Windows.",
+                "HawaiiBeach/TinyNvidiaUpdateChecker · GPL-3.0",
+              ],
+            }]
+          : [],
+        slots,
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "system-windows-update"
+    ) {
+      const snapshot = getWindowsSystemUpdateSnapshot();
+      const updates = Array.isArray(snapshot?.updates) ? snapshot.updates : [];
+      const runArmed = isWindowsSystemUpdateRunArmed();
+      const updateSlots = updates.map((update) => {
+        const kbIds = Array.isArray(update.kbArticleIds) ? update.kbArticleIds : [];
+        const details = [
+          kbIds.length ? kbIds.map((kb) => `KB${kb}`).join(", ") : null,
+          formatSystemUpdateSize(update.downloadSizeBytes),
+          update.isDownloaded ? "Downloaded" : null,
+          update.mayRequireRestart ? "Restart may be required" : null,
+        ].filter(Boolean).join(" · ");
+        return makeCommandSlot(
+          update.title || "Windows update",
+          details,
+          () => {},
+          {
+            slotKey: `windows-system-update-${update.id}`,
+            badge: update.kind || "Software",
+            disabled: true,
+            leadingIcon: HeaderUpdateIcon,
+          },
+        );
+      });
+      const actionStartIndex = updateSlots.length;
+
+      return {
+        ...defaultModel,
+        title: "System",
+        subtitle: "Windows Update",
+        status: resolveWindowsSystemUpdateStatusText(),
+        error: state.systemWindowsUpdates.error,
+        note: "TFS reads the official Windows Update catalog. Windows itself handles download, installation, policy, and restart scheduling through its current update workflow.",
+        sectionHeaders: [
+          ...(updates.length
+            ? [
+                createSectionHeader(0, "Available Updates", "Applicable software and driver updates.", {
+                  icon: HeaderUpdateIcon,
+                }),
+              ]
+            : []),
+          createSectionHeader(actionStartIndex, "Actions", "Refresh the catalog or hand updates to Windows.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: [{
+          title: updates.length
+            ? `${updates.length} Update${updates.length === 1 ? "" : "s"} Available`
+            : snapshot?.lastCheckedAt
+              ? "Windows Is Up to Date"
+              : "Windows Update",
+          lines: [
+            `Last checked: ${formatSystemUpdateCheckedAt(snapshot?.lastCheckedAt)}`,
+            updates.some((update) => update.mayRequireRestart)
+              ? "One or more updates may require a restart."
+              : null,
+          ].filter(Boolean),
+        }],
+        slots: [
+          ...updateSlots,
+          makeCommandSlot(
+            "Check for Updates",
+            "Search the Windows Update catalog again.",
+            () => void loadWindowsSystemUpdates({ force: true }),
+            {
+              slotKey: "windows-system-update-refresh",
+              badge: state.systemWindowsUpdates.loading ? "Checking" : "Refresh",
+              disabled: isWindowsSystemUpdateBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            runArmed ? "Confirm Run Updates" : "Run Windows Updates",
+            runArmed
+              ? "Press again within five seconds to open the Windows Update action."
+              : "Hand the update run to Windows so policy, progress, and restart scheduling stay synchronized.",
+            () => armOrRunWindowsSystemUpdates(),
+            {
+              slotKey: "windows-system-update-run",
+              badge: runArmed ? "Confirm" : "Windows",
+              disabled: isWindowsSystemUpdateBusy(),
+              leadingIcon: InstallActionIcon,
+            },
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
+      state.route.pageId === "system-bluetooth"
+    ) {
+      const snapshot = getBluetoothDeviceSnapshot();
+      const devices = Array.isArray(snapshot?.devices) ? snapshot.devices : [];
+      const pairedDevices = devices.filter((device) => device.isPaired);
+      const availableDevices = devices.filter((device) => !device.isPaired);
+      const pairingDeviceId = snapshot?.pairingDeviceId || "";
+      const deviceSlots = [
+        ...pairedDevices.map((device) =>
+          makeCommandSlot(
+            device.name || "Bluetooth device",
+            getBluetoothDeviceCopy(device),
+            () => {},
+            {
+              slotKey: `bluetooth-paired-${device.id}`,
+              badge: device.isConnected ? "Connected" : "Paired",
+              disabled: true,
+              selected: device.isConnected === true,
+              leadingIcon: AudioPluginIcon,
+            },
+          ),
+        ),
+        ...availableDevices.map((device) =>
+          makeCommandSlot(
+            device.name || "Bluetooth device",
+            getBluetoothDeviceCopy(device) || "Nearby Bluetooth device",
+            () => void pairBluetoothDevice(device.id),
+            {
+              slotKey: `bluetooth-available-${device.id}`,
+              badge: pairingDeviceId === device.id ? "Pairing" : "Pair",
+              disabled: isBluetoothDeviceBusy() || device.canPair !== true,
+              leadingIcon: AddActionIcon,
+            },
+          ),
+        ),
+      ];
+      const actionStartIndex = deviceSlots.length;
+      const bluetoothPowered = snapshot?.radioStateKnown !== true || snapshot?.powered === true;
+
+      return {
+        ...defaultModel,
+        title: "System",
+        subtitle: "Bluetooth",
+        status: resolveBluetoothDeviceStatusText(),
+        error: state.systemBluetooth.error,
+        note: "Nearby scanning runs only on this page and stops after 12 seconds. Windows may show its own PIN or confirmation prompt while pairing.",
+        sectionHeaders: [
+          ...(pairedDevices.length
+            ? [
+                createSectionHeader(0, "Paired Devices", "Known Bluetooth devices on this PC.", {
+                  icon: AudioPluginIcon,
+                }),
+              ]
+            : []),
+          ...(availableDevices.length
+            ? [
+                createSectionHeader(
+                  pairedDevices.length,
+                  "Nearby Devices",
+                  "Select a visible device to pair it.",
+                  { icon: AddActionIcon },
+                ),
+              ]
+            : []),
+          createSectionHeader(actionStartIndex, "Discovery", "Refresh known devices or run a bounded scan.", {
+            icon: RefreshActionIcon,
+          }),
+        ],
+        cards: [{
+          title: snapshot?.radioStateKnown
+            ? snapshot.available
+              ? snapshot.powered
+                ? "Bluetooth On"
+                : "Bluetooth Off"
+              : "Bluetooth Unavailable"
+            : "Bluetooth",
+          lines: [
+            `${pairedDevices.length} paired`,
+            `${availableDevices.length} nearby`,
+            snapshot?.scanning ? "Scanning nearby devices now" : "Scanner idle",
+          ],
+        }],
+        slots: [
+          ...deviceSlots,
+          makeCommandSlot(
+            "Refresh Paired Devices",
+            "Read paired and connected Bluetooth devices without a nearby scan.",
+            () => void loadBluetoothDeviceState({ refresh: true }),
+            {
+              slotKey: "bluetooth-refresh",
+              badge: "Refresh",
+              disabled: isBluetoothDeviceBusy(),
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+          makeCommandSlot(
+            snapshot?.scanning ? "Scanning for Devices" : "Scan for Devices",
+            bluetoothPowered
+              ? snapshot?.scanning
+                ? "Nearby results update live until the 12-second scan ends."
+                : "Temporarily discover nearby Bluetooth and Bluetooth LE devices."
+              : "Turn on Bluetooth in Windows before scanning.",
+            () => void scanBluetoothDevices(),
+            {
+              slotKey: "bluetooth-scan",
+              badge: snapshot?.scanning ? "Scanning" : "12 seconds",
+              disabled: isBluetoothDeviceBusy() || snapshot?.scanning === true || !bluetoothPowered,
+              leadingIcon: RefreshActionIcon,
+            },
+          ),
+          ...(snapshot?.radioStateKnown === true && snapshot?.powered !== true
+            ? [
+                makeCommandSlot(
+                  "Open Bluetooth Settings",
+                  "Turn on the Bluetooth radio in Windows, then return and refresh this page.",
+                  () => void openBluetoothSettings(),
+                  {
+                    slotKey: "bluetooth-open-settings",
+                    badge: "Windows",
+                    disabled: isBluetoothDeviceBusy(),
+                    leadingIcon: LaunchActionIcon,
+                  },
+                ),
+              ]
+            : []),
         ],
       };
     }
@@ -24232,128 +26476,638 @@
       };
     }
 
-    if (storefrontEnabled && state.route.screen === "plugin" && state.route.pluginId === "unifystore") {
-      const stores = getUnifySteamStores();
-      const installedCount = stores.reduce((total, store) => total + (Number(store.installedCount) || 0), 0);
-      const libraryCount = stores.reduce((total, store) => total + (Number(store.availableCount) || 0), 0);
-      const authEditors = stores
-        .filter((store) => store.supportsManualCodeAuth)
-        .map((store) => {
-          const inputVersion = state.storeSync.unifySteamAuthInputVersionByStoreId[store.id] || 0;
-          return {
-            label: `${store.title || "Store"} Login Code`,
-            help: store.id === "epic-games"
-              ? "After Epic login, paste the authorizationCode JSON, the code, or the final page URL here."
-              : "After GOG login, paste the final URL or code here.",
-            value: state.storeSync.unifySteamAuthDraftByStoreId[store.id] || "",
-            placeholder: store.id === "epic-games"
-              ? '{"authorizationCode":"..."}'
-              : "https://embed.gog.com/on_login_success?code=...",
-            inputKey: `unifystore-login-code-${store.id}-${inputVersion}`,
-            rows: 2,
-            onInput: (value) => {
-              state.storeSync.unifySteamAuthDraftByStoreId[store.id] = value;
-            },
-          };
+    if (storefrontEnabled && state.route.screen === "plugin" && state.route.pluginId === "omnilibrary") {
+      const xbox = getUnifySteamStore("xbox-game-pass");
+      const epic = getUnifySteamStore("epic-games");
+      const omniLibraryPlugin = getPluginSettingsEntry("omnilibrary");
+      const omniLibraryEnabled = omniLibraryPlugin?.enabled === true;
+      const xboxEnabled = xbox?.enabled === true;
+      const xboxPcGamePassEnabled = xbox?.xboxPcGamePassEnabled === true;
+      const xboxCloudGamingEnabled = xbox?.xboxCloudGamingEnabled === true;
+      const epicEnabled = epic?.enabled === true;
+      const epicDisconnectBlocked =
+        hasOmniLibraryStoreDisconnectBlocker("epic-games");
+      const restartRequiredStores = getUnifySteamStores().filter(
+        (store) => store?.enabled === true && store?.steamRestartRequired === true,
+      );
+      const xboxSectionKey = "omnilibrary-store-xbox-game-pass";
+      const epicSectionKey = "omnilibrary-store-epic-games";
+      const xboxExpanded = isExpandedSection(xboxSectionKey, true);
+      const epicExpanded = isExpandedSection(epicSectionKey, false);
+      const installedCount = Number(xbox?.installedCount) || 0;
+      const libraryCount = Number(xbox?.availableCount) || 0;
+      const installPathValue = state.storeSync.xboxInstallPathDraftDirty
+        ? state.storeSync.xboxInstallPathDraft
+        : xbox?.installPath || "";
+      const xboxPreparationProgress = String(xbox?.preparationStatus || "").toLowerCase() === "artwork"
+        ? ` - artwork ${xbox?.preparationCompletedCount || 0}/${xbox?.preparationTotalCount || 0}`
+        : xbox?.steamRestartRequired
+          ? " - restart Steam"
+          : "";
+      const xboxSummary = xboxEnabled
+        ? `${xbox?.statusText || "Enabled"} - ${installedCount} installed / ${libraryCount} available${xboxPreparationProgress}`
+        : "Disabled · Xbox tab, games, and background refresh are hidden.";
+      const epicInstalledCount = Number(epic?.installedCount) || 0;
+      const epicLibraryCount = Number(epic?.availableCount) || 0;
+      const epicInstallPathValue = state.storeSync.epicInstallPathDraftDirty
+        ? state.storeSync.epicInstallPathDraft
+        : epic?.installPath || "";
+      const epicDownloadWorkersValue = state.storeSync.epicDownloadOptionsDirty
+        ? state.storeSync.epicDownloadWorkersDraft
+        : String(epic?.downloadWorkers || 16);
+      const epicDownloadTimeoutValue = state.storeSync.epicDownloadOptionsDirty
+        ? state.storeSync.epicDownloadTimeoutDraft
+        : String(epic?.downloadTimeoutSeconds || 60);
+      const epicPreparationProgress = String(epic?.preparationStatus || "").toLowerCase() === "artwork"
+        ? ` - artwork ${epic?.preparationCompletedCount || 0}/${epic?.preparationTotalCount || 0}`
+        : epic?.steamRestartRequired
+          ? " - restart Steam"
+          : "";
+      const epicSummary = epicEnabled
+        ? `${epic?.statusText || "Enabled"} - ${epicInstalledCount} installed / ${epicLibraryCount} available${epicPreparationProgress}`
+        : "Disabled · Epic tab, games, downloads, and background refresh are hidden.";
+      const xboxSlots = xbox
+        ? [
+            makeSettingToggleSlot(
+              "omnilibrary-store",
+              "xbox-game-pass",
+              "Enable Xbox / PC Game Pass",
+              xboxEnabled
+                ? xbox?.readyForLibraryTab
+                  ? "Xbox is connected and its prepared tab is active in this Steam session."
+                  : "Xbox is enabled. Its tab stays hidden while the library and artwork are prepared."
+                : "Turn this on to connect Xbox and prepare its library in the background.",
+              xboxEnabled,
+              () => toggleUnifyStoreEnabled("xbox-game-pass", !xboxEnabled),
+              {
+                slotKey: "unifystore-xbox-enabled",
+                disabled: isStoreSyncBusy(),
+              },
+            ),
+            ...(xboxEnabled
+              ? [
+                  makeSettingToggleSlot(
+                    "omnilibrary-xbox-source",
+                    "pc-game-pass",
+                    "Include PC Game Pass",
+                    "Add the downloadable Windows PC Game Pass catalog to the Xbox tab.",
+                    xboxPcGamePassEnabled,
+                    () => toggleXboxLibrarySource("pc-game-pass", !xboxPcGamePassEnabled),
+                    {
+                      slotKey: "unifystore-xbox-source-pc-game-pass",
+                      disabled: isStoreSyncBusy(),
+                    },
+                  ),
+                  makeSettingToggleSlot(
+                    "omnilibrary-xbox-source",
+                    "xcloud",
+                    "Enable Xbox Cloud tab",
+                    "Optional. Prepare cloud-playable titles in a separate XBOX CLOUD tab. Cloud games open their stream instead of a download.",
+                    xboxCloudGamingEnabled,
+                    () => toggleXboxLibrarySource("xcloud", !xboxCloudGamingEnabled),
+                    {
+                      slotKey: "unifystore-xbox-source-xcloud",
+                      disabled: isStoreSyncBusy(),
+                    },
+                  ),
+                  makeCommandSlot(
+                    xbox.authReady ? "Open Xbox Account" : "Sign in to Xbox",
+                    xbox.authReady
+                      ? "Your Xbox account is available. Open the official app to change it."
+                      : xbox.detailText || "Open the official Xbox app and sign in.",
+                    () => startUnifyStoreLogin("xbox-game-pass"),
+                    {
+                      slotKey: "unifystore-xbox-login",
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: StoreSyncPluginIcon,
+                    },
+                  ),
+                  makeCommandSlot(
+                    "Sync Xbox Library",
+                    buildUnifySteamStoreCopy(xbox),
+                    () => refreshUnifyStore("xbox-game-pass"),
+                    {
+                      slotKey: "unifystore-xbox-sync",
+                      disabled: isStoreSyncBusy() || !xbox.canRefresh,
+                      leadingIcon: RefreshActionIcon,
+                    },
+                  ),
+                  {
+                    title: "Xbox Library Path",
+                    slotKey: "unifystore-xbox-path-editor",
+                    customRenderer: () =>
+                      createEditorCard({
+                        label: "Xbox Library Path",
+                        help: "Optional. Choose the folder that contains your Xbox games (for example D:\\XboxGames). Leave it empty to scan all fixed drives automatically.",
+                        value: installPathValue,
+                        placeholder: "D:\\XboxGames",
+                        inputKey: `unifystore-xbox-path-${state.storeSync.xboxInstallPathInputVersion}`,
+                        rows: 1,
+                        onInput: (value) => {
+                          state.storeSync.xboxInstallPathDraft = value;
+                          state.storeSync.xboxInstallPathDraftDirty = true;
+                        },
+                      }),
+                  },
+                  makeCommandSlot(
+                    "Save Xbox Library Path",
+                    installPathValue
+                      ? `Use ${installPathValue} when detecting installed Xbox games.`
+                      : "Keep the field empty to scan XboxGames folders on all fixed drives.",
+                    () => saveXboxInstallPath(),
+                    {
+                      slotKey: "unifystore-xbox-save-path",
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: SaveActionIcon,
+                    },
+                  ),
+                ]
+              : []),
+          ]
+        : [
+            makeCommandSlot(
+              "Load Xbox State",
+              "Load the Xbox account and library configuration.",
+              () => loadStoreSyncState(),
+              {
+                slotKey: "unifystore-load-state",
+                disabled: isStoreSyncBusy(),
+                leadingIcon: RefreshActionIcon,
+              },
+            ),
+          ];
+      const epicSlots = epic
+        ? [
+            makeSettingToggleSlot(
+              "omnilibrary-store",
+              "epic-games",
+              "Enable Epic Games",
+              epicEnabled
+                ? epic?.readyForLibraryTab
+                  ? "Epic is connected and its prepared tab is active in this Steam session."
+                  : "Epic is enabled. Its tab stays hidden while the library and artwork are prepared."
+                : "Turn this on to connect Epic and prepare its library in the background.",
+              epicEnabled,
+              () => toggleUnifyStoreEnabled("epic-games", !epicEnabled),
+              {
+                slotKey: "unifystore-epic-enabled",
+                disabled: isStoreSyncBusy(),
+              },
+            ),
+            ...(epicEnabled
+              ? [
+                  makeCommandSlot(
+                    epic.authReady ? "Reconnect Epic Account" : "Sign in to Epic",
+                    epic.authReady
+                      ? "Open OmniLibrary's isolated Epic window to replace the connected account. The library syncs when sign-in finishes."
+                      : "Sign in inside OmniLibrary's isolated Epic window; it closes and syncs your library automatically. On first use, TFS downloads the verified Legendary 0.20.43 helper (GPL-3.0) from its official release.",
+                    () => startUnifyStoreLogin("epic-games"),
+                    {
+                      slotKey: "unifystore-epic-login",
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: StoreSyncPluginIcon,
+                    },
+                  ),
+                  ...(epic.authReady
+                    ? [
+                        makeCommandSlot(
+                          state.storeSync.disconnectStoreArmedId === "epic-games"
+                            ? "Confirm Disconnect Epic"
+                            : "Disconnect Epic Account",
+                          state.storeSync.disconnectStoreArmedId === "epic-games"
+                            ? "Press once more to remove OmniLibrary's Epic session, isolated browser data, cached account library, and managed Epic shortcuts. Installed game files are kept."
+                            : epicDisconnectBlocked
+                              ? "Finish or cancel Epic operations in Download Center before disconnecting this account."
+                              : "Remove OmniLibrary's isolated Epic sign-in and account cache. This does not uninstall your Epic games.",
+                          () => disconnectUnifyStore("epic-games"),
+                          {
+                            slotKey: "unifystore-epic-disconnect",
+                            disabled: isStoreSyncBusy() || epicDisconnectBlocked,
+                            leadingIcon: DeleteActionIcon,
+                          },
+                        ),
+                      ]
+                    : []),
+                  makeCommandSlot(
+                    "Sync Epic Library",
+                    buildUnifySteamStoreCopy(epic),
+                    () => refreshUnifyStore("epic-games"),
+                    {
+                      slotKey: "unifystore-epic-sync",
+                      disabled: isStoreSyncBusy() || !epic.canRefresh,
+                      leadingIcon: RefreshActionIcon,
+                    },
+                  ),
+                  {
+                    title: "Epic Install Path",
+                    slotKey: "unifystore-epic-path-editor",
+                    customRenderer: () =>
+                      createEditorCard({
+                        label: "Epic Install Path",
+                        help: "Optional. New Epic downloads are installed below this folder. Leave it empty to use Legendary's default.",
+                        value: epicInstallPathValue,
+                        placeholder: "D:\\Epic Games",
+                        inputKey: `unifystore-epic-path-${state.storeSync.epicInstallPathInputVersion}`,
+                        rows: 1,
+                        onInput: (value) => {
+                          state.storeSync.epicInstallPathDraft = value;
+                          state.storeSync.epicInstallPathDraftDirty = true;
+                        },
+                      }),
+                  },
+                  makeCommandSlot(
+                    "Save Epic Install Path",
+                    epicInstallPathValue
+                      ? `Install new Epic games below ${epicInstallPathValue}.`
+                      : "Use Legendary's default Epic game folder.",
+                    () => saveEpicInstallPath(),
+                    {
+                      slotKey: "unifystore-epic-save-path",
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: SaveActionIcon,
+                    },
+                  ),
+                  {
+                    title: "Epic Download Workers",
+                    slotKey: "unifystore-epic-download-workers-editor",
+                    customRenderer: () =>
+                      createEditorCard({
+                        label: "Parallel Download Workers",
+                        help: "1-32. Keep 16 unless the Epic CDN or your storage behaves better with fewer parallel workers.",
+                        value: epicDownloadWorkersValue,
+                        placeholder: "16",
+                        inputKey: `unifystore-epic-workers-${state.storeSync.epicDownloadOptionsInputVersion}`,
+                        rows: 1,
+                        onInput: (value) => {
+                          state.storeSync.epicDownloadWorkersDraft = value;
+                          state.storeSync.epicDownloadTimeoutDraft =
+                            state.storeSync.epicDownloadOptionsDirty
+                              ? state.storeSync.epicDownloadTimeoutDraft
+                              : epicDownloadTimeoutValue;
+                          state.storeSync.epicDownloadOptionsDirty = true;
+                        },
+                      }),
+                  },
+                  {
+                    title: "Epic Connection Timeout",
+                    slotKey: "unifystore-epic-download-timeout-editor",
+                    customRenderer: () =>
+                      createEditorCard({
+                        label: "Connection Timeout (seconds)",
+                        help: "15-300. The default 60 seconds tolerates short CDN stalls without aborting a large download.",
+                        value: epicDownloadTimeoutValue,
+                        placeholder: "60",
+                        inputKey: `unifystore-epic-timeout-${state.storeSync.epicDownloadOptionsInputVersion}`,
+                        rows: 1,
+                        onInput: (value) => {
+                          state.storeSync.epicDownloadTimeoutDraft = value;
+                          state.storeSync.epicDownloadWorkersDraft =
+                            state.storeSync.epicDownloadOptionsDirty
+                              ? state.storeSync.epicDownloadWorkersDraft
+                              : epicDownloadWorkersValue;
+                          state.storeSync.epicDownloadOptionsDirty = true;
+                        },
+                      }),
+                  },
+                  makeCommandSlot(
+                    "Save Epic Download Settings",
+                    `Use up to ${epicDownloadWorkersValue || 16} workers and wait ${epicDownloadTimeoutValue || 60} seconds for stalled Epic CDN requests.`,
+                    () => saveEpicDownloadOptions(),
+                    {
+                      slotKey: "unifystore-epic-save-download-options",
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: SaveActionIcon,
+                    },
+                  ),
+                ]
+              : []),
+          ]
+        : [];
+      const genericStoreSlots = getUnifySteamStores()
+        .filter((store) => !["xbox-game-pass", "epic-games"].includes(store?.id))
+        .flatMap((store) => {
+          const storeId = String(store?.id || "");
+          const title = String(store?.title || storeId || "Store");
+          const enabled = store?.enabled === true;
+          const sectionKey = `omnilibrary-store-${storeId}`;
+          const expanded = isExpandedSection(sectionKey, false);
+          const capabilities = new Set(
+            Array.isArray(store?.capabilities) ? store.capabilities : [],
+          );
+          const disconnectBlocked =
+            hasOmniLibraryStoreDisconnectBlocker(storeId);
+          const pathValue = state.storeSync.unifySteamInstallPathDirtyByStoreId[storeId]
+            ? state.storeSync.unifySteamInstallPathDraftByStoreId[storeId]
+            : store?.installPath || "";
+          const downloadOptionsDirty =
+            state.storeSync.unifySteamDownloadOptionsDirtyByStoreId[storeId] === true;
+          const downloadWorkersValue = downloadOptionsDirty
+            ? state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId]
+            : String(store?.downloadWorkers || 16);
+          const downloadTimeoutValue = downloadOptionsDirty
+            ? state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId]
+            : String(store?.downloadTimeoutSeconds || 60);
+          const summary = enabled
+            ? `${store?.statusText || "Enabled"} - ${Number(store?.installedCount) || 0} installed / ${Number(store?.availableCount) || 0} available${store?.steamRestartRequired ? " - restart Steam" : ""}`
+            : `Disabled - ${title} tabs and background work are stopped.`;
+          const detailSlots = [
+            makeSettingToggleSlot(
+              "omnilibrary-store",
+              storeId,
+              `Enable ${title}`,
+              enabled
+                ? store?.readyForLibraryTab
+                  ? `${title} is connected and its prepared tabs are active.`
+                  : store?.steamRestartRequired
+                    ? `${title} is prepared. Restart Steam once to activate its tab.`
+                    : String(store?.lifecycle?.shortcuts || "").toLowerCase() === "ready"
+                      ? `${title}'s library is ready; optional artwork continues in the background.`
+                      : `${title} is enabled and preparing its shortcut catalog.`
+                : `Connect ${title} and prepare only this store in the background.`,
+              enabled,
+              () => toggleUnifyStoreEnabled(storeId, !enabled),
+              {
+                slotKey: `unifystore-${storeId}-enabled`,
+                disabled: isStoreSyncBusy(),
+              },
+            ),
+            ...(enabled
+              ? [
+                  makeCommandSlot(
+                    store?.authReady ? `Reconnect ${title}` : `Sign in to ${title}`,
+                    store?.authReady
+                      ? `Open OmniLibrary's isolated ${title} sign-in window to replace the connected account.`
+                      : storeId === "gog-galaxy"
+                        ? "Sign in inside OmniLibrary's isolated GOG window. On first use, TFS downloads the verified heroic-gogdl 1.2.2 helper (GPL-3.0)."
+                        : store?.detailText || `Connect the ${title} account used for this library.`,
+                    () => startUnifyStoreLogin(storeId),
+                    {
+                      slotKey: `unifystore-${storeId}-login`,
+                      disabled: isStoreSyncBusy(),
+                      leadingIcon: StoreSyncPluginIcon,
+                    },
+                  ),
+                  ...(store?.authReady && capabilities.has("managed-web-sign-in")
+                    ? [
+                        makeCommandSlot(
+                          state.storeSync.disconnectStoreArmedId === storeId
+                            ? `Confirm Disconnect ${title}`
+                            : `Disconnect ${title} Account`,
+                          state.storeSync.disconnectStoreArmedId === storeId
+                            ? `Press once more to remove OmniLibrary's isolated ${title} session, browser data, cached library, and managed shortcuts. Installed game files are kept.`
+                            : disconnectBlocked
+                              ? `Finish or cancel ${title} operations in Download Center before disconnecting this account.`
+                              : `Remove OmniLibrary's isolated ${title} sign-in and account cache without uninstalling games.`,
+                          () => disconnectUnifyStore(storeId),
+                          {
+                            slotKey: `unifystore-${storeId}-disconnect`,
+                            disabled: isStoreSyncBusy() || disconnectBlocked,
+                            leadingIcon: DeleteActionIcon,
+                          },
+                        ),
+                      ]
+                    : []),
+                  makeCommandSlot(
+                    `Sync ${title} Library`,
+                    buildUnifySteamStoreCopy(store),
+                    () => refreshUnifyStore(storeId),
+                    {
+                      slotKey: `unifystore-${storeId}-sync`,
+                      disabled: isStoreSyncBusy() || !store?.canRefresh,
+                      leadingIcon: RefreshActionIcon,
+                    },
+                  ),
+                  ...(storeId === "gog-galaxy"
+                    ? [
+                        makeSettingToggleSlot(
+                          "omnilibrary-gog",
+                          "include-dlc",
+                          "Install owned DLC",
+                          store?.gogDlcEnabled === true
+                            ? "Managed GOG downloads include owned DLC and keep it attached to the base game."
+                            : "Managed GOG downloads install only the base game. Existing DLC files are not removed.",
+                          store?.gogDlcEnabled === true,
+                          () => saveGogOptions(
+                            store?.gogDlcEnabled !== true,
+                            store?.gogGalaxyLaunchEnabled === true,
+                          ),
+                          {
+                            slotKey: "unifystore-gog-include-dlc",
+                            disabled: isStoreSyncBusy(),
+                          },
+                        ),
+                        makeSettingToggleSlot(
+                          "omnilibrary-gog",
+                          "galaxy-launch",
+                          "Use GOG Galaxy for Play",
+                          store?.gogGalaxyLaunchEnabled === true
+                            ? "Play is delegated to GOG Galaxy for its cloud saves, achievements, overlay, and online authentication."
+                            : "Games launch directly through the managed GOG helper. Enable this for titles that require Galaxy features.",
+                          store?.gogGalaxyLaunchEnabled === true,
+                          () => saveGogOptions(
+                            store?.gogDlcEnabled === true,
+                            store?.gogGalaxyLaunchEnabled !== true,
+                          ),
+                          {
+                            slotKey: "unifystore-gog-galaxy-launch",
+                            disabled: isStoreSyncBusy(),
+                          },
+                        ),
+                        {
+                          title: "GOG Parallel Download Workers",
+                          slotKey: "unifystore-gog-download-workers-editor",
+                          customRenderer: () =>
+                            createEditorCard({
+                              label: "Parallel Download Workers",
+                              help: "1-32. More workers can improve fast connections; slower disks may work better with fewer.",
+                              value: downloadWorkersValue,
+                              placeholder: "16",
+                              inputKey: `unifystore-gog-workers-${state.storeSync.unifySteamDownloadOptionsVersionByStoreId[storeId] || 0}`,
+                              rows: 1,
+                              onInput: (value) => {
+                                state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId] = value;
+                                state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId] =
+                                  downloadOptionsDirty
+                                    ? state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId]
+                                    : downloadTimeoutValue;
+                                state.storeSync.unifySteamDownloadOptionsDirtyByStoreId[storeId] = true;
+                              },
+                            }),
+                        },
+                        {
+                          title: "GOG Connection Timeout",
+                          slotKey: "unifystore-gog-download-timeout-editor",
+                          customRenderer: () =>
+                            createEditorCard({
+                              label: "Connection Timeout (seconds)",
+                              help: "15-300. Longer timeouts tolerate temporary CDN stalls without discarding the resumable transfer.",
+                              value: downloadTimeoutValue,
+                              placeholder: "60",
+                              inputKey: `unifystore-gog-timeout-${state.storeSync.unifySteamDownloadOptionsVersionByStoreId[storeId] || 0}`,
+                              rows: 1,
+                              onInput: (value) => {
+                                state.storeSync.unifySteamDownloadTimeoutDraftByStoreId[storeId] = value;
+                                state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId] =
+                                  downloadOptionsDirty
+                                    ? state.storeSync.unifySteamDownloadWorkersDraftByStoreId[storeId]
+                                    : downloadWorkersValue;
+                                state.storeSync.unifySteamDownloadOptionsDirtyByStoreId[storeId] = true;
+                              },
+                            }),
+                        },
+                        makeCommandSlot(
+                          "Save GOG Download Settings",
+                          `Use up to ${downloadWorkersValue || 16} workers and tolerate ${downloadTimeoutValue || 60} seconds of CDN inactivity.`,
+                          () => saveGenericDownloadOptions(storeId),
+                          {
+                            slotKey: "unifystore-gog-save-download-options",
+                            disabled: isStoreSyncBusy(),
+                            leadingIcon: SaveActionIcon,
+                          },
+                        ),
+                      ]
+                    : []),
+                  ...(capabilities.has("install-path")
+                    ? [
+                        {
+                          title: `${title} Install Path`,
+                          slotKey: `unifystore-${storeId}-path-editor`,
+                          customRenderer: () =>
+                            createEditorCard({
+                              label: `${title} Install Path`,
+                              help: `Optional installation root for ${title}. Leave it empty to use the store default.`,
+                              value: pathValue,
+                              placeholder: `D:\\${title} Games`,
+                              inputKey: `unifystore-${storeId}-path-${state.storeSync.unifySteamInstallPathVersionByStoreId[storeId] || 0}`,
+                              rows: 1,
+                              onInput: (value) => {
+                                state.storeSync.unifySteamInstallPathDraftByStoreId[storeId] = value;
+                                state.storeSync.unifySteamInstallPathDirtyByStoreId[storeId] = true;
+                              },
+                            }),
+                        },
+                        makeCommandSlot(
+                          `Save ${title} Install Path`,
+                          pathValue
+                            ? `Use ${pathValue} for ${title}.`
+                            : `Use the default ${title} installation folder.`,
+                          () => saveGenericUnifyStoreInstallPath(storeId),
+                          {
+                            slotKey: `unifystore-${storeId}-save-path`,
+                            disabled: isStoreSyncBusy(),
+                            leadingIcon: SaveActionIcon,
+                          },
+                        ),
+                      ]
+                    : []),
+                ]
+              : []),
+          ];
+          return [
+            makeAccordionSlot(
+              title,
+              summary,
+              expanded,
+              () => {
+                toggleExpandedSection(sectionKey, false);
+                rerenderStoreSyncPanel();
+              },
+              {
+                slotKey: `unifystore-${storeId}-accordion`,
+                badge: enabled ? "Enabled" : "Off",
+                leadingIcon: StoreSyncPluginIcon,
+              },
+            ),
+            ...(expanded ? detailSlots : []),
+          ];
         });
-      const storeSlots = stores.flatMap((store) => [
-        makeCommandSlot(
-          `${store.title || "Store"} Login`,
-          store.authReady
-            ? `Signed in${store.accountName ? ` as ${store.accountName}` : ""}.`
-            : store.detailText || "Open the store login flow.",
-          () => startUnifyStoreLogin(store.id),
-          {
-            slotKey: `unifystore-login-${store.id}`,
-            disabled: isStoreSyncBusy(),
-            leadingIcon: StoreSyncPluginIcon,
-          },
-        ),
-        makeCommandSlot(
-          `Save ${store.title || "Store"} Login Code`,
-          "Paste the browser login result above, then save it locally for Storefront.",
-          () => submitUnifySteamAuthCode(store.id),
-          {
-            slotKey: `unifystore-save-login-${store.id}`,
-            disabled: isStoreSyncBusy() || !store.supportsManualCodeAuth,
-            leadingIcon: SaveActionIcon,
-          },
-        ),
-        makeCommandSlot(
-          `Refresh ${store.title || "Store"}`,
-          buildUnifySteamStoreCopy(store),
-          () => refreshUnifyStore(store.id),
-          {
-            slotKey: `unifystore-refresh-${store.id}`,
-            disabled: isStoreSyncBusy() || !store.enabled,
-            leadingIcon: RefreshActionIcon,
-          },
-        ),
-      ]);
+      const downloadCenterSlots = buildOmniLibraryDownloadCenterSlots(
+        makeAccordionSlot,
+        makeCommandSlot,
+      );
+      const restartSteamSlots = restartRequiredStores.length
+        ? [
+            makeCommandSlot(
+              "Restart Steam Now",
+              `Activate ${restartRequiredStores.map((store) => store.title).join(" and ")} in this Steam session. Big Picture relaunches automatically.`,
+              () => restartSteamForOmniLibrary(),
+              {
+                slotKey: "omnilibrary-restart-steam",
+                badge: "Required",
+                disabled: isStoreSyncBusy() || isPowerBusy(),
+                leadingIcon: RefreshActionIcon,
+              },
+            ),
+          ]
+        : [];
 
       return {
         ...defaultModel,
-        title: "Storefront",
-        subtitle: "Epic and GOG in one fullscreen launcher",
+        title: "OmniLibrary",
+        subtitle: "Connected stores in Steam's native library",
         status: storeSyncStatus,
         error: state.storeSync.error,
-        note: "Open the fullscreen surface to browse stores with LB/RB, mark installed games, and install or launch directly.",
-        editors: authEditors.length ? authEditors : null,
-        cards: [
-          {
-            title: "Storefront",
-            lines: [
-              `${installedCount} installed / ${libraryCount} in account libraries`,
-              getUnifySteamSnapshot()?.statusText || "Waiting for Epic or GOG setup.",
-              getUnifySteamSnapshot()?.detailText || "Login and refresh to populate the fullscreen launcher.",
-            ].filter(Boolean),
-          },
+        note: "Expand a store to enable it and configure only what that launcher needs. Disabled stores stay out of Steam and do no background work.",
+        editors: null,
+        cards: [],
+        topSlots: [
+          ...downloadCenterSlots,
+          ...restartSteamSlots,
         ],
         autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
         sectionHeaders: [
-          createSectionHeader(0, "Launcher", "Jump into the dedicated fullscreen library.", {
+          createSectionHeader(0, "Library Mode", "Choose exactly one library integration. The inactive plugin is hidden and stopped.", {
             icon: StoreSyncPluginIcon,
           }),
-          createSectionHeader(2, "Accounts", "Login and refresh the store libraries used by Storefront.", {
-            icon: RefreshActionIcon,
+          createSectionHeader(1, "Stores", "Enable only the launchers you want OmniLibrary to manage.", {
+            icon: StoreSyncPluginIcon,
           }),
         ],
-        dividerAfterIndices: [1],
+        dividerAfterIndices: [0],
         slots: [
-          makeCommandSlot(
-            "Open Fullscreen",
-            "Launch Storefront with controller navigation, Epic/GOG tabs, and install-ready game cards.",
-            () => openUnifyStoreOverlay(),
+          makeSettingToggleSlot(
+            "library-mode",
+            "use-omnilibrary",
+            "Use OmniLibrary instead of Store Sync",
+            "Enabling OmniLibrary disables and hides Store Sync, including its background sync. Turning it off switches back to Store Sync.",
+            omniLibraryEnabled,
+            () => togglePluginEnabled(omniLibraryEnabled ? "store-sync" : "omnilibrary", true),
             {
-              slotKey: "unifystore-open-fullscreen",
-              disabled: isStoreSyncBusy(),
+              slotKey: "library-mode-use-omnilibrary",
+              disabled: isGeneralSettingsBusy() || !omniLibraryPlugin,
+            },
+          ),
+          makeAccordionSlot(
+            "Xbox",
+            xboxSummary,
+            xboxExpanded,
+            () => {
+              toggleExpandedSection(xboxSectionKey, true);
+              rerenderStoreSyncPanel();
+            },
+            {
+              slotKey: "unifystore-xbox-accordion",
+              badge: xboxEnabled ? "Enabled" : "Off",
               leadingIcon: StoreSyncPluginIcon,
             },
           ),
-          makeCommandSlot(
-            "Refresh Libraries",
-            "Reload Epic and GOG account libraries before opening the fullscreen launcher.",
-            () => refreshUnifyStore(),
+          ...(xboxExpanded ? xboxSlots : []),
+          makeAccordionSlot(
+            "Epic Games",
+            epicSummary,
+            epicExpanded,
+            () => {
+              toggleExpandedSection(epicSectionKey, false);
+              rerenderStoreSyncPanel();
+            },
             {
-              slotKey: "unifystore-refresh-all",
-              disabled: isStoreSyncBusy(),
-              leadingIcon: RefreshActionIcon,
+              slotKey: "unifystore-epic-accordion",
+              badge: epicEnabled ? "Enabled" : "Off",
+              leadingIcon: StoreSyncPluginIcon,
             },
           ),
-          ...(storeSlots.length
-            ? storeSlots
-            : [
-                makeCommandSlot(
-                  "Load Store State",
-                  "Reload Store Sync so Epic and GOG account status can appear here.",
-                  () => loadStoreSyncState(),
-                  {
-                    slotKey: "unifystore-load-state",
-                    disabled: isStoreSyncBusy(),
-                    leadingIcon: RefreshActionIcon,
-                  },
-                ),
-              ]),
+          ...(epicExpanded ? epicSlots : []),
+          ...genericStoreSlots,
         ],
       };
     }
@@ -24506,6 +27260,7 @@
                 key: "update",
                 title: `Install ${updateSnapshot?.latestVersion || "Update"}`,
                 icon: HeaderUpdateIcon,
+                ...getHomeHeaderNavigationProps("update"),
                 disabled: state.homeReorder.active || state.generalSettings.saving || isUpdatesBusy(),
                 buttonStyle: {
                   width: "30px",
@@ -24521,9 +27276,27 @@
             ]
           : []),
         {
+          key: "wishlist",
+          title: "Wishlist",
+          icon: HeaderWishlistIcon,
+          ...getHomeHeaderNavigationProps("wishlist"),
+          disabled: state.homeReorder.active || state.generalSettings.saving,
+          buttonStyle: {
+            width: "30px",
+            height: "30px",
+            minWidth: "30px",
+            minHeight: "30px",
+            padding: "0",
+          },
+          onClick: () => {
+            void openStoreOverlay();
+          },
+        },
+        {
           key: "store",
           title: "Store",
           icon: HeaderStoreIcon,
+          ...getHomeHeaderNavigationProps("store"),
           disabled: state.homeReorder.active || state.generalSettings.saving,
           buttonStyle: {
             width: "30px",
@@ -24540,6 +27313,7 @@
           key: "settings",
           title: "Settings",
           icon: HeaderSettingsIcon,
+          ...getHomeHeaderNavigationProps("settings"),
           disabled: state.homeReorder.active || state.generalSettings.saving,
           buttonStyle: {
             width: "30px",
@@ -24567,11 +27341,6 @@
           }
 
           rememberCurrentRouteIndex(pluginIndex);
-          if (plugin.id === "unifystore") {
-            void openUnifyStoreOverlay();
-            return;
-          }
-
           const targetRoute =
             plugin.id === "artwork"
               ? { screen: "page", pluginId: "artwork", pageId: "settings" }
@@ -24611,6 +27380,11 @@
                 },
               }
             : {
+                ...(pluginIndex === 0
+                  ? {
+                      onMoveUp: (event) => moveHomeContentToHeader(event),
+                    }
+                  : {}),
                 onSecondaryButton: () => {
                   return startHomeReorderFromFocusedPlugin("onSecondaryButton", plugin.id);
                 },
@@ -24816,12 +27590,18 @@
     }
 
     if (
-      route.pluginId === "store-sync" &&
+      (route.pluginId === "store-sync" || route.pluginId === "omnilibrary") &&
       !state.storeSync.loading &&
       !state.storeSync.snapshot &&
       !state.storeSync.error
     ) {
       void loadStoreSyncState();
+    }
+    if (
+      route.pluginId === "omnilibrary" &&
+      !state.storeSync.downloadCenterLoading
+    ) {
+      void loadOmniLibraryDownloadCenter({ showLoading: true });
     }
 
     if (
@@ -24912,6 +27692,64 @@
     }
 
     if (
+      route.screen === "page" &&
+      route.pluginId === "settings" &&
+      route.pageId === "system" &&
+      !state.systemTools.loading &&
+      (enteringSettingsPage || (!state.systemTools.snapshot && !state.systemTools.error))
+    ) {
+      void loadSystemToolsState();
+    }
+
+    if (
+      route.screen === "page" &&
+      route.pluginId === "settings" &&
+      route.pageId === "system" &&
+      !state.systemHdr.loading &&
+      (enteringSettingsPage || (!state.systemHdr.snapshot && !state.systemHdr.error))
+    ) {
+      void loadHdrDisplayState();
+    }
+
+    if (
+      route.screen === "page" &&
+      route.pluginId === "settings" &&
+      route.pageId === "system-windows-update" &&
+      !state.systemWindowsUpdates.loading &&
+      !state.systemWindowsUpdates.snapshot &&
+      !state.systemWindowsUpdates.error
+    ) {
+      void loadWindowsSystemUpdates({ force: true });
+    }
+
+    if (
+      route.screen === "page" &&
+      route.pluginId === "settings" &&
+      route.pageId === "system-bluetooth" &&
+      enteringSettingsPage &&
+      !state.systemBluetooth.loading &&
+      !state.systemBluetooth.saving
+    ) {
+      void loadBluetoothDeviceState({ refresh: true });
+    }
+
+    if (
+      route.screen !== "page" ||
+      route.pluginId !== "settings" ||
+      route.pageId !== "system-windows-update"
+    ) {
+      resetWindowsSystemUpdateRunArm();
+    }
+
+    if (
+      route.screen !== "page" ||
+      route.pluginId !== "settings" ||
+      route.pageId !== "system"
+    ) {
+      resetSilentNvidiaGameReadyArm();
+    }
+
+    if (
       (route.pluginId === "settings" || route.screen === "root") &&
       !state.generalSettings.loading &&
       !state.generalSettings.snapshot &&
@@ -24934,6 +27772,7 @@
     updateStoreSyncPolling();
     updateSmartHomePolling();
     updateUpdatesPolling();
+    updateBluetoothPolling();
     updateHomeReorderInputCapture();
 
     refreshQuickAccessPanel();
@@ -25593,7 +28432,7 @@
 
   function resolveAppStartStatusText() {
     if (state.appStart.saving) {
-      return "Updating App Start...";
+      return "Updating Apps...";
     }
 
     if (state.appStart.catalogLoading) {
@@ -25660,6 +28499,7 @@
     updateStoreSyncPolling();
     updateSmartHomePolling();
     updateUpdatesPolling();
+    updateBluetoothPolling();
   }
 
   function isUpdatesVisibleRoute() {
@@ -25704,9 +28544,15 @@
       return;
     }
 
-    if (state.route?.pluginId === "store-sync") {
+    if (state.route?.pluginId === "store-sync" || state.route?.pluginId === "omnilibrary") {
       if (!isStoreSyncBusy() && !hasRouteTextInputFocus()) {
         void loadStoreSyncState({ showLoading: false, preserveDrafts: true });
+      }
+      if (
+        state.route?.pluginId === "omnilibrary" &&
+        !state.storeSync.downloadCenterLoading
+      ) {
+        void loadOmniLibraryDownloadCenter();
       }
       return;
     }
@@ -25823,7 +28669,11 @@
           preserveDrafts,
           forceDraftSync: !preserveDrafts,
         });
-        if (state.panelVisible && state.route?.pluginId === "store-sync" && !hasRouteTextInputFocus()) {
+        if (
+          state.panelVisible &&
+          (state.route?.pluginId === "store-sync" || state.route?.pluginId === "omnilibrary") &&
+          !hasRouteTextInputFocus()
+        ) {
           rerenderStoreSyncPanel();
         }
         return true;
@@ -26018,7 +28868,7 @@
       window.__steamToolsAudioMixerPollTimer = null;
     }
 
-    if (state.route?.pluginId !== "audio" || !shouldUseLiveUpdatePollingFallback()) {
+    if (state.route?.pluginId !== "audio") {
       return;
     }
 
@@ -26045,12 +28895,33 @@
   }
 
   function updateStoreSyncPolling() {
+    if (window.__steamToolsOmniDownloadsPollTimer) {
+      window.clearTimeout(window.__steamToolsOmniDownloadsPollTimer);
+      window.__steamToolsOmniDownloadsPollTimer = null;
+    }
+    if (
+      state.panelVisible &&
+      state.route?.pluginId === "omnilibrary"
+    ) {
+      if (
+        !state.storeSync.downloadCenter &&
+        !state.storeSync.downloadCenterLoading
+      ) {
+        void loadOmniLibraryDownloadCenter();
+      } else {
+        scheduleOmniLibraryDownloadCenterRefresh();
+      }
+    }
+
     if (window.__steamToolsStoreSyncPollTimer) {
       window.clearInterval(window.__steamToolsStoreSyncPollTimer);
       window.__steamToolsStoreSyncPollTimer = null;
     }
 
-    if (state.route?.pluginId !== "store-sync" || !shouldUseLiveUpdatePollingFallback()) {
+    if (
+      (state.route?.pluginId !== "store-sync" && state.route?.pluginId !== "omnilibrary") ||
+      !shouldUseLiveUpdatePollingFallback()
+    ) {
       return;
     }
 
@@ -26081,6 +28952,28 @@
         void loadSmartHomeState({ force: false, showLoading: false });
       }
     }, 6000);
+  }
+
+  function updateBluetoothPolling() {
+    if (window.__steamToolsBluetoothPollTimer) {
+      window.clearInterval(window.__steamToolsBluetoothPollTimer);
+      window.__steamToolsBluetoothPollTimer = null;
+    }
+
+    if (
+      state.route?.screen !== "page" ||
+      state.route?.pluginId !== "settings" ||
+      state.route?.pageId !== "system-bluetooth" ||
+      getBluetoothDeviceSnapshot()?.scanning !== true
+    ) {
+      return;
+    }
+
+    window.__steamToolsBluetoothPollTimer = window.setInterval(() => {
+      if (!isBluetoothDeviceBusy()) {
+        void loadBluetoothDeviceState({ showLoading: false });
+      }
+    }, 900);
   }
 
   async function switchDisplayMode(mode) {
@@ -26411,6 +29304,7 @@
     captureNativeUi();
     ensureLiveUpdateConnection();
     setupPluginStoreBridge();
+    ensureOmniLibraryDownloadStatusChannel();
     ensureVolumeSliderHotkeys();
     ensureAudioDashboardHotkeys();
     ensurePerformanceSliderHotkeys();
@@ -26515,6 +29409,29 @@
     return true;
   }
 
+  function scheduleInstallRetry(attempt = 0) {
+    if (state.installed || window.__steamLoaderPopupInstallRetryTimer) {
+      return;
+    }
+
+    // Steam creates the Quick Access browser target before its React tab host is
+    // always mounted. Retry only this lightweight final attachment step: quickly
+    // during startup, then with a long idle cadence. The timer stops permanently
+    // as soon as the native host is available.
+    const delay =
+      attempt < 20
+        ? 250
+        : attempt < 60
+          ? 1000
+          : 5000;
+    window.__steamLoaderPopupInstallRetryTimer = window.setTimeout(() => {
+      window.__steamLoaderPopupInstallRetryTimer = null;
+      if (!install()) {
+        scheduleInstallRetry(attempt + 1);
+      }
+    }, delay);
+  }
+
   window.__steamLoaderPluginStoreOverlayBridge = {
     togglePluginEnabled,
     refreshSettings: () => loadGeneralSettingsState({ showLoading: false }),
@@ -26525,5 +29442,10 @@
     },
   };
 
-  return install() ? "injected" : "waiting";
+  const installed = install();
+  if (!installed) {
+    scheduleInstallRetry();
+  }
+
+  return installed ? "injected" : "waiting";
 })();

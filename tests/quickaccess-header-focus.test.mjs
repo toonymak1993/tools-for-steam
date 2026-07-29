@@ -21,6 +21,10 @@ test("Quick Access header actions participate in focus restoration", async () =>
     assert.match(createHeaderActionButton, /data-slot-key/);
     assert.match(createHeaderActionButton, /data-header-action/);
     assert.match(createHeaderActionButton, /onGamepadFocus/);
+    assert.match(createHeaderActionButton, /onMoveLeft/);
+    assert.match(createHeaderActionButton, /onMoveRight/);
+    assert.match(createHeaderActionButton, /onMoveUp/);
+    assert.match(createHeaderActionButton, /onMoveDown/);
   }
 
   assert.match(
@@ -32,6 +36,14 @@ test("Quick Access header actions participate in focus restoration", async () =>
     popupSource,
     /pendingSlotKey\.startsWith\("header-action:"\)/,
     "a pending header focus must bypass row auto-focus",
+  );
+  assert.match(popupSource, /function moveHomeHeaderActionFocus\(/);
+  assert.match(popupSource, /function moveHomeHeaderToContent\(/);
+  assert.match(popupSource, /function moveHomeContentToHeader\(/);
+  assert.match(
+    popupSource,
+    /pluginIndex === 0[\s\S]*?onMoveUp:[\s\S]*?moveHomeContentToHeader/,
+    "only the first plugin row should move up into the horizontal header action group",
   );
   assert.match(popupSource, /fallbackSlotKey: "header-action:settings"/);
 });

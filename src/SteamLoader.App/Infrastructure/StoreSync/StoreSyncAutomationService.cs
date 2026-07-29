@@ -27,13 +27,35 @@ public sealed class StoreSyncAutomationService
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        var automationActive = false;
+
         try
         {
-            RefreshWatchers();
-
             while (!cancellationToken.IsCancellationRequested)
             {
                 var now = DateTimeOffset.UtcNow;
+                if (!_isPluginEnabled())
+                {
+                    if (automationActive)
+                    {
+                        ClearWatchers();
+                        ClearPendingWatcherTrigger();
+                        automationActive = false;
+                    }
+
+                    _nextPollAtUtc = now;
+                    _nextWatcherRefreshAtUtc = now;
+                    await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                    continue;
+                }
+
+                if (!automationActive)
+                {
+                    RefreshWatchers();
+                    automationActive = true;
+                    _nextPollAtUtc = now;
+                    _nextWatcherRefreshAtUtc = now.Add(WatcherRefreshInterval);
+                }
 
                 if (now >= _nextWatcherRefreshAtUtc)
                 {
@@ -60,6 +82,15 @@ public sealed class StoreSyncAutomationService
         {
             ClearWatchers();
             _storeSyncService.UpdateAutomationWatchers(0, false);
+        }
+    }
+
+    private void ClearPendingWatcherTrigger()
+    {
+        lock (_gate)
+        {
+            _pendingWatcherTriggerSource = string.Empty;
+            _lastWatcherEventAtUtc = null;
         }
     }
 

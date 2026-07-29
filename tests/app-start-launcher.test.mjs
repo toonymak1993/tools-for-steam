@@ -14,6 +14,18 @@ const apiSource = readFileSync(
   new URL("../src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs", import.meta.url),
   "utf8",
 );
+const pluginCatalogSource = readFileSync(
+  new URL(
+    "../src/SteamLoader.App/Infrastructure/Settings/SteamLoaderPluginCatalog.cs",
+    import.meta.url,
+  ),
+  "utf8",
+);
+
+test("App Start keeps its stable id while the visible plugin name is Apps", () => {
+  assert.match(popupSource, /id:\s*"app-start",\s*title:\s*"Apps"/);
+  assert.match(pluginCatalogSource, /new\("app-start",\s*"Apps"/);
+});
 
 test("App Start indexes desktop and packaged apps incrementally", () => {
   assert.match(serviceSource, /Get-StartApps/);

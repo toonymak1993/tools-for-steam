@@ -1,6 +1,7 @@
 #define MyAppName "Tools for Steam"
 #define MyAppShortName "TFS"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.4.1-beta.1"
+#define MyAppBinaryVersion "0.4.1.0"
 #define MyAppPublisher "GCM - Gaming Console Mode"
 #define MyAppExeName "ToolsForSteam.exe"
 #define MyAppId "{{9A9F0B7E-4C79-4C7D-8E4B-0E0D766E0B72}"
@@ -33,6 +34,14 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL=https://github.com/toonymak1993/tools-for-steam
 AppSupportURL=https://github.com/toonymak1993/tools-for-steam/issues
 AppUpdatesURL=https://github.com/toonymak1993/tools-for-steam/releases
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Installer
+VersionInfoOriginalFileName=ToolsForSteamSetup.exe
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppBinaryVersion}
+VersionInfoProductTextVersion={#MyAppVersion}
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppBinaryVersion}
 DefaultDirName={localappdata}\Programs\ToolsForSteam
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -74,6 +83,8 @@ Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\NOTICE.txt"; DestDir: "{app}\T
 Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\PawnIO_setup.exe"; DestDir: "{app}\ThirdParty\PawnIO"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\DiscordSocialSdk\License-Notices.txt"; DestDir: "{app}\ThirdParty\DiscordSocialSdk"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\DiscordSocialSdk\NOTICE.txt"; DestDir: "{app}\ThirdParty\DiscordSocialSdk"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\Legendary\NOTICE.txt"; DestDir: "{app}\ThirdParty\Legendary"; Flags: ignoreversion
+Source: "..\src\SteamLoader.App\ThirdParty\GogDl\NOTICE.txt"; DestDir: "{app}\ThirdParty\GogDl"; Flags: ignoreversion
 Source: "..\dist\handheld-runtime\VIIPER\viiper.exe"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion
 Source: "..\dist\handheld-runtime\VIIPER\licenses.txt"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion
 Source: "..\dist\handheld-runtime\VIIPER\VIIPER-v0.7.0-source.zip"; DestDir: "{app}\ThirdParty\VIIPER"; Flags: ignoreversion

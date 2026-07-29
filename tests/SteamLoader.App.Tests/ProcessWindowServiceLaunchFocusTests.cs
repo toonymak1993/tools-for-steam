@@ -104,6 +104,52 @@ public sealed class ProcessWindowServiceLaunchFocusTests
         Assert.Null(selected);
     }
 
+    [Fact]
+    public void XboxHostedWindow_IsAllowedWhileOtherFrameHostsRemainIgnored()
+    {
+        Assert.True(ProcessWindowService.IsAllowedHostedAppWindow(
+            "ApplicationFrameHost",
+            "XBOX"));
+        Assert.False(ProcessWindowService.IsAllowedHostedAppWindow(
+            "ApplicationFrameHost",
+            "Settings"));
+        Assert.False(ProcessWindowService.IsAllowedHostedAppWindow(
+            "XboxPcApp",
+            "XBOX"));
+    }
+
+    [Fact]
+    public void SelectUrlHandlerWindow_PrefersBrowserWhoseTabTitleChanged()
+    {
+        var before = new[]
+        {
+            Window("0x1", "Tools for Steam", "ToolsForSteam", 10, foreground: true),
+            Window("0x2", "Previous tab", "msedge", 20)
+        };
+        var current = new[]
+        {
+            Window("0x1", "Tools for Steam", "ToolsForSteam", 10, foreground: true),
+            Window("0x2", "Steam Store", "msedge", 20)
+        };
+
+        var selected = ProcessWindowService.SelectUrlHandlerWindow(before, current);
+
+        Assert.Equal("0x2", selected?.Handle);
+    }
+
+    [Fact]
+    public void SelectUrlHandlerWindow_FallsBackToTheOnlyExistingBrowser()
+    {
+        var before = new[]
+        {
+            Window("0x1", "Tools for Steam", "ToolsForSteam", 10, foreground: true),
+            Window("0x2", "Existing tab", "firefox", 20)
+        };
+
+        Assert.Null(ProcessWindowService.SelectUrlHandlerWindow(before, before, allowExistingWindow: false));
+        Assert.Equal("0x2", ProcessWindowService.SelectUrlHandlerWindow(before, before)?.Handle);
+    }
+
     private static ProcessWindowInfo Window(
         string handle,
         string title,

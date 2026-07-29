@@ -135,6 +135,37 @@ internal sealed class HandheldSystemControlService
     public HandheldOemSoftwareSnapshot GetOemSoftware(HandheldDeviceProfile device)
     {
         var supported = HandheldDeviceCatalog.IsSupported(device) && device.OemSoftware.Supported;
+        if (!supported)
+        {
+            return new HandheldOemSoftwareSnapshot(
+                false,
+                device.Id,
+                device.OemSoftware.SoftwareName,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                device.Controller.MinimumVibrationStrengthPercent,
+                device.Controller.MaximumVibrationStrengthPercent,
+                0,
+                false,
+                "OEM control is not available for this device.",
+                BuildBindings(device),
+                OemActions,
+                new HandheldOemCaptureSnapshot(
+                    false,
+                    string.Empty,
+                    string.Empty,
+                    "Select a button and start Live Detect."));
+        }
+
         var service = ReadMsiFoundationService();
         var tasks = MsiCenterTaskNames.Select(ReadScheduledTask).ToArray();
         var startupEntries = FindOemStartupEntries();
@@ -937,13 +968,35 @@ internal sealed class HandheldSystemControlService
     {
         try
         {
-            return IsMsiCenterMText(process.ProcessName) ||
-                string.Equals(process.ProcessName, "MSIAPService", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(process.ProcessName, "Command Center", StringComparison.OrdinalIgnoreCase) ||
-                IsMsiCenterMText(process.MainModule?.FileVersionInfo.ProductName ?? string.Empty) ||
-                IsMsiCenterMText(process.MainModule?.FileVersionInfo.FileDescription ?? string.Empty);
+            var processName = process.ProcessName;
+            if (IsMsiCenterMText(processName) ||
+                string.Equals(processName, "MSIAPService", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(processName, "Command Center", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (!ShouldInspectMsiCenterProcessMetadata(processName))
+            {
+                return false;
+            }
+
+            var versionInfo = process.MainModule?.FileVersionInfo;
+            return IsMsiCenterMText(versionInfo?.ProductName ?? string.Empty) ||
+                IsMsiCenterMText(versionInfo?.FileDescription ?? string.Empty);
         }
-        catch { return false; }
+        catch
+        {
+            return false;
+        }
+    }
+
+    internal static bool ShouldInspectMsiCenterProcessMetadata(string processName)
+    {
+        return processName.Contains("MSI", StringComparison.OrdinalIgnoreCase) ||
+            processName.Contains("Center", StringComparison.OrdinalIgnoreCase) ||
+            processName.Contains("QuickSettings", StringComparison.OrdinalIgnoreCase) ||
+            processName.Contains("DCv2", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsMsiCenterMText(string value)

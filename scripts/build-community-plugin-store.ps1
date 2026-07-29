@@ -26,7 +26,7 @@ function Resolve-RuntimeDataDirectory {
         return (Join-Path (Split-Path -Parent $runningProcess.ExecutablePath) "data")
     }
 
-    return (Join-Path $RepoRoot "src\SteamLoader.App\bin\Debug\net10.0-windows\data")
+    return (Join-Path $RepoRoot "src\SteamLoader.App\bin\Debug\net10.0-windows10.0.19041.0\data")
 }
 
 function Get-FileSha256 {

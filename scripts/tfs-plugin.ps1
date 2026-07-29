@@ -58,8 +58,32 @@ function Get-PluginPublishedAtUtc {
 
     $gitCommand = Get-Command git -ErrorAction SilentlyContinue
     if ($gitCommand) {
-        $relativeManifestPath = [System.IO.Path]::GetRelativePath($RepoRoot, $PluginManifestPath).Replace("\", "/")
-        $gitDates = @(& $gitCommand.Source -C $RepoRoot log --diff-filter=A --format=%aI -- $relativeManifestPath 2>$null)
+        # System.IO.Path.GetRelativePath is unavailable in Windows PowerShell 5.1.
+        # Keep the public plugin tooling compatible with the Windows inbox shell.
+        $gitWorkingTreePath = [System.IO.Path]::GetFullPath($RepoRoot)
+        while (
+            $gitWorkingTreePath.Length -gt 3 -and
+            (
+                $gitWorkingTreePath.EndsWith([System.IO.Path]::DirectorySeparatorChar.ToString()) -or
+                $gitWorkingTreePath.EndsWith([System.IO.Path]::AltDirectorySeparatorChar.ToString())
+            )
+        ) {
+            $gitWorkingTreePath = $gitWorkingTreePath.Substring(0, $gitWorkingTreePath.Length - 1)
+        }
+
+        $repoRootPath = $gitWorkingTreePath
+        if (-not $repoRootPath.EndsWith([System.IO.Path]::DirectorySeparatorChar.ToString())) {
+            $repoRootPath += [System.IO.Path]::DirectorySeparatorChar
+        }
+
+        $manifestFullPath = [System.IO.Path]::GetFullPath($PluginManifestPath)
+        $relativeManifestPath = if ($manifestFullPath.StartsWith($repoRootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $manifestFullPath.Substring($repoRootPath.Length)
+        } else {
+            $manifestFullPath
+        }
+        $relativeManifestPath = $relativeManifestPath.Replace("\", "/")
+        $gitDates = @(& $gitCommand.Source -C $gitWorkingTreePath log --diff-filter=A --format=%aI -- $relativeManifestPath 2>$null)
         if ($LASTEXITCODE -eq 0) {
             $oldestGitTimestamp = $gitDates |
                 ForEach-Object {
@@ -241,7 +265,7 @@ switch ($Command) {
             $RuntimeDataDirectory = if (Test-Path -LiteralPath (Split-Path -Parent $installedData)) {
                 $installedData
             } else {
-                Join-Path (Split-Path -Parent $PSScriptRoot) "src\SteamLoader.App\bin\Debug\net10.0-windows\data"
+                Join-Path (Split-Path -Parent $PSScriptRoot) "src\SteamLoader.App\bin\Debug\net10.0-windows10.0.19041.0\data"
             }
         }
         $storeRoot = Join-Path ([System.IO.Path]::GetFullPath($RuntimeDataDirectory)) "plugin-store"

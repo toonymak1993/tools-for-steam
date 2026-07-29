@@ -11,6 +11,17 @@ public sealed class QuickAccessLiveUpdateHub
     private readonly Dictionary<Guid, Channel<string>> _subscribers = new();
     private long _nextSequence;
 
+    public bool HasSubscribers
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _subscribers.Count > 0;
+            }
+        }
+    }
+
     public QuickAccessLiveUpdateSubscription Subscribe()
     {
         var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions

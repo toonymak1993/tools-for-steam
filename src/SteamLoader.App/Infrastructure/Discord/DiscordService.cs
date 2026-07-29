@@ -484,7 +484,7 @@ public sealed class DiscordService : IAsyncDisposable
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
             request.Headers.TryAddWithoutValidation(
                 "User-Agent",
-                "ToolsForSteam/0.4.0 (+https://github.com/toonymak1993/tools-for-steam)");
+                "ToolsForSteam/0.4.1-beta.1 (+https://github.com/toonymak1993/tools-for-steam)");
 
             using var response = await _httpClient.SendAsync(request, cancellationToken);
             var discordError = response.IsSuccessStatusCode
@@ -760,7 +760,7 @@ public sealed class DiscordService : IAsyncDisposable
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
         request.Headers.TryAddWithoutValidation(
             "User-Agent",
-            "ToolsForSteam/0.4.0 (+https://github.com/toonymak1993/tools-for-steam)");
+            "ToolsForSteam/0.4.1-beta.1 (+https://github.com/toonymak1993/tools-for-steam)");
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)

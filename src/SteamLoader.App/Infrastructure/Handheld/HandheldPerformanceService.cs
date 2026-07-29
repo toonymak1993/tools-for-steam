@@ -19,6 +19,7 @@ public sealed class HandheldPerformanceService
     private readonly WindowsProfileNotificationService? _notificationService;
     private readonly HandheldPowerStateReader _powerStateReader = new();
     private readonly HandheldSystemControlService _systemControls;
+    private readonly HandheldDeviceProfile _device;
     private HandheldRunningGame? _currentGame;
     private HandheldPowerState _powerState = new();
     private string _lastAutomaticTargetKey = string.Empty;
@@ -49,6 +50,7 @@ public sealed class HandheldPerformanceService
         _lightingPath = Path.Combine(dataDirectory, "handheld-lighting.json");
         _hapticCommandPath = Path.Combine(dataDirectory, "handheld-ui-haptic.json");
         _systemControls = new HandheldSystemControlService(dataDirectory);
+        _device = HandheldDeviceCatalog.Detect();
         _notificationService = notificationService;
         _powerState = _powerStateReader.Read(force: true);
     }
@@ -57,7 +59,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            var device = HandheldDeviceCatalog.Detect();
+            var device = _device;
             var settings = LoadSettings(device);
             var profileSettings = LoadProfileSettings(device);
             var activeProfile = _currentGame is null
@@ -70,7 +72,7 @@ public sealed class HandheldPerformanceService
             var supported = HandheldDeviceCatalog.IsSupported(device);
             var statusText = !supported
                 ? $"Unsupported device ({device.Manufacturer} {device.ProductCode})."
-                : !IsPawnIoInstalled()
+                : !pawnIoInstalled
                     ? "PawnIO 2.1 or newer is required before TDP control can be enabled."
                     : status.Message;
             var globalAcWatts = ResolveSettingsTdp(settings, "ac");
@@ -99,6 +101,20 @@ public sealed class HandheldPerformanceService
                 status.LightingApplied,
                 status.LightingMessage,
                 device.Lighting.Effects);
+            var cpuBoost = supported
+                ? _systemControls.GetCpuBoost()
+                : new HandheldCpuBoostSnapshot(
+                    false,
+                    0,
+                    0,
+                    "CPU boost control is not available for this device.");
+            var afmf = supported
+                ? _systemControls.GetAfmf()
+                : new HandheldAfmfSnapshot(
+                    false,
+                    false,
+                    "AFMF control is not available for this device.");
+            var oemSoftware = _systemControls.GetOemSoftware(device);
 
             return new HandheldPerformanceSnapshot(
                 device.DisplayName,
@@ -131,9 +147,9 @@ public sealed class HandheldPerformanceService
                 statusText,
                 status.Success || status.Nonce == 0 ? string.Empty : status.Message,
                 lighting,
-                _systemControls.GetCpuBoost(),
-                _systemControls.GetAfmf(),
-                _systemControls.GetOemSoftware(device));
+                cpuBoost,
+                afmf,
+                oemSoftware);
         }
     }
 
@@ -200,7 +216,7 @@ public sealed class HandheldPerformanceService
         lock (_sync)
         {
             var dataDirectory = Path.GetDirectoryName(_hapticCommandPath)!;
-            var device = _uiHapticDevice ??= HandheldDeviceCatalog.Detect();
+            var device = _uiHapticDevice ??= _device;
             if (!HandheldDeviceCatalog.IsSupported(device) || !device.Controller.VibrationSupported)
             {
                 return false;
@@ -257,7 +273,7 @@ public sealed class HandheldPerformanceService
 
     public void ObserveOemInput(HidMenuButtonReport report)
     {
-        _systemControls.ObserveOemInput(HandheldDeviceCatalog.Detect(), report);
+        _systemControls.ObserveOemInput(_device, report);
     }
 
     public HandheldPerformanceSnapshot SetLighting(
@@ -615,7 +631,7 @@ public sealed class HandheldPerformanceService
 
     private HandheldDeviceProfile RequireSupportedDevice()
     {
-        var device = HandheldDeviceCatalog.Detect();
+        var device = _device;
         return HandheldDeviceCatalog.IsSupported(device)
             ? device
             : throw new InvalidOperationException("No supported handheld was detected.");

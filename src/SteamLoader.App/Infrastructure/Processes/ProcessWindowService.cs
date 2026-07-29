@@ -47,7 +47,24 @@ public sealed class ProcessWindowService
         "wscript",
     };
 
+    private static readonly HashSet<string> BrowserProcessNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "arc",
+        "brave",
+        "chrome",
+        "firefox",
+        "floorp",
+        "librewolf",
+        "msedge",
+        "opera",
+        "operagx",
+        "vivaldi",
+        "waterfox",
+        "zen",
+    };
+
     private int _launchedAppFocusGeneration;
+    private int _urlHandlerFocusGeneration;
 
     public ProcessesSnapshot GetSnapshot()
     {
@@ -105,6 +122,55 @@ public sealed class ProcessWindowService
             launchedProcessId,
             windowsBeforeLaunch,
             generation);
+    }
+
+    public void ActivateUrlHandlerWhenReady(IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch)
+    {
+        var generation = Interlocked.Increment(ref _urlHandlerFocusGeneration);
+        _ = ActivateUrlHandlerWhenReadyAsync(windowsBeforeLaunch, generation);
+    }
+
+    private async Task ActivateUrlHandlerWhenReadyAsync(
+        IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch,
+        int generation)
+    {
+        try
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            var deadline = startedAt + LaunchedAppFocusTimeout;
+            while (DateTimeOffset.UtcNow < deadline &&
+                   Volatile.Read(ref _urlHandlerFocusGeneration) == generation)
+            {
+                var candidate = SelectUrlHandlerWindow(
+                    windowsBeforeLaunch,
+                    GetSnapshot().Windows,
+                    allowExistingWindow: DateTimeOffset.UtcNow - startedAt >= ExistingNameMatchDelay);
+                if (candidate is not null)
+                {
+                    if (!candidate.IsForeground)
+                    {
+                        try
+                        {
+                            ActivateWindow(candidate.Handle);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            await Task.Delay(LaunchedAppPollInterval).ConfigureAwait(false);
+                            continue;
+                        }
+                    }
+
+                    return;
+                }
+
+                await Task.Delay(LaunchedAppPollInterval).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // The URL launch itself remains successful when Windows refuses a
+            // foreground handoff or the configured handler has no normal window.
+        }
     }
 
     private async Task ActivateLaunchedAppWhenReadyAsync(
@@ -237,6 +303,42 @@ public sealed class ProcessWindowService
             .FirstOrDefault();
     }
 
+    internal static ProcessWindowInfo? SelectUrlHandlerWindow(
+        IReadOnlyList<ProcessWindowInfo> windowsBeforeLaunch,
+        IReadOnlyList<ProcessWindowInfo> currentWindows,
+        bool allowExistingWindow = true)
+    {
+        var previousByHandle = windowsBeforeLaunch.ToDictionary(
+            window => window.Handle,
+            StringComparer.OrdinalIgnoreCase);
+        var browserWindows = currentWindows
+            .Where(window => IsBrowserProcess(window.ProcessName))
+            .ToArray();
+
+        var changedBrowser = browserWindows
+            .Where(window =>
+                !previousByHandle.TryGetValue(window.Handle, out var previous) ||
+                !window.Title.Equals(previous.Title, StringComparison.Ordinal))
+            .OrderByDescending(window => window.IsForeground)
+            .FirstOrDefault();
+        if (changedBrowser is not null)
+        {
+            return changedBrowser;
+        }
+
+        var newlyForegroundBrowser = browserWindows.FirstOrDefault(window =>
+            window.IsForeground &&
+            (!previousByHandle.TryGetValue(window.Handle, out var previous) || !previous.IsForeground));
+        if (newlyForegroundBrowser is not null || !allowExistingWindow)
+        {
+            return newlyForegroundBrowser;
+        }
+
+        return browserWindows.Length == 1
+            ? browserWindows[0]
+            : browserWindows.FirstOrDefault(window => window.IsForeground);
+    }
+
     private static bool ProcessNameMatches(string processName, string normalizedExpectedProcessName)
     {
         var normalizedProcessName = NormalizeAppIdentifier(processName);
@@ -293,6 +395,15 @@ public sealed class ProcessWindowService
 
     private static bool IsGenericLaunchHostProcess(string processName) =>
         GenericLaunchHostProcessNames.Contains(NormalizeAppIdentifier(processName));
+
+    private static bool IsBrowserProcess(string processName) =>
+        BrowserProcessNames.Contains(NormalizeAppIdentifier(processName));
+
+    internal static bool IsAllowedHostedAppWindow(
+        string processName,
+        string title) =>
+        processName.Equals("ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
+        title.Trim().Equals("XBOX", StringComparison.OrdinalIgnoreCase);
 
     private static IReadOnlyList<ProcessWindowInfo> EnumerateWindows()
     {
@@ -527,7 +638,8 @@ public sealed class ProcessWindowService
                 return;
             }
 
-            if (IgnoredProcessNames.Contains(processName))
+            if (IgnoredProcessNames.Contains(processName) &&
+                !IsAllowedHostedAppWindow(processName, title))
             {
                 return;
             }

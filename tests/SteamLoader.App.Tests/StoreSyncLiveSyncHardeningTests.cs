@@ -1,6 +1,8 @@
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
+using SteamLoader.App.Hosting;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Models;
@@ -683,6 +685,18 @@ public sealed class StoreSyncLiveSyncHardeningTests
     }
 
     [Fact]
+    public void CurrentScriptVersionValue_AcceptsDevToolsJsonBooleanWithoutReinjecting()
+    {
+        using var trueDocument = JsonDocument.Parse("true");
+        using var falseDocument = JsonDocument.Parse("false");
+
+        Assert.True(QuickAccessShellInjector.IsCurrentScriptVersionValue(trueDocument.RootElement));
+        Assert.True(SteamDevToolsClient.TryReadBoolean(trueDocument.RootElement, out var parsed));
+        Assert.True(parsed);
+        Assert.False(QuickAccessShellInjector.IsCurrentScriptVersionValue(falseDocument.RootElement));
+    }
+
+    [Fact]
     public void BuildLiveShortcutSyncExpression_AlwaysCreatesNewShortcutsThroughAddShortcut()
     {
         var serviceType = typeof(StoreSyncService);
@@ -731,6 +745,198 @@ public sealed class StoreSyncLiveSyncHardeningTests
         var createBlock = expression.Substring(createStart, updateStart - createStart);
         Assert.Contains("\"AddShortcut\"", createBlock, StringComparison.Ordinal);
         Assert.DoesNotContain("tryApplyToShortcut", createBlock, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GetManifestMatchScore_OmniLibraryRejectsSharedExecutableForDifferentStoreProduct()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("GetManifestMatchScore", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(method);
+
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "xbox-game-pass:PRODUCT-B",
+            "Cloud Game B",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch xbox-game-pass:PRODUCT-B");
+        var unrelatedManifest = new StoreSyncManifestEntry
+        {
+            TitleId = "unifysteam-product-a",
+            StoreId = "unifysteam",
+            StoreItemId = "xbox-game-pass:PRODUCT-A",
+            Title = "Cloud Game A",
+            EffectiveTitle = "Cloud Game A",
+            ExecutablePath = @"C:\ToolsForSteam\ToolsForSteam.exe",
+            AppId = 2214928963u,
+            ManagedShortcut = true,
+        };
+
+        var score = (int?)method!.Invoke(
+            null,
+            [unrelatedManifest, game, "Cloud Game B", null]);
+
+        Assert.Equal(int.MaxValue, score);
+    }
+
+    [Fact]
+    public void GetOmniLibraryDuplicateSteamAppIdGameIds_ReturnsEveryCollidingProduct()
+    {
+        var method = typeof(StoreSyncService).GetMethod(
+            "GetOmniLibraryDuplicateSteamAppIdGameIds",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(method);
+
+        var store = new UnifySteamStoreConfiguration
+        {
+            Cache = new UnifySteamLibraryCache
+            {
+                Games =
+                [
+                    new() { Id = "PRODUCT-A", SteamAppId = 2214928963u },
+                    new() { Id = "PRODUCT-B", SteamAppId = 2214928963u },
+                    new() { Id = "PRODUCT-C", SteamAppId = 991u },
+                ],
+            },
+        };
+
+        var result = Assert.IsType<string[]>(method!.Invoke(null, [store]));
+
+        Assert.Equal(["PRODUCT-A", "PRODUCT-B"], result);
+    }
+
+    [Fact]
+    public void BuildLiveShortcutSyncPlan_ForcesDistinctOmniShortcutsForDuplicateAppId()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("BuildLiveShortcutSyncPlan", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        const uint collidedAppId = 2214928963u;
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "unifysteam",
+            "Storefront",
+            "Test store",
+            true,
+            false);
+        var actionKind = Enum.Parse(actionKindType!, "RefreshManaged");
+        var analysisItems = Array.CreateInstance(analysisItemType!, 2);
+
+        for (var index = 0; index < 2; index++)
+        {
+            var suffix = index == 0 ? "A" : "B";
+            var titleId = $"unifysteam-product-{suffix.ToLowerInvariant()}";
+            var launchOptions = $"--unifysteam-launch xbox-game-pass:PRODUCT-{suffix}";
+            var game = CreateNonPublicInstance(
+                storeGameEntryType!,
+                "unifysteam",
+                $"xbox-game-pass:PRODUCT-{suffix}",
+                $"Cloud Game {suffix}",
+                @"C:\ToolsForSteam\ToolsForSteam.exe",
+                @"C:\ToolsForSteam",
+                launchOptions);
+            var entry = new Dictionary<string, object?>
+            {
+                ["appid"] = unchecked((int)collidedAppId),
+                ["appname"] = $"Cloud Game {suffix}",
+                ["Exe"] = "\"C:\\ToolsForSteam\\ToolsForSteam.exe\"",
+                ["StartDir"] = "\"C:\\ToolsForSteam\"",
+                ["LaunchOptions"] = launchOptions,
+                ["tags"] = new Dictionary<string, object?>
+                {
+                    ["2"] = "unifysteam",
+                    ["3"] = titleId,
+                },
+            };
+            var existingShortcut = CreateNonPublicInstance(
+                existingShortcutEntryType!,
+                index,
+                collidedAppId,
+                $"Cloud Game {suffix}",
+                @"C:\ToolsForSteam\ToolsForSteam.exe",
+                @"C:\ToolsForSteam",
+                launchOptions,
+                true,
+                "unifysteam",
+                titleId,
+                entry);
+            var manifest = new StoreSyncManifestEntry
+            {
+                TitleId = titleId,
+                StoreId = "unifysteam",
+                StoreItemId = $"xbox-game-pass:PRODUCT-{suffix}",
+                Title = $"Cloud Game {suffix}",
+                EffectiveTitle = $"Cloud Game {suffix}",
+                ExecutablePath = @"C:\ToolsForSteam\ToolsForSteam.exe",
+                AppId = collidedAppId,
+                ManagedShortcut = true,
+            };
+            var item = CreateNonPublicInstance(
+                analysisItemType!,
+                titleId,
+                titleId,
+                definition,
+                game,
+                new StoreSyncTitleOverride(),
+                $"Cloud Game {suffix}",
+                $"Cloud Game {suffix}",
+                collidedAppId,
+                actionKind,
+                "Refresh Managed",
+                string.Empty,
+                existingShortcut,
+                manifest,
+                null,
+                Array.Empty<string>());
+            analysisItems.SetValue(item, index);
+        }
+
+        var emptyCleanupCandidates = Array.CreateInstance(
+            serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic)!,
+            0);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            emptyCleanupCandidates,
+            0,
+            new StoreSyncPreviewState(0, 2, 0, 0, 0, 0, 0, []));
+
+        var plan = method!.Invoke(
+            null,
+            [
+                new StoreSyncConfiguration(),
+                new SteamProfileInfo("User", "user", "1", "1", @"C:\Steam\shortcuts.vdf"),
+                analysis
+            ]);
+
+        Assert.NotNull(plan);
+        var updates = Assert.IsAssignableFrom<System.Collections.IEnumerable>(
+                plan!.GetType().GetProperty("UpdateOperations")!.GetValue(plan))
+            .Cast<object>()
+            .ToArray();
+        Assert.Equal(2, updates.Length);
+        Assert.Single(updates, update => (bool)update.GetType().GetProperty("ForceCreate")!.GetValue(update)!);
+        Assert.Single(updates, update => !(bool)update.GetType().GetProperty("ForceCreate")!.GetValue(update)!);
     }
 
     [Fact]

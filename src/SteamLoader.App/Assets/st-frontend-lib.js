@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 44) {
+  if (existing?.version >= 45) {
     return;
   }
 
@@ -1578,6 +1578,10 @@
             helpers.rememberCurrentRouteSlot?.(null, focusKey);
             action.onGamepadFocus?.();
           },
+          onMoveLeft: action.onMoveLeft,
+          onMoveRight: action.onMoveRight,
+          onMoveUp: action.onMoveUp,
+          onMoveDown: action.onMoveDown,
         },
       },
     );
@@ -2512,6 +2516,16 @@
           box-shadow: 0 20px 64px rgba(0, 0, 0, 0.48), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
           animation: steamloader-sdk-notification-in 160ms ease-out;
         }
+        .steamloader-sdk-notification.is-actionable {
+          cursor: pointer;
+          pointer-events: auto;
+        }
+        .steamloader-sdk-notification.is-actionable:hover,
+        .steamloader-sdk-notification.is-actionable:focus-visible {
+          outline: 2px solid #61d68a;
+          outline-offset: 2px;
+          transform: translateY(-2px);
+        }
         .steamloader-sdk-notification.is-leaving {
           opacity: 0;
           transform: translateY(8px);
@@ -2528,6 +2542,7 @@
         .steamloader-sdk-notification[data-level="error"] .steamloader-sdk-notification-accent { background: #ff6b78; }
         .steamloader-sdk-notification-title { font-size: 16px; font-weight: 950; line-height: 1.2; }
         .steamloader-sdk-notification-message { margin-top: 4px; color: rgba(220, 229, 238, 0.78); font-size: 13px; font-weight: 750; line-height: 1.4; }
+        .steamloader-sdk-notification-action { margin-top: 7px; color: #61d68a; font-size: 12px; font-weight: 900; }
         @keyframes steamloader-sdk-notification-in {
           from { opacity: 0; transform: translateY(10px) scale(0.98); }
           to { opacity: 1; transform: translateY(0) scale(1); }
@@ -2566,6 +2581,33 @@
     message.className = "steamloader-sdk-notification-message";
     message.textContent = String(notification.message || "");
     content.append(title, message);
+    const actionUrl = String(notification.actionUrl || "").trim();
+    if (actionUrl) {
+      toast.classList.add("is-actionable");
+      toast.tabIndex = 0;
+      toast.setAttribute("role", "button");
+      const action = document.createElement("div");
+      action.className = "steamloader-sdk-notification-action";
+      action.textContent = String(notification.actionLabel || "Open");
+      content.append(action);
+      const openAction = async () => {
+        try {
+          await fetch(joinApiPath(window.__steamLoaderApiBase, "api/store/offers/open"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dealUrl: actionUrl }),
+          });
+        } catch {
+        }
+      };
+      toast.addEventListener("click", () => void openAction());
+      toast.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          void openAction();
+        }
+      });
+    }
     toast.append(accent, content);
     container.append(toast);
 
@@ -3303,7 +3345,7 @@
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 44,
+        libraryVersion: window.STFrontendLib?.version || 45,
         sdkVersion: "1.0.0",
         pluginId,
       }),
@@ -3315,7 +3357,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 44,
+      version: 45,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3383,7 +3425,7 @@
   }
 
   window.STFrontendLib = {
-    version: 44,
+    version: 45,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

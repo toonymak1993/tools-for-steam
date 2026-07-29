@@ -8,6 +8,7 @@ namespace SteamLoader.App.Infrastructure.Helpers;
 
 internal sealed class ElevatedHelperTaskService
 {
+    private static readonly TimeSpan CompatibilityCacheLifetime = TimeSpan.FromMinutes(5);
     private const string FolderPath = "\\ToolsForSteam";
     private const int TaskCreateOrUpdate = 6;
     private const int TaskLogonInteractiveToken = 3;
@@ -24,6 +25,10 @@ internal sealed class ElevatedHelperTaskService
     private readonly string _registerArguments;
     private readonly string _workingDirectory;
     private readonly string _registrationLogPath;
+    private readonly object _compatibilityCacheGate = new();
+    private DateTimeOffset _compatibilityCacheExpiresAtUtc = DateTimeOffset.MinValue;
+    private bool _cachedCompatibilityResult;
+    private string _cachedCompatibilityIssue = string.Empty;
 
     public ElevatedHelperTaskService(
         string taskName,
@@ -88,6 +93,7 @@ internal sealed class ElevatedHelperTaskService
 
             if (!process.Start())
             {
+                InvalidateCompatibilityCache();
                 errorText = $"The elevated {_displayName} task could not be started.";
                 return false;
             }
@@ -102,6 +108,7 @@ internal sealed class ElevatedHelperTaskService
                 {
                 }
 
+                InvalidateCompatibilityCache();
                 errorText = $"The elevated {_displayName} task start timed out.";
                 return false;
             }
@@ -110,6 +117,7 @@ internal sealed class ElevatedHelperTaskService
             var error = process.StandardError.ReadToEnd().Trim();
             if (process.ExitCode != 0)
             {
+                InvalidateCompatibilityCache();
                 errorText = !string.IsNullOrWhiteSpace(error)
                     ? error
                     : !string.IsNullOrWhiteSpace(output)
@@ -175,7 +183,7 @@ internal sealed class ElevatedHelperTaskService
 
         try
         {
-            if (IsRegistered())
+            if (IsRegistered(forceRefresh: true))
             {
                 errorText = string.Empty;
                 return true;
@@ -210,7 +218,7 @@ internal sealed class ElevatedHelperTaskService
             var deadline = DateTimeOffset.UtcNow.AddSeconds(20);
             while (DateTimeOffset.UtcNow < deadline)
             {
-                if (IsRegistered())
+                if (IsRegistered(forceRefresh: true))
                 {
                     errorText = string.Empty;
                     return true;
@@ -224,7 +232,7 @@ internal sealed class ElevatedHelperTaskService
                 Thread.Sleep(200);
             }
 
-            if (process.HasExited && process.ExitCode == 0 && IsRegistered())
+            if (process.HasExited && process.ExitCode == 0 && IsRegistered(forceRefresh: true))
             {
                 errorText = string.Empty;
                 ClearRegistrationLog();
@@ -304,7 +312,8 @@ internal sealed class ElevatedHelperTaskService
             TaskLogonInteractiveToken,
             Type.Missing);
 
-        if (!IsRegistered())
+        InvalidateCompatibilityCache();
+        if (!IsRegistered(forceRefresh: true))
         {
             throw new InvalidOperationException($"Windows created the elevated {_displayName} task, but it does not match this installation.");
         }
@@ -333,16 +342,61 @@ internal sealed class ElevatedHelperTaskService
         }
     }
 
-    private bool TryGetRegisteredTaskCompatibilityIssue(out string issue)
+    private bool IsRegistered(bool forceRefresh)
     {
+        try
+        {
+            return TryGetRegisteredTaskCompatibilityIssue(out _, forceRefresh);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryGetRegisteredTaskCompatibilityIssue(
+        out string issue,
+        bool forceRefresh = false)
+    {
+        lock (_compatibilityCacheGate)
+        {
+            if (!forceRefresh &&
+                DateTimeOffset.UtcNow < _compatibilityCacheExpiresAtUtc)
+            {
+                issue = _cachedCompatibilityIssue;
+                return _cachedCompatibilityResult;
+            }
+        }
+
         var xml = TryReadTaskXmlFromSchtasks();
+        bool compatible;
         if (string.IsNullOrWhiteSpace(xml))
         {
             issue = string.Empty;
-            return false;
+            compatible = false;
+        }
+        else
+        {
+            compatible = IsCompatibleTaskXml(xml, out issue);
         }
 
-        return IsCompatibleTaskXml(xml, out issue);
+        lock (_compatibilityCacheGate)
+        {
+            _cachedCompatibilityResult = compatible;
+            _cachedCompatibilityIssue = issue;
+            _compatibilityCacheExpiresAtUtc =
+                DateTimeOffset.UtcNow.Add(CompatibilityCacheLifetime);
+        }
+
+        return compatible;
+    }
+
+    private void InvalidateCompatibilityCache()
+    {
+        lock (_compatibilityCacheGate)
+        {
+            _compatibilityCacheExpiresAtUtc = DateTimeOffset.MinValue;
+        }
     }
 
     private bool IsCompatibleTaskXml(string xml, out string issue)

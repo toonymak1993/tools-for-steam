@@ -1,17 +1,17 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 8;
+  const stateVersion = 9;
   const overlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
   const inputStorageKey = "ToolsForSteamPluginStoreInput";
   const channelName = "ToolsForSteamPluginStoreChannel";
   const rootId = "steamloader-unifystore-root";
   const styleId = "steamloader-unifystore-style";
-  const storeOrder = ["epic-games", "gog-galaxy"];
+  const storeOrder = ["epic-games", "gog-galaxy", "xbox-game-pass"];
   const storeFallbacks = {
     "epic-games": {
       id: "epic-games",
       title: "Epic",
-      enabled: true,
+      enabled: false,
       authReady: false,
       statusText: "Waiting for login",
       detailText: "Login with Epic and refresh the account library.",
@@ -22,10 +22,21 @@
     "gog-galaxy": {
       id: "gog-galaxy",
       title: "GOG",
-      enabled: true,
+      enabled: false,
       authReady: false,
       statusText: "Waiting for login",
       detailText: "Login with GOG and refresh the account library.",
+      installedCount: 0,
+      availableCount: 0,
+      games: [],
+    },
+    "xbox-game-pass": {
+      id: "xbox-game-pass",
+      title: "Xbox / PC Game Pass",
+      enabled: false,
+      authReady: false,
+      statusText: "Xbox app required",
+      detailText: "Sign in in the official Xbox app, then refresh the PC Game Pass catalog.",
       installedCount: 0,
       availableCount: 0,
       games: [],
@@ -54,6 +65,8 @@
     status: "",
     snapshot: null,
     activeStoreId: "epic-games",
+    selectedGameId: "",
+    installingGameKeys: {},
     focusIndex: 0,
     authDraftByStoreId: {},
     authPanelStoreId: "",
@@ -158,7 +171,7 @@
       }
     } catch {
       if (state.open) {
-        state.error = "Storefront backend is not reachable.";
+        state.error = "OmniLibrary backend is not reachable.";
         render();
       }
     }
@@ -276,6 +289,7 @@
     render();
     try {
       state.snapshot = await fetchJson("api/store-sync/state");
+      reconcileInstallingGames();
       state.status = state.snapshot?.unifySteam?.statusText || "Libraries loaded.";
       if (!getStores().some((store) => store.id === state.activeStoreId)) {
         state.activeStoreId = getStores()[0]?.id || "epic-games";
@@ -292,13 +306,14 @@
   async function refreshLibrary(storeId = "") {
     state.busy = true;
     state.error = "";
-    state.status = storeId ? "Refreshing store library..." : "Refreshing Epic and GOG...";
+    state.status = storeId ? "Refreshing store library..." : "Refreshing Epic, GOG, and Xbox...";
     render();
     try {
       state.snapshot = await fetchJson("api/unifystore/stores/refresh", {
         method: "POST",
         body: JSON.stringify({ value: storeId || "" }),
       });
+      reconcileInstallingGames();
       state.status = state.snapshot?.unifySteam?.statusText || "Libraries refreshed.";
     } catch (error) {
       state.error = error instanceof Error ? error.message : String(error);
@@ -379,7 +394,45 @@
     }
   }
 
-  function scheduleLibraryReload() {
+  async function installGame(storeId, gameId, title) {
+    const installKey = `${storeId}:${gameId}`;
+    state.busy = true;
+    state.error = "";
+    state.status = `Starting download for ${title || "game"}...`;
+    render();
+    try {
+      const payload = await fetchJson("api/unifystore/games/install", {
+        method: "POST",
+        body: JSON.stringify({ storeId, gameId }),
+      });
+      state.installingGameKeys[installKey] = Date.now();
+      state.status = payload?.message || "Download started.";
+      scheduleLibraryReload(5000);
+    } catch (error) {
+      delete state.installingGameKeys[installKey];
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.busy = false;
+      render();
+    }
+  }
+
+  function isGameInstalling(storeId, gameId) {
+    const startedAt = Number(state.installingGameKeys[`${storeId}:${gameId}`] || 0);
+    return startedAt > 0 && Date.now() - startedAt < 30 * 60 * 1000;
+  }
+
+  function reconcileInstallingGames() {
+    for (const store of getStores()) {
+      for (const game of Array.isArray(store.games) ? store.games : []) {
+        if (game.installed) {
+          delete state.installingGameKeys[`${store.id}:${game.id}`];
+        }
+      }
+    }
+  }
+
+  function scheduleLibraryReload(delayMs = 2500) {
     if (state.reloadTimer) {
       window.clearTimeout(state.reloadTimer);
     }
@@ -388,7 +441,7 @@
       if (state.open) {
         void loadLibrary();
       }
-    }, 2500);
+    }, delayMs);
   }
 
   async function closeOverlay() {
@@ -479,6 +532,7 @@
     const currentIndex = Math.max(0, stores.findIndex((store) => store.id === state.activeStoreId));
     const nextIndex = (currentIndex + delta + stores.length) % stores.length;
     state.activeStoreId = stores[nextIndex]?.id || state.activeStoreId;
+    state.selectedGameId = "";
     state.focusIndex = 0;
     render();
   }
@@ -934,6 +988,86 @@
         color: #071008;
       }
 
+      .steamloader-unifystore-detail {
+        display: grid;
+        grid-template-columns: minmax(220px, 30vw) minmax(0, 1fr);
+        gap: clamp(22px, 3vw, 46px);
+        align-items: start;
+        padding: clamp(18px, 2.5vw, 34px);
+        border: 1px solid var(--unifystore-border-soft);
+        border-radius: 20px;
+        background:
+          radial-gradient(circle at 15% 10%, rgba(102, 192, 244, 0.13), transparent 42%),
+          rgba(16, 24, 34, 0.92);
+      }
+
+      .steamloader-unifystore-detail-art {
+        width: min(100%, 420px);
+        aspect-ratio: 2 / 3;
+        border-radius: 14px;
+        overflow: hidden;
+        background: linear-gradient(180deg, #26394f, #121a24);
+        box-shadow: 0 24px 54px rgba(0, 0, 0, 0.44);
+      }
+
+      .steamloader-unifystore-detail-art img,
+      .steamloader-unifystore-detail-art .steamloader-unifystore-placeholder {
+        position: static;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .steamloader-unifystore-detail-copy {
+        min-width: 0;
+        padding-top: clamp(4px, 2vw, 28px);
+      }
+
+      .steamloader-unifystore-detail-store {
+        color: var(--unifystore-blue);
+        font-size: 13px;
+        font-weight: 950;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .steamloader-unifystore-detail-title {
+        margin-top: 8px;
+        font-size: clamp(30px, 4.4vw, 64px);
+        font-weight: 950;
+        line-height: 0.98;
+        letter-spacing: -0.04em;
+      }
+
+      .steamloader-unifystore-detail-status {
+        margin-top: 20px;
+        color: var(--unifystore-muted);
+        font-size: 15px;
+        line-height: 1.55;
+      }
+
+      .steamloader-unifystore-detail-meta {
+        display: grid;
+        gap: 8px;
+        margin-top: 18px;
+        color: var(--unifystore-dim);
+        font-size: 12px;
+      }
+
+      .steamloader-unifystore-detail-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 28px;
+      }
+
+      .steamloader-unifystore-detail-actions .steamloader-unifystore-button {
+        min-width: 148px;
+        min-height: 46px;
+        justify-content: center;
+        font-size: 15px;
+      }
+
       .steamloader-unifystore-empty,
       .steamloader-unifystore-error {
         margin-top: 16px;
@@ -980,6 +1114,11 @@
           grid-template-columns: 1fr;
           display: grid;
           min-height: 0;
+        }
+
+        .steamloader-unifystore-detail {
+          grid-template-columns: minmax(160px, 34vw) minmax(0, 1fr);
+          gap: 18px;
         }
 
         .steamloader-unifystore-subtitle {
@@ -1054,12 +1193,14 @@
     const stores = getStores();
     const activeStore = getActiveStore();
     const groups = getGameGroups(activeStore);
+    const selectedGame = getSortedGames(activeStore)
+      .find((game) => String(game.id || "") === state.selectedGameId) || null;
     const shell = el("div", "steamloader-unifystore-shell");
 
     shell.append(
       renderTopbar(activeStore),
       renderTabs(stores),
-      renderMain(activeStore, groups),
+      renderMain(activeStore, groups, selectedGame),
       renderFooter(),
     );
 
@@ -1072,7 +1213,7 @@
     const brand = el("div");
     brand.append(
       textEl("div", "steamloader-unifystore-kicker", "Tools for Steam"),
-      textEl("div", "steamloader-unifystore-title", "Storefront"),
+      textEl("div", "steamloader-unifystore-title", "OmniLibrary"),
       textEl(
         "div",
         "steamloader-unifystore-subtitle",
@@ -1117,7 +1258,11 @@
         textEl(
           "div",
           "steamloader-unifystore-tab-copy",
-          store.authReady
+          store.id === "xbox-game-pass"
+            ? store.authReady
+              ? "Official Xbox app detected"
+              : store.statusText || "Xbox app required"
+            : store.authReady
             ? store.accountName
               ? `Signed in as ${store.accountName}`
               : "Signed in and ready"
@@ -1135,10 +1280,14 @@
     return tabs;
   }
 
-  function renderMain(store, groups) {
+  function renderMain(store, groups, selectedGame = null) {
     const main = el("div", "steamloader-unifystore-main");
     if (state.error) {
       main.append(textEl("div", "steamloader-unifystore-error", state.error));
+    }
+    if (selectedGame) {
+      main.append(renderGameDetails(store, selectedGame));
+      return main;
     }
     const showAuthPanel = store.supportsManualCodeAuth && (!store.authReady || state.authPanelStoreId === store.id);
 
@@ -1151,7 +1300,9 @@
         "steamloader-unifystore-store-copy",
         [
           `${store.installedCount || 0} installed / ${store.availableCount || 0} total`,
-          store.authReady ? "Account ready" : "Login required",
+          store.id === "xbox-game-pass"
+            ? store.authReady ? "Xbox app detected" : "Xbox app required"
+            : store.authReady ? "Account ready" : "Login required",
           store.detailText || "",
         ].filter(Boolean).join(" - "),
       ),
@@ -1160,9 +1311,9 @@
     const hasGames = groups.installed.length + groups.available.length > 0;
     actions.append(
       buttonEl(
-        store.authReady ? "Account Settings" : "Login",
+        store.id === "xbox-game-pass" ? "Open Xbox App" : store.authReady ? "Account Settings" : "Login",
         "steamloader-unifystore-button",
-        store.authReady ? "toggle-auth-panel" : "login",
+        store.id === "xbox-game-pass" ? "login" : store.authReady ? "toggle-auth-panel" : "login",
         store.id,
         { focusable: !hasGames },
       ),
@@ -1182,7 +1333,7 @@
     }
 
     if (state.loading && !state.snapshot) {
-      main.append(textEl("div", "steamloader-unifystore-empty", "Loading Epic and GOG libraries..."));
+      main.append(textEl("div", "steamloader-unifystore-empty", "Loading Epic, GOG, and Xbox libraries..."));
       return main;
     }
 
@@ -1198,7 +1349,7 @@
       appendSection(
         main,
         "Available",
-        store.id === "gog-galaxy" ? "Open in GOG Galaxy to install" : "Install on first launch",
+        "Select a game to open its detail page and start the download",
         groups.available,
         store.id
       );
@@ -1209,6 +1360,66 @@
     }
 
     return main;
+  }
+
+  function renderGameDetails(store, game) {
+    const installing = isGameInstalling(store.id, game.id);
+    const detail = el("section", "steamloader-unifystore-detail");
+    const artwork = el("div", "steamloader-unifystore-detail-art");
+    const artworkUrl = resolveArtworkUrl(game.imageUrl);
+    if (artworkUrl) {
+      const image = document.createElement("img");
+      image.src = artworkUrl;
+      image.alt = game.title || "Game artwork";
+      image.referrerPolicy = "no-referrer";
+      image.onerror = () => image.replaceWith(textEl("div", "steamloader-unifystore-placeholder", initials(game.title)));
+      artwork.append(image);
+    } else {
+      artwork.append(textEl("div", "steamloader-unifystore-placeholder", initials(game.title)));
+    }
+
+    const copy = el("div", "steamloader-unifystore-detail-copy");
+    copy.append(
+      textEl("div", "steamloader-unifystore-detail-store", store.title || store.id),
+      textEl("div", "steamloader-unifystore-detail-title", game.title || "Unknown game"),
+      textEl(
+        "div",
+        "steamloader-unifystore-detail-status",
+        game.installed
+          ? "Installed and ready. Start the game directly from OmniLibrary."
+          : installing
+            ? "The store download worker is running. Refresh the status after the store finishes installing the game."
+          : "Available in your connected library. Downloading is handled by the official store or its authenticated command-line tool.",
+      ),
+    );
+
+    const meta = el("div", "steamloader-unifystore-detail-meta");
+    meta.append(
+      textEl("div", "", game.statusText || (game.installed ? "Installed" : "Available to download")),
+      ...(game.version ? [textEl("div", "", `Version ${game.version}`)] : []),
+      ...(game.installPath ? [textEl("div", "", game.installPath)] : []),
+      ...(state.status ? [textEl("div", "", state.status)] : []),
+    );
+    copy.append(meta);
+
+    const actions = el("div", "steamloader-unifystore-detail-actions");
+    const primary = buttonEl(
+      state.busy ? "Working..." : game.installed ? "Play" : installing ? "Downloading..." : "Download",
+      "steamloader-unifystore-button is-primary",
+      game.installed ? "launch" : "install",
+      store.id,
+    );
+    primary.dataset.gameId = game.id || "";
+    primary.dataset.title = game.title || "Game";
+    primary.disabled = state.busy || installing;
+    actions.append(
+      primary,
+      buttonEl("Back to Library", "steamloader-unifystore-button", "back-to-library", store.id),
+      buttonEl("Refresh Status", "steamloader-unifystore-button", "refresh-store", store.id),
+    );
+    copy.append(actions);
+    detail.append(artwork, copy);
+    return detail;
   }
 
   function renderAuthCodePanel(store) {
@@ -1268,7 +1479,7 @@
   }
 
   function renderGameCard(storeId, game) {
-    const card = buttonEl("", `steamloader-unifystore-card${game.installed ? " is-installed" : ""}`, "launch", storeId);
+    const card = buttonEl("", `steamloader-unifystore-card${game.installed ? " is-installed" : ""}`, "details", storeId);
     card.dataset.gameId = game.id || "";
     card.dataset.title = game.title || "Game";
 
@@ -1314,14 +1525,18 @@
       return "Installed";
     }
 
-    return storeId === "gog-galaxy" ? "Open in Galaxy" : "Install";
+    if (isGameInstalling(storeId, game?.id)) {
+      return "Downloading";
+    }
+
+    return "Download";
   }
 
   function renderFooter() {
     return withChildren(
       el("div", "steamloader-unifystore-footer"),
       textEl("span", "", "A Select"),
-      textEl("span", "", "B Back"),
+      textEl("span", "", state.selectedGameId ? "B Library" : "B Back"),
       textEl("span", "", "LB/RB Stores"),
       textEl("span", "", "X Refresh"),
     );
@@ -1533,6 +1748,7 @@
     }
     if (action === "tab") {
       state.activeStoreId = storeId;
+      state.selectedGameId = "";
       render();
       return;
     }
@@ -1555,6 +1771,22 @@
     }
     if (action === "auth-code") {
       void submitAuthCode(storeId);
+      return;
+    }
+    if (action === "details") {
+      state.selectedGameId = element.dataset.gameId || "";
+      state.focusIndex = 0;
+      render();
+      return;
+    }
+    if (action === "back-to-library") {
+      state.selectedGameId = "";
+      state.focusIndex = 0;
+      render();
+      return;
+    }
+    if (action === "install") {
+      void installGame(storeId, element.dataset.gameId || "", element.dataset.title || "");
       return;
     }
     if (action === "launch") {
@@ -1583,6 +1815,12 @@
       return;
     }
     if (action === "b") {
+      if (state.selectedGameId) {
+        state.selectedGameId = "";
+        state.focusIndex = 0;
+        render();
+        return;
+      }
       void closeOverlay();
       return;
     }

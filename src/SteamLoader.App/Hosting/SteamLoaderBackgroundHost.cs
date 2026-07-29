@@ -13,8 +13,10 @@ using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.SmartHome;
+using SteamLoader.App.Infrastructure.Store;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
+using SteamLoader.App.Infrastructure.SystemTools;
 using SteamLoader.App.Infrastructure.Themes;
 using SteamLoader.App.Services;
 
@@ -25,6 +27,10 @@ public sealed class SteamLoaderBackgroundHost
     private static readonly Uri DebugEndpoint = new("http://127.0.0.1:8080");
     private static readonly Uri ApiBaseUri = new("http://127.0.0.1:47652/");
     private static readonly Uri CssLoaderApiUri = new("http://127.0.0.1:35821/req");
+    private static readonly TimeSpan OmniLibraryStartupDelay = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan OmniLibraryCatalogCheckInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan OmniLibraryMaximumFailureBackoff = TimeSpan.FromHours(1);
+    private static readonly TimeSpan OmniLibrarySchedulerWakeInterval = TimeSpan.FromMinutes(1);
 
     private readonly SteamLoaderHostState _hostState;
 
@@ -42,7 +48,7 @@ public sealed class SteamLoaderBackgroundHost
             Timeout = TimeSpan.FromSeconds(5)
         };
 
-        var audioOutputDeviceService = new CoreAudioOutputDeviceService();
+        using var audioOutputDeviceService = new CoreAudioOutputDeviceService();
         var displaySwitchService = new DisplaySwitchService();
         var processWindowService = new ProcessWindowService();
         var steamWindowFocusService = new SteamWindowFocusService(processWindowService);
@@ -75,6 +81,12 @@ public sealed class SteamLoaderBackgroundHost
             steamInstallationService,
             devToolsClient,
             storeSyncJournal);
+        var storeService = new StoreService(
+            httpClient,
+            new StoreSettingsStore(Path.Combine(dataDirectory, "store.json")),
+            () => storeSyncService.GetSnapshot().SteamProfile,
+            processWindowService,
+            Path.Combine(dataDirectory, "cache", "store-artwork"));
         var artworkService = new SteamGridDbManualArtworkService(
             steamInstallationService,
             new ArtworkSettingsStore(Path.Combine(dataDirectory, "artwork.json")));
@@ -142,7 +154,32 @@ public sealed class SteamLoaderBackgroundHost
             gamepadHelperTaskService,
             Path.Combine(dataDirectory, "gamepad-helper-watchdog.log"));
         var releaseUpdateService = new ReleaseUpdateService();
+        var nvidiaDriverUpdateService = new NvidiaDriverUpdateService();
+        var windowsSystemUpdateService = new WindowsSystemUpdateService();
+        var hdrDisplayService = new HdrDisplayService();
+        using var bluetoothDeviceService = new BluetoothDeviceService();
         var liveUpdateHub = new QuickAccessLiveUpdateHub();
+        var storePriceNotificationService = new StorePriceNotificationService();
+        storeService.PriceAlertReached += notification =>
+        {
+            if (liveUpdateHub.HasSubscribers)
+            {
+                liveUpdateHub.Publish(
+                    "notifications.show",
+                    new
+                    {
+                        title = notification.Title,
+                        message = notification.Message,
+                        level = "success",
+                        durationMs = 9000,
+                        actionUrl = notification.DealUrl,
+                        actionLabel = "Open deal"
+                    });
+                return;
+            }
+
+            storePriceNotificationService.Show(notification, storeService.OpenDeal);
+        };
         var externalGameQuickAccessService = new ExternalGameQuickAccessService(
             storeSyncService,
             processWindowService,
@@ -160,9 +197,12 @@ public sealed class SteamLoaderBackgroundHost
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/omnilibrary-tab-topology.js"),
+            EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
+            EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
-            EmbeddedAssetReader.ReadText("Assets/unifystore-overlay.js"));
+            EmbeddedAssetReader.ReadText("Assets/store-overlay.js"));
 
         var appStartService = new AppStartService(
             Path.Combine(dataDirectory, "app-start.json"),
@@ -177,9 +217,9 @@ public sealed class SteamLoaderBackgroundHost
             new SmartHomeSettingsStore(Path.Combine(dataDirectory, "smart-home.json")));
         var liveStatePublisher = new QuickAccessLiveStatePublisher(
             liveUpdateHub,
-            audioOutputDeviceService,
             processWindowService,
             storeSyncService,
+            () => steamLoaderSettingsService.IsPluginEnabled("store-sync"),
             smartHomeService,
             handheldPerformanceService,
             () => steamLoaderSettingsService.IsPluginEnabled("smart-home"),
@@ -218,6 +258,7 @@ public sealed class SteamLoaderBackgroundHost
             autoSisirService,
             appStartService,
             hltbService,
+            storeService,
             storeSyncService,
             themesService,
             performanceService,
@@ -226,6 +267,10 @@ public sealed class SteamLoaderBackgroundHost
             pluginStoreService,
             powerActionService,
             releaseUpdateService,
+            nvidiaDriverUpdateService,
+            windowsSystemUpdateService,
+            hdrDisplayService,
+            bluetoothDeviceService,
             frontendComponentService,
             devToolsClient,
             smartHomeService,
@@ -263,6 +308,10 @@ public sealed class SteamLoaderBackgroundHost
         var autoSisirTask = autoSisirService.RunAsync(autoSisirCts.Token);
         using var storeSyncAutomationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var storeSyncAutomationTask = storeSyncAutomationService.RunAsync(storeSyncAutomationCts.Token);
+        using var storeRefreshCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var storeRefreshTask = storeService.RunRefreshLoopAsync(
+            static () => true,
+            storeRefreshCts.Token);
         using var liveStatePublisherCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var liveStatePublisherTask = liveStatePublisher.RunAsync(liveStatePublisherCts.Token);
         using var gamepadHelperSupervisorCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -271,6 +320,24 @@ public sealed class SteamLoaderBackgroundHost
         var controllerShortcutTask = controllerShortcutService.RunAsync(controllerShortcutCts.Token);
         using var handheldProfileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var handheldProfileTask = handheldProfileCoordinator.RunAsync(handheldProfileCts.Token);
+        using var omniLibraryRefreshCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var omniLibraryRefreshTask = RunOmniLibraryRefreshLoopAsync(
+            storeSyncService,
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
+            dataDirectory,
+            omniLibraryRefreshCts.Token);
+        using var omniLibraryDownloadPowerCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        // Existing transfers are user operations, not UI state. They recover
+        // even if OmniLibrary was disabled before TFS/Windows restarted.
+        UnifySteamLauncher.ResumeInterruptedDownloads();
+        var omniLibraryDownloadPowerTask =
+            OmniLibraryDownloadSleepBlocker.RunStatusMonitorAsync(
+                omniLibraryDownloadPowerCts.Token);
+        using var gogInstallStateCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var gogInstallStateTask =
+            GogInstallStateTracker.RunAsync(gogInstallStateCts.Token);
 
         try
         {
@@ -278,6 +345,33 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
+            await gogInstallStateCts.CancelAsync();
+            try
+            {
+                await gogInstallStateTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await omniLibraryDownloadPowerCts.CancelAsync();
+            try
+            {
+                await omniLibraryDownloadPowerTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await omniLibraryRefreshCts.CancelAsync();
+            try
+            {
+                await omniLibraryRefreshTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             await handheldProfileCts.CancelAsync();
             try
             {
@@ -323,6 +417,15 @@ public sealed class SteamLoaderBackgroundHost
             {
             }
 
+            await storeRefreshCts.CancelAsync();
+            try
+            {
+                await storeRefreshTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             await autoSisirCts.CancelAsync();
             try
             {
@@ -363,6 +466,125 @@ public sealed class SteamLoaderBackgroundHost
         {
         }
     }
+
+    private static async Task RunOmniLibraryRefreshLoopAsync(
+        StoreSyncService storeSyncService,
+        Func<bool> isEnabled,
+        string dataDirectory,
+        CancellationToken cancellationToken)
+    {
+        await Task.Delay(OmniLibraryStartupDelay, cancellationToken);
+        var schedules = new Dictionary<string, OmniLibraryStoreCheckSchedule>(
+            StringComparer.OrdinalIgnoreCase);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!isEnabled())
+            {
+                schedules.Clear();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+                continue;
+            }
+
+            var enabledStoreIds = storeSyncService.GetEnabledUnifySteamStoreIds();
+            var enabledStoreSet = enabledStoreIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var staleStoreId in schedules.Keys
+                         .Where(storeId => !enabledStoreSet.Contains(storeId))
+                         .ToArray())
+            {
+                schedules.Remove(staleStoreId);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            foreach (var storeId in enabledStoreIds)
+            {
+                schedules.TryGetValue(storeId, out var schedule);
+                if (schedule is not null && now < schedule.NextCheckAtUtc)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var result = await Task.Run(
+                        () => storeSyncService.CheckUnifySteamStoreForChanges(storeId),
+                        cancellationToken);
+                    if (!result.Checked)
+                    {
+                        schedules[storeId] = new OmniLibraryStoreCheckSchedule(
+                            FailureCount: 0,
+                            now.Add(OmniLibraryCatalogCheckInterval));
+                        continue;
+                    }
+
+                    if (result.Succeeded)
+                    {
+                        schedules[storeId] = new OmniLibraryStoreCheckSchedule(
+                            FailureCount: 0,
+                            now.Add(OmniLibraryCatalogCheckInterval));
+                        if (result.CatalogChanged || result.StateChanged)
+                        {
+                            AppendDiagnosticLog(
+                                Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
+                                $"{storeId} five-minute check: {result.Detail}");
+                        }
+                        continue;
+                    }
+
+                    var failureCount = Math.Min((schedule?.FailureCount ?? 0) + 1, 8);
+                    var backoff = ComputeOmniLibraryFailureBackoff(failureCount);
+                    schedules[storeId] = new OmniLibraryStoreCheckSchedule(
+                        failureCount,
+                        now.Add(backoff));
+                    AppendDiagnosticLog(
+                        Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
+                        $"{storeId} five-minute check failed; retry in {backoff.TotalMinutes:0} min: {result.Detail}");
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    var failureCount = Math.Min((schedule?.FailureCount ?? 0) + 1, 8);
+                    var backoff = ComputeOmniLibraryFailureBackoff(failureCount);
+                    schedules[storeId] = new OmniLibraryStoreCheckSchedule(
+                        failureCount,
+                        now.Add(backoff));
+                    AppendDiagnosticLog(
+                        Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
+                        $"{storeId} five-minute check failed; retry in {backoff.TotalMinutes:0} min: " +
+                        $"{exception.GetType().Name}:{exception.Message}");
+                }
+            }
+
+            var nextCheckAtUtc = schedules.Count == 0
+                ? now.Add(OmniLibrarySchedulerWakeInterval)
+                : schedules.Values.Min(schedule => schedule.NextCheckAtUtc);
+            var delay = nextCheckAtUtc - DateTimeOffset.UtcNow;
+            if (delay < TimeSpan.FromSeconds(5))
+            {
+                delay = TimeSpan.FromSeconds(5);
+            }
+            if (delay > OmniLibrarySchedulerWakeInterval)
+            {
+                delay = OmniLibrarySchedulerWakeInterval;
+            }
+            await Task.Delay(delay, cancellationToken);
+        }
+    }
+
+    private static TimeSpan ComputeOmniLibraryFailureBackoff(int failureCount)
+    {
+        var multiplier = Math.Pow(2, Math.Max(0, failureCount - 1));
+        return TimeSpan.FromTicks(Math.Min(
+            OmniLibraryMaximumFailureBackoff.Ticks,
+            (long)(OmniLibraryCatalogCheckInterval.Ticks * multiplier)));
+    }
+
+    private sealed record OmniLibraryStoreCheckSchedule(
+        int FailureCount,
+        DateTimeOffset NextCheckAtUtc);
 
     private static async Task ExecuteOemButtonActionAsync(
         HandheldOemButtonBinding binding,

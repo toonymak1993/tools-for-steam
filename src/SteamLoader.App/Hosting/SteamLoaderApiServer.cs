@@ -15,8 +15,10 @@ using SteamLoader.App.Infrastructure.PluginStore;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.SmartHome;
+using SteamLoader.App.Infrastructure.Store;
 using SteamLoader.App.Infrastructure.StoreSync;
 using SteamLoader.App.Infrastructure.Steam;
+using SteamLoader.App.Infrastructure.SystemTools;
 using SteamLoader.App.Infrastructure.Themes;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
@@ -35,6 +37,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly AutoSisirService _autoSisirService;
     private readonly AppStartService _appStartService;
     private readonly HltbService _hltbService;
+    private readonly StoreService _storeService;
     private readonly StoreSyncService _storeSyncService;
     private readonly ThemesService _themesService;
     private readonly TfsPerformanceService _performanceService;
@@ -43,6 +46,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly PluginStoreService _pluginStoreService;
     private readonly PowerActionService _powerActionService;
     private readonly ReleaseUpdateService _releaseUpdateService;
+    private readonly NvidiaDriverUpdateService _nvidiaDriverUpdateService;
+    private readonly WindowsSystemUpdateService _windowsSystemUpdateService;
+    private readonly HdrDisplayService _hdrDisplayService;
+    private readonly BluetoothDeviceService _bluetoothDeviceService;
     private readonly SteamFrontendComponentService _frontendComponentService;
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SmartHomeService _smartHomeService;
@@ -57,6 +64,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly string _apiSessionToken;
     private readonly object _artworkOpenRequestLock = new();
     private readonly object _unifyStoreOverlayLock = new();
+    private readonly object _storeOverlayLock = new();
+    private readonly object _omniLibraryLoginProcessLock = new();
+    private readonly Dictionary<string, Process> _omniLibraryLoginProcesses =
+        new(StringComparer.OrdinalIgnoreCase);
     private ArtworkOpenRequest? _latestArtworkOpenRequest;
     private DateTimeOffset _latestArtworkOpenRequestAt = DateTimeOffset.MinValue;
     private string _latestArtworkOpenRequestKey = string.Empty;
@@ -67,6 +78,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private Task? _activeUpdateInstallTask;
     private Task? _acceptLoopTask;
     private bool _unifyStoreOverlayOpen;
+    private bool _storeOverlayOpen;
 
     public SteamLoaderApiServer(
         IAudioOutputDeviceService audioOutputDeviceService,
@@ -76,6 +88,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         AutoSisirService autoSisirService,
         AppStartService appStartService,
         HltbService hltbService,
+        StoreService storeService,
         StoreSyncService storeSyncService,
         ThemesService themesService,
         TfsPerformanceService performanceService,
@@ -84,6 +97,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         PluginStoreService pluginStoreService,
         PowerActionService powerActionService,
         ReleaseUpdateService releaseUpdateService,
+        NvidiaDriverUpdateService nvidiaDriverUpdateService,
+        WindowsSystemUpdateService windowsSystemUpdateService,
+        HdrDisplayService hdrDisplayService,
+        BluetoothDeviceService bluetoothDeviceService,
         SteamFrontendComponentService frontendComponentService,
         SteamDevToolsClient devToolsClient,
         SmartHomeService smartHomeService,
@@ -104,6 +121,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _autoSisirService = autoSisirService;
         _appStartService = appStartService;
         _hltbService = hltbService;
+        _storeService = storeService;
         _storeSyncService = storeSyncService;
         _themesService = themesService;
         _performanceService = performanceService;
@@ -112,6 +130,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _pluginStoreService = pluginStoreService;
         _powerActionService = powerActionService;
         _releaseUpdateService = releaseUpdateService;
+        _nvidiaDriverUpdateService = nvidiaDriverUpdateService;
+        _windowsSystemUpdateService = windowsSystemUpdateService;
+        _hdrDisplayService = hdrDisplayService;
+        _bluetoothDeviceService = bluetoothDeviceService;
         _frontendComponentService = frontendComponentService;
         _devToolsClient = devToolsClient;
         _smartHomeService = smartHomeService;
@@ -236,7 +258,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 await WriteJsonAsync(
                     response,
                     HttpStatusCode.NotFound,
-                    new { message = "Storefront is disabled in this build." },
+                    new { message = "OmniLibrary is disabled in this build." },
                     cancellationToken);
                 return;
             }
@@ -1441,6 +1463,159 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/driver/nvidia/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _nvidiaDriverUpdateService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/driver/nvidia/update")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _nvidiaDriverUpdateService.LaunchAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/driver/nvidia/game-ready/silent")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _nvidiaDriverUpdateService.LaunchSilentGameReadyAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/windows-update/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _windowsSystemUpdateService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/windows-update/scan")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _windowsSystemUpdateService.ScanAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/windows-update/run")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _windowsSystemUpdateService.RunWindowsUpdate(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/hdr/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _hdrDisplayService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/hdr/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken)
+                    ?? throw new InvalidOperationException("The HDR state is missing.");
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _hdrDisplayService.SetEnabled(payload.Value),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/bluetooth/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _bluetoothDeviceService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/bluetooth/refresh")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _bluetoothDeviceService.RefreshAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/bluetooth/scan")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _bluetoothDeviceService.StartScanAsync(cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/bluetooth/settings")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _bluetoothDeviceService.OpenSettings(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/system/bluetooth/pair")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<BluetoothPairRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken)
+                    ?? throw new InvalidOperationException("The Bluetooth device is missing.");
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _bluetoothDeviceService.PairAsync(payload.DeviceId, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/plugin-store/state")
             {
                 await WriteJsonAsync(
@@ -2343,6 +2518,14 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 }
 
                 var settingsSnapshot = _steamLoaderSettingsService.SetPluginEnabled(payload.PluginId, payload.Enabled);
+                if (payload.PluginId.Equals("omnilibrary", StringComparison.OrdinalIgnoreCase) ||
+                    payload.PluginId.Equals("store-sync", StringComparison.OrdinalIgnoreCase))
+                {
+                    _storeSyncService.SetOmniLibraryPluginRuntimeEnabled(
+                        _steamLoaderSettingsService.IsPluginEnabled("omnilibrary"));
+                    _storeSyncService.SetStoreSyncPluginRuntimeEnabled(
+                        _steamLoaderSettingsService.IsPluginEnabled("store-sync"));
+                }
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -2900,12 +3083,278 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/artwork")
+            {
+                var source = request.QueryString["source"] ?? string.Empty;
+                var artwork = await _storeService.GetCachedArtworkAsync(source, cancellationToken);
+                if (artwork is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.NotFound,
+                        new { message = "Artwork is unavailable from the trusted image sources." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteFileAsync(
+                    response,
+                    artwork.Path,
+                    artwork.ContentType,
+                    cancellationToken,
+                    "public, max-age=31536000, immutable");
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/state")
+            {
+                var forceRefresh = bool.TryParse(request.QueryString["refresh"], out var parsedRefresh) && parsedRefresh;
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _storeService.GetSnapshotAsync(forceRefresh, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/refresh")
+            {
+                var snapshot = await _storeService.RefreshAsync(cancellationToken);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    snapshot,
+                    "store.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/offers")
+            {
+                var gameId = request.QueryString["gameId"] ?? string.Empty;
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _storeService.GetOffersAsync(gameId, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/search")
+            {
+                var query = request.QueryString["q"] ?? string.Empty;
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _storeService.SearchAsync(query, cancellationToken),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/wishlist")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStoreWishlistRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload?.Game is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A store game is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var snapshot = _storeService.SetLocalWishlist(payload.Game, payload.Enabled);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    snapshot,
+                    "store.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/alerts")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePriceAlertRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Price alert details are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var snapshot = _storeService.SetAlert(
+                    payload.SteamAppId,
+                    payload.GameId,
+                    payload.Title,
+                    payload.TargetPrice,
+                    payload.CurrencyCode,
+                    payload.Enabled);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    snapshot,
+                    "store.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/settings/currency")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                var snapshot = _storeService.SetDisplayCurrency(payload?.Value ?? "USD");
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    snapshot,
+                    "store.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/settings/region")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                _storeService.SetStoreRegion(payload?.Value ?? "US");
+                var snapshot = await _storeService.RefreshAsync(cancellationToken);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    snapshot,
+                    "store.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/offers/open")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<OpenStoreDealRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                _storeService.OpenDeal(payload?.DealUrl ?? string.Empty);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    new { message = "Offer opened in the default browser." },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/store/overlay/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    GetStoreOverlayState(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath is "/api/store/overlay/open" or "/api/store/overlay/close")
+            {
+                var open = request.Url.AbsolutePath.EndsWith("/open", StringComparison.OrdinalIgnoreCase);
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    SetStoreOverlayOpen(open),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/store-sync/state")
             {
                 await WriteJsonAsync(
                     response,
                     HttpStatusCode.OK,
                     _storeSyncService.GetSnapshot(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/settings-state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.GetUnifySteamSettingsState(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/downloads")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.GetOmniLibraryDownloadCenter(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/state")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.GetUnifySteamState(),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/summary")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _storeSyncService.GetUnifySteamLibrarySummary(),
+                    cancellationToken);
+                return;
+            }
+
+            const string unifySteamGamePathPrefix = "/api/unifystore/games/";
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath is { } unifySteamGamePath &&
+                unifySteamGamePath.StartsWith(unifySteamGamePathPrefix, StringComparison.OrdinalIgnoreCase) &&
+                uint.TryParse(unifySteamGamePath[unifySteamGamePathPrefix.Length..], out var unifySteamGameAppId))
+            {
+                var game = _storeSyncService.GetUnifySteamGame(unifySteamGameAppId);
+                await WriteJsonAsync(
+                    response,
+                    game.Game is null ? HttpStatusCode.NotFound : HttpStatusCode.OK,
+                    game,
                     cancellationToken);
                 return;
             }
@@ -2962,6 +3411,66 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/enabled")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStoreEnabledRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamStoreEnabled(
+                    payload.StoreId,
+                    payload.Enabled);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/xbox-source")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetXboxSourceEnabledRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.SourceId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An Xbox library source ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamXboxSourceEnabled(
+                    payload.SourceId,
+                    payload.Enabled);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/unifystore/stores/login")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
@@ -2974,17 +3483,178 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A Storefront store ID is required." },
+                        new { message = "An OmniLibrary store ID is required." },
                         cancellationToken);
                     return;
                 }
 
-                var storeSyncSnapshot = _storeSyncService.StartUnifySteamLogin(payload.Value);
+                var storeSyncSnapshot = StartUnifySteamLogin(payload.Value);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
                     storeSyncSnapshot,
                     "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/disconnect")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.DisconnectUnifySteamStore(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/auth-code")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePathRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID and authorization code are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.CompleteUnifySteamManualAuth(
+                    payload.StoreId,
+                    payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/install-path")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStorePathRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamInstallPath(
+                    payload.StoreId,
+                    payload.Value ?? string.Empty);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/download-options")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetStoreDownloadOptionsRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.StoreId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamDownloadOptions(
+                    payload.StoreId,
+                    payload.DownloadWorkers,
+                    payload.DownloadTimeoutSeconds);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/stores/gog-options")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetGogOptionsRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "GOG options are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetUnifySteamGogOptions(
+                    payload.IncludeDlc,
+                    payload.PreferGalaxyForLaunch);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/restart-steam")
+            {
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    _powerActionService.RestartSteam(),
                     cancellationToken);
                 return;
             }
@@ -3004,7 +3674,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A Storefront store ID and game ID are required." },
+                        new { message = "An OmniLibrary store ID and game ID are required." },
                         cancellationToken);
                     return;
                 }
@@ -3027,6 +3697,175 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         message = launchMessage,
                         snapshot = _storeSyncService.GetSnapshot()
                     },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/games/install")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<UnifyStoreLaunchRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.GameId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID and game ID are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryStartUnifyStoreInstall(payload.StoreId, payload.GameId, out var installMessage))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = installMessage },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.Accepted,
+                    new { message = installMessage },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/games/repair")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<UnifyStoreLaunchRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.GameId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A GOG store ID and game ID are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryStartGogRepair(
+                        payload.StoreId,
+                        payload.GameId,
+                        out var repairMessage))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = repairMessage },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.Accepted,
+                    new { message = repairMessage },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/downloads/action")
+            {
+                var payload =
+                    await JsonSerializer.DeserializeAsync<UnifyStoreDownloadActionRequest>(
+                        request.InputStream,
+                        JsonOptions,
+                        cancellationToken);
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.GameId) ||
+                    string.IsNullOrWhiteSpace(payload.Action))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A download, store, and action are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryControlUnifyStoreDownload(
+                        payload.StoreId,
+                        payload.GameId,
+                        payload.Action,
+                        out var controlMessage))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new
+                        {
+                            message = controlMessage,
+                            downloads =
+                                _storeSyncService.GetOmniLibraryDownloadCenter(),
+                        },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.Accepted,
+                    new
+                    {
+                        message = controlMessage,
+                        downloads =
+                            _storeSyncService.GetOmniLibraryDownloadCenter(),
+                    },
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/games/uninstall")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<UnifyStoreLaunchRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null ||
+                    string.IsNullOrWhiteSpace(payload.StoreId) ||
+                    string.IsNullOrWhiteSpace(payload.GameId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An OmniLibrary store ID and game ID are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryStartUnifyStoreUninstall(payload.StoreId, payload.GameId, out var uninstallMessage))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = uninstallMessage },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.Accepted,
+                    new { message = uninstallMessage },
                     cancellationToken);
                 return;
             }
@@ -4229,7 +5068,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A Storefront store ID is required." },
+                        new { message = "An OmniLibrary store ID is required." },
                         cancellationToken);
                     return;
                 }
@@ -4257,7 +5096,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A Storefront store ID is required." },
+                        new { message = "An OmniLibrary store ID is required." },
                         cancellationToken);
                     return;
                 }
@@ -4285,7 +5124,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     await WriteJsonAsync(
                         response,
                         HttpStatusCode.BadRequest,
-                        new { message = "A Storefront store ID is required." },
+                        new { message = "An OmniLibrary store ID is required." },
                         cancellationToken);
                     return;
                 }
@@ -4601,13 +5440,14 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         HttpListenerResponse response,
         string path,
         string contentType,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string cacheControl = "no-cache, no-store")
     {
         var fileInfo = new FileInfo(path);
         response.StatusCode = (int)HttpStatusCode.OK;
         response.ContentType = contentType;
         response.ContentLength64 = fileInfo.Length;
-        response.Headers["Cache-Control"] = "no-cache, no-store";
+        response.Headers["Cache-Control"] = cacheControl;
 
         await using var input = File.OpenRead(path);
         await using var output = response.OutputStream;
@@ -4740,6 +5580,19 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return;
         }
 
+        if (string.Equals(path, "/api/unifystore/summary", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(
+                response,
+                HttpStatusCode.OK,
+                new UnifySteamLibrarySummarySnapshot(
+                    0,
+                    false,
+                    []),
+                cancellationToken);
+            return;
+        }
+
         await WriteJsonAsync(
             response,
             HttpStatusCode.Forbidden,
@@ -4762,6 +5615,23 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         }
     }
 
+    private PluginStoreOverlayState GetStoreOverlayState()
+    {
+        lock (_storeOverlayLock)
+        {
+            return new PluginStoreOverlayState(_storeOverlayOpen);
+        }
+    }
+
+    private PluginStoreOverlayState SetStoreOverlayOpen(bool open)
+    {
+        lock (_storeOverlayLock)
+        {
+            _storeOverlayOpen = open;
+            return new PluginStoreOverlayState(_storeOverlayOpen);
+        }
+    }
+
     private PluginStoreOverlayState SetUnifyStoreOverlayOpen(bool open)
     {
         lock (_unifyStoreOverlayLock)
@@ -4771,32 +5641,144 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         }
     }
 
+    private StoreSyncSnapshot StartUnifySteamLogin(string storeId)
+    {
+        var snapshot = _storeSyncService.StartUnifySteamLogin(storeId);
+        if (!OmniLibraryStoreRegistry.TryGet(storeId, out var descriptor) ||
+            !descriptor.Supports(OmniLibraryStoreCapabilities.ManagedWebSignIn))
+        {
+            return snapshot;
+        }
+
+        lock (_omniLibraryLoginProcessLock)
+        {
+            if (_omniLibraryLoginProcesses.TryGetValue(descriptor.Id, out var existing) &&
+                !existing.HasExited)
+            {
+                return snapshot;
+            }
+
+            existing?.Dispose();
+            var process = OmniLibraryLoginRuntime.StartProcess(descriptor.Id);
+            _omniLibraryLoginProcesses[descriptor.Id] = process;
+            _ = MonitorOmniLibraryLoginAsync(descriptor.Id, process);
+        }
+
+        return snapshot;
+    }
+
+    private async Task MonitorOmniLibraryLoginAsync(string storeId, Process process)
+    {
+        try
+        {
+            await process.WaitForExitAsync();
+            if (process.ExitCode == 0)
+            {
+                var snapshot = _storeSyncService.RefreshUnifySteam(storeId);
+                _liveUpdateHub.Publish("store-sync.state", snapshot);
+            }
+        }
+        catch
+        {
+            // The sign-in window owns user-facing errors. A retry starts a fresh process.
+        }
+        finally
+        {
+            lock (_omniLibraryLoginProcessLock)
+            {
+                if (_omniLibraryLoginProcesses.TryGetValue(storeId, out var current) &&
+                    ReferenceEquals(current, process))
+                {
+                    _omniLibraryLoginProcesses.Remove(storeId);
+                }
+            }
+
+            process.Dispose();
+        }
+    }
+
     private bool TryStartUnifyStoreLaunch(string storeId, string gameId, out string message)
     {
         var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
         var normalizedGameId = (gameId ?? string.Empty).Trim();
 
-        if (normalizedStoreId is not ("epic-games" or "gog-galaxy"))
+        if (!OmniLibraryStoreRegistry.TryGet(normalizedStoreId, out _))
         {
-            message = "Storefront can launch Epic and GOG games right now.";
+            message = "This OmniLibrary store is not supported.";
             return false;
         }
 
         if (!IsSafeUnifyStoreLaunchId(normalizedGameId))
         {
-            message = "The Storefront game ID is invalid.";
+            message = "The OmniLibrary game ID is invalid.";
             return false;
         }
 
         var snapshot = _storeSyncService.GetSnapshot();
-        var gameState = snapshot.UnifySteam.Stores
-            .Where(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase))
-            .SelectMany(store => store.Games)
+        var storeState = snapshot.UnifySteam.Stores
+            .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
+        if (storeState is null || !storeState.Enabled)
+        {
+            message = "Enable this OmniLibrary store before downloading its games.";
+            return false;
+        }
+
+        var gameState = storeState.Games
             .FirstOrDefault(game => string.Equals(game.Id, normalizedGameId, StringComparison.OrdinalIgnoreCase));
         if (gameState is null)
         {
-            message = "The selected game is not in the cached Storefront library. Refresh Epic or GOG first.";
+            message = "The selected game is not in the cached OmniLibrary catalog. Refresh its store first.";
             return false;
+        }
+
+        if (normalizedStoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!gameState.Installed && gameState.CloudPlayable)
+            {
+                if (!UnifySteamLauncher.TryOpenXboxCloudGame(gameState.Title, normalizedGameId))
+                {
+                    message = "Xbox Cloud Gaming could not be opened for this game.";
+                    return false;
+                }
+
+                message = $"Opening {gameState.Title} in Xbox Cloud Gaming.";
+                return true;
+            }
+
+            if (!gameState.Installed)
+            {
+                message = "Download this Xbox game before launching it.";
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(gameState.ExecutablePath) && File.Exists(gameState.ExecutablePath))
+            {
+                var xboxHostPath = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(xboxHostPath) || !File.Exists(xboxHostPath))
+                {
+                    message = "Tools for Steam could not resolve its Xbox launch host.";
+                    return false;
+                }
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = xboxHostPath,
+                    Arguments = XboxStoreLaunchHost.BuildLaunchArguments(gameState.ExecutablePath, gameState.InstallPath),
+                    WorkingDirectory = Path.GetDirectoryName(xboxHostPath) ?? AppContext.BaseDirectory,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                message = $"Starting {gameState.Title} through the Xbox launch host.";
+                return true;
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = $"msxbox://game/?productId={Uri.EscapeDataString(normalizedGameId)}",
+                UseShellExecute = true,
+            })?.Dispose();
+            message = "The local Xbox executable is protected or unavailable, so the Xbox game page was opened.";
+            return true;
         }
 
         var executablePath = Environment.ProcessPath;
@@ -4811,16 +5793,574 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             FileName = executablePath,
             WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
             UseShellExecute = false,
-            CreateNoWindow = false,
+            CreateNoWindow = true,
         };
         startInfo.ArgumentList.Add("--unifysteam-launch");
         startInfo.ArgumentList.Add($"{normalizedStoreId}:{normalizedGameId}");
         Process.Start(startInfo);
 
         message = normalizedStoreId.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) && !gameState.Installed
-            ? "Opening the GOG Galaxy game page. Install the game there, then refresh Storefront."
-            : "Storefront started the launcher. If the game is not installed yet, the store tool will download it first.";
+            ? "Opening the GOG Galaxy game page. Install the game there, then refresh OmniLibrary."
+            : "OmniLibrary started the store launcher.";
         return true;
+    }
+
+    private bool TryStartUnifyStoreInstall(
+        string storeId,
+        string gameId,
+        out string message,
+        bool allowDisabledExistingDownload = false)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        if (!OmniLibraryStoreRegistry.TryGet(normalizedStoreId, out var descriptor) ||
+            (!descriptor.Supports(OmniLibraryStoreCapabilities.ManagedInstall) &&
+             !descriptor.Supports(OmniLibraryStoreCapabilities.ProductPageInstallFallback)))
+        {
+            message = "This OmniLibrary store is not supported.";
+            return false;
+        }
+
+        if (!IsSafeUnifyStoreLaunchId(normalizedGameId))
+        {
+            message = "The OmniLibrary game ID is invalid.";
+            return false;
+        }
+
+        var snapshot = _storeSyncService.GetSnapshot();
+        var storeState = snapshot.UnifySteam.Stores
+            .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
+        if (storeState is null ||
+            (!storeState.Enabled && !allowDisabledExistingDownload))
+        {
+            message = "Enable this OmniLibrary store before launching its games.";
+            return false;
+        }
+
+        var gameState = storeState.Games
+            .FirstOrDefault(game => string.Equals(game.Id, normalizedGameId, StringComparison.OrdinalIgnoreCase));
+        if (gameState is null)
+        {
+            message = "The selected game is not in the cached OmniLibrary catalog. Refresh its store first.";
+            return false;
+        }
+
+        var gogTransaction = normalizedStoreId.Equals(
+                "gog-galaxy",
+                StringComparison.OrdinalIgnoreCase)
+            ? GogOperationJournal.Get(normalizedGameId)
+            : null;
+        var resumeGogRepair =
+            gogTransaction?.IsRepair == true &&
+            gogTransaction.IsRecoverableInstall &&
+            gameState.Download.Status is
+                "failed" or
+                "paused" or
+                "reconnecting" or
+                "queued";
+        if (gameState.Installed &&
+            !gameState.UpdateAvailable &&
+            !resumeGogRepair)
+        {
+            message = $"{gameState.Title} is already installed.";
+            return true;
+        }
+
+        if (UnifySteamDownloadStatusStore.IsActivelyTransferring(
+                gameState.Download.Status))
+        {
+            message = string.IsNullOrWhiteSpace(gameState.Download.DetailText)
+                ? $"{gameState.Title} is already being downloaded."
+                : gameState.Download.DetailText;
+            return true;
+        }
+
+        if (normalizedStoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
+            gameState.CloudPlayable)
+        {
+            if (!UnifySteamLauncher.TryOpenXboxCloudGame(gameState.Title, normalizedGameId))
+            {
+                message = "Xbox Cloud Gaming could not be opened for this game.";
+                return false;
+            }
+
+            message = $"Opening {gameState.Title} in Xbox Cloud Gaming.";
+            return true;
+        }
+
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            message = "Tools for Steam could not resolve its download worker.";
+            return false;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add(resumeGogRepair
+            ? UnifySteamLauncher.RepairArgument
+            : UnifySteamLauncher.InstallArgument);
+        startInfo.ArgumentList.Add($"{normalizedStoreId}:{normalizedGameId}");
+        UnifySteamDownloadStatusStore.Update(
+            normalizedStoreId,
+            normalizedGameId,
+            "preparing",
+            gameState.Download.ProgressPercent,
+            normalizedStoreId switch
+            {
+                "epic-games" => "Preparing the Epic download worker.",
+                "gog-galaxy" => resumeGogRepair
+                    ? "Preparing the GOG repair worker."
+                    : "Preparing the GOG download worker.",
+                "xbox-game-pass" => "Preparing the Xbox installation request.",
+                _ => "Preparing download.",
+            },
+            workerProcessId: 0,
+            downloadedBytes: gameState.Download.DownloadedBytes,
+            totalBytes: gameState.Download.TotalBytes,
+            attempt: gameState.Download.Attempt,
+            gameTitle: gameState.Title,
+            steamAppId: gameState.SteamAppId);
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                throw new InvalidOperationException(
+                    "Windows did not start the OmniLibrary download worker.");
+            }
+
+            UnifySteamLauncher.AssignDownloadWorkerIfUnclaimed(
+                normalizedStoreId,
+                normalizedGameId,
+                process.Id);
+        }
+        catch (Exception exception)
+        {
+            UnifySteamDownloadStatusStore.Update(
+                normalizedStoreId,
+                normalizedGameId,
+                "failed",
+                gameState.Download.ProgressPercent,
+                $"The download worker could not start: {exception.Message}",
+                workerProcessId: 0,
+                downloadedBytes: gameState.Download.DownloadedBytes,
+                totalBytes: gameState.Download.TotalBytes,
+                attempt: gameState.Download.Attempt);
+            message = "The OmniLibrary download worker could not be started.";
+            return false;
+        }
+
+        message = normalizedStoreId switch
+        {
+            "epic-games" => $"Epic download started for {gameState.Title}.",
+            "gog-galaxy" => resumeGogRepair
+                ? $"GOG repair resumed for {gameState.Title}."
+                : gameState.UpdateAvailable
+                ? $"GOG update started for {gameState.Title}."
+                : $"GOG download started for {gameState.Title}.",
+            "xbox-game-pass" =>
+                $"Requesting the Xbox installation for {gameState.Title}. " +
+                "If Windows blocks direct installation, its Xbox product page will open.",
+            _ => "Download started.",
+        };
+        return true;
+    }
+
+    private bool TryStartGogRepair(
+        string storeId,
+        string gameId,
+        out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        if (!normalizedStoreId.Equals(
+                "gog-galaxy",
+                StringComparison.OrdinalIgnoreCase) ||
+            !IsSafeUnifyStoreLaunchId(normalizedGameId))
+        {
+            message = "Verify & Repair is available only for a valid GOG game.";
+            return false;
+        }
+
+        var store = _storeSyncService.GetSnapshot().UnifySteam.Stores
+            .FirstOrDefault(candidate =>
+                candidate.Id.Equals(
+                    normalizedStoreId,
+                    StringComparison.OrdinalIgnoreCase));
+        var game = store?.Games.FirstOrDefault(candidate =>
+            candidate.Id.Equals(
+                normalizedGameId,
+                StringComparison.OrdinalIgnoreCase));
+        if (store?.Enabled != true ||
+            game?.Installed != true ||
+            !UnifySteamLauncher.IsManagedGogInstall(
+                game.InstallPath,
+                normalizedGameId))
+        {
+            message =
+                "Verify & Repair is available only for GOG games installed by OmniLibrary.";
+            return false;
+        }
+
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) ||
+            !File.Exists(executablePath))
+        {
+            message = "Tools for Steam could not resolve its GOG repair worker.";
+            return false;
+        }
+
+        var current = UnifySteamDownloadStatusStore.Get(
+            normalizedStoreId,
+            normalizedGameId);
+        if (UnifySteamDownloadStatusStore.IsBusyOperation(current.Status))
+        {
+            message = string.IsNullOrWhiteSpace(current.DetailText)
+                ? "A GOG operation is already active for this game."
+                : current.DetailText;
+            return true;
+        }
+
+        UnifySteamDownloadStatusStore.Update(
+            normalizedStoreId,
+            normalizedGameId,
+            "preparing",
+            0,
+            $"Verifying {game.Title} and repairing changed or missing files.",
+            workerProcessId: 0,
+            gameTitle: game.Title,
+            steamAppId: game.SteamAppId);
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory =
+                Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add(UnifySteamLauncher.RepairArgument);
+        startInfo.ArgumentList.Add(
+            $"{normalizedStoreId}:{normalizedGameId}");
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                throw new InvalidOperationException(
+                    "Windows did not start the GOG repair worker.");
+            }
+
+            UnifySteamLauncher.AssignDownloadWorkerIfUnclaimed(
+                normalizedStoreId,
+                normalizedGameId,
+                process.Id);
+            message = $"Verify & Repair started for {game.Title}.";
+            return true;
+        }
+        catch (Exception exception)
+        {
+            GogOperationJournal.Fail(normalizedGameId, exception.Message);
+            UnifySteamDownloadStatusStore.Update(
+                normalizedStoreId,
+                normalizedGameId,
+                "failed",
+                0,
+                $"The GOG repair worker could not start: {exception.Message}",
+                workerProcessId: 0,
+                gameTitle: game.Title,
+                steamAppId: game.SteamAppId);
+            message = "The GOG repair worker could not be started.";
+            return false;
+        }
+    }
+
+    private bool TryStartUnifyStoreUninstall(string storeId, string gameId, out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        if (!OmniLibraryStoreRegistry.TryGet(normalizedStoreId, out var descriptor) ||
+            (!descriptor.Supports(OmniLibraryStoreCapabilities.ManagedUninstall) &&
+             !descriptor.Supports(OmniLibraryStoreCapabilities.ProductPageUninstall)))
+        {
+            message = "This OmniLibrary store is not supported.";
+            return false;
+        }
+
+        if (!IsSafeUnifyStoreLaunchId(normalizedGameId))
+        {
+            message = "The OmniLibrary game ID is invalid.";
+            return false;
+        }
+
+        var snapshot = _storeSyncService.GetSnapshot();
+        var storeState = snapshot.UnifySteam.Stores
+            .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
+        if (storeState is null || !storeState.Enabled)
+        {
+            message = "Enable this OmniLibrary store before managing its games.";
+            return false;
+        }
+
+        var gameState = storeState.Games
+            .FirstOrDefault(game => string.Equals(game.Id, normalizedGameId, StringComparison.OrdinalIgnoreCase));
+        if (gameState is null)
+        {
+            message = "The selected game is not in the cached OmniLibrary catalog. Refresh its store first.";
+            return false;
+        }
+
+        if (!gameState.Installed)
+        {
+            message = $"{gameState.Title} is not installed.";
+            return false;
+        }
+
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            message = "Tools for Steam could not resolve its uninstall worker.";
+            return false;
+        }
+
+        var windowsBeforeLaunch = normalizedStoreId == "xbox-game-pass"
+            ? _processWindowService.GetSnapshot().Windows
+            : null;
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add(UnifySteamLauncher.UninstallArgument);
+        startInfo.ArgumentList.Add($"{normalizedStoreId}:{normalizedGameId}");
+        var currentStatus = UnifySteamDownloadStatusStore.Get(
+            normalizedStoreId,
+            normalizedGameId);
+        UnifySteamDownloadStatusStore.Update(
+            normalizedStoreId,
+            normalizedGameId,
+            "uninstalling",
+            0,
+            $"Preparing to uninstall {gameState.Title}.",
+            workerProcessId: 0,
+            downloadedBytes: currentStatus.DownloadedBytes,
+            totalBytes: currentStatus.TotalBytes,
+            attempt: currentStatus.Attempt,
+            gameTitle: gameState.Title,
+            steamAppId: gameState.SteamAppId);
+        try
+        {
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                throw new InvalidOperationException(
+                    "Windows did not start the OmniLibrary uninstall worker.");
+            }
+
+            UnifySteamLauncher.AssignDownloadWorkerIfUnclaimed(
+                normalizedStoreId,
+                normalizedGameId,
+                process.Id);
+        }
+        catch (Exception exception)
+        {
+            UnifySteamDownloadStatusStore.Update(
+                normalizedStoreId,
+                normalizedGameId,
+                "uninstall-failed",
+                0,
+                $"The uninstall worker could not start: {exception.Message}",
+                workerProcessId: 0,
+                gameTitle: gameState.Title,
+                steamAppId: gameState.SteamAppId);
+            message = "The OmniLibrary uninstall worker could not be started.";
+            return false;
+        }
+
+        if (windowsBeforeLaunch is not null)
+        {
+            _processWindowService.ActivateLaunchedAppWhenReady(
+                "Xbox",
+                "XboxPcApp",
+                launchedProcessId: null,
+                windowsBeforeLaunch: windowsBeforeLaunch);
+        }
+
+        message = normalizedStoreId switch
+        {
+            "epic-games" =>
+                $"Uninstalling {gameState.Title}. OmniLibrary will keep the library entry available for download.",
+            "gog-galaxy" =>
+                $"Uninstalling {gameState.Title}. OmniLibrary removes managed installs automatically and opens GOG Galaxy only for externally managed files.",
+            _ =>
+                $"Opening {gameState.Title} in the Xbox app. Finish the uninstall there; OmniLibrary will detect the removal.",
+        };
+        return true;
+    }
+
+    private bool TryControlUnifyStoreDownload(
+        string storeId,
+        string gameId,
+        string action,
+        out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        var normalizedAction = (action ?? string.Empty).Trim().ToLowerInvariant();
+        if (!OmniLibraryStoreRegistry.TryGet(normalizedStoreId, out _) ||
+            !IsSafeUnifyStoreLaunchId(normalizedGameId))
+        {
+            message = "This Download Center entry is invalid.";
+            return false;
+        }
+
+        var entry = _storeSyncService.GetOmniLibraryDownloadCenter().Entries
+            .FirstOrDefault(candidate =>
+                candidate.StoreId.Equals(
+                    normalizedStoreId,
+                    StringComparison.OrdinalIgnoreCase) &&
+                candidate.GameId.Equals(
+                    normalizedGameId,
+                    StringComparison.OrdinalIgnoreCase));
+        if (entry is null)
+        {
+            message = "This download is no longer present. Refresh Download Center.";
+            return false;
+        }
+
+        switch (normalizedAction)
+        {
+            case "pause" when entry.CanPause:
+                return UnifySteamLauncher.TryPauseDownload(
+                    normalizedStoreId,
+                    normalizedGameId,
+                    out message);
+            case "resume" when entry.CanResume:
+                return TryStartUnifyStoreInstall(
+                    normalizedStoreId,
+                    normalizedGameId,
+                    out message,
+                    allowDisabledExistingDownload: true);
+            case "cancel" when entry.CanCancel:
+                if (UnifySteamDownloadStatusStore.IsActivelyTransferring(
+                        entry.Status) &&
+                    !UnifySteamLauncher.TryPauseDownload(
+                        normalizedStoreId,
+                        normalizedGameId,
+                        out message))
+                {
+                    return false;
+                }
+
+                return TryStartUnifyDownloadCancellation(
+                    entry,
+                    out message);
+            case "dismiss" when entry.CanDismiss:
+                UnifySteamDownloadStatusStore.Clear(
+                    normalizedStoreId,
+                    normalizedGameId);
+                message = $"{entry.GameTitle} was removed from Download Center.";
+                return true;
+            case "play" when entry.CanPlay:
+                return TryStartUnifyStoreLaunch(
+                    normalizedStoreId,
+                    normalizedGameId,
+                    out message);
+            case "manage" when entry.CanManageExternally:
+                return UnifySteamLauncher.TryOpenExternalDownloadManager(
+                    normalizedStoreId,
+                    normalizedGameId,
+                    out message);
+            case "retry-uninstall" when entry.CanRetryUninstall:
+                return TryStartUnifyStoreUninstall(
+                    normalizedStoreId,
+                    normalizedGameId,
+                    out message);
+            default:
+                message =
+                    "That action is no longer available for the current download state.";
+                return false;
+        }
+    }
+
+    private static bool TryStartUnifyDownloadCancellation(
+        OmniLibraryDownloadCenterEntry entry,
+        out string message)
+    {
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) ||
+            !File.Exists(executablePath))
+        {
+            message = "Tools for Steam could not resolve its cleanup worker.";
+            return false;
+        }
+
+        var current = UnifySteamDownloadStatusStore.Get(
+            entry.StoreId,
+            entry.GameId);
+        UnifySteamDownloadStatusStore.Update(
+            entry.StoreId,
+            entry.GameId,
+            "canceling",
+            current.ProgressPercent,
+            "Stopping the transfer and removing its partial files.",
+            workerProcessId: 0,
+            downloadedBytes: current.DownloadedBytes,
+            totalBytes: current.TotalBytes,
+            attempt: current.Attempt,
+            gameTitle: entry.GameTitle,
+            steamAppId: entry.SteamAppId);
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executablePath,
+                WorkingDirectory =
+                    Path.GetDirectoryName(executablePath) ??
+                    AppContext.BaseDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add(
+                UnifySteamLauncher.CancelDownloadArgument);
+            startInfo.ArgumentList.Add($"{entry.StoreId}:{entry.GameId}");
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                throw new InvalidOperationException(
+                    "Windows did not start the cleanup worker.");
+            }
+
+            UnifySteamLauncher.AssignDownloadWorkerIfUnclaimed(
+                entry.StoreId,
+                entry.GameId,
+                process.Id);
+            message =
+                $"Canceling {entry.GameTitle} and removing its partial files.";
+            return true;
+        }
+        catch (Exception exception)
+        {
+            UnifySteamDownloadStatusStore.Update(
+                entry.StoreId,
+                entry.GameId,
+                "cancel-failed",
+                current.ProgressPercent,
+                $"The cleanup worker could not start: {exception.Message}",
+                workerProcessId: 0,
+                downloadedBytes: current.DownloadedBytes,
+                totalBytes: current.TotalBytes,
+                attempt: current.Attempt);
+            message = "The download cleanup worker could not be started.";
+            return false;
+        }
     }
 
     private static bool IsSafeUnifyStoreLaunchId(string value)
@@ -4854,6 +6394,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/hltb"] = "hltb",
             ["/api/smart-home"] = "smart-home",
             ["/api/store-sync"] = "store-sync",
+            ["/api/unifystore"] = "omnilibrary",
             ["/api/themes"] = "themes",
             ["/api/power"] = "power"
         };
@@ -5186,7 +6727,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             "setstorefrontenabled" => _storeSyncService.SetUnifySteamStoreEnabled(
                 GetCapabilityString(arguments, "storeId"),
                 GetCapabilityBoolean(arguments, "enabled")),
-            "startstorefrontlogin" => _storeSyncService.StartUnifySteamLogin(
+            "startstorefrontlogin" => StartUnifySteamLogin(
                 GetCapabilityString(arguments, "storeId")),
             "completestorefrontauth" => _storeSyncService.CompleteUnifySteamManualAuth(
                 GetCapabilityString(arguments, "storeId"),
@@ -5661,6 +7202,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record SetBooleanValueRequest(bool Value);
 
+    private sealed record BluetoothPairRequest(string DeviceId);
+
     private sealed record SetDiscordSettingsRequest(string ApplicationId, string ServerId, string InviteUrl);
 
     private sealed record DiscordIdRequest(string Id);
@@ -5695,9 +7238,37 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record UnifyStoreLaunchRequest(string StoreId, string GameId);
 
+    private sealed record UnifyStoreDownloadActionRequest(
+        string StoreId,
+        string GameId,
+        string Action);
+
+    private sealed record SetStorePriceAlertRequest(
+        long? SteamAppId,
+        string? GameId,
+        string Title,
+        decimal TargetPrice,
+        string CurrencyCode,
+        bool Enabled);
+
+    private sealed record OpenStoreDealRequest(string DealUrl);
+
+    private sealed record SetStoreWishlistRequest(StoreGameState Game, bool Enabled);
+
     private sealed record SetStoreEnabledRequest(string StoreId, bool Enabled);
 
+    private sealed record SetXboxSourceEnabledRequest(string SourceId, bool Enabled);
+
     private sealed record SetStorePathRequest(string StoreId, string? Value);
+
+    private sealed record SetStoreDownloadOptionsRequest(
+        string StoreId,
+        int DownloadWorkers,
+        int DownloadTimeoutSeconds);
+
+    private sealed record SetGogOptionsRequest(
+        bool IncludeDlc,
+        bool PreferGalaxyForLaunch);
 
     private sealed record SetStorePathsRequest(string StoreId, IReadOnlyList<string>? Values);
 

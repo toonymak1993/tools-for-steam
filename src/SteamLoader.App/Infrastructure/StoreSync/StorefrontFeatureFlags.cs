@@ -4,7 +4,13 @@ namespace SteamLoader.App.Infrastructure.StoreSync;
 
 internal static class StorefrontFeatureFlags
 {
-    public static bool Enabled => false;
+    // OmniLibrary is a settings surface plus an Xbox-only native Library bridge.
+    // Its dedicated sync stays independent from normal Store Sync status and analysis.
+    public static bool Enabled => true;
+
+    public static bool SteamShortcutSyncEnabled => false;
+
+    public static bool AutomaticRefreshEnabled => false;
 
     public static bool IsDisabledRequestPath(string? path)
     {
@@ -21,7 +27,7 @@ internal static class StorefrontFeatureFlags
     {
         return new UnifySteamSnapshot(
             "Disabled",
-            "Storefront is disabled in this build.",
+            "OmniLibrary is disabled in this build.",
             null,
             []);
     }

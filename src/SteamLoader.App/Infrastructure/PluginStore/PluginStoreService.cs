@@ -87,6 +87,7 @@ public sealed class PluginStoreService
             ["processes"] = "#14B8A6",
             ["smart-home"] = "#06B6D4",
             ["store-sync"] = "#60A5FA",
+            ["store"] = "#5EE6A8",
             ["themes"] = "#A855F7"
         };
 

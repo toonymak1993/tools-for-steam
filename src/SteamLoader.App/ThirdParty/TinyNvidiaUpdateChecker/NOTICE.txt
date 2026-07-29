@@ -1,0 +1,19 @@
+TinyNvidiaUpdateChecker
+=======================
+
+The System > Driver > GPU Update action can download TinyNvidiaUpdateChecker
+1.25.2 on demand from the project's official GitHub release. The executable is
+not embedded in the Tools for Steam source tree or installer.
+
+Project: https://github.com/HawaiiBeach/TinyNvidiaUpdateChecker
+Release asset:
+https://github.com/HawaiiBeach/TinyNvidiaUpdateChecker/releases/download/v1.25.2/TinyNvidiaUpdateChecker.exe
+Expected SHA-256:
+69760c6933cd9ad30bbdf60dd55b262d0a625239ab4c7db424dd7a2a793692ec
+License: GNU General Public License v3.0
+License text and corresponding source:
+https://github.com/HawaiiBeach/TinyNvidiaUpdateChecker/tree/v1.25.2
+
+Tools for Steam stores the verified helper and its isolated configuration in
+data\system\driver\tiny-nvidia-update-checker, then launches it as a separate
+application.

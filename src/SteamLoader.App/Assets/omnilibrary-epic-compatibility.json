@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "appName": "Heather",
+      "fakeEpicLauncher": true
+    },
+    {
+      "appName": "9d2d0eb64d5c44529cece33fe2a46482",
+      "fakeEpicLauncher": true
+    },
+    {
+      "appName": "8769e24080ea413b8ebca3f1b8c50951",
+      "fakeEpicLauncher": true
+    },
+    {
+      "appName": "c180bd9859624278aa20f1333918498a",
+      "fakeEpicLauncher": true
+    },
+    {
+      "appName": "afd9f29c1af44610b9e0f9b69742e257",
+      "fakeEpicLauncher": true
+    },
+    {
+      "appName": "e5f031908d2e460b8757387d1a136e48",
+      "fakeEpicLauncher": true
+    }
+  ]
+}

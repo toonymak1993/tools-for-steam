@@ -6,6 +6,45 @@ namespace SteamLoader.App.Tests;
 public sealed class StoreSyncSettingsStoreTests
 {
     [Fact]
+    public void Load_NormalizesEpicDownloadOptionsAndKeepsSafeDefaults()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            File.WriteAllText(settingsPath, """
+                {
+                  "unifySteam": {
+                    "stores": {
+                      "epic-games": {
+                        "enabled": true,
+                        "downloadWorkers": 99,
+                        "downloadTimeoutSeconds": 5
+                      },
+                      "gog-galaxy": {
+                        "enabled": false
+                      }
+                    }
+                  }
+                }
+                """);
+            var store = new StoreSyncSettingsStore(settingsPath);
+
+            var configuration = store.Load();
+
+            var epic = configuration.UnifySteam.Stores["epic-games"];
+            Assert.Equal(32, epic.DownloadWorkers);
+            Assert.Equal(15, epic.DownloadTimeoutSeconds);
+            var gog = configuration.UnifySteam.Stores["gog-galaxy"];
+            Assert.Equal(16, gog.DownloadWorkers);
+            Assert.Equal(60, gog.DownloadTimeoutSeconds);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
     public void Load_MigratesLegacyConfigurationToNewSyncBehaviorDefaults()
     {
         var settingsPath = CreateTempSettingsPath();
@@ -156,6 +195,140 @@ public sealed class StoreSyncSettingsStoreTests
     }
 
     [Fact]
+    public void Load_XboxCloudDefaultsOffAndPersistsIndependentChoices()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            File.WriteAllText(settingsPath, """
+                {
+                  "unifySteam": {
+                    "stores": {
+                      "xbox-game-pass": {
+                        "enabled": true,
+                        "includeXboxCloudGaming": true
+                      }
+                    }
+                  }
+                }
+                """);
+            var store = new StoreSyncSettingsStore(settingsPath);
+
+            var configuration = store.Load();
+            var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
+
+            Assert.Equal(4, configuration.OmniLibrarySettingsVersion);
+            Assert.True(xbox.IncludeXboxPcGamePass);
+            Assert.False(xbox.IncludeXboxCloudGaming);
+
+            xbox.IncludeXboxPcGamePass = false;
+            xbox.IncludeXboxCloudGaming = true;
+            xbox.Cache.Games =
+            [
+                new UnifySteamGameCacheEntry
+                {
+                    Id = "9TESTCLOUD",
+                    Title = "Cloud Test",
+                    CloudPlayable = true,
+                },
+            ];
+            store.Save(configuration);
+
+            var reloaded = store.Load().UnifySteam.Stores["xbox-game-pass"];
+            Assert.False(reloaded.IncludeXboxPcGamePass);
+            Assert.True(reloaded.IncludeXboxCloudGaming);
+            Assert.True(Assert.Single(reloaded.Cache.Games).CloudPlayable);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Load_MigratesArtworkBlockedXboxAndEpicStoresToReadyBackgroundRepair()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            File.WriteAllText(settingsPath, """
+                {
+                  "omniLibrarySettingsVersion": 1,
+                  "unifySteam": {
+                    "stores": {
+                      "xbox-game-pass": {
+                        "enabled": true,
+                        "preparationStatus": "artwork",
+                        "preparationDetail": "Preparing artwork 1/1. The store tab stays hidden.",
+                        "cache": {
+                          "refreshedAtUtc": "2026-07-27T20:00:00Z",
+                          "games": [
+                            {
+                              "id": "9XBOXTEST",
+                              "title": "Xbox Test",
+                              "steamAppId": 3000000001
+                            }
+                          ]
+                        }
+                      },
+                      "epic-games": {
+                        "enabled": true,
+                        "preparationStatus": "failed",
+                        "preparationDetail": "Artwork preparation paused: hero missing.",
+                        "cache": {
+                          "refreshedAtUtc": "2026-07-27T20:01:00Z",
+                          "games": [
+                            {
+                              "id": "EpicTest",
+                              "title": "Epic Test",
+                              "steamAppId": 3000000002
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+
+            var configuration = new StoreSyncSettingsStore(settingsPath).Load();
+
+            Assert.Equal(4, configuration.OmniLibrarySettingsVersion);
+            foreach (var storeId in new[] { "xbox-game-pass", "epic-games" })
+            {
+                var store = configuration.UnifySteam.Stores[storeId];
+                Assert.Equal("prepared", store.PreparationStatus);
+                Assert.NotNull(store.PreparedAtUtc);
+                Assert.NotEmpty(store.PreparedCatalogSignature);
+                Assert.StartsWith("Library ready.", store.PreparationDetail);
+                Assert.Equal("degraded", store.Lifecycle.Artwork);
+                Assert.NotEqual("failed", store.Lifecycle.Shortcuts);
+            }
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Load_FreshConfiguration_LeavesEveryOmniLibraryStoreDisabled()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            var configuration = new StoreSyncSettingsStore(settingsPath).Load();
+
+            Assert.False(configuration.UnifySteam.Stores["xbox-game-pass"].Enabled);
+            Assert.False(configuration.UnifySteam.Stores["epic-games"].Enabled);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
     public void SaveAndLoad_NormalizesAndDeduplicatesAdditionalScanPaths()
     {
         var settingsPath = CreateTempSettingsPath();
@@ -190,6 +363,100 @@ public sealed class StoreSyncSettingsStoreTests
             Assert.Equal(2, customStore.AdditionalScanPaths.Count);
             Assert.Equal(Path.GetFullPath(@"D:\Games\Extra"), customStore.AdditionalScanPaths[0]);
             Assert.Equal(Path.GetFullPath(@"E:\Portable Library\"), customStore.AdditionalScanPaths[1]);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Update_PreservesConcurrentNarrowChanges()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            var store = new StoreSyncSettingsStore(settingsPath);
+            store.Save(new StoreSyncConfiguration());
+
+            Parallel.For(0, 24, index =>
+            {
+                new StoreSyncSettingsStore(settingsPath).Update(configuration =>
+                {
+                    configuration.TitleOverrides[$"title-{index}"] = new StoreSyncTitleOverride
+                    {
+                        TitleOverride = $"Title {index}",
+                    };
+                });
+            });
+
+            var reloaded = store.Load();
+            Assert.Equal(24, reloaded.TitleOverrides.Count);
+            for (var index = 0; index < 24; index++)
+            {
+                Assert.Equal(
+                    $"Title {index}",
+                    reloaded.TitleOverrides[$"title-{index}"].TitleOverride);
+            }
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Load_UsesLastValidBackupWhenPrimaryFileIsDamaged()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            var store = new StoreSyncSettingsStore(settingsPath);
+            var first = new StoreSyncConfiguration { SteamGridDbApiKey = "last-valid" };
+            store.Save(first);
+            store.Update(configuration => configuration.SteamGridDbApiKey = "newest");
+            File.WriteAllText(settingsPath, "{ damaged");
+
+            var recovered = store.Load();
+
+            Assert.Equal("last-valid", recovered.SteamGridDbApiKey);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Load_NormalizesGogRemoteMembershipForDeltaSync()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            File.WriteAllText(settingsPath, """
+                {
+                  "unifySteam": {
+                    "stores": {
+                      "gog-galaxy": {
+                        "enabled": false,
+                        "remoteCatalogItemIds": [
+                          " 123 ",
+                          "123",
+                          "ABC",
+                          "abc",
+                          ""
+                        ]
+                      }
+                    }
+                  }
+                }
+                """);
+
+            var configuration = new StoreSyncSettingsStore(settingsPath).Load();
+            var gog = configuration.UnifySteam.Stores["gog-galaxy"];
+
+            Assert.False(gog.Enabled);
+            Assert.Equal(["123", "ABC"], gog.RemoteCatalogItemIds);
         }
         finally
         {

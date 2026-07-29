@@ -30,7 +30,13 @@ public sealed class TfsPerformanceService : IDisposable
     public TfsPerformanceService(PerformanceSettingsStore settingsStore)
     {
         _settingsStore = settingsStore;
-        _updateTimer = new System.Threading.Timer(_ => UpdateOverlay(), null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
+        var configuration = _settingsStore.Load();
+        var pollingEnabled = configuration.OverlayEnabled || configuration.FrameLimitConfigured;
+        _updateTimer = new System.Threading.Timer(
+            _ => UpdateOverlay(),
+            null,
+            pollingEnabled ? TimeSpan.FromMilliseconds(250) : Timeout.InfiniteTimeSpan,
+            pollingEnabled ? TimeSpan.FromMilliseconds(250) : Timeout.InfiniteTimeSpan);
     }
 
     public PerformanceSnapshot GetSnapshot()
@@ -52,6 +58,7 @@ public sealed class TfsPerformanceService : IDisposable
             if (!configuration.OverlayEnabled)
             {
                 _settingsStore.Save(configuration);
+                UpdateTimerSchedule(configuration);
                 _sharedMemory.ReleaseOverlay();
                 SetRuntimeStatus(new PerformanceRuntimeStatus
                 {
@@ -64,6 +71,7 @@ public sealed class TfsPerformanceService : IDisposable
 
             var installation = _installationService.EnsureInstalledAndRunning(allowInstall: true);
             _settingsStore.Save(configuration);
+            UpdateTimerSchedule(configuration);
             UpdateOverlayLocked(configuration, installation);
             return BuildSnapshot(
                 configuration,
@@ -78,6 +86,7 @@ public sealed class TfsPerformanceService : IDisposable
             var configuration = _settingsStore.Load();
             configuration.AutoTargetEnabled = true;
             _settingsStore.Save(configuration);
+            UpdateTimerSchedule(configuration);
             return BuildSnapshot(configuration, "RTSS automatically follows the active 3D game.");
         }
     }
@@ -117,6 +126,7 @@ public sealed class TfsPerformanceService : IDisposable
             }
 
             _settingsStore.Save(configuration);
+            UpdateTimerSchedule(configuration);
             configuration = _settingsStore.Load();
             _lastProfileFingerprint = 0;
             RefreshWhileRunning(configuration);
@@ -218,6 +228,19 @@ public sealed class TfsPerformanceService : IDisposable
         {
             Monitor.Exit(_gate);
         }
+    }
+
+    private void UpdateTimerSchedule(PerformanceSettingsConfiguration configuration)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        var enabled = configuration.OverlayEnabled || configuration.FrameLimitConfigured;
+        _updateTimer.Change(
+            enabled ? TimeSpan.FromMilliseconds(250) : Timeout.InfiniteTimeSpan,
+            enabled ? TimeSpan.FromMilliseconds(250) : Timeout.InfiniteTimeSpan);
     }
 
     private void UpdateOverlayLocked(PerformanceSettingsConfiguration configuration, RtssInstallation installation)

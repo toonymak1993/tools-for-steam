@@ -1,0 +1,19 @@
+heroic-gogdl
+============
+
+OmniLibrary can download heroic-gogdl 1.2.2 on demand from the official
+Heroic-Games-Launcher release. heroic-gogdl is not embedded in the Tools for
+Steam source tree or installer.
+
+Project: https://github.com/Heroic-Games-Launcher/heroic-gogdl
+Release asset:
+https://github.com/Heroic-Games-Launcher/heroic-gogdl/releases/download/v1.2.2/gogdl_windows_x86_64.exe
+Expected SHA-256:
+37e7cf848d35ffff92dfaeb62d7751709e0b8a0deb17dda36a013d73300e61c1
+License: GNU General Public License v3.0
+License text and corresponding source:
+https://github.com/Heroic-Games-Launcher/heroic-gogdl/tree/v1.2.2
+
+Tools for Steam stores heroic-gogdl and its GOG session in the isolated
+data\omnilibrary directory. Disconnect GOG Account removes that session and
+the isolated browser profile without deleting installed game files.

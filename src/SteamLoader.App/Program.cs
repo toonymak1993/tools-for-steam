@@ -73,6 +73,100 @@ public static class Program
             return Infrastructure.StoreSync.XboxStoreLaunchHost.Run(xboxLaunchPayload);
         }
 
+        if (Infrastructure.StoreSync.OmniLibraryLoginRuntime.TryParseArguments(
+                args,
+                out var omniLibraryLoginStoreId))
+        {
+            return Infrastructure.StoreSync.OmniLibraryLoginRuntime.Run(omniLibraryLoginStoreId);
+        }
+
+        var gogPreparationIndex = Array.FindIndex(args, argument =>
+            string.Equals(
+                argument,
+                Infrastructure.StoreSync.GogInstallPreparation.ElevatedArgument,
+                StringComparison.OrdinalIgnoreCase));
+        if (gogPreparationIndex >= 0)
+        {
+            if (gogPreparationIndex + 4 >= args.Length)
+            {
+                Console.Error.WriteLine("The elevated GOG setup request is incomplete.");
+                return 1;
+            }
+
+            return Infrastructure.StoreSync.GogInstallPreparation.RunElevated(
+                args[gogPreparationIndex + 1],
+                args[gogPreparationIndex + 2],
+                args[gogPreparationIndex + 3],
+                args[gogPreparationIndex + 4]);
+        }
+
+        var unifyInstallIndex = Array.FindIndex(args, argument =>
+            string.Equals(argument, Infrastructure.StoreSync.UnifySteamLauncher.InstallArgument, StringComparison.OrdinalIgnoreCase));
+        if (unifyInstallIndex >= 0)
+        {
+            var installTarget = unifyInstallIndex + 1 < args.Length ? args[unifyInstallIndex + 1] : string.Empty;
+            if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
+            {
+                Console.Error.WriteLine("OmniLibrary is disabled in this build.");
+                return 1;
+            }
+
+            return Infrastructure.StoreSync.UnifySteamLauncher.Install(installTarget);
+        }
+
+        var unifyRepairIndex = Array.FindIndex(args, argument =>
+            string.Equals(
+                argument,
+                Infrastructure.StoreSync.UnifySteamLauncher.RepairArgument,
+                StringComparison.OrdinalIgnoreCase));
+        if (unifyRepairIndex >= 0)
+        {
+            var repairTarget = unifyRepairIndex + 1 < args.Length
+                ? args[unifyRepairIndex + 1]
+                : string.Empty;
+            if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
+            {
+                Console.Error.WriteLine("OmniLibrary is disabled in this build.");
+                return 1;
+            }
+
+            return Infrastructure.StoreSync.UnifySteamLauncher.Repair(repairTarget);
+        }
+
+        var unifyUninstallIndex = Array.FindIndex(args, argument =>
+            string.Equals(argument, Infrastructure.StoreSync.UnifySteamLauncher.UninstallArgument, StringComparison.OrdinalIgnoreCase));
+        if (unifyUninstallIndex >= 0)
+        {
+            var uninstallTarget = unifyUninstallIndex + 1 < args.Length ? args[unifyUninstallIndex + 1] : string.Empty;
+            if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
+            {
+                Console.Error.WriteLine("OmniLibrary is disabled in this build.");
+                return 1;
+            }
+
+            return Infrastructure.StoreSync.UnifySteamLauncher.Uninstall(uninstallTarget);
+        }
+
+        var unifyCancelDownloadIndex = Array.FindIndex(args, argument =>
+            string.Equals(
+                argument,
+                Infrastructure.StoreSync.UnifySteamLauncher.CancelDownloadArgument,
+                StringComparison.OrdinalIgnoreCase));
+        if (unifyCancelDownloadIndex >= 0)
+        {
+            var cancelTarget = unifyCancelDownloadIndex + 1 < args.Length
+                ? args[unifyCancelDownloadIndex + 1]
+                : string.Empty;
+            if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
+            {
+                Console.Error.WriteLine("OmniLibrary is disabled in this build.");
+                return 1;
+            }
+
+            return Infrastructure.StoreSync.UnifySteamLauncher.CancelDownload(
+                cancelTarget);
+        }
+
         var unifyLaunchIndex = Array.FindIndex(args, argument =>
             string.Equals(argument, "--unifysteam-launch", StringComparison.OrdinalIgnoreCase));
         if (unifyLaunchIndex >= 0)
@@ -80,7 +174,7 @@ public static class Program
             var unifyTarget = unifyLaunchIndex + 1 < args.Length ? args[unifyLaunchIndex + 1] : string.Empty;
             if (!Infrastructure.StoreSync.StorefrontFeatureFlags.Enabled)
             {
-                Console.Error.WriteLine("Storefront is disabled in this build.");
+                Console.Error.WriteLine("OmniLibrary is disabled in this build.");
                 return 1;
             }
 

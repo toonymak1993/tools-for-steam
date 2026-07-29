@@ -18,7 +18,8 @@ namespace SteamLoader.App.Services;
 /// </summary>
 public sealed class ControllerShortcutService
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(15);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(25);
+    private static readonly TimeSpan ContextRefreshInterval = TimeSpan.FromMilliseconds(150);
     private static readonly TimeSpan SettingsRefreshInterval = TimeSpan.FromMilliseconds(500);
 
     private const int SteamMenuDigit = 1;    // Ctrl+1 -> STEAM menu (left)
@@ -47,11 +48,13 @@ public sealed class ControllerShortcutService
     private readonly SemaphoreSlim _shortcutGate = new(1, 1);
 
     private ShortcutContext _context;
+    private ShortcutContext _detectedContext;
     private readonly ShortcutPressState _steamMenuPress = new();
     private readonly ShortcutPressState _steamQuickAccessPress = new();
     private readonly ShortcutPressState _inGameOverlayPress = new();
     private readonly ShortcutPressState _inGameQuickAccessPress = new();
     private DateTime _nextSettingsRefreshAtUtc;
+    private DateTime _nextContextRefreshAtUtc;
     private ControllerShortcutSettingsSnapshot _settings = ControllerShortcutSettingsSnapshot.Default;
     private string _settingsSignature = string.Empty;
 
@@ -136,17 +139,26 @@ public sealed class ControllerShortcutService
             return;
         }
 
-        var context = _isBigPictureForeground()
-            ? ShortcutContext.BigPicture
-            : _isGameInForeground()
-                ? ShortcutContext.InGameOverlay
-                : ShortcutContext.None;
         var nowUtc = DateTime.UtcNow;
+        if (nowUtc >= _nextContextRefreshAtUtc)
+        {
+            _nextContextRefreshAtUtc = nowUtc + ContextRefreshInterval;
+            _detectedContext = _isBigPictureForeground()
+                ? ShortcutContext.BigPicture
+                : _isGameInForeground()
+                    ? ShortcutContext.InGameOverlay
+                    : ShortcutContext.None;
+        }
+        var context = _detectedContext;
         var settings = GetSettings(nowUtc);
-        var controllerButtonMasks = ReadConnectedControllerButtonMasks()
-            .Concat(_hidControllerButtonMasksProvider())
-            .Distinct()
-            .ToArray();
+        var controllerButtonMasks = ReadConnectedControllerButtonMasks().ToList();
+        foreach (var hidMask in _hidControllerButtonMasksProvider())
+        {
+            if (!controllerButtonMasks.Contains(hidMask))
+            {
+                controllerButtonMasks.Add(hidMask);
+            }
+        }
         var steamMenuDown = context == ShortcutContext.BigPicture &&
             IsCombinationDown(settings.SteamMenuButtons, controllerButtonMasks);
         var steamQuickAccessDown = context == ShortcutContext.BigPicture &&
@@ -209,6 +221,8 @@ public sealed class ControllerShortcutService
     private void ResetState()
     {
         _context = ShortcutContext.None;
+        _detectedContext = ShortcutContext.None;
+        _nextContextRefreshAtUtc = DateTime.MinValue;
         _steamMenuPress.Reset();
         _steamQuickAccessPress.Reset();
         _inGameOverlayPress.Reset();

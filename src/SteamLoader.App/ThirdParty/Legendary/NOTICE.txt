@@ -1,0 +1,19 @@
+Legendary
+=========
+
+OmniLibrary can download Legendary 0.20.43 on demand from the official
+Heroic-Games-Launcher release. Legendary is not embedded in the Tools for Steam
+source tree or installer.
+
+Project: https://github.com/Heroic-Games-Launcher/legendary
+Release asset:
+https://github.com/Heroic-Games-Launcher/legendary/releases/download/0.20.43/legendary_windows_x86_64.exe
+Expected SHA-256:
+ec1ad2d19d44e07b2b0330191c300979f102c509f2a889708099f453c5188f20
+License: GNU General Public License v3.0
+License text and corresponding source:
+https://github.com/Heroic-Games-Launcher/legendary/tree/0.20.43
+
+Tools for Steam stores Legendary and its Epic session in the isolated
+data\omnilibrary directory. Disconnect Epic Account removes that session and
+the isolated browser profile without deleting installed game files.

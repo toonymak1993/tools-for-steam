@@ -100,6 +100,12 @@ public partial class MainWindow : Window
 
         Activate();
         Focus();
+        _refreshTimer.Start();
+
+        if (DataContext is MainWindowViewModel viewModel)
+        {
+            _ = viewModel.RefreshAsync();
+        }
     }
 
     public void CloseFromTray()
@@ -115,8 +121,15 @@ public partial class MainWindow : Window
 
     private void HideToTray()
     {
+        _refreshTimer.Stop();
         ShowInTaskbar = false;
         Hide();
+
+        if (DataContext is MainWindowViewModel viewModel &&
+            !viewModel.ShowStartupSplash)
+        {
+            viewModel.ReleaseSplashArtwork();
+        }
     }
 
     private async Task InitializeRuntimeAsync()
@@ -134,7 +147,10 @@ public partial class MainWindow : Window
             await viewModel.InitializeAsync();
         }
 
-        _refreshTimer.Start();
+        if (IsVisible)
+        {
+            _refreshTimer.Start();
+        }
     }
 
     private async Task CloseSplashPreviewAsync()

@@ -1,5 +1,4 @@
 using System.Text.Json;
-using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Discord;
 using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Processes;
@@ -14,16 +13,15 @@ public sealed class QuickAccessLiveStatePublisher
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan LoopInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ProcessesInterval = TimeSpan.FromMilliseconds(1500);
-    private static readonly TimeSpan AudioInterval = TimeSpan.FromMilliseconds(1500);
-    private static readonly TimeSpan StoreSyncInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan StoreSyncInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SmartHomeInterval = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan HandheldPerformanceInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan DiscordPresenceInterval = TimeSpan.FromSeconds(15);
 
     private readonly QuickAccessLiveUpdateHub _liveUpdateHub;
-    private readonly IAudioOutputDeviceService _audioOutputDeviceService;
     private readonly ProcessWindowService _processWindowService;
     private readonly StoreSyncService _storeSyncService;
+    private readonly Func<bool> _isStoreSyncEnabled;
     private readonly SmartHomeService _smartHomeService;
     private readonly Func<bool> _isSmartHomeEnabled;
     private readonly HandheldPerformanceService _handheldPerformanceService;
@@ -32,7 +30,6 @@ public sealed class QuickAccessLiveStatePublisher
     private readonly DiscordFriendPresenceTracker _discordPresenceTracker = new();
 
     private string _lastProcessesFingerprint = string.Empty;
-    private string _lastAudioDashboardFingerprint = string.Empty;
     private string _lastStoreSyncFingerprint = string.Empty;
     private string _lastSmartHomeFingerprint = string.Empty;
     private string _lastHandheldPerformanceFingerprint = string.Empty;
@@ -40,9 +37,9 @@ public sealed class QuickAccessLiveStatePublisher
 
     public QuickAccessLiveStatePublisher(
         QuickAccessLiveUpdateHub liveUpdateHub,
-        IAudioOutputDeviceService audioOutputDeviceService,
         ProcessWindowService processWindowService,
         StoreSyncService storeSyncService,
+        Func<bool> isStoreSyncEnabled,
         SmartHomeService smartHomeService,
         HandheldPerformanceService handheldPerformanceService,
         Func<bool> isSmartHomeEnabled,
@@ -50,9 +47,9 @@ public sealed class QuickAccessLiveStatePublisher
         Func<bool> isDiscordEnabled)
     {
         _liveUpdateHub = liveUpdateHub;
-        _audioOutputDeviceService = audioOutputDeviceService;
         _processWindowService = processWindowService;
         _storeSyncService = storeSyncService;
+        _isStoreSyncEnabled = isStoreSyncEnabled;
         _smartHomeService = smartHomeService;
         _handheldPerformanceService = handheldPerformanceService;
         _isSmartHomeEnabled = isSmartHomeEnabled;
@@ -65,7 +62,6 @@ public sealed class QuickAccessLiveStatePublisher
         using var discordPresenceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var discordPresenceTask = RunDiscordPresenceMonitorAsync(discordPresenceCts.Token);
         var nextProcessesAtUtc = DateTimeOffset.UtcNow;
-        var nextAudioAtUtc = DateTimeOffset.UtcNow;
         var nextStoreSyncAtUtc = DateTimeOffset.UtcNow;
         var nextSmartHomeAtUtc = DateTimeOffset.UtcNow;
         var nextHandheldPerformanceAtUtc = DateTimeOffset.UtcNow;
@@ -74,17 +70,20 @@ public sealed class QuickAccessLiveStatePublisher
             while (!cancellationToken.IsCancellationRequested)
             {
                 var now = DateTimeOffset.UtcNow;
+                if (!_liveUpdateHub.HasSubscribers)
+                {
+                    nextProcessesAtUtc = now;
+                    nextStoreSyncAtUtc = now;
+                    nextSmartHomeAtUtc = now;
+                    nextHandheldPerformanceAtUtc = now;
+                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                    continue;
+                }
 
                 if (now >= nextProcessesAtUtc)
                 {
                     await PublishProcessesStateIfChangedAsync(cancellationToken);
                     nextProcessesAtUtc = now.Add(ProcessesInterval);
-                }
-
-                if (now >= nextAudioAtUtc)
-                {
-                    await PublishAudioStateIfChangedAsync(cancellationToken);
-                    nextAudioAtUtc = now.Add(AudioInterval);
                 }
 
                 if (now >= nextStoreSyncAtUtc)
@@ -246,31 +245,14 @@ public sealed class QuickAccessLiveStatePublisher
         return Task.CompletedTask;
     }
 
-    private async Task PublishAudioStateIfChangedAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            var snapshot = await StaThread.RunAsync(
-                () => _audioOutputDeviceService.GetDashboardSnapshot(),
-                cancellationToken);
-
-            PublishIfChanged(
-                "audio.dashboard",
-                snapshot,
-                snapshot,
-                ref _lastAudioDashboardFingerprint);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-        }
-    }
-
     private void PublishStoreSyncStateIfChanged()
     {
+        if (!_isStoreSyncEnabled())
+        {
+            _lastStoreSyncFingerprint = string.Empty;
+            return;
+        }
+
         try
         {
             var snapshot = _storeSyncService.GetSnapshot();

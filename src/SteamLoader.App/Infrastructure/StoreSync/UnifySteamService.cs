@@ -1,9 +1,13 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
+using Microsoft.Win32;
 using SteamLoader.App.Models;
 
 namespace SteamLoader.App.Infrastructure.StoreSync;
@@ -18,32 +22,30 @@ internal sealed class UnifySteamService
     private const string EpicClientId = "34a02cf8f4414e29b15921876da36f9a";
     private const string EpicClientSecret = "daafbccc737745039dffe53d94fc76cf";
     private const string EpicRedirectPrefix = "https://www.epicgames.com/id/api/redirect";
+    private const string XboxPcGamePassCatalogId = "fdd9e2a7-0fee-49f6-ad69-4354098401ff";
+    private const string XboxCloudGamingCatalogId = "af206485-e87d-4624-9007-cb7f6d0cc42e";
+    private const string XboxCloudCatalogMarker = "__Cloud:XGPUWEB";
+    private const string XboxCatalogShapeVersion = "xbox-catalog-v2-console-cloud";
+    private const string GogCatalogShapeVersion = "gog-catalog-v1";
 
     private static readonly HttpClient HttpClient = new()
     {
         Timeout = TimeSpan.FromSeconds(20)
     };
 
-    private static readonly ConcurrentDictionary<string, string> GogArtworkCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, string> SteamGridDbPortraitCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object XboxInstalledCacheGate = new();
+    private static readonly Dictionary<string, XboxInstalledCacheState> XboxInstalledCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, (int MissingCount, DateTimeOffset FirstMissingAtUtc)>
+        XboxPendingUninstallMisses = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan XboxInstalledCacheLifetime = TimeSpan.FromSeconds(30);
+    private static DateTimeOffset XboxLastCompletedDownloadObservedUtc = DateTimeOffset.MinValue;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    private static readonly UnifySteamStoreDefinition[] Definitions =
-    [
-        new(
-            "epic-games",
-            "Epic Games",
-            "legendary",
-            "legendary.exe",
-            SupportsManualCodeAuth: true),
-        new(
-            "gog-galaxy",
-            "GOG",
-            "gogdl",
-            "gogdl.exe",
-            SupportsManualCodeAuth: true),
-    ];
+    private static IReadOnlyList<OmniLibraryStoreDescriptor> Definitions =>
+        OmniLibraryStoreRegistry.All;
 
     private readonly StoreSyncJournal _journal;
 
@@ -59,26 +61,69 @@ internal sealed class UnifySteamService
         var detectedTitles = storeSyncStores
             .SelectMany(store => store.DetectedTitles)
             .ToArray();
+        var downloadStatuses = UnifySteamDownloadStatusStore.GetAll();
+        Dictionary<string, UnifySteamGameCacheEntry>? installedXboxGames = null;
+        var xboxInstallPath =
+            configuration.UnifySteam.Stores.TryGetValue("xbox-game-pass", out var xboxStore)
+                ? xboxStore?.InstallPath
+                : null;
+        if (XboxInstallEventTracker.ReconcileStatusStore(
+                downloadStatuses,
+                productId =>
+                {
+                    installedXboxGames ??= LoadXboxInstalledGames(
+                        xboxInstallPath,
+                        forceRefresh: true);
+                    var catalogGame = xboxStore?.Cache?.Games?.FirstOrDefault(game =>
+                        game is not null &&
+                        string.Equals(
+                            game.Id,
+                            productId,
+                            StringComparison.OrdinalIgnoreCase)) ??
+                        new UnifySteamGameCacheEntry
+                        {
+                            Id = productId,
+                            Title = productId,
+                        };
+                    return TryResolveXboxInstalledGame(
+                        catalogGame,
+                        installedXboxGames,
+                        out _);
+                }))
+        {
+            downloadStatuses = UnifySteamDownloadStatusStore.GetAll();
+        }
 
         var stores = Definitions
-            .Select(definition => BuildStoreState(definition, configuration, detectedTitles))
+            .Select(definition => BuildStoreState(
+                definition,
+                configuration,
+                detectedTitles,
+                downloadStatuses))
+            .ToArray();
+        var enabledStores = stores
+            .Where(store => store.Enabled)
             .ToArray();
 
-        var lastRefreshedAtUtc = stores
+        var lastRefreshedAtUtc = enabledStores
             .Where(store => store.RefreshedAtUtc.HasValue)
             .Select(store => store.RefreshedAtUtc)
             .Max();
 
-        var readyCount = stores.Count(store => store.AuthReady || store.ToolDetected);
-        var totalAvailable = stores.Sum(store => store.AvailableCount);
-        var totalInstalled = stores.Sum(store => store.InstalledCount);
+        var readyCount = enabledStores.Count(store => store.AuthReady);
+        var totalAvailable = enabledStores.Sum(store => store.AvailableCount);
+        var totalInstalled = enabledStores.Sum(store => store.InstalledCount);
 
-        var statusText = readyCount > 0
-            ? "Ready"
-            : "Setup";
-        var detailText = totalAvailable > 0 || totalInstalled > 0
-            ? $"{totalInstalled} installed / {totalAvailable} in library across Epic and GOG."
-            : "Sign in and refresh a store to build your unified launcher library.";
+        var statusText = enabledStores.Length == 0
+            ? "Disabled"
+            : readyCount > 0
+                ? "Ready"
+                : "Setup";
+        var detailText = enabledStores.Length == 0
+            ? "Enable at least one store to add its library to Steam."
+            : totalAvailable > 0 || totalInstalled > 0
+                ? $"{totalInstalled} installed / {totalAvailable} titles across {enabledStores.Length} enabled store(s)."
+                : "Sign in to an enabled store, then sync its library into Steam.";
 
         return new UnifySteamSnapshot(
             statusText,
@@ -87,10 +132,18 @@ internal sealed class UnifySteamService
             stores);
     }
 
-    public void RefreshLibraries(StoreSyncConfiguration configuration, string? storeId = null, bool skipUnconfigured = false)
+    public UnifySteamRefreshBatchResult RefreshLibraries(
+        StoreSyncConfiguration configuration,
+        string? storeId = null,
+        bool skipUnconfigured = false,
+        bool lightweight = false,
+        bool quiet = false,
+        CancellationToken cancellationToken = default)
     {
+        var results = new List<UnifySteamStoreRefreshResult>();
         foreach (var definition in ResolveDefinitions(storeId))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
             if (!storeConfiguration.Enabled)
             {
@@ -102,11 +155,32 @@ internal sealed class UnifySteamService
                 continue;
             }
 
-            RefreshStore(definition, storeConfiguration);
+            var previousSteamAppIds = (storeConfiguration.Cache?.Games ?? [])
+                .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id) && game.SteamAppId != 0)
+                .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First().SteamAppId, StringComparer.OrdinalIgnoreCase);
+            var result = RefreshStore(definition, storeConfiguration, lightweight, quiet);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result.Succeeded)
+            {
+                PreserveSteamAppIds(storeConfiguration.Cache?.Games, previousSteamAppIds);
+            }
+            results.Add(result);
         }
+
+        return new UnifySteamRefreshBatchResult(results);
     }
 
-    private static bool IsStoreConfigured(UnifySteamStoreDefinition definition, UnifySteamStoreConfiguration storeConfiguration)
+    public IReadOnlyList<string> GetEnabledStoreIds(StoreSyncConfiguration configuration)
+    {
+        return Definitions
+            .Where(definition =>
+                GetStoreConfiguration(configuration, definition.Id).Enabled)
+            .Select(definition => definition.Id)
+            .ToArray();
+    }
+
+    private static bool IsStoreConfigured(OmniLibraryStoreDescriptor definition, UnifySteamStoreConfiguration storeConfiguration)
     {
         if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
         {
@@ -114,6 +188,11 @@ internal sealed class UnifySteamService
             return !string.IsNullOrWhiteSpace(ResolveToolPath(definition, storeConfiguration.ToolPath)) ||
                    !string.IsNullOrWhiteSpace(ResolveEpicLauncherPath()) ||
                    (!string.IsNullOrWhiteSpace(epicAuthPath) && File.Exists(epicAuthPath));
+        }
+
+        if (definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
+        {
+            return IsXboxAppInstalled() && IsXboxAppSignedIn();
         }
 
         var authPath = ResolveReadableGogAuthPath(storeConfiguration.AuthPath);
@@ -125,26 +204,35 @@ internal sealed class UnifySteamService
         var definition = ResolveDefinition(storeId);
         var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
 
-        if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
+        if (definition.Supports(OmniLibraryStoreCapabilities.ManagedWebSignIn))
         {
-            storeConfiguration.AuthPath = ResolveWritableEpicAuthPath(storeConfiguration.AuthPath);
-            OpenInDefaultBrowser(BuildEpicLoginUrl());
+            storeConfiguration.AuthPath = definition.Id switch
+            {
+                "epic-games" => ManagedLegendaryHelper.UserDataPath,
+                "gog-galaxy" => ManagedGogDlHelper.AuthPath,
+                _ => storeConfiguration.AuthPath,
+            };
             _journal.Append(
                 "info",
-                "unifysteam",
-                "Opened Epic login page in the browser.",
-                "Sign in there; the final page shows \"authorizationCode\". Copy it and paste it into the Login Code field.");
+                "omnilibrary",
+                $"Prepared secure {definition.Title} sign-in.",
+                $"Tools for Steam opens {definition.Title} in an isolated sign-in window and captures the authorization response automatically.");
             return;
         }
 
-        var authPath = ResolveWritableGogAuthPath(storeConfiguration.AuthPath);
-        storeConfiguration.AuthPath = authPath;
-        OpenInDefaultBrowser(BuildGogAuthUrl());
-        _journal.Append(
-            "info",
-            "unifysteam",
-            "Opened GOG login page in the browser.",
-            "Sign in there, then copy the final page URL (it contains code=...) and paste it into the Login Code field.");
+        if (definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
+        {
+            OpenInDefaultBrowser("msxbox://signIn/");
+            _journal.Append(
+                "info",
+                "omnilibrary",
+                "Opened Xbox sign-in.",
+                "Sign in with the Windows account that owns Game Pass, then choose Sync Xbox Library in OmniLibrary.");
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"The {definition.Title} sign-in flow is not implemented.");
     }
 
     private static void OpenInDefaultBrowser(string url)
@@ -156,11 +244,13 @@ internal sealed class UnifySteamService
         })?.Dispose();
     }
 
-    private static string BuildEpicLoginUrl()
+    internal static string BuildEpicLoginUrl()
     {
         var redirect = $"{EpicRedirectPrefix}?clientId={EpicClientId}&responseType=code";
         return $"https://www.epicgames.com/id/login?redirectUrl={Uri.EscapeDataString(redirect)}";
     }
+
+    internal static string BuildGogLoginUrl() => BuildGogAuthUrl();
 
     public void CompleteManualCodeAuth(StoreSyncConfiguration configuration, string storeId, string value)
     {
@@ -179,30 +269,43 @@ internal sealed class UnifySteamService
 
         if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
         {
-            var epicAuthPath = ResolveWritableEpicAuthPath(storeConfiguration.AuthPath);
-            var epicToken = ExchangeEpicAuthorizationCode(authCode);
-            SaveEpicCredentials(epicAuthPath, epicToken);
-            storeConfiguration.AuthPath = epicAuthPath;
-            _journal.Append("info", "unifysteam", "Saved Epic sign-in.", $"Auth data was stored at {epicAuthPath}.");
+            var toolPath = ManagedLegendaryHelper.Authenticate(authCode);
+
+            storeConfiguration.ToolPath = toolPath;
+            storeConfiguration.AuthPath = ManagedLegendaryHelper.UserDataPath;
+            _journal.Append(
+                "info",
+                "omnilibrary",
+                "Saved Epic sign-in.",
+                "Legendary stores the Epic session in OmniLibrary's isolated data folder.");
             return;
         }
 
-        var authPath = ResolveWritableGogAuthPath(storeConfiguration.AuthPath);
-        var token = ExchangeGogAuthorizationCode(authCode);
-        SaveGogCredentials(authPath, token);
-        storeConfiguration.AuthPath = authPath;
-        _journal.Append("info", "unifysteam", "Saved GOG sign-in.", $"Auth data was stored at {authPath}.");
+        if (definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase))
+        {
+            var toolPath = ManagedGogDlHelper.Authenticate(authCode);
+            storeConfiguration.ToolPath = toolPath;
+            storeConfiguration.AuthPath = ManagedGogDlHelper.AuthPath;
+            _journal.Append(
+                "info",
+                "omnilibrary",
+                "Saved GOG sign-in.",
+                "gogdl stores the GOG session in OmniLibrary's isolated data folder.");
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"The {definition.Title} manual sign-in flow is not implemented.");
     }
 
     private UnifySteamStoreState BuildStoreState(
-        UnifySteamStoreDefinition definition,
+        OmniLibraryStoreDescriptor definition,
         StoreSyncConfiguration configuration,
-        IReadOnlyList<StoreSyncDetectedTitleState> detectedTitles)
+        IReadOnlyList<StoreSyncDetectedTitleState> detectedTitles,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
     {
         var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
-        var effectiveToolPath = !string.IsNullOrWhiteSpace(storeConfiguration.ToolPath)
-            ? storeConfiguration.ToolPath
-            : ResolveToolPath(definition, storeConfiguration.ToolPath);
+        var effectiveToolPath = ResolveToolPath(definition, storeConfiguration.ToolPath);
         var effectiveEpicLauncherPath = definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
             ? ResolveEpicLauncherPath()
             : string.Empty;
@@ -223,23 +326,90 @@ internal sealed class UnifySteamService
             .Where(title => string.Equals(title.StoreId, definition.Id, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
-        var games = cache.Games
-            .Select(game => ToGameState(definition, game, detectedByStore))
+        var effectiveDownloadStatuses = downloadStatuses;
+        var cachedGames = cache.Games.AsEnumerable();
+        if (definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
+        {
+            var forceInstalledRefresh = ShouldRefreshXboxInstallState(
+                cache.Games,
+                downloadStatuses);
+            var installedXboxGames = LoadXboxInstalledGames(
+                storeConfiguration.InstallPath,
+                forceInstalledRefresh);
+            if (ReconcileXboxInstalledDownloadStatuses(
+                    cache.Games,
+                    installedXboxGames,
+                    effectiveDownloadStatuses))
+            {
+                effectiveDownloadStatuses = UnifySteamDownloadStatusStore.GetAll();
+            }
+
+            cachedGames = cache.Games
+                .Where(game => game is not null)
+                .Select(game => MergeXboxInstallState(
+                    game,
+                    installedXboxGames,
+                    UnifySteamDownloadStatusStore.Get(
+                        effectiveDownloadStatuses,
+                        definition.Id,
+                        game.Id)));
+        }
+        else if (definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase))
+        {
+            cachedGames = cache.Games
+                .Where(game => game is not null)
+                .Select(game => MergeGogInstallState(
+                    game,
+                    storeConfiguration.InstallPath,
+                    UnifySteamDownloadStatusStore.Get(
+                        effectiveDownloadStatuses,
+                        definition.Id,
+                        game.Id)));
+        }
+
+        var games = cachedGames
+            .Select(game => ToGameState(
+                definition,
+                game,
+                detectedByStore,
+                effectiveDownloadStatuses))
             .OrderByDescending(game => game.Installed)
             .ThenBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
         var installedCount = games.Count(game => game.Installed);
         var availableCount = games.Length;
+        var xboxAppInstalled = definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) && IsXboxAppInstalled();
+        var xboxSignedIn = xboxAppInstalled && IsXboxAppSignedIn();
         var toolDetected = definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
             ? !string.IsNullOrWhiteSpace(effectiveToolPath) || !string.IsNullOrWhiteSpace(effectiveEpicLauncherPath)
-            : !string.IsNullOrWhiteSpace(effectiveToolPath);
+            : definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+                ? xboxAppInstalled || !string.IsNullOrWhiteSpace(effectiveToolPath)
+                : !string.IsNullOrWhiteSpace(effectiveToolPath);
         var authConfigured = definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
             ? !string.IsNullOrWhiteSpace(effectiveAuthPath)
             : definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
                 ? !string.IsNullOrWhiteSpace(effectiveAuthPath) || toolDetected
-                : toolDetected;
-        var authReady = !string.IsNullOrWhiteSpace(cache.AccountName);
+                : definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+                    ? xboxSignedIn
+                    : toolDetected;
+        var authReady = definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+            ? xboxSignedIn
+            : !string.IsNullOrWhiteSpace(cache.AccountName);
+        var canRefresh = storeConfiguration.Enabled && authReady;
+        var steamSessionStartedAtUtc = GetSteamSessionStartedAtUtc();
+        var readiness = OmniLibraryLifecycle.Evaluate(
+            storeConfiguration,
+            authConfigured,
+            authReady,
+            games.Length,
+            games.Length > 0 && games.All(game => game.SteamAppId != 0),
+            ComputePreparedCatalogSignature(storeConfiguration),
+            cacheLastError,
+            steamSessionStartedAtUtc);
+        var preparationComplete = readiness.CurrentShortcutCatalogReady;
+        var readyForLibraryTab = readiness.ReadyForLibraryTab;
+        var steamRestartRequired = readiness.SteamRestartRequired;
 
         var statusText = !storeConfiguration.Enabled
             ? "Disabled"
@@ -253,6 +423,8 @@ internal sealed class UnifySteamService
                         ? authConfigured
                             ? "Login required"
                             : "Setup required"
+                        : !authReady && definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+                            ? xboxAppInstalled ? "Sign-in required" : "Xbox app required"
                         : availableCount > 0
                             ? "Ready"
                             : "Not loaded";
@@ -263,17 +435,46 @@ internal sealed class UnifySteamService
                 ? authConfigured
                     ? !string.IsNullOrWhiteSpace(cache.DetailText)
                         ? cache.DetailText
-                        : "Sign in with Epic, paste the login code, then refresh the library."
-                    : "Sign in with Epic or install Epic Games Launcher, Heroic, or legendary, then refresh Storefront."
+                        : "Sign in with Epic. OmniLibrary completes the connection and refreshes the library automatically."
+                    : "Sign in with Epic or install Epic Games Launcher, Heroic, or legendary, then refresh OmniLibrary."
                 : !authReady && definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
                     ? authConfigured
                         ? "Sign in with GOG, then refresh the library."
                         : "Sign in with GOG or refresh after Heroic has saved GOG auth data."
+                    : !authReady && definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+                        ? xboxAppInstalled
+                            ? "Sign in inside the official Xbox app, then sync the Xbox library."
+                            : "Install the Xbox app, sign in there, and sync the PC Game Pass catalog."
                     : !string.IsNullOrWhiteSpace(cache.DetailText)
                         ? cache.DetailText
                         : availableCount > 0
                             ? $"{installedCount} installed / {availableCount} total."
                             : "Refresh this store to build the library snapshot.";
+        if (storeConfiguration.Enabled && authReady && availableCount > 0 && string.IsNullOrWhiteSpace(cacheLastError))
+        {
+            if (!preparationComplete)
+            {
+                var preparationFailed = storeConfiguration.PreparationStatus.Equals(
+                    "failed",
+                    StringComparison.OrdinalIgnoreCase);
+                statusText = preparationFailed ? "Preparation failed" : "Preparing";
+                detailText = !string.IsNullOrWhiteSpace(storeConfiguration.PreparationDetail)
+                    ? storeConfiguration.PreparationDetail
+                    : "OmniLibrary is preparing Steam shortcuts in the background. Artwork continues independently.";
+            }
+            else if (steamRestartRequired)
+            {
+                statusText = "Restart required";
+                detailText = "Preparation is complete. Restart Steam once to activate the fully populated store tab.";
+            }
+            else if (readyForLibraryTab)
+            {
+                statusText = "Ready";
+                detailText = string.IsNullOrWhiteSpace(cache.DetailText)
+                    ? $"{installedCount} installed / {availableCount} total."
+                    : cache.DetailText;
+            }
+        }
 
         return new UnifySteamStoreState(
             definition.Id,
@@ -282,21 +483,498 @@ internal sealed class UnifySteamService
             toolDetected,
             authConfigured,
             authReady,
-            CanRefresh: storeConfiguration.Enabled && (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase) ? authConfigured : authConfigured),
+            canRefresh,
+            readyForLibraryTab,
+            steamRestartRequired,
+            storeConfiguration.PreparationStatus,
+            storeConfiguration.PreparationDetail,
+            Math.Max(0, storeConfiguration.PreparationCompletedCount),
+            Math.Max(0, storeConfiguration.PreparationTotalCount),
             definition.SupportsManualCodeAuth,
+            definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
+            storeConfiguration.IncludeXboxPcGamePass,
+            definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
+            storeConfiguration.IncludeXboxCloudGaming,
             statusText,
             detailText,
             cache.AccountName,
+            storeConfiguration.InstallPath,
             cache.RefreshedAtUtc,
             installedCount,
             availableCount,
-            games);
+            games)
+        {
+            Lifecycle = readiness.Lifecycle,
+            Capabilities = OmniLibraryStoreRegistry.GetCapabilityIds(definition),
+            LibraryTabs = OmniLibraryStoreRegistry.BuildLibraryTabSummaries(definition),
+            DownloadWorkers = Math.Clamp(storeConfiguration.DownloadWorkers, 1, 32),
+            DownloadTimeoutSeconds = Math.Clamp(
+                storeConfiguration.DownloadTimeoutSeconds,
+                15,
+                300),
+            GogDlcEnabled =
+                !definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) ||
+                storeConfiguration.IncludeGogDlc,
+            GogGalaxyLaunchEnabled =
+                definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) &&
+                storeConfiguration.PreferGogGalaxyForLaunch,
+        };
+    }
+
+    internal static string ComputePreparedCatalogSignature(UnifySteamStoreConfiguration storeConfiguration)
+    {
+        var games = storeConfiguration.Cache?.Games?
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .OrderBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(game => $"{game.Id.Trim().ToLowerInvariant()}\t{game.SteamAppId}")
+            .ToArray() ?? [];
+        if (games.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', games))));
+    }
+
+    internal static string GetRemoteCatalogSignature(UnifySteamStoreConfiguration storeConfiguration)
+    {
+        return string.IsNullOrWhiteSpace(storeConfiguration.RemoteCatalogSignature)
+            ? ComputeLibraryCatalogSignature(storeConfiguration.Cache?.Games?.Select(game => game.Id) ?? [])
+            : storeConfiguration.RemoteCatalogSignature;
+    }
+
+    internal static string ComputeLibraryStateSignature(UnifySteamStoreConfiguration storeConfiguration)
+    {
+        var cache = storeConfiguration.Cache ?? new UnifySteamLibraryCache();
+        var games = cache.Games
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .OrderBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(game => string.Join(
+                '\t',
+                game.Id.Trim().ToLowerInvariant(),
+                game.Title.Trim(),
+                game.Installed,
+                game.CloudPlayable,
+                game.InstallPath.Trim(),
+                game.ExecutablePath.Trim(),
+                game.Version.Trim(),
+                game.DeliveryProvider.Trim(),
+                game.ThirdPartyManagedApp.Trim(),
+                game.PartnerLinkType.Trim(),
+                game.PartnerLinkId.Trim(),
+                game.ProviderGameId.Trim(),
+                game.RegistryPath.Trim(),
+                game.RegistryValueName.Trim(),
+                game.ProcessNames.Trim(),
+                game.HasInstallableAsset,
+                game.RequiresAccountLink,
+                game.RequiresExternalLauncher,
+                game.RequiresEpicLauncherBridge,
+                game.SupportsCloudSaves,
+                game.IsPreloaded,
+                game.LatestVersion.Trim(),
+                game.PreparationSignature.Trim(),
+                game.ImageUrl.Trim(),
+                game.SteamAppId))
+            .ToArray();
+        var state = string.Join(
+            '\n',
+            storeConfiguration.RemoteCatalogSignature,
+            cache.AccountName,
+            cache.StatusText,
+            cache.DetailText,
+            cache.LastError,
+            string.Join('\n', games));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(state)));
+    }
+
+    private static string ComputeLibraryCatalogSignature(IEnumerable<UnifySteamGameCacheEntry> games)
+    {
+        return ComputeLibraryCatalogSignature(games.Select(game => game.Id));
+    }
+
+    private static string ComputeLibraryCatalogSignature(IEnumerable<string?> gameIds)
+    {
+        var normalizedIds = gameIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id!.Trim().ToLowerInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return normalizedIds.Length == 0
+            ? string.Empty
+            : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', normalizedIds))));
+    }
+
+    private static void PreserveSteamAppIds(
+        IEnumerable<UnifySteamGameCacheEntry>? games,
+        IReadOnlyDictionary<string, uint> previousSteamAppIds)
+    {
+        if (games is null || previousSteamAppIds.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var game in games)
+        {
+            if (game is not null &&
+                game.SteamAppId == 0 &&
+                previousSteamAppIds.TryGetValue(game.Id, out var steamAppId))
+            {
+                game.SteamAppId = steamAppId;
+            }
+        }
+    }
+
+    private static DateTimeOffset? GetSteamSessionStartedAtUtc()
+    {
+        DateTimeOffset? earliestStart = null;
+        foreach (var process in Process.GetProcessesByName("steam"))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.HasExited)
+                    {
+                        continue;
+                    }
+
+                    var startedAt = new DateTimeOffset(process.StartTime.ToUniversalTime(), TimeSpan.Zero);
+                    if (!earliestStart.HasValue || startedAt < earliestStart.Value)
+                    {
+                        earliestStart = startedAt;
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return earliestStart;
+    }
+
+    private static UnifySteamGameCacheEntry MergeXboxInstallState(
+        UnifySteamGameCacheEntry game,
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedGames,
+        UnifySteamDownloadStatus downloadStatus)
+    {
+        TryResolveXboxInstalledGame(game, installedGames, out var installed);
+        var downloadActive =
+            UnifySteamDownloadStatusStore.IsActivelyTransferring(downloadStatus.Status) ||
+            downloadStatus.Status == "paused";
+        var uninstallPending =
+            downloadStatus.Status.Equals(
+                "uninstall-action-required",
+                StringComparison.OrdinalIgnoreCase);
+        var scannerReportsInstalled = installed?.Installed == true;
+        var removalConfirmed = ConfirmXboxRemoval(
+            game.Id,
+            scannerReportsInstalled,
+            uninstallPending);
+        var installationReady =
+            scannerReportsInstalled ||
+            (!downloadActive &&
+             uninstallPending &&
+             !removalConfirmed &&
+             game.Installed);
+        return new UnifySteamGameCacheEntry
+        {
+            Id = game.Id,
+            Title = game.Title,
+            Installed = installationReady,
+            CloudPlayable = game.CloudPlayable,
+            InstallPath = installationReady ? installed?.InstallPath ?? string.Empty : string.Empty,
+            ExecutablePath = installationReady ? installed?.ExecutablePath ?? string.Empty : string.Empty,
+            Version = installationReady ? installed?.Version ?? string.Empty : string.Empty,
+            ImageUrl = game.ImageUrl,
+            HeroImageUrl = game.HeroImageUrl,
+            SteamAppId = game.SteamAppId,
+            DeliveryProvider = game.DeliveryProvider,
+            ThirdPartyManagedApp = game.ThirdPartyManagedApp,
+            PartnerLinkType = game.PartnerLinkType,
+            PartnerLinkId = game.PartnerLinkId,
+            ProviderGameId = installationReady
+                ? installed?.Id ?? game.ProviderGameId
+                : game.ProviderGameId,
+            RegistryPath = game.RegistryPath,
+            RegistryValueName = game.RegistryValueName,
+            ProcessNames = game.ProcessNames,
+            HasInstallableAsset = game.HasInstallableAsset,
+            RequiresAccountLink = game.RequiresAccountLink,
+            RequiresExternalLauncher = game.RequiresExternalLauncher,
+            RequiresEpicLauncherBridge = game.RequiresEpicLauncherBridge,
+            SupportsCloudSaves = game.SupportsCloudSaves,
+            IsPreloaded = game.IsPreloaded,
+            LatestVersion = game.LatestVersion,
+            PreparationSignature = game.PreparationSignature,
+        };
+    }
+
+    private static bool ReconcileXboxInstalledDownloadStatuses(
+        IReadOnlyList<UnifySteamGameCacheEntry> catalogGames,
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedGames,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
+    {
+        var changed = false;
+        foreach (var game in catalogGames.Where(game =>
+                     game is not null &&
+                     !string.IsNullOrWhiteSpace(game.Id)))
+        {
+            var status = UnifySteamDownloadStatusStore.Get(
+                downloadStatuses,
+                "xbox-game-pass",
+                game.Id);
+            var canComplete =
+                UnifySteamDownloadStatusStore.IsActivelyTransferring(status.Status) ||
+                status.Status is "paused" or "action-required" or "failed";
+            if (!canComplete ||
+                !TryResolveXboxInstalledGame(
+                    game,
+                    installedGames,
+                    out _))
+            {
+                continue;
+            }
+
+            UnifySteamDownloadStatusStore.Update(
+                "xbox-game-pass",
+                game.Id,
+                "completed",
+                100,
+                "Installed.",
+                workerProcessId: 0,
+                downloadedBytes: Math.Max(
+                    status.DownloadedBytes,
+                    status.TotalBytes),
+                totalBytes: status.TotalBytes,
+                attempt: status.Attempt);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static UnifySteamGameCacheEntry MergeGogInstallState(
+        UnifySteamGameCacheEntry game,
+        string configuredInstallRoot,
+        UnifySteamDownloadStatus downloadStatus)
+    {
+        var transaction = GogOperationJournal.Get(game.Id);
+        var operationRelevant =
+            transaction is not null ||
+            downloadStatus.Status is
+                "action-required" or
+                "uninstall-action-required" or
+                "uninstalling" or
+                "finalizing" or
+                "failed";
+        var probe = GogInstallStateTracker.Probe(
+            game.Id,
+            configuredInstallRoot,
+            game.InstallPath,
+            force: operationRelevant);
+        var transferActive =
+            UnifySteamDownloadStatusStore.IsActivelyTransferring(downloadStatus.Status) ||
+            downloadStatus.Status == "paused";
+        var installed = probe.Installed ||
+                        (!probe.Conclusive && game.Installed && !transferActive);
+        var installPath = installed
+            ? FirstNonEmpty(probe.InstallPath, game.InstallPath)
+            : string.Empty;
+        var executablePath = installed
+            ? FirstNonEmpty(probe.ExecutablePath, game.ExecutablePath)
+            : string.Empty;
+        return new UnifySteamGameCacheEntry
+        {
+            Id = game.Id,
+            Title = game.Title,
+            Installed = installed,
+            CloudPlayable = game.CloudPlayable,
+            InstallPath = installPath,
+            ExecutablePath = executablePath,
+            Version = installed
+                ? FirstNonEmpty(probe.BuildId, game.Version)
+                : string.Empty,
+            DeliveryProvider = game.DeliveryProvider,
+            ThirdPartyManagedApp = game.ThirdPartyManagedApp,
+            PartnerLinkType = game.PartnerLinkType,
+            PartnerLinkId = game.PartnerLinkId,
+            ProviderGameId = game.ProviderGameId,
+            RegistryPath = game.RegistryPath,
+            RegistryValueName = game.RegistryValueName,
+            ProcessNames = game.ProcessNames,
+            HasInstallableAsset = game.HasInstallableAsset,
+            RequiresAccountLink = game.RequiresAccountLink,
+            RequiresExternalLauncher = game.RequiresExternalLauncher,
+            RequiresEpicLauncherBridge = game.RequiresEpicLauncherBridge,
+            SupportsCloudSaves = game.SupportsCloudSaves,
+            IsPreloaded = game.IsPreloaded,
+            LatestVersion = game.LatestVersion,
+            PreparationSignature = game.PreparationSignature,
+            ImageUrl = game.ImageUrl,
+            HeroImageUrl = game.HeroImageUrl,
+            SteamAppId = game.SteamAppId,
+        };
+    }
+
+    internal static bool TryConfirmPendingXboxRemoval(
+        UnifySteamGameState game,
+        UnifySteamDownloadStatus downloadStatus)
+    {
+        if (!downloadStatus.Status.Equals(
+                "uninstall-action-required",
+                StringComparison.OrdinalIgnoreCase) ||
+            !TryProbeXboxGameInstallation(game, out var scannerReportsInstalled))
+        {
+            return false;
+        }
+
+        return ConfirmXboxRemoval(
+            game.Id,
+            scannerReportsInstalled,
+            uninstallPending: true);
+    }
+
+    internal static bool TryProbeXboxGameInstallation(
+        UnifySteamGameState game,
+        out bool installed)
+    {
+        installed = game.Installed;
+        if (!game.Installed)
+        {
+            installed = false;
+            return true;
+        }
+
+        var contentDirectory = game.InstallPath?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(contentDirectory))
+        {
+            // A previously installed catalog entry normally always has its
+            // Content path. Treat missing metadata as inconclusive instead of
+            // turning a temporary cache issue into a false uninstall.
+            return false;
+        }
+
+        if (!Directory.Exists(contentDirectory))
+        {
+            installed = false;
+            return true;
+        }
+
+        var configPath = new[]
+            {
+                Path.Combine(contentDirectory, "MicrosoftGame.Config"),
+                Path.Combine(contentDirectory, "MicrosoftGame.config"),
+            }
+            .FirstOrDefault(File.Exists);
+        if (string.IsNullOrWhiteSpace(configPath))
+        {
+            installed = false;
+            return true;
+        }
+
+        try
+        {
+            var document = XDocument.Load(configPath, LoadOptions.None);
+            var root = document.Root;
+            var storeId = root?.Elements().FirstOrDefault(element =>
+                element.Name.LocalName.Equals(
+                    "StoreId",
+                    StringComparison.OrdinalIgnoreCase))?.Value?.Trim() ?? string.Empty;
+            if (!string.Equals(storeId, game.Id, StringComparison.OrdinalIgnoreCase) &&
+                !XboxProductRelationStore.IsRelated(game.Id, storeId))
+            {
+                return false;
+            }
+
+            var identity = root?.Elements().FirstOrDefault(element =>
+                element.Name.LocalName.Equals(
+                    "Identity",
+                    StringComparison.OrdinalIgnoreCase));
+            var executable = root?.Descendants().FirstOrDefault(element =>
+                element.Name.LocalName.Equals(
+                    "Executable",
+                    StringComparison.OrdinalIgnoreCase));
+            var identityName = identity?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
+            var identityVersion = identity?.Attribute("Version")?.Value?.Trim() ?? string.Empty;
+            var executableName = executable?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
+            var executablePath = string.IsNullOrWhiteSpace(executableName)
+                ? game.ExecutablePath
+                : Path.Combine(contentDirectory, executableName);
+            installed = IsReadyXboxExecutable(
+                executablePath,
+                identityName,
+                identityVersion,
+                LoadRegisteredXboxPackageNames());
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (System.Xml.XmlException)
+        {
+            return false;
+        }
+    }
+
+    private static bool ConfirmXboxRemoval(
+        string productId,
+        bool scannerReportsInstalled,
+        bool uninstallPending)
+    {
+        var confirmed = false;
+        lock (XboxInstalledCacheGate)
+        {
+            if (!uninstallPending || scannerReportsInstalled)
+            {
+                XboxPendingUninstallMisses.Remove(productId);
+                return false;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            if (!XboxPendingUninstallMisses.TryGetValue(productId, out var observation))
+            {
+                XboxPendingUninstallMisses[productId] = (1, now);
+                return false;
+            }
+
+            observation = (observation.MissingCount + 1, observation.FirstMissingAtUtc);
+            confirmed =
+                observation.MissingCount >= 2 &&
+                now - observation.FirstMissingAtUtc >= TimeSpan.FromSeconds(1);
+            if (confirmed)
+            {
+                XboxPendingUninstallMisses.Remove(productId);
+                foreach (var cached in XboxInstalledCache.Values)
+                {
+                    cached.Games.Remove(productId);
+                }
+            }
+            else
+            {
+                XboxPendingUninstallMisses[productId] = observation;
+            }
+        }
+
+        if (confirmed)
+        {
+            UnifySteamDownloadStatusStore.Clear("xbox-game-pass", productId);
+        }
+        return confirmed;
     }
 
     private UnifySteamGameState ToGameState(
-        UnifySteamStoreDefinition definition,
+        OmniLibraryStoreDescriptor definition,
         UnifySteamGameCacheEntry game,
-        IReadOnlyList<StoreSyncDetectedTitleState> detectedTitles)
+        IReadOnlyList<StoreSyncDetectedTitleState> detectedTitles,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
     {
         var matchedDetectedTitle = detectedTitles.FirstOrDefault(title =>
         {
@@ -315,55 +993,175 @@ internal sealed class UnifySteamService
             return string.Equals(title.Title, game.Title, StringComparison.OrdinalIgnoreCase);
         });
 
-        var installed = definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
-            ? matchedDetectedTitle is not null || game.Installed
-            : game.Installed || matchedDetectedTitle is not null;
-        var syncedToSteam = matchedDetectedTitle is not null;
-        var executablePath = !string.IsNullOrWhiteSpace(game.ExecutablePath)
+        var externalRegistryIsAuthoritative =
+            definition.Id.Equals(
+                "epic-games",
+                StringComparison.OrdinalIgnoreCase) &&
+            game.RequiresExternalLauncher &&
+            !string.IsNullOrWhiteSpace(game.RegistryPath);
+        var externalInstallPath = string.Empty;
+        var externalInstalled = externalRegistryIsAuthoritative &&
+                                TryReadEpicExternalInstallPath(
+                                    game.RegistryPath,
+                                    game.RegistryValueName,
+                                    out externalInstallPath);
+        var installed = externalRegistryIsAuthoritative
+            ? externalInstalled
+            : definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
+                ? game.Installed
+                : game.Installed || matchedDetectedTitle is not null;
+        var syncedToSteam = game.SteamAppId != 0 || matchedDetectedTitle is not null;
+        var executablePath = externalInstalled &&
+                             !string.Equals(
+                                 externalInstallPath,
+                                 game.InstallPath,
+                                 StringComparison.OrdinalIgnoreCase)
+            ? FindEpicExternalExecutable(externalInstallPath, game.ProcessNames)
+            : !string.IsNullOrWhiteSpace(game.ExecutablePath)
             ? game.ExecutablePath
             : matchedDetectedTitle?.ExecutablePath ?? string.Empty;
-        var installPath = !string.IsNullOrWhiteSpace(game.InstallPath)
+        var installPath = externalInstalled
+            ? externalInstallPath
+            : !string.IsNullOrWhiteSpace(game.InstallPath)
             ? game.InstallPath
             : matchedDetectedTitle?.StartDirectory ?? string.Empty;
-        var statusText = !installed
-            ? "Available"
+        var updateAvailable =
+            installed &&
+            !string.IsNullOrWhiteSpace(game.LatestVersion) &&
+            !string.IsNullOrWhiteSpace(game.Version) &&
+            !string.Equals(
+                game.LatestVersion,
+                game.Version,
+                StringComparison.OrdinalIgnoreCase);
+        var providerDisplayName = GetEpicProviderDisplayName(game.DeliveryProvider);
+        var statusText = game.IsPreloaded
+            ? "Preloaded"
+            : updateAvailable
+                ? "Update available"
+            : !installed
+            ? game.RequiresExternalLauncher
+                ? $"Available via {providerDisplayName}"
+                : "Available"
             : syncedToSteam
                 ? "Installed + Synced"
                 : "Installed";
-        var detailText = !installed
-            ? "In your account library."
+        var detailText = game.IsPreloaded
+            ? "Game files are preloaded. Play becomes available after the store release unlock."
+            : !installed
+            ? game.RequiresExternalLauncher
+                ? $"Owned on Epic. Installation and account linking continue in {providerDisplayName}."
+                : "In your account library."
             : !string.IsNullOrWhiteSpace(installPath)
                 ? installPath
                 : "Installed locally.";
+        var downloadState = ToDownloadState(
+            definition.Id,
+            game.Id,
+            downloadStatuses);
+        if (externalRegistryIsAuthoritative &&
+            ((installed &&
+              downloadState.Status.Equals(
+                  "action-required",
+                  StringComparison.OrdinalIgnoreCase)) ||
+             (!installed &&
+              downloadState.Status.Equals(
+                  "uninstall-action-required",
+                  StringComparison.OrdinalIgnoreCase))))
+        {
+            UnifySteamDownloadStatusStore.Clear(definition.Id, game.Id);
+            downloadState = new UnifySteamDownloadState(
+                "idle",
+                0,
+                string.Empty,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0);
+        }
 
         return new UnifySteamGameState(
             game.Id,
             game.Title,
             installed,
+            game.CloudPlayable,
             syncedToSteam,
             statusText,
             detailText,
             NormalizeImageUrl(game.ImageUrl),
             installPath,
             executablePath,
-            game.Version);
+            game.Version,
+            game.SteamAppId,
+            downloadState)
+        {
+            DeliveryProvider = game.DeliveryProvider,
+            ProviderDisplayName = providerDisplayName,
+            RequiresAccountLink = game.RequiresAccountLink,
+            RequiresExternalLauncher = game.RequiresExternalLauncher,
+            CanInstallDirectly =
+                string.IsNullOrWhiteSpace(game.DeliveryProvider) ||
+                game.HasInstallableAsset,
+            SupportsCloudSaves = game.SupportsCloudSaves,
+            IsPreloaded = game.IsPreloaded,
+            UpdateAvailable = updateAvailable,
+        };
     }
 
-    private void RefreshStore(UnifySteamStoreDefinition definition, UnifySteamStoreConfiguration storeConfiguration)
+    private static UnifySteamDownloadState ToDownloadState(
+        string storeId,
+        string gameId,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
+    {
+        var download = UnifySteamDownloadStatusStore.Get(downloadStatuses, storeId, gameId);
+        return new UnifySteamDownloadState(
+            download.Status,
+            download.ProgressPercent,
+            download.DetailText,
+            download.DownloadedBytes,
+            download.TotalBytes,
+            download.DownloadBytesPerSecond,
+            download.DecompressedBytesPerSecond,
+            download.DiskWriteBytesPerSecond,
+            download.DiskReadBytesPerSecond,
+            download.Attempt);
+    }
+
+    private UnifySteamStoreRefreshResult RefreshStore(
+        OmniLibraryStoreDescriptor definition,
+        UnifySteamStoreConfiguration storeConfiguration,
+        bool lightweight,
+        bool quiet)
     {
         try
         {
             switch (definition.Id)
             {
                 case "epic-games":
-                    RefreshEpicStore(definition, storeConfiguration);
+                    RefreshEpicStore(definition, storeConfiguration, quiet);
                     break;
                 case "gog-galaxy":
-                    RefreshGogStore(storeConfiguration);
+                    RefreshGogStore(storeConfiguration, lightweight, quiet);
+                    break;
+                case "xbox-game-pass":
+                    RefreshXboxStore(storeConfiguration, lightweight, quiet);
                     break;
                 default:
-                    throw new InvalidOperationException("Unknown Storefront store.");
+                    throw new InvalidOperationException("Unknown OmniLibrary store.");
             }
+
+            var cache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
+            OmniLibraryLifecycle.SetStage(
+                storeConfiguration,
+                "authentication",
+                string.IsNullOrWhiteSpace(cache.AccountName) ? "required" : "ready");
+            OmniLibraryLifecycle.SetStage(
+                storeConfiguration,
+                "catalog",
+                cache.Games.Count > 0 ? "ready" : "empty");
+            return new UnifySteamStoreRefreshResult(definition.Id, true, string.Empty);
         }
         catch (Exception exception)
         {
@@ -372,30 +1170,91 @@ internal sealed class UnifySteamService
             storeConfiguration.Cache.StatusText = "Attention";
             storeConfiguration.Cache.DetailText = exception.Message.Trim();
             storeConfiguration.Cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+            OmniLibraryLifecycle.SetStage(
+                storeConfiguration,
+                "catalog",
+                storeConfiguration.Cache.Games.Count > 0 ? "degraded" : "failed",
+                exception.Message);
             _journal.Append("warning", "unifysteam", $"Failed to refresh {definition.Title}.", exception.Message);
+            return new UnifySteamStoreRefreshResult(definition.Id, false, exception.Message.Trim());
         }
     }
 
-    private void RefreshEpicStore(UnifySteamStoreDefinition definition, UnifySteamStoreConfiguration storeConfiguration)
+    private void RefreshEpicStore(
+        OmniLibraryStoreDescriptor definition,
+        UnifySteamStoreConfiguration storeConfiguration,
+        bool quiet)
     {
         var toolPath = ResolveToolPath(definition, storeConfiguration.ToolPath);
         var launcherInstalledGames = LoadEpicLauncherInstalledGames();
-        var authPath = ResolveReadableEpicAuthPath(storeConfiguration.AuthPath);
-        if (!string.IsNullOrWhiteSpace(authPath))
+        if (!string.IsNullOrWhiteSpace(toolPath))
         {
-            var credentials = EnsureEpicCredentials(authPath);
-            var epicInstalledMap = !string.IsNullOrWhiteSpace(toolPath)
-                ? MergeEpicInstalledGames(LoadEpicInstalledGames(toolPath), launcherInstalledGames)
-                : launcherInstalledGames;
-            var epicGames = LoadEpicAccountLibraryGames(credentials.AccessToken, epicInstalledMap);
-            var epicCache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
-            epicCache.AccountName = FirstNonEmpty(credentials.DisplayName, credentials.AccountId, "Epic Account");
-            epicCache.Games = epicGames;
-            epicCache.LastError = string.Empty;
-            epicCache.StatusText = "Ready";
-            epicCache.DetailText = $"Loaded {epicGames.Count} Epic title{(epicGames.Count == 1 ? string.Empty : "s")} for {epicCache.AccountName}.";
-            epicCache.RefreshedAtUtc = DateTimeOffset.UtcNow;
-            _journal.Append("info", "unifysteam", "Refreshed Epic library.", epicCache.DetailText);
+            storeConfiguration.ToolPath = toolPath;
+            storeConfiguration.AuthPath = ManagedLegendaryHelper.UserDataPath;
+            var installedMap = MergeEpicInstalledGames(
+                LoadEpicInstalledGames(toolPath),
+                launcherInstalledGames);
+            var status = LoadEpicStatus(toolPath);
+            var cache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
+
+            if (!status.Authenticated)
+            {
+                cache.AccountName = string.Empty;
+                cache.LastError = string.Empty;
+                cache.StatusText = "Login required";
+                cache.DetailText = installedMap.Count > 0
+                    ? "Installed titles were found locally, but Epic sign-in is still required for the full library."
+                    : "Choose Sign in to Epic. OmniLibrary will finish the secure sign-in and sync automatically.";
+                cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+                if (cache.Games.Count == 0 && installedMap.Count > 0)
+                {
+                    cache.Games = installedMap.Values
+                        .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    storeConfiguration.RemoteCatalogSignature = ComputeLibraryCatalogSignature(cache.Games);
+                }
+
+                if (!quiet)
+                {
+                    _journal.Append("info", "omnilibrary", "Epic refresh needs sign-in.", cache.DetailText);
+                }
+                return;
+            }
+
+            var games = LoadEpicLibraryGames(toolPath, installedMap);
+            PreserveEpicPreparationState(cache.Games, games);
+            cache.AccountName = status.AccountName;
+            cache.Games = games;
+            storeConfiguration.RemoteCatalogSignature = ComputeLibraryCatalogSignature(games);
+            cache.LastError = string.Empty;
+            cache.StatusText = "Ready";
+            cache.DetailText = $"Loaded {games.Count} Epic title{(games.Count == 1 ? string.Empty : "s")} for {status.AccountName}.";
+            cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+            if (!quiet)
+            {
+                _journal.Append("info", "omnilibrary", "Refreshed Epic library.", cache.DetailText);
+            }
+            return;
+        }
+
+        var legacyAuthPath = ResolveReadableEpicAuthPath(storeConfiguration.AuthPath);
+        if (!string.IsNullOrWhiteSpace(legacyAuthPath) &&
+            !legacyAuthPath.Equals(ManagedLegendaryHelper.UserDataPath, StringComparison.OrdinalIgnoreCase))
+        {
+            var credentials = EnsureEpicCredentials(legacyAuthPath);
+            var epicGames = LoadEpicAccountLibraryGames(credentials.AccessToken, launcherInstalledGames);
+            var legacyCache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
+            legacyCache.AccountName = FirstNonEmpty(credentials.DisplayName, credentials.AccountId, "Epic Account");
+            legacyCache.Games = epicGames;
+            storeConfiguration.RemoteCatalogSignature = ComputeLibraryCatalogSignature(epicGames);
+            legacyCache.LastError = string.Empty;
+            legacyCache.StatusText = "Ready";
+            legacyCache.DetailText = $"Loaded {epicGames.Count} Epic title{(epicGames.Count == 1 ? string.Empty : "s")} for {legacyCache.AccountName}.";
+            legacyCache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+            if (!quiet)
+            {
+                _journal.Append("info", "omnilibrary", "Refreshed legacy Epic library.", legacyCache.DetailText);
+            }
             return;
         }
 
@@ -404,7 +1263,7 @@ internal sealed class UnifySteamService
             var launcherPath = ResolveEpicLauncherPath();
             if (string.IsNullOrWhiteSpace(launcherPath))
             {
-                throw new InvalidOperationException("Epic Games Launcher or legendary was not found. Install Epic Games Launcher, Heroic, or legendary, then refresh Storefront.");
+                throw new InvalidOperationException("Epic Games Launcher or legendary was not found. Install Epic Games Launcher, Heroic, or legendary, then refresh OmniLibrary.");
             }
 
             var launcherCache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
@@ -412,51 +1271,51 @@ internal sealed class UnifySteamService
             launcherCache.Games = launcherInstalledGames.Values
                 .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+            storeConfiguration.RemoteCatalogSignature = ComputeLibraryCatalogSignature(launcherCache.Games);
             launcherCache.LastError = string.Empty;
             launcherCache.StatusText = "Ready";
             launcherCache.DetailText = launcherInstalledGames.Count > 0
                 ? $"Epic Games Launcher detected. Showing {launcherInstalledGames.Count} installed title{(launcherInstalledGames.Count == 1 ? string.Empty : "s")} from the local launcher manifest."
                 : "Epic Games Launcher detected. Use Epic Login, paste the code, then refresh to import the full account library.";
             launcherCache.RefreshedAtUtc = DateTimeOffset.UtcNow;
-            _journal.Append("info", "unifysteam", "Refreshed Epic launcher fallback.", launcherCache.DetailText);
-            return;
-        }
-
-        var installedMap = LoadEpicInstalledGames(toolPath);
-        var status = LoadEpicStatus(toolPath);
-        var cache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
-
-        if (!status.Authenticated)
-        {
-            cache.AccountName = string.Empty;
-            cache.LastError = string.Empty;
-            cache.StatusText = "Login required";
-            cache.DetailText = installedMap.Count > 0
-                ? "Installed titles were found locally, but Epic sign-in is still required for the full library."
-                : "Run Epic sign-in, then refresh the library.";
-            cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
-            if (cache.Games.Count == 0 && installedMap.Count > 0)
+            if (!quiet)
             {
-                cache.Games = installedMap.Values
-                    .OrderBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
+                _journal.Append("info", "unifysteam", "Refreshed Epic launcher fallback.", launcherCache.DetailText);
             }
-
-            _journal.Append("info", "unifysteam", "Epic refresh needs sign-in.", cache.DetailText);
             return;
         }
 
-        var games = LoadEpicLibraryGames(toolPath, installedMap);
-        cache.AccountName = status.AccountName;
-        cache.Games = games;
-        cache.LastError = string.Empty;
-        cache.StatusText = "Ready";
-        cache.DetailText = $"Loaded {games.Count} Epic title{(games.Count == 1 ? string.Empty : "s")} for {status.AccountName}.";
-        cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
-        _journal.Append("info", "unifysteam", "Refreshed Epic library.", cache.DetailText);
     }
 
-    private void RefreshGogStore(UnifySteamStoreConfiguration storeConfiguration)
+    private static void PreserveEpicPreparationState(
+        IReadOnlyList<UnifySteamGameCacheEntry>? previousGames,
+        IReadOnlyList<UnifySteamGameCacheEntry> currentGames)
+    {
+        if (previousGames is null || previousGames.Count == 0)
+        {
+            return;
+        }
+
+        var previousById = previousGames
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First(),
+                StringComparer.OrdinalIgnoreCase);
+        foreach (var game in currentGames)
+        {
+            if (previousById.TryGetValue(game.Id, out var previous))
+            {
+                game.PreparationSignature = previous.PreparationSignature;
+            }
+        }
+    }
+
+    private void RefreshGogStore(
+        UnifySteamStoreConfiguration storeConfiguration,
+        bool lightweight,
+        bool quiet)
     {
         var cache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
         var authPath = ResolveReadableGogAuthPath(storeConfiguration.AuthPath);
@@ -466,16 +1325,1519 @@ internal sealed class UnifySteamService
         }
 
         var credentials = EnsureGogCredentials(authPath);
-        var response = LoadGogLibrary(credentials.AccessToken);
+        ReconcileGogCachedInstallState(cache);
+        var installedGames = LoadGogInstalledGames(cache);
+        ApplyGogInstalledState(cache.Games, installedGames);
+        var ownedIds = LoadGogOwnedIds(credentials.AccessToken)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var remoteCatalogSignature = ComputeLibraryCatalogSignature(
+            new[] { GogCatalogShapeVersion }.Concat(ownedIds));
+        var previouslyProcessedIds = (storeConfiguration.RemoteCatalogItemIds ?? [])
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var currentOwnedIdSet = ownedIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var membershipFullyProcessed = previouslyProcessedIds.SetEquals(currentOwnedIdSet);
+        if (lightweight &&
+            !string.IsNullOrWhiteSpace(storeConfiguration.RemoteCatalogSignature) &&
+            string.Equals(
+                storeConfiguration.RemoteCatalogSignature,
+                remoteCatalogSignature,
+                StringComparison.OrdinalIgnoreCase) &&
+            membershipFullyProcessed)
+        {
+            RefreshGogInstalledBuildMetadataIfDue(
+                storeConfiguration,
+                authPath,
+                cache.Games,
+                force: false);
+            cache.LastError = string.Empty;
+            cache.StatusText = "Ready";
+            if (string.IsNullOrWhiteSpace(cache.DetailText))
+            {
+                cache.DetailText =
+                    $"Loaded {cache.Games.Count} GOG title{(cache.Games.Count == 1 ? string.Empty : "s")}.";
+            }
+            cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+            return;
+        }
+
+        var previousGames = cache.Games
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        GogLibraryResponse response;
+        IReadOnlyCollection<string> processedOwnedIds;
+        if (previouslyProcessedIds.Count > 0 && previousGames.Count > 0)
+        {
+            var addedIds = ownedIds
+                .Where(id => !previouslyProcessedIds.Contains(id))
+                .ToArray();
+            var removedIds = previouslyProcessedIds
+                .Where(id => !currentOwnedIdSet.Contains(id))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var retainedGames = previousGames.Values
+                .Where(game => !removedIds.Contains(game.Id))
+                .ToList();
+            var productDetails = new List<UnifySteamGameCacheEntry>();
+            var resolvedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (removedIds.Count > 0)
+            {
+                // A removed edition may have been the representative of several
+                // same-title products. Rebuild cheap product metadata for the remaining
+                // IDs, but keep existing artwork and never redownload the art set.
+                AppendGogProductDetails(
+                    ownedIds,
+                    productDetails,
+                    resolvedIds);
+                processedOwnedIds = resolvedIds;
+            }
+            else
+            {
+                AppendGogProductDetails(
+                    addedIds,
+                    productDetails,
+                    // The batched products response already contains a usable
+                    // portrait. Higher quality Steam/SteamGridDB artwork belongs
+                    // to the existing asynchronous artwork worker and must never
+                    // delay a catalog delta.
+                    resolvedIds);
+                processedOwnedIds = previouslyProcessedIds
+                    .Concat(resolvedIds)
+                    .Where(currentOwnedIdSet.Contains)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+            }
+
+            response = new GogLibraryResponse(
+                cache.AccountName,
+                MergeGogProductDetails(retainedGames, productDetails),
+                processedOwnedIds);
+        }
+        else
+        {
+            response = LoadGogLibrary(credentials.AccessToken, ownedIds);
+            processedOwnedIds = response.ProcessedOwnedIds;
+        }
+        ApplyGogInstalledState(response.Games, installedGames);
         cache.AccountName = string.IsNullOrWhiteSpace(response.AccountName)
             ? "GOG Account"
             : response.AccountName;
         cache.Games = response.Games;
+        RefreshGogInstalledBuildMetadataIfDue(
+            storeConfiguration,
+            authPath,
+            cache.Games,
+            force: !lightweight);
+        storeConfiguration.RemoteCatalogSignature = remoteCatalogSignature;
+        storeConfiguration.RemoteCatalogItemIds = processedOwnedIds
+            .Where(currentOwnedIdSet.Contains)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
         cache.LastError = string.Empty;
         cache.StatusText = "Ready";
-        cache.DetailText = $"Loaded {response.Games.Count} GOG title{(response.Games.Count == 1 ? string.Empty : "s")}.";
+        var pendingMetadataCount = Math.Max(
+            0,
+            ownedIds.Length - storeConfiguration.RemoteCatalogItemIds.Count);
+        cache.DetailText =
+            $"Loaded {response.Games.Count} GOG title{(response.Games.Count == 1 ? string.Empty : "s")}." +
+            (pendingMetadataCount > 0
+                ? $" Metadata for {pendingMetadataCount} product{(pendingMetadataCount == 1 ? string.Empty : "s")} will retry during the next background sync."
+                : string.Empty);
         cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
-        _journal.Append("info", "unifysteam", "Refreshed GOG library.", cache.DetailText);
+        if (!quiet)
+        {
+            _journal.Append("info", "unifysteam", "Refreshed GOG library.", cache.DetailText);
+        }
+    }
+
+    private static void ApplyGogInstalledState(
+        IEnumerable<UnifySteamGameCacheEntry> games,
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedGames)
+    {
+        var gamesArray = games
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .ToArray();
+        var installedByTitle = installedGames.Values
+            .Where(game => !string.IsNullOrWhiteSpace(game.Title))
+            .GroupBy(
+                game => NormalizeGameTitleKey(game.Title),
+                StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Take(2).ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+        foreach (var game in gamesArray)
+        {
+            var installed = installedGames.GetValueOrDefault(game.Id);
+            if (installed is null)
+            {
+                var normalizedTitle = NormalizeGameTitleKey(game.Title);
+                if (!string.IsNullOrWhiteSpace(normalizedTitle) &&
+                    installedByTitle.TryGetValue(normalizedTitle, out var titleMatches) &&
+                    titleMatches.Length == 1)
+                {
+                    installed = titleMatches[0];
+                }
+            }
+
+            if (installed is null)
+            {
+                continue;
+            }
+
+            game.Installed = true;
+            game.InstallPath = installed.InstallPath;
+            game.ExecutablePath = installed.ExecutablePath;
+            game.Version = installed.Version;
+        }
+    }
+
+    private static void RefreshGogInstalledBuildMetadataIfDue(
+        UnifySteamStoreConfiguration storeConfiguration,
+        string authPath,
+        IEnumerable<UnifySteamGameCacheEntry> games,
+        bool force)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!force &&
+            storeConfiguration.InstalledMetadataCheckedAtUtc.HasValue &&
+            now - storeConfiguration.InstalledMetadataCheckedAtUtc.Value <
+            TimeSpan.FromMinutes(30))
+        {
+            return;
+        }
+
+        var installedGames = games
+            .Where(game =>
+                game is not null &&
+                game.Installed &&
+                !string.IsNullOrWhiteSpace(game.Id))
+            .OrderBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (installedGames.Length == 0)
+        {
+            storeConfiguration.InstalledMetadataCheckedAtUtc = now;
+            return;
+        }
+
+        var gogdl = ManagedGogDlHelper.ResolveExistingToolPath(
+            storeConfiguration.ToolPath);
+        if (string.IsNullOrWhiteSpace(gogdl) ||
+            string.IsNullOrWhiteSpace(authPath) ||
+            !File.Exists(authPath))
+        {
+            return;
+        }
+
+        const int maximumChecksPerPass = 4;
+        var cursor = Math.Clamp(
+            storeConfiguration.InstalledMetadataCursor,
+            0,
+            Math.Max(0, installedGames.Length - 1));
+        var selectedGames = installedGames
+            .Skip(cursor)
+            .Concat(installedGames.Take(cursor))
+            .Take(Math.Min(maximumChecksPerPass, installedGames.Length))
+            .ToArray();
+        foreach (var game in selectedGames)
+        {
+            try
+            {
+                var arguments = new List<string>
+                {
+                    "--auth-config-path",
+                    authPath,
+                    "info",
+                    game.Id,
+                    "--platform",
+                    "windows",
+                };
+                arguments.Add(
+                    storeConfiguration.IncludeGogDlc
+                        ? "--with-dlcs"
+                        : "--skip-dlcs");
+                var result = RunTool(gogdl, arguments.ToArray());
+                if (result.ExitCode != 0 ||
+                    string.IsNullOrWhiteSpace(result.StandardOutput))
+                {
+                    continue;
+                }
+
+                using var document = JsonDocument.Parse(result.StandardOutput);
+                var buildId = GetJsonString(document.RootElement, "buildId");
+                if (!string.IsNullOrWhiteSpace(buildId))
+                {
+                    game.LatestVersion = buildId;
+                }
+            }
+            catch
+            {
+                // Update discovery is optional metadata. It must never turn a
+                // healthy cached library into an error or delay its next delta.
+            }
+        }
+
+        var nextCursor = installedGames.Length == 0
+            ? 0
+            : (cursor + selectedGames.Length) % installedGames.Length;
+        storeConfiguration.InstalledMetadataCursor = nextCursor;
+        storeConfiguration.InstalledMetadataCheckedAtUtc =
+            nextCursor == 0
+                ? now
+                : now - TimeSpan.FromMinutes(25);
+    }
+
+    private static void ReconcileGogCachedInstallState(UnifySteamLibraryCache cache)
+    {
+        foreach (var game in cache.Games.Where(game => game?.Installed == true))
+        {
+            var executableExists =
+                !string.IsNullOrWhiteSpace(game.ExecutablePath) &&
+                File.Exists(game.ExecutablePath);
+            var manifestExists =
+                !string.IsNullOrWhiteSpace(game.InstallPath) &&
+                File.Exists(Path.Combine(game.InstallPath, $"goggame-{game.Id}.info"));
+            if (executableExists || manifestExists)
+            {
+                continue;
+            }
+
+            game.Installed = false;
+            game.InstallPath = string.Empty;
+            game.ExecutablePath = string.Empty;
+            game.Version = string.Empty;
+        }
+    }
+
+    private static Dictionary<string, UnifySteamGameCacheEntry> LoadGogInstalledGames(
+        UnifySteamLibraryCache cache)
+    {
+        var installed = cache.Games
+            .Where(game =>
+                game is not null &&
+                game.Installed &&
+                !string.IsNullOrWhiteSpace(game.Id) &&
+                ((!string.IsNullOrWhiteSpace(game.ExecutablePath) &&
+                  File.Exists(game.ExecutablePath)) ||
+                 (!string.IsNullOrWhiteSpace(game.InstallPath) &&
+                  File.Exists(Path.Combine(game.InstallPath, $"goggame-{game.Id}.info")))))
+            .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var hive in new[]
+                 {
+                     RegistryHive.CurrentUser,
+                     RegistryHive.LocalMachine,
+                 })
+        {
+            foreach (var view in new[]
+                     {
+                         RegistryView.Registry64,
+                         RegistryView.Registry32,
+                     })
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                    using var root = baseKey.OpenSubKey(@"SOFTWARE\GOG.com\Games");
+                    if (root is null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var subKeyName in root.GetSubKeyNames())
+                    {
+                        using var gameKey = root.OpenSubKey(subKeyName);
+                        if (gameKey is null)
+                        {
+                            continue;
+                        }
+
+                        var gameId = FirstNonEmpty(
+                            gameKey.GetValue("gameID")?.ToString(),
+                            gameKey.GetValue("gameId")?.ToString(),
+                            gameKey.GetValue("productID")?.ToString(),
+                            gameKey.GetValue("productId")?.ToString(),
+                            subKeyName);
+                        var installPath = NormalizePath(FirstNonEmpty(
+                            gameKey.GetValue("path")?.ToString(),
+                            gameKey.GetValue("PATH")?.ToString(),
+                            gameKey.GetValue("InstallLocation")?.ToString()));
+                        if (string.IsNullOrWhiteSpace(gameId) ||
+                            string.IsNullOrWhiteSpace(installPath) ||
+                            !Directory.Exists(installPath))
+                        {
+                            continue;
+                        }
+
+                        var executablePath = ResolveGogManifestExecutable(
+                            installPath,
+                            gameId);
+                        if (string.IsNullOrWhiteSpace(executablePath))
+                        {
+                            executablePath = ResolveExecutablePath(
+                                installPath,
+                                FirstNonEmpty(
+                                    gameKey.GetValue("exe")?.ToString(),
+                                    gameKey.GetValue("gameExe")?.ToString(),
+                                    gameKey.GetValue("launchCommand")?.ToString()));
+                        }
+
+                        var manifestExists = File.Exists(
+                            Path.Combine(installPath, $"goggame-{gameId}.info"));
+                        if (!manifestExists &&
+                            (string.IsNullOrWhiteSpace(executablePath) ||
+                             !File.Exists(executablePath)))
+                        {
+                            continue;
+                        }
+
+                        installed[gameId] = new UnifySteamGameCacheEntry
+                        {
+                            Id = gameId,
+                            Title = FirstNonEmpty(
+                                gameKey.GetValue("gameName")?.ToString(),
+                                gameKey.GetValue("GAMENAME")?.ToString(),
+                                gameKey.GetValue("DisplayName")?.ToString(),
+                                gameId),
+                            Installed = true,
+                            InstallPath = installPath,
+                            ExecutablePath = executablePath,
+                            Version = FirstNonEmpty(
+                                ReadGogManifestBuildId(installPath, gameId),
+                                gameKey.GetValue("buildId")?.ToString(),
+                                gameKey.GetValue("version")?.ToString()),
+                        };
+                    }
+                }
+                catch
+                {
+                    // GOG's registry data is optional. Managed gogdl installs
+                    // remain authoritative when a view is unavailable.
+                }
+            }
+        }
+
+        return installed;
+    }
+
+    private static string ReadGogManifestBuildId(
+        string installPath,
+        string gameId)
+    {
+        try
+        {
+            foreach (var path in new[]
+                     {
+                         ManagedGogDlHelper.GetInstalledManifestPath(gameId),
+                         Path.Combine(installPath, $"goggame-{gameId}.info"),
+                     })
+            {
+                if (!File.Exists(path))
+                {
+                    continue;
+                }
+
+                using var document = JsonDocument.Parse(File.ReadAllText(path));
+                var buildId = FirstNonEmpty(
+                    GetJsonString(document.RootElement, "buildId"),
+                    GetJsonString(document.RootElement, "build_id"));
+                if (!string.IsNullOrWhiteSpace(buildId))
+                {
+                    return buildId;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return string.Empty;
+    }
+
+    private static string ResolveGogManifestExecutable(string installPath, string gameId)
+    {
+        try
+        {
+            var manifestPath = Path.Combine(installPath, $"goggame-{gameId}.info");
+            if (!File.Exists(manifestPath))
+            {
+                return string.Empty;
+            }
+
+            using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+            if (!document.RootElement.TryGetProperty("playTasks", out var tasks) ||
+                tasks.ValueKind != JsonValueKind.Array)
+            {
+                return string.Empty;
+            }
+
+            JsonElement? fallbackTask = null;
+            foreach (var task in tasks.EnumerateArray())
+            {
+                if (task.ValueKind != JsonValueKind.Object ||
+                    !task.TryGetProperty("path", out var pathNode) ||
+                    string.IsNullOrWhiteSpace(pathNode.GetString()))
+                {
+                    continue;
+                }
+
+                fallbackTask ??= task;
+                if (task.TryGetProperty("isPrimary", out var primaryNode) &&
+                    primaryNode.ValueKind == JsonValueKind.True)
+                {
+                    return ResolveExecutablePath(installPath, pathNode.GetString()!);
+                }
+            }
+
+            return fallbackTask is { } fallback &&
+                   fallback.TryGetProperty("path", out var fallbackPath)
+                ? ResolveExecutablePath(installPath, fallbackPath.GetString() ?? string.Empty)
+                : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private void RefreshXboxStore(
+        UnifySteamStoreConfiguration storeConfiguration,
+        bool lightweight,
+        bool quiet)
+    {
+        var cache = storeConfiguration.Cache ??= new UnifySteamLibraryCache();
+        if (!storeConfiguration.IncludeXboxPcGamePass &&
+            !storeConfiguration.IncludeXboxCloudGaming)
+        {
+            cache.AccountName = "Xbox account";
+            cache.Games = [];
+            cache.LastError = string.Empty;
+            cache.StatusText = "Ready";
+            cache.DetailText = "Both Xbox library sources are disabled.";
+            cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+            storeConfiguration.RemoteCatalogSignature = string.Empty;
+            return;
+        }
+
+        if (!IsXboxAppInstalled())
+        {
+            throw new InvalidOperationException("The Xbox app is not installed. Install it from Microsoft Store, sign in there, then refresh OmniLibrary.");
+        }
+
+        if (!IsXboxAppSignedIn())
+        {
+            throw new InvalidOperationException("Sign in inside the official Xbox app before syncing the Xbox library.");
+        }
+
+        var previousSteamAppIds = (storeConfiguration.Cache?.Games ?? [])
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id) && game.SteamAppId != 0)
+            .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First().SteamAppId, StringComparer.OrdinalIgnoreCase);
+
+        var (language, market) = ResolveXboxCatalogLocale();
+        var pcProductIds = storeConfiguration.IncludeXboxPcGamePass
+            ? LoadXboxPcGamePassProductIds(language, market)
+            : [];
+        var cloudProductIds = storeConfiguration.IncludeXboxCloudGaming
+            ? LoadXboxCloudProductIds(language, market)
+            : [];
+        var pcProductIdSet = pcProductIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var cloudProductIdSet = cloudProductIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var productIds = pcProductIds
+            .Concat(cloudProductIds)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var remoteCatalogSignature = ComputeLibraryCatalogSignature(
+            new[] { XboxCatalogShapeVersion }
+                .Concat(pcProductIds.Select(productId => $"pc:{productId}"))
+                .Concat(cloudProductIds.Select(productId => $"cloud:{productId}")));
+        var previousRemoteCatalogSignature = string.IsNullOrWhiteSpace(storeConfiguration.RemoteCatalogSignature)
+            ? string.Empty
+            : storeConfiguration.RemoteCatalogSignature;
+        if (lightweight &&
+            !string.IsNullOrWhiteSpace(previousRemoteCatalogSignature) &&
+            string.Equals(
+                previousRemoteCatalogSignature,
+                remoteCatalogSignature,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // The two public membership lists are sufficient for the frequent probe.
+            // Avoid hundreds of product-detail records when neither source changed.
+            storeConfiguration.RemoteCatalogSignature = remoteCatalogSignature;
+            cache.LastError = string.Empty;
+            cache.StatusText = "Ready";
+            if (string.IsNullOrWhiteSpace(cache.DetailText))
+            {
+                cache.DetailText = $"Loaded {cache.Games.Count} Xbox title{(cache.Games.Count == 1 ? string.Empty : "s")}.";
+            }
+            return;
+        }
+
+        var installed = LoadXboxInstalledGames(storeConfiguration.InstallPath, forceRefresh: true);
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        var catalogCandidates = new List<XboxCatalogCandidate>();
+
+        const int batchSize = 30;
+        for (var offset = 0; offset < productIds.Length; offset += batchSize)
+        {
+            var batch = productIds.Skip(offset).Take(batchSize).ToArray();
+            var productsUri =
+                $"https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={Uri.EscapeDataString(string.Join(',', batch))}" +
+                $"&market={Uri.EscapeDataString(market)}&languages={Uri.EscapeDataString(language)}";
+            using var productsDocument = LoadRequiredJson(productsUri, "Xbox product details could not be loaded.");
+            if (!productsDocument.RootElement.TryGetProperty("Products", out var products) ||
+                products.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+
+            foreach (var product in products.EnumerateArray())
+            {
+                var productId = GetJsonString(product, "ProductId");
+                if (string.IsNullOrWhiteSpace(productId) || !IsSafeXboxProductId(productId))
+                {
+                    continue;
+                }
+
+                var localized = product.TryGetProperty("LocalizedProperties", out var localizedProperties) &&
+                                localizedProperties.ValueKind == JsonValueKind.Array
+                    ? localizedProperties.EnumerateArray().FirstOrDefault()
+                    : default;
+                var title = localized.ValueKind == JsonValueKind.Object
+                    ? GetJsonString(localized, "ProductTitle")
+                    : string.Empty;
+                if (string.IsNullOrWhiteSpace(title))
+                {
+                    title = productId;
+                }
+
+                TryResolveXboxInstalledGame(
+                    new UnifySteamGameCacheEntry
+                    {
+                        Id = productId,
+                        Title = title,
+                    },
+                    installed,
+                    out var installedGame);
+                previousSteamAppIds.TryGetValue(productId, out var steamAppId);
+                var cloudPlayable =
+                    cloudProductIdSet.Contains(productId) &&
+                    !pcProductIdSet.Contains(productId);
+                if (cloudPlayable && !IsXboxConsoleCatalogProduct(product))
+                {
+                    // The public cloud SIGL currently also contains EA Play PC
+                    // products. They often have the same title as the actual Xbox
+                    // stream and produced duplicate, non-launchable Cloud entries.
+                    continue;
+                }
+
+                var game = new UnifySteamGameCacheEntry
+                {
+                    Id = productId,
+                    Title = title,
+                    Installed = installedGame?.Installed == true,
+                    // Prefer the downloadable PC entry when a title belongs to both
+                    // catalogs. The cloud tab owns only cloud-only titles, avoiding
+                    // duplicate Steam shortcuts with conflicting launch actions.
+                    CloudPlayable = cloudPlayable,
+                    InstallPath = installedGame?.InstallPath ?? string.Empty,
+                    ExecutablePath = installedGame?.ExecutablePath ?? string.Empty,
+                    Version = installedGame?.Version ?? string.Empty,
+                    ProviderGameId = installedGame?.Id ?? string.Empty,
+                    ImageUrl = localized.ValueKind == JsonValueKind.Object
+                        ? ResolveXboxPortraitUrl(localized)
+                        : string.Empty,
+                    HeroImageUrl = localized.ValueKind == JsonValueKind.Object
+                        ? ResolveXboxHeroUrl(localized)
+                        : string.Empty,
+                    SteamAppId = steamAppId,
+                };
+                catalogCandidates.Add(new XboxCatalogCandidate(
+                    game,
+                    ScoreXboxCatalogLocalization(localized, language),
+                    ResolveXboxMaximumPackageSize(product)));
+            }
+        }
+
+        foreach (var candidate in catalogCandidates.Where(candidate => !candidate.Game.CloudPlayable))
+        {
+            games[candidate.Game.Id] = candidate.Game;
+        }
+
+        foreach (var candidate in catalogCandidates
+                     .Where(candidate => candidate.Game.CloudPlayable)
+                     .GroupBy(
+                         candidate => NormalizeGameTitleKey(candidate.Game.Title),
+                         StringComparer.OrdinalIgnoreCase)
+                     .Select(group => group
+                         .OrderByDescending(candidate => candidate.LocalizationScore)
+                         .ThenByDescending(candidate => candidate.MaximumPackageSize)
+                         .ThenBy(candidate => candidate.Game.Id, StringComparer.OrdinalIgnoreCase)
+                         .First()))
+        {
+            // Regional and PC/console product variants can share the exact
+            // display title. Keep one localized, console-launchable product so
+            // the native Cloud tab never repeats the same visible game.
+            games[candidate.Game.Id] = candidate.Game;
+        }
+
+        var selectedProductIds = games.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var (productId, installedGame) in installed)
+        {
+            if (!installedGame.Installed ||
+                !selectedProductIds.Contains(productId))
+            {
+                continue;
+            }
+
+            if (!games.TryGetValue(productId, out var catalogGame))
+            {
+                installedGame.CloudPlayable =
+                    cloudProductIdSet.Contains(productId) &&
+                    !pcProductIdSet.Contains(productId);
+                games[productId] = installedGame;
+                continue;
+            }
+
+            catalogGame.Installed = true;
+            catalogGame.InstallPath = installedGame.InstallPath;
+            catalogGame.ExecutablePath = installedGame.ExecutablePath;
+            catalogGame.Version = installedGame.Version;
+            if (catalogGame.SteamAppId == 0 && previousSteamAppIds.TryGetValue(productId, out var steamAppId))
+            {
+                catalogGame.SteamAppId = steamAppId;
+            }
+        }
+
+        cache.AccountName = "Xbox account";
+        cache.Games = games.Values
+            .OrderByDescending(game => game.Installed)
+            .ThenBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        storeConfiguration.RemoteCatalogSignature = remoteCatalogSignature;
+        cache.LastError = string.Empty;
+        cache.StatusText = "Ready";
+        cache.DetailText =
+            $"Loaded {cache.Games.Count} Xbox title{(cache.Games.Count == 1 ? string.Empty : "s")} " +
+            $"({cache.Games.Count(game => !game.CloudPlayable)} PC Game Pass, " +
+            $"{cache.Games.Count(game => game.CloudPlayable)} Xbox Cloud); " +
+            $"{cache.Games.Count(game => game.Installed)} installed locally.";
+        cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
+        if (!quiet)
+        {
+            _journal.Append("info", "omnilibrary", "Refreshed Xbox library.", cache.DetailText);
+        }
+    }
+
+    private static string[] LoadXboxPcGamePassProductIds(string language, string market)
+    {
+        return LoadXboxSiglProductIds(
+            XboxPcGamePassCatalogId,
+            language,
+            market,
+            "The PC Game Pass catalog could not be loaded.");
+    }
+
+    private static string[] LoadXboxSiglProductIds(
+        string catalogId,
+        string language,
+        string market,
+        string failureMessage)
+    {
+        var catalogUri =
+            $"https://catalog.gamepass.com/sigls/v2?id={Uri.EscapeDataString(catalogId)}" +
+            $"&language={Uri.EscapeDataString(language)}&market={Uri.EscapeDataString(market)}";
+        using var catalogDocument = LoadRequiredJson(catalogUri, failureMessage);
+        if (catalogDocument.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException($"{failureMessage} The response format was unexpected.");
+        }
+
+        return catalogDocument.RootElement
+            .EnumerateArray()
+            .Select(item => GetJsonString(item, "id"))
+            .Where(id => !string.IsNullOrWhiteSpace(id) && IsSafeXboxProductId(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string[] LoadXboxCloudProductIds(string language, string market)
+    {
+        try
+        {
+            var productIds = LoadXboxSiglProductIds(
+                XboxCloudGamingCatalogId,
+                language,
+                market,
+                "The Xbox Cloud Gaming catalog could not be loaded.");
+            if (productIds.Length > 0)
+            {
+                return productIds;
+            }
+        }
+        catch
+        {
+            // Microsoft occasionally replaces curated SIGLS identifiers. The public
+            // Xbox play page remains a robust discovery fallback, but is avoided on
+            // the normal five-minute path because it is much larger.
+        }
+
+        var locale = NormalizeXboxWebLocale(language);
+        var requestUri = $"https://www.xbox.com/{Uri.EscapeDataString(locale)}/play";
+        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(
+                $"The Xbox Cloud Gaming catalog could not be loaded. HTTP {(int)response.StatusCode}.");
+        }
+
+        var page = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        return ExtractXboxCloudProductIds(page);
+    }
+
+    internal static string[] ExtractXboxCloudProductIds(string page)
+    {
+        var catalogMatch = Regex.Match(
+            page ?? string.Empty,
+            $"\"v3_[^\"]+{Regex.Escape(XboxCloudCatalogMarker)}\"\\s*:\\s*\\{{.*?\"products\"\\s*:\\s*\\[(?<products>.*?)\\]",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        if (!catalogMatch.Success)
+        {
+            throw new InvalidOperationException("The Xbox Cloud Gaming catalog returned an unexpected response.");
+        }
+
+        return Regex.Matches(
+                catalogMatch.Groups["products"].Value,
+                "\"(?<id>[A-Z0-9]{6,32})\"",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            .Select(match => match.Groups["id"].Value)
+            .Where(IsSafeXboxProductId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string NormalizeXboxWebLocale(string? language)
+    {
+        var locale = (language ?? string.Empty).Trim();
+        return Regex.IsMatch(
+            locale,
+            "^[a-z]{2}-[a-z]{2}$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            ? locale.ToLowerInvariant()
+            : "en-us";
+    }
+
+    private static JsonDocument LoadRequiredJson(string requestUri, string failureMessage)
+    {
+        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"{failureMessage} HTTP {(int)response.StatusCode}.");
+        }
+
+        using var stream = response.Content.ReadAsStream();
+        return JsonDocument.Parse(stream);
+    }
+
+    private static (string Language, string Market) ResolveXboxCatalogLocale()
+    {
+        var culture = CultureInfo.CurrentUICulture;
+        var language = string.IsNullOrWhiteSpace(culture.Name) ? "en-US" : culture.Name;
+        try
+        {
+            return (language.ToLowerInvariant(), new RegionInfo(culture.Name).TwoLetterISORegionName.ToUpperInvariant());
+        }
+        catch
+        {
+            return ("en-us", "US");
+        }
+    }
+
+    private static string ResolveXboxPortraitUrl(JsonElement localizedProduct)
+    {
+        if (!localizedProduct.TryGetProperty("Images", out var images) || images.ValueKind != JsonValueKind.Array)
+        {
+            return string.Empty;
+        }
+
+        var best = images
+            .EnumerateArray()
+            .Select(image => new
+            {
+                Uri = GetJsonString(image, "Uri"),
+                Purpose = GetJsonString(image, "ImagePurpose"),
+                Width = GetJsonInt(image, "Width"),
+                Height = GetJsonInt(image, "Height"),
+            })
+            .Where(image => !string.IsNullOrWhiteSpace(image.Uri))
+            .OrderByDescending(image => image.Purpose.Equals("Poster", StringComparison.OrdinalIgnoreCase) ? 100 :
+                image.Purpose.Equals("BrandedKeyArt", StringComparison.OrdinalIgnoreCase) ? 90 :
+                image.Purpose.Equals("BoxArt", StringComparison.OrdinalIgnoreCase) ? 80 : 0)
+            .ThenByDescending(image => image.Height > image.Width ? 1 : 0)
+            .ThenByDescending(image => image.Width * image.Height)
+            .FirstOrDefault();
+        return best is null ? string.Empty : NormalizeImageUrl(best.Uri);
+    }
+
+    private static string ResolveXboxHeroUrl(JsonElement localizedProduct)
+    {
+        if (!localizedProduct.TryGetProperty("Images", out var images) ||
+            images.ValueKind != JsonValueKind.Array)
+        {
+            return string.Empty;
+        }
+
+        var best = images
+            .EnumerateArray()
+            .Select(image => new
+            {
+                Uri = GetJsonString(image, "Uri"),
+                Purpose = GetJsonString(image, "ImagePurpose"),
+                Width = GetJsonInt(image, "Width"),
+                Height = GetJsonInt(image, "Height"),
+            })
+            .Where(image =>
+                !string.IsNullOrWhiteSpace(image.Uri) &&
+                image.Width > image.Height)
+            .OrderByDescending(image => image.Purpose.Equals("TitledHeroArt", StringComparison.OrdinalIgnoreCase) ? 100 :
+                image.Purpose.Equals("SuperHeroArt", StringComparison.OrdinalIgnoreCase) ? 90 :
+                image.Purpose.Equals("FeaturePromotionalWideArt", StringComparison.OrdinalIgnoreCase) ? 80 :
+                image.Purpose.Equals("Screenshot", StringComparison.OrdinalIgnoreCase) ? 10 : 0)
+            .ThenByDescending(image => image.Width * image.Height)
+            .FirstOrDefault();
+        return best is null ? string.Empty : NormalizeImageUrl(best.Uri);
+    }
+
+    internal static bool IsXboxConsoleCatalogProduct(JsonElement product)
+    {
+        if (product.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (product.TryGetProperty("Properties", out var properties) &&
+            properties.ValueKind == JsonValueKind.Object)
+        {
+            if (HasXboxCatalogValues(properties, "XboxConsoleGenCompatible") ||
+                HasXboxCatalogValues(properties, "XboxConsoleGenOptimized"))
+            {
+                return true;
+            }
+        }
+
+        if (!product.TryGetProperty("DisplaySkuAvailabilities", out var availabilities) ||
+            availabilities.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        foreach (var availability in availabilities.EnumerateArray())
+        {
+            if (!availability.TryGetProperty("Sku", out var sku) ||
+                !sku.TryGetProperty("Properties", out var skuProperties) ||
+                !skuProperties.TryGetProperty("Packages", out var packages) ||
+                packages.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+
+            foreach (var package in packages.EnumerateArray())
+            {
+                if (!package.TryGetProperty("PlatformDependencies", out var dependencies) ||
+                    dependencies.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                if (dependencies.EnumerateArray().Any(dependency =>
+                        GetJsonString(dependency, "PlatformName")
+                            .Equals("Windows.Xbox", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasXboxCatalogValues(JsonElement properties, string propertyName)
+    {
+        if (!properties.TryGetProperty(propertyName, out var values))
+        {
+            return false;
+        }
+
+        return values.ValueKind switch
+        {
+            JsonValueKind.Array => values.EnumerateArray().Any(value =>
+                value.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(value.GetString())),
+            JsonValueKind.String => !string.IsNullOrWhiteSpace(values.GetString()),
+            _ => false,
+        };
+    }
+
+    private static int ScoreXboxCatalogLocalization(JsonElement localizedProduct, string language)
+    {
+        var localizedLanguage = GetJsonString(localizedProduct, "Language");
+        if (localizedLanguage.Equals(language, StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        return localizedLanguage.Equals("neutral", StringComparison.OrdinalIgnoreCase)
+            ? 0
+            : 1;
+    }
+
+    private static long ResolveXboxMaximumPackageSize(JsonElement product)
+    {
+        if (!product.TryGetProperty("DisplaySkuAvailabilities", out var availabilities) ||
+            availabilities.ValueKind != JsonValueKind.Array)
+        {
+            return 0;
+        }
+
+        long maximum = 0;
+        foreach (var availability in availabilities.EnumerateArray())
+        {
+            if (!availability.TryGetProperty("Sku", out var sku) ||
+                !sku.TryGetProperty("Properties", out var properties) ||
+                !properties.TryGetProperty("Packages", out var packages) ||
+                packages.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+
+            foreach (var package in packages.EnumerateArray())
+            {
+                if (package.TryGetProperty("MaxDownloadSizeInBytes", out var size) &&
+                    size.TryGetInt64(out var bytes))
+                {
+                    maximum = Math.Max(maximum, bytes);
+                }
+            }
+        }
+
+        return maximum;
+    }
+
+    internal static Dictionary<string, UnifySteamGameCacheEntry> LoadXboxInstalledGames(
+        string? preferredInstallPath = null,
+        bool forceRefresh = false)
+    {
+        var cacheKey = string.IsNullOrWhiteSpace(preferredInstallPath)
+            ? string.Empty
+            : preferredInstallPath.Trim();
+        lock (XboxInstalledCacheGate)
+        {
+            if (!forceRefresh &&
+                XboxInstalledCache.TryGetValue(cacheKey, out var cached) &&
+                DateTimeOffset.UtcNow - cached.CreatedAtUtc < XboxInstalledCacheLifetime)
+            {
+                return CloneXboxInstalledGames(cached.Games);
+            }
+        }
+
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        var registeredPackageNames = LoadRegisteredXboxPackageNames();
+        var xboxRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var drive in DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (!drive.IsReady || drive.DriveType != DriveType.Fixed)
+                {
+                    continue;
+                }
+
+                var xboxRoot = Path.Combine(drive.RootDirectory.FullName, "XboxGames");
+                if (!Directory.Exists(xboxRoot))
+                {
+                    continue;
+                }
+
+                xboxRoots.Add(xboxRoot);
+            }
+            catch
+            {
+                // Drives can disappear or deny enumeration while the catalog refresh is running.
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(preferredInstallPath))
+        {
+            try
+            {
+                var normalizedPreferredPath = Path.GetFullPath(preferredInstallPath);
+                if (Directory.Exists(normalizedPreferredPath))
+                {
+                    xboxRoots.Add(normalizedPreferredPath);
+                    var nestedXboxRoot = Path.Combine(normalizedPreferredPath, "XboxGames");
+                    if (Directory.Exists(nestedXboxRoot))
+                    {
+                        xboxRoots.Add(nestedXboxRoot);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        foreach (var xboxRoot in xboxRoots)
+        {
+            try
+            {
+                foreach (var gameDirectory in Directory.EnumerateDirectories(xboxRoot))
+                {
+                    var contentDirectory = Path.Combine(gameDirectory, "Content");
+                    var configPath = new[]
+                        {
+                            Path.Combine(contentDirectory, "MicrosoftGame.Config"),
+                            Path.Combine(contentDirectory, "MicrosoftGame.config"),
+                        }
+                        .FirstOrDefault(File.Exists);
+                    if (string.IsNullOrWhiteSpace(configPath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var document = XDocument.Load(configPath, LoadOptions.None);
+                        var root = document.Root;
+                        var storeId = root?.Elements().FirstOrDefault(element =>
+                            element.Name.LocalName.Equals("StoreId", StringComparison.OrdinalIgnoreCase))?.Value?.Trim() ?? string.Empty;
+                        if (!IsSafeXboxProductId(storeId))
+                        {
+                            continue;
+                        }
+
+                        var shellVisuals = root?.Elements().FirstOrDefault(element =>
+                            element.Name.LocalName.Equals("ShellVisuals", StringComparison.OrdinalIgnoreCase));
+                        var executable = root?.Descendants().FirstOrDefault(element =>
+                            element.Name.LocalName.Equals("Executable", StringComparison.OrdinalIgnoreCase));
+                        var identity = root?.Elements().FirstOrDefault(element =>
+                            element.Name.LocalName.Equals("Identity", StringComparison.OrdinalIgnoreCase));
+                        var identityName = identity?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
+                        var identityVersion = identity?.Attribute("Version")?.Value?.Trim() ?? string.Empty;
+                        var executableName = executable?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
+                        var executablePath = string.IsNullOrWhiteSpace(executableName)
+                            ? string.Empty
+                            : Path.Combine(contentDirectory, executableName);
+                        var executableReady = IsReadyXboxExecutable(
+                            executablePath,
+                            identityName,
+                            identityVersion,
+                            registeredPackageNames);
+                        var title = ResolveXboxManifestDisplayName(
+                            executable?.Attribute("OverrideDisplayName")?.Value,
+                            shellVisuals?.Attribute("DefaultDisplayName")?.Value,
+                            Path.GetFileName(gameDirectory),
+                            storeId);
+                        var candidate = new UnifySteamGameCacheEntry
+                        {
+                            Id = storeId,
+                            Title = title,
+                            Installed = executableReady,
+                            InstallPath = contentDirectory,
+                            ExecutablePath = executableReady ? executablePath : string.Empty,
+                            Version = identityVersion,
+                        };
+                        if (!games.TryGetValue(storeId, out var existing) ||
+                            (!existing.Installed && candidate.Installed) ||
+                            (existing.Installed == candidate.Installed &&
+                             CompareXboxVersions(
+                                 candidate.Version,
+                                 existing.Version) > 0))
+                        {
+                            games[storeId] = candidate;
+                        }
+                    }
+                    catch
+                    {
+                        // A single malformed or locked game config must not hide the rest of the Xbox library.
+                    }
+                }
+            }
+            catch
+            {
+                // Xbox library roots can disappear or deny enumeration while refresh is running.
+            }
+        }
+
+        lock (XboxInstalledCacheGate)
+        {
+            XboxInstalledCache[cacheKey] = new XboxInstalledCacheState(
+                DateTimeOffset.UtcNow,
+                CloneXboxInstalledGames(games));
+        }
+
+        return games;
+    }
+
+    internal static bool TryResolveXboxInstalledGame(
+        UnifySteamGameCacheEntry catalogGame,
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedGames,
+        out UnifySteamGameCacheEntry installedGame)
+    {
+        installedGame = default!;
+        if (catalogGame is null ||
+            string.IsNullOrWhiteSpace(catalogGame.Id))
+        {
+            return false;
+        }
+
+        var relatedProductIds = XboxProductRelationStore
+            .GetRelatedProductIds(catalogGame.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var candidateIds = relatedProductIds
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        candidateIds.Add(catalogGame.Id);
+        if (IsSafeXboxProductId(catalogGame.ProviderGameId))
+        {
+            candidateIds.Add(catalogGame.ProviderGameId);
+        }
+
+        foreach (var candidateId in candidateIds)
+        {
+            if (!installedGames.TryGetValue(candidateId, out var candidate) ||
+                !IsReadyXboxInstalledGame(candidate))
+            {
+                continue;
+            }
+
+            if (!string.Equals(
+                    candidate.Id,
+                    catalogGame.Id,
+                    StringComparison.OrdinalIgnoreCase) &&
+                !relatedProductIds.Contains(candidate.Id))
+            {
+                XboxProductRelationStore.Register(catalogGame.Id, candidate.Id);
+            }
+
+            installedGame = candidate;
+            return true;
+        }
+
+        var catalogTitle = NormalizeXboxInstallMatchTitle(catalogGame.Title);
+        if (string.IsNullOrWhiteSpace(catalogTitle))
+        {
+            return false;
+        }
+
+        var titleMatches = installedGames.Values
+            .Where(IsReadyXboxInstalledGame)
+            .Where(candidate => string.Equals(
+                NormalizeXboxInstallMatchTitle(candidate.Title),
+                catalogTitle,
+                StringComparison.OrdinalIgnoreCase))
+            .GroupBy(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .Take(2)
+            .ToArray();
+        if (titleMatches.Length != 1)
+        {
+            return false;
+        }
+
+        installedGame = titleMatches[0];
+        XboxProductRelationStore.Register(catalogGame.Id, installedGame.Id);
+        return true;
+    }
+
+    internal static string ResolveXboxManifestDisplayName(
+        string? executableOverrideDisplayName,
+        string? shellDefaultDisplayName,
+        string? gameDirectoryName,
+        string storeId)
+    {
+        return new[]
+            {
+                executableOverrideDisplayName,
+                shellDefaultDisplayName,
+                gameDirectoryName,
+                storeId,
+            }
+            .Select(value => value?.Trim() ?? string.Empty)
+            .FirstOrDefault(value =>
+                !string.IsNullOrWhiteSpace(value) &&
+                !value.StartsWith(
+                    "ms-resource:",
+                    StringComparison.OrdinalIgnoreCase)) ??
+            storeId;
+    }
+
+    internal static string NormalizeXboxInstallMatchTitle(string value)
+    {
+        var normalized = NormalizeGameTitleKey(value ?? string.Empty);
+        string previous;
+        do
+        {
+            previous = normalized;
+            normalized = Regex.Replace(
+                    normalized,
+                    @"\s+(?:standard edition|for windows|windows|pc)$",
+                    string.Empty,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+                .Trim();
+        }
+        while (!string.Equals(previous, normalized, StringComparison.Ordinal));
+
+        return normalized;
+    }
+
+    private static bool IsReadyXboxInstalledGame(UnifySteamGameCacheEntry game)
+    {
+        return game is not null &&
+               game.Installed &&
+               !string.IsNullOrWhiteSpace(game.ExecutablePath);
+    }
+
+    private static bool IsReadyXboxExecutable(
+        string executablePath,
+        string identityName,
+        string identityVersion,
+        IReadOnlyList<string> registeredPackageNames)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            return false;
+        }
+
+        // Xbox protects many fully installed game executables from direct reads.
+        // Their AppX registration is the authoritative readiness boundary: it
+        // appears only after Gaming Services has registered the completed
+        // package. Requiring it also prevents a partially downloaded PE from
+        // being mistaken for a launchable game.
+        if (!string.IsNullOrWhiteSpace(identityName))
+        {
+            if (IsXboxPackageRegistered(
+                    identityName,
+                    identityVersion,
+                    registeredPackageNames))
+            {
+                return true;
+            }
+
+            if (registeredPackageNames.Count > 0)
+            {
+                return false;
+            }
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                executablePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length < 64)
+            {
+                return false;
+            }
+
+            Span<byte> dosHeader = stackalloc byte[64];
+            if (stream.Read(dosHeader) != dosHeader.Length ||
+                dosHeader[0] != (byte)'M' ||
+                dosHeader[1] != (byte)'Z')
+            {
+                return false;
+            }
+
+            var peHeaderOffset = BitConverter.ToInt32(dosHeader[60..64]);
+            if (peHeaderOffset < 64 ||
+                peHeaderOffset > stream.Length - 4 ||
+                peHeaderOffset > 1024 * 1024)
+            {
+                return false;
+            }
+
+            stream.Position = peHeaderOffset;
+            Span<byte> peSignature = stackalloc byte[4];
+            return stream.Read(peSignature) == peSignature.Length &&
+                   peSignature[0] == (byte)'P' &&
+                   peSignature[1] == (byte)'E' &&
+                   peSignature[2] == 0 &&
+                   peSignature[3] == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static IReadOnlyList<string> LoadRegisteredXboxPackageNames()
+    {
+        const string packagesKeyPath =
+            @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+        try
+        {
+            using var packagesKey = Registry.CurrentUser.OpenSubKey(packagesKeyPath);
+            return packagesKey?.GetSubKeyNames() ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static bool IsXboxPackageRegistered(
+        string identityName,
+        string identityVersion,
+        IReadOnlyList<string> registeredPackageNames)
+    {
+        var identityPrefix = identityName.Trim() + "_";
+        var versionPrefix = string.IsNullOrWhiteSpace(identityVersion)
+            ? identityPrefix
+            : identityPrefix + identityVersion.Trim() + "_";
+        return registeredPackageNames.Any(packageName =>
+            packageName.StartsWith(versionPrefix, StringComparison.OrdinalIgnoreCase) ||
+            (string.IsNullOrWhiteSpace(identityVersion) &&
+             packageName.StartsWith(identityPrefix, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static int CompareXboxVersions(string left, string right)
+    {
+        return Version.TryParse(left, out var leftVersion) &&
+               Version.TryParse(right, out var rightVersion)
+            ? leftVersion.CompareTo(rightVersion)
+            : string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldRefreshXboxInstallState(
+        IReadOnlyList<UnifySteamGameCacheEntry> games,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
+    {
+        var relevantStatuses = games
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .Select(game => UnifySteamDownloadStatusStore.Get(
+                downloadStatuses,
+                "xbox-game-pass",
+                game.Id))
+            .ToArray();
+        if (relevantStatuses.Any(download =>
+                download.Status.Equals(
+                    "uninstall-action-required",
+                    StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var latestCompletion = relevantStatuses
+            .Where(download =>
+                download.Status.Equals("completed", StringComparison.OrdinalIgnoreCase))
+            .Select(download => download.UpdatedAtUtc)
+            .DefaultIfEmpty(DateTimeOffset.MinValue)
+            .Max();
+        if (latestCompletion == DateTimeOffset.MinValue)
+        {
+            return false;
+        }
+
+        lock (XboxInstalledCacheGate)
+        {
+            if (latestCompletion <= XboxLastCompletedDownloadObservedUtc)
+            {
+                return false;
+            }
+
+            XboxLastCompletedDownloadObservedUtc = latestCompletion;
+            return true;
+        }
+    }
+
+    private static Dictionary<string, UnifySteamGameCacheEntry> CloneXboxInstalledGames(
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> games)
+    {
+        return games.ToDictionary(
+            pair => pair.Key,
+            pair => new UnifySteamGameCacheEntry
+            {
+                Id = pair.Value.Id,
+                Title = pair.Value.Title,
+                Installed = pair.Value.Installed,
+                CloudPlayable = pair.Value.CloudPlayable,
+                InstallPath = pair.Value.InstallPath,
+                ExecutablePath = pair.Value.ExecutablePath,
+                Version = pair.Value.Version,
+                ImageUrl = pair.Value.ImageUrl,
+                HeroImageUrl = pair.Value.HeroImageUrl,
+                SteamAppId = pair.Value.SteamAppId,
+            },
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed record XboxInstalledCacheState(
+        DateTimeOffset CreatedAtUtc,
+        Dictionary<string, UnifySteamGameCacheEntry> Games);
+
+    private sealed record XboxCatalogCandidate(
+        UnifySteamGameCacheEntry Game,
+        int LocalizationScore,
+        long MaximumPackageSize);
+
+    private static bool IsXboxAppInstalled()
+    {
+        var packageRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Packages",
+            "Microsoft.GamingApp_8wekyb3d8bbwe");
+        return Directory.Exists(packageRoot);
+    }
+
+    private static bool IsXboxAppSignedIn()
+    {
+        var packageRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Packages",
+            "Microsoft.GamingApp_8wekyb3d8bbwe");
+        if (!Directory.Exists(packageRoot))
+        {
+            return false;
+        }
+
+        // Do not read or copy Xbox credentials. The official app's token broker and
+        // OneAuth account stores expose enough filesystem state to tell whether the
+        // user has completed sign-in while keeping all tokens inside Microsoft's app.
+        var accountDirectories = new[]
+        {
+            Path.Combine(packageRoot, "AC", "Microsoft", "OneAuth", "accounts"),
+            Path.Combine(packageRoot, "AC", "TokenBroker", "Cache"),
+        };
+
+        return accountDirectories.Any(directory =>
+        {
+            try
+            {
+                return Directory.Exists(directory) && Directory.EnumerateFiles(directory).Any();
+            }
+            catch
+            {
+                return false;
+            }
+        });
+    }
+
+    private static bool IsSafeXboxProductId(string value)
+    {
+        return !string.IsNullOrWhiteSpace(value) &&
+               value.Length <= 32 &&
+               value.All(char.IsLetterOrDigit);
     }
 
     private static Dictionary<string, UnifySteamGameCacheEntry> LoadEpicLauncherInstalledGames()
@@ -633,7 +2995,8 @@ internal sealed class UnifySteamService
                 InstallPath = installed?.InstallPath ?? string.Empty,
                 ExecutablePath = installed?.ExecutablePath ?? string.Empty,
                 Version = installed?.Version ?? string.Empty,
-                ImageUrl = ResolveSteamGridDbPortraitArtworkUrl(title),
+                // Artwork is resolved later by the asynchronous Steam-first worker.
+                ImageUrl = string.Empty,
             });
         }
     }
@@ -681,7 +3044,16 @@ internal sealed class UnifySteamService
             {
                 Id = appName,
                 Title = FirstNonEmpty(GetJsonString(item, "title"), appName),
-                Installed = true,
+                Installed =
+                    !string.Equals(
+                        GetJsonString(item, "is_preloaded"),
+                        "true",
+                        StringComparison.OrdinalIgnoreCase),
+                IsPreloaded =
+                    string.Equals(
+                        GetJsonString(item, "is_preloaded"),
+                        "true",
+                        StringComparison.OrdinalIgnoreCase),
                 InstallPath = GetJsonString(item, "install_path"),
                 ExecutablePath = ResolveInstalledExecutablePath(item),
                 Version = GetJsonString(item, "version"),
@@ -695,7 +3067,7 @@ internal sealed class UnifySteamService
         string toolPath,
         IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedMap)
     {
-        var result = RunTool(toolPath, "list", "--json");
+        var result = RunTool(toolPath, "list", "--third-party", "--json");
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException(FirstNonEmpty(result.StandardError, result.StandardOutput, "legendary list failed."));
@@ -727,7 +3099,22 @@ internal sealed class UnifySteamService
             }
 
             installedMap.TryGetValue(appName, out var installed);
-            games.Add(new UnifySteamGameCacheEntry
+            var thirdPartyManagedApp = GetEpicCustomAttribute(
+                metadata,
+                "ThirdPartyManagedApp");
+            var thirdPartyManagedProvider = GetEpicCustomAttribute(
+                metadata,
+                "ThirdPartyManagedProvider");
+            var partnerLinkType = GetEpicCustomAttribute(
+                metadata,
+                "partnerLinkType");
+            var deliveryProvider = ResolveEpicDeliveryProvider(
+                thirdPartyManagedApp,
+                thirdPartyManagedProvider,
+                partnerLinkType);
+            var hasInstallableAsset = HasEpicWindowsAsset(item);
+            var latestVersion = GetEpicWindowsBuildVersion(item);
+            var entry = new UnifySteamGameCacheEntry
             {
                 Id = appName,
                 Title = FirstNonEmpty(GetJsonString(item, "app_title"), appName),
@@ -735,11 +3122,244 @@ internal sealed class UnifySteamService
                 InstallPath = installed?.InstallPath ?? string.Empty,
                 ExecutablePath = installed?.ExecutablePath ?? string.Empty,
                 Version = installed?.Version ?? string.Empty,
+                DeliveryProvider = deliveryProvider,
+                ThirdPartyManagedApp = thirdPartyManagedApp,
+                PartnerLinkType = partnerLinkType,
+                PartnerLinkId = GetEpicCustomAttribute(metadata, "partnerLinkId"),
+                ProviderGameId = GetEpicCustomAttribute(metadata, "GameID"),
+                RegistryPath = GetEpicCustomAttribute(metadata, "RegistryPath"),
+                RegistryValueName = FirstNonEmpty(
+                    GetEpicCustomAttribute(metadata, "RegistryKey"),
+                    "Install Dir"),
+                ProcessNames = FirstNonEmpty(
+                    GetEpicCustomAttribute(metadata, "ProcessNames"),
+                    GetEpicCustomAttribute(metadata, "MainWindowProcessName")),
+                HasInstallableAsset = hasInstallableAsset,
+                RequiresAccountLink =
+                    deliveryProvider is "ea-app" or "ubisoft-connect",
+                RequiresExternalLauncher =
+                    deliveryProvider == "ea-app" ||
+                    (!hasInstallableAsset && deliveryProvider != "epic"),
+                RequiresEpicLauncherBridge =
+                    EpicCompatibilityCatalog.Get(appName).FakeEpicLauncher,
+                SupportsCloudSaves =
+                    !string.IsNullOrWhiteSpace(
+                        GetEpicCustomAttribute(metadata, "CloudSaveFolder")),
+                IsPreloaded = installed?.IsPreloaded == true,
+                LatestVersion = latestVersion,
                 ImageUrl = ResolveEpicImageUrl(metadata),
-            });
+            };
+            MergeEpicExternalInstallState(entry);
+            games.Add(entry);
         }
 
         return DedupeLibraryGames(games);
+    }
+
+    private static string GetEpicCustomAttribute(
+        JsonElement metadata,
+        string propertyName)
+    {
+        if (metadata.ValueKind != JsonValueKind.Object ||
+            !metadata.TryGetProperty("customAttributes", out var attributes) ||
+            attributes.ValueKind != JsonValueKind.Object ||
+            !attributes.TryGetProperty(propertyName, out var attribute))
+        {
+            return string.Empty;
+        }
+
+        return attribute.ValueKind == JsonValueKind.Object
+            ? GetJsonString(attribute, "value")
+            : GetJsonString(attributes, propertyName);
+    }
+
+    private static bool HasEpicWindowsAsset(JsonElement item)
+    {
+        return item.ValueKind == JsonValueKind.Object &&
+               item.TryGetProperty("asset_infos", out var assetInfos) &&
+               assetInfos.ValueKind == JsonValueKind.Object &&
+               assetInfos.TryGetProperty("Windows", out var windows) &&
+               windows.ValueKind == JsonValueKind.Object &&
+               windows.EnumerateObject().Any();
+    }
+
+    private static string GetEpicWindowsBuildVersion(JsonElement item)
+    {
+        return item.ValueKind == JsonValueKind.Object &&
+               item.TryGetProperty("asset_infos", out var assetInfos) &&
+               assetInfos.ValueKind == JsonValueKind.Object &&
+               assetInfos.TryGetProperty("Windows", out var windows)
+            ? GetJsonString(windows, "build_version")
+            : string.Empty;
+    }
+
+    internal static string ResolveEpicDeliveryProvider(
+        string? thirdPartyManagedApp,
+        string? thirdPartyManagedProvider,
+        string? partnerLinkType)
+    {
+        var combined =
+            $"{thirdPartyManagedApp} {thirdPartyManagedProvider} {partnerLinkType}";
+        if (combined.Contains("origin", StringComparison.OrdinalIgnoreCase) ||
+            combined.Contains("ea app", StringComparison.OrdinalIgnoreCase) ||
+            combined.Contains("electronic arts", StringComparison.OrdinalIgnoreCase))
+        {
+            return "ea-app";
+        }
+
+        if (combined.Contains("ubisoft", StringComparison.OrdinalIgnoreCase) ||
+            combined.Contains("uplay", StringComparison.OrdinalIgnoreCase))
+        {
+            return "ubisoft-connect";
+        }
+
+        return string.IsNullOrWhiteSpace(combined)
+            ? "epic"
+            : "external";
+    }
+
+    internal static string GetEpicProviderDisplayName(string? provider)
+    {
+        return provider?.Trim().ToLowerInvariant() switch
+        {
+            "ea-app" => "EA app",
+            "ubisoft-connect" => "Ubisoft Connect",
+            "external" => "the publisher launcher",
+            _ => "Epic Games",
+        };
+    }
+
+    private static void MergeEpicExternalInstallState(
+        UnifySteamGameCacheEntry game)
+    {
+        if (!game.RequiresExternalLauncher ||
+            string.IsNullOrWhiteSpace(game.RegistryPath) ||
+            !TryReadEpicExternalInstallPath(
+                game.RegistryPath,
+                game.RegistryValueName,
+                out var installPath))
+        {
+            return;
+        }
+
+        game.Installed = true;
+        game.InstallPath = installPath;
+        game.ExecutablePath = FindEpicExternalExecutable(
+            installPath,
+            game.ProcessNames);
+    }
+
+    internal static bool TryReadEpicExternalInstallPath(
+        string registryPath,
+        string registryValueName,
+        out string installPath)
+    {
+        installPath = string.Empty;
+        var normalizedPath = (registryPath ?? string.Empty)
+            .Trim()
+            .TrimStart('\\');
+        foreach (var prefix in new[]
+                 {
+                     @"HKEY_LOCAL_MACHINE\",
+                     @"HKLM\",
+                     @"HKEY_CURRENT_USER\",
+                     @"HKCU\",
+                 })
+        {
+            if (normalizedPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                normalizedPath = normalizedPath[prefix.Length..];
+                break;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            return false;
+        }
+
+        foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })
+        {
+            foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                    using var key = baseKey.OpenSubKey(normalizedPath);
+                    var value = key?.GetValue(
+                        string.IsNullOrWhiteSpace(registryValueName)
+                            ? null
+                            : registryValueName.Trim()) as string;
+                    if (string.IsNullOrWhiteSpace(value) ||
+                        !Directory.Exists(value.Trim().Trim('"')))
+                    {
+                        continue;
+                    }
+
+                    installPath = NormalizePath(value.Trim().Trim('"'));
+                    return true;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static string FindEpicExternalExecutable(
+        string installPath,
+        string processNames)
+    {
+        if (string.IsNullOrWhiteSpace(installPath) ||
+            !Directory.Exists(installPath))
+        {
+            return string.Empty;
+        }
+
+        var names = Regex.Split(processNames ?? string.Empty, @"[;,|]")
+            .Select(Path.GetFileName)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (names.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        var pending = new Stack<(string Path, int Depth)>();
+        pending.Push((installPath, 0));
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            foreach (var name in names)
+            {
+                var candidate = Path.Combine(current.Path, name!);
+                if (File.Exists(candidate))
+                {
+                    return NormalizePath(candidate);
+                }
+            }
+
+            if (current.Depth >= 3)
+            {
+                continue;
+            }
+
+            try
+            {
+                foreach (var child in Directory.EnumerateDirectories(current.Path))
+                {
+                    pending.Push((child, current.Depth + 1));
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return string.Empty;
     }
 
     private static string ResolveEpicImageUrl(JsonElement metadata)
@@ -852,10 +3472,12 @@ internal sealed class UnifySteamService
         return token;
     }
 
-    private GogLibraryResponse LoadGogLibrary(string accessToken)
+    private GogLibraryResponse LoadGogLibrary(
+        string accessToken,
+        IReadOnlyList<string>? knownOwnedIds = null)
     {
         // 1) Authoritative ownership list; works reliably with the Galaxy bearer token.
-        var ownedIds = LoadGogOwnedIds(accessToken);
+        var ownedIds = knownOwnedIds?.ToList() ?? LoadGogOwnedIds(accessToken);
 
         // 2) Try the account pages for rich data (may return nothing for bearer sessions).
         var games = new List<UnifySteamGameCacheEntry>();
@@ -883,9 +3505,17 @@ internal sealed class UnifySteamService
         // small cover thumbnails, while product details include higher resolution cards.
         var beforeDetails = games.Count;
         var productDetails = new List<UnifySteamGameCacheEntry>();
+        var processedOwnedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (ownedIds.Count > 0)
         {
-            AppendGogProductDetails(ownedIds, productDetails);
+            AppendGogProductDetails(
+                ownedIds,
+                productDetails,
+                // Preparing the store only needs usable catalog metadata. The
+                // central artwork pipeline upgrades images asynchronously after
+                // shortcuts are ready; one GOG v2 request per title here made
+                // first-time sign-in scale with the library size.
+                processedOwnedIds);
             games = MergeGogProductDetails(games, productDetails);
         }
 
@@ -895,7 +3525,10 @@ internal sealed class UnifySteamService
             "GOG library assembled.",
             $"Owned product IDs: {ownedIds.Count}; from account pages: {fromAccountPages}; enriched from products API: {productDetails.Count}; added from products API: {Math.Max(0, games.Count - beforeDetails)}.");
 
-        return new GogLibraryResponse(string.Empty, DedupeLibraryGames(games));
+        return new GogLibraryResponse(
+            string.Empty,
+            DedupeLibraryGames(games),
+            processedOwnedIds);
     }
 
     private List<string> LoadGogOwnedIds(string accessToken)
@@ -928,7 +3561,10 @@ internal sealed class UnifySteamService
         return ids;
     }
 
-    private void AppendGogProductDetails(IReadOnlyList<string> ids, ICollection<UnifySteamGameCacheEntry> target)
+    private void AppendGogProductDetails(
+        IReadOnlyList<string> ids,
+        ICollection<UnifySteamGameCacheEntry> target,
+        ISet<string> processedIds)
     {
         const int batchSize = 50;
         for (var offset = 0; offset < ids.Count; offset += batchSize)
@@ -953,6 +3589,11 @@ internal sealed class UnifySteamService
                 if (document.RootElement.ValueKind != JsonValueKind.Array)
                 {
                     continue;
+                }
+
+                foreach (var id in batch)
+                {
+                    processedIds.Add(id);
                 }
 
                 var entries = new List<UnifySteamGameCacheEntry>();
@@ -1003,20 +3644,8 @@ internal sealed class UnifySteamService
                     });
                 }
 
-                var steamGridPortraitByTitle = LoadSteamGridDbPortraitArtworkBatch(entries.Select(entry => entry.Title).ToArray());
-                var artworkById = LoadGogV2ArtworkBatch(entries.Select(entry => entry.Id).ToArray());
                 foreach (var entry in entries)
                 {
-                    if (steamGridPortraitByTitle.TryGetValue(entry.Title, out var steamGridArtworkUrl) &&
-                        !string.IsNullOrWhiteSpace(steamGridArtworkUrl))
-                    {
-                        entry.ImageUrl = steamGridArtworkUrl;
-                    }
-                    else if (artworkById.TryGetValue(entry.Id, out var artworkUrl) && !string.IsNullOrWhiteSpace(artworkUrl))
-                    {
-                        entry.ImageUrl = artworkUrl;
-                    }
-
                     target.Add(entry);
                 }
             }
@@ -1241,74 +3870,6 @@ internal sealed class UnifySteamService
         return Regex.Replace(normalized, @"\s+", " ").Trim();
     }
 
-    private static Dictionary<string, string> LoadGogV2ArtworkBatch(IReadOnlyList<string> ids)
-    {
-        var uniqueIds = ids
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (uniqueIds.Length == 0)
-        {
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        }
-
-        var artworkById = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        Parallel.ForEach(
-            uniqueIds,
-            new ParallelOptions { MaxDegreeOfParallelism = 6 },
-            id =>
-            {
-                var artworkUrl = ResolveGogV2ArtworkUrl(id);
-                if (!string.IsNullOrWhiteSpace(artworkUrl))
-                {
-                    artworkById[id] = artworkUrl;
-                }
-            });
-
-        return artworkById.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static string ResolveGogV2ArtworkUrl(string id)
-    {
-        id = id.Trim();
-        if (GogArtworkCache.TryGetValue(id, out var cachedArtworkUrl))
-        {
-            return cachedArtworkUrl;
-        }
-
-        var imageUrl = string.Empty;
-        try
-        {
-            using var response = HttpClient.GetAsync(
-                $"https://api.gog.com/v2/games/{Uri.EscapeDataString(id)}?locale=en-US").GetAwaiter().GetResult();
-            if (response.IsSuccessStatusCode)
-            {
-                var payload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                using var document = JsonDocument.Parse(payload);
-                if (document.RootElement.ValueKind == JsonValueKind.Object &&
-                    document.RootElement.TryGetProperty("_links", out var links))
-                {
-                    imageUrl = FirstNonEmpty(
-                        GetGogLinkHref(links, "boxArtImage"),
-                        GetGogLinkHref(links, "productCardImage"),
-                        GetGogLinkHref(links, "coverArtImage"),
-                        GetGogLinkHref(links, "backgroundImage"),
-                        GetGogLinkHref(links, "galaxyBackgroundImage"),
-                        GetGogLinkHref(links, "iconSquare"),
-                        GetGogLinkHref(links, "icon"));
-                }
-            }
-        }
-        catch (Exception)
-        {
-            imageUrl = string.Empty;
-        }
-
-        var normalizedArtworkUrl = NormalizeImageUrl(imageUrl);
-        GogArtworkCache[id] = normalizedArtworkUrl;
-        return normalizedArtworkUrl;
-    }
-
     private static List<UnifySteamGameCacheEntry> MergeGogProductDetails(
         IReadOnlyList<UnifySteamGameCacheEntry> games,
         IReadOnlyList<UnifySteamGameCacheEntry> productDetails)
@@ -1337,6 +3898,8 @@ internal sealed class UnifySteamService
                 ExecutablePath = game.ExecutablePath,
                 Version = game.Version,
                 ImageUrl = FirstNonEmpty(details.ImageUrl, game.ImageUrl),
+                HeroImageUrl = game.HeroImageUrl,
+                SteamAppId = game.SteamAppId,
             });
         }
 
@@ -1733,6 +4296,16 @@ internal sealed class UnifySteamService
     private static CommandResult RunTool(string toolPath, params string[] arguments)
     {
         var startInfo = CreateHiddenStartInfo(toolPath, arguments);
+        if (Path.GetFileName(toolPath).Equals("legendary.exe", StringComparison.OrdinalIgnoreCase) ||
+            Path.GetFileNameWithoutExtension(toolPath).Equals("legendary", StringComparison.OrdinalIgnoreCase))
+        {
+            ManagedLegendaryHelper.ConfigureEnvironment(startInfo);
+        }
+        else if (Path.GetFileName(toolPath).Equals("gogdl.exe", StringComparison.OrdinalIgnoreCase) ||
+                 Path.GetFileNameWithoutExtension(toolPath).Equals("gogdl", StringComparison.OrdinalIgnoreCase))
+        {
+            ManagedGogDlHelper.ConfigureEnvironment(startInfo);
+        }
         using var process = new Process
         {
             StartInfo = startInfo
@@ -1842,11 +4415,28 @@ internal sealed class UnifySteamService
                extension.Equals(".bat", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string ResolveToolPath(UnifySteamStoreDefinition definition, string configuredPath)
+    private static string ResolveToolPath(OmniLibraryStoreDescriptor definition, string configuredPath)
     {
         if (!string.IsNullOrWhiteSpace(configuredPath) && File.Exists(configuredPath))
         {
             return configuredPath;
+        }
+
+        if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
+        {
+            var managedPath = ManagedLegendaryHelper.ResolveExistingToolPath(configuredPath);
+            if (!string.IsNullOrWhiteSpace(managedPath))
+            {
+                return managedPath;
+            }
+        }
+        else if (definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase))
+        {
+            var managedPath = ManagedGogDlHelper.ResolveExistingToolPath(configuredPath);
+            if (!string.IsNullOrWhiteSpace(managedPath))
+            {
+                return managedPath;
+            }
         }
 
         foreach (var candidate in GetCandidateToolPaths(definition))
@@ -1898,7 +4488,7 @@ internal sealed class UnifySteamService
         }
     }
 
-    private static IEnumerable<string> GetCandidateToolPaths(UnifySteamStoreDefinition definition)
+    private static IEnumerable<string> GetCandidateToolPaths(OmniLibraryStoreDescriptor definition)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1969,24 +4559,35 @@ internal sealed class UnifySteamService
 
     private static string ResolveReadableGogAuthPath(string configuredPath)
     {
+        if (File.Exists(ManagedGogDlHelper.AuthPath))
+        {
+            return ManagedGogDlHelper.AuthPath;
+        }
+
         if (!string.IsNullOrWhiteSpace(configuredPath) && File.Exists(configuredPath))
         {
             return configuredPath;
         }
 
-        foreach (var candidate in GetCandidateGogAuthPaths())
-        {
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-
-        return configuredPath.Trim();
+        return string.Empty;
     }
 
     private static string ResolveReadableEpicAuthPath(string configuredPath)
     {
+        if (File.Exists(ManagedLegendaryHelper.UserDataPath))
+        {
+            return ManagedLegendaryHelper.UserDataPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(configuredPath) && Directory.Exists(configuredPath))
+        {
+            var configuredUserDataPath = Path.Combine(configuredPath, "user.json");
+            if (File.Exists(configuredUserDataPath))
+            {
+                return configuredUserDataPath;
+            }
+        }
+
         if (!string.IsNullOrWhiteSpace(configuredPath) && File.Exists(configuredPath))
         {
             return configuredPath;
@@ -2010,28 +4611,18 @@ internal sealed class UnifySteamService
             return NormalizePath(configuredPath);
         }
 
-        return NormalizePath(GetCandidateGogAuthPaths().First());
+        return NormalizePath(ManagedGogDlHelper.AuthPath);
     }
 
     private static string ResolveWritableEpicAuthPath(string configuredPath)
     {
-        if (!string.IsNullOrWhiteSpace(configuredPath))
-        {
-            return NormalizePath(configuredPath);
-        }
-
-        return NormalizePath(GetCandidateEpicAuthPaths().First());
-    }
-
-    private static IEnumerable<string> GetCandidateGogAuthPaths()
-    {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        yield return Path.Combine(appData, "heroic", "gog_store", "auth.json");
-        yield return Path.Combine(appData, "heroic_gogdl", "auth.json");
+        _ = configuredPath;
+        return ManagedLegendaryHelper.UserDataPath;
     }
 
     private static IEnumerable<string> GetCandidateEpicAuthPaths()
     {
+        yield return ManagedLegendaryHelper.UserDataPath;
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         yield return Path.Combine(appData, "ToolsForSteam", "unifystore", "epic-auth.json");
     }
@@ -2255,19 +4846,17 @@ internal sealed class UnifySteamService
         return storeConfiguration;
     }
 
-    private static UnifySteamStoreDefinition ResolveDefinition(string storeId)
+    private static OmniLibraryStoreDescriptor ResolveDefinition(string storeId)
     {
         if (string.IsNullOrWhiteSpace(storeId))
         {
             throw new InvalidOperationException("A store ID is required.");
         }
 
-        return Definitions.FirstOrDefault(definition =>
-                   string.Equals(definition.Id, storeId.Trim(), StringComparison.OrdinalIgnoreCase))
-               ?? throw new InvalidOperationException("Unknown Storefront store.");
+        return OmniLibraryStoreRegistry.GetRequired(storeId);
     }
 
-    private static IEnumerable<UnifySteamStoreDefinition> ResolveDefinitions(string? storeId)
+    private static IEnumerable<OmniLibraryStoreDescriptor> ResolveDefinitions(string? storeId)
     {
         if (string.IsNullOrWhiteSpace(storeId))
         {
@@ -2276,13 +4865,6 @@ internal sealed class UnifySteamService
 
         return [ResolveDefinition(storeId)];
     }
-
-    private sealed record UnifySteamStoreDefinition(
-        string Id,
-        string Title,
-        string ToolCommandName,
-        string ToolExecutableName,
-        bool SupportsManualCodeAuth);
 
     private sealed record GogCredential(
         string AccessToken,
@@ -2301,7 +4883,8 @@ internal sealed class UnifySteamService
 
     private sealed record GogLibraryResponse(
         string AccountName,
-        List<UnifySteamGameCacheEntry> Games);
+        List<UnifySteamGameCacheEntry> Games,
+        IReadOnlyCollection<string> ProcessedOwnedIds);
 
     private sealed record EpicStatus(
         bool Authenticated,
@@ -2312,3 +4895,11 @@ internal sealed class UnifySteamService
         string StandardOutput,
         string StandardError);
 }
+
+internal sealed record UnifySteamStoreRefreshResult(
+    string StoreId,
+    bool Succeeded,
+    string Error);
+
+internal sealed record UnifySteamRefreshBatchResult(
+    IReadOnlyList<UnifySteamStoreRefreshResult> Stores);

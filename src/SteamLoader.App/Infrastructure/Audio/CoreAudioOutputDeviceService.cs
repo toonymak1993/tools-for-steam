@@ -2,138 +2,172 @@ using AudioSwitcher.AudioApi;
 using AudioSwitcher.AudioApi.CoreAudio;
 using AudioSwitcher.AudioApi.Session;
 using System.Diagnostics;
+using System.Reflection;
 using SteamLoader.App.Models;
 
 namespace SteamLoader.App.Infrastructure.Audio;
 
-public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
+public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService, IDisposable
 {
-    private readonly CoreAudioController _controller = new();
+    private static readonly TimeSpan ControllerIdleTimeout = TimeSpan.FromSeconds(30);
+    private static readonly FieldInfo? PeakTimerSubscriptionField = typeof(CoreAudioDevice).GetField(
+        "_peakValueTimerSubscription",
+        BindingFlags.Instance | BindingFlags.NonPublic);
+
+    private readonly object _sync = new();
+    private CoreAudioController? _controller;
+    private System.Threading.Timer? _controllerIdleTimer;
+    private DateTimeOffset _lastControllerUseUtc;
+    private bool _disposed;
 
     public IReadOnlyList<AudioOutputDeviceInfo> GetPlaybackDevices()
     {
-        return CreateDeviceList(
-            _controller.GetPlaybackDevices(DeviceState.Active));
+        return UseController(controller =>
+            CreateDeviceList(controller.GetPlaybackDevices(DeviceState.Active)));
     }
 
     public IReadOnlyList<AudioOutputDeviceInfo> GetCaptureDevices()
     {
-        return CreateDeviceList(
-            _controller.GetCaptureDevices(DeviceState.Active));
+        return UseController(controller =>
+            CreateDeviceList(controller.GetCaptureDevices(DeviceState.Active)));
     }
 
     public void SetDefaultPlaybackDevice(string deviceId)
     {
-        SetDefaultDevice(deviceId);
+        UseController(controller => SetDefaultDevice(controller, deviceId));
     }
 
     public void SetDefaultCaptureDevice(string deviceId)
     {
-        SetDefaultDevice(deviceId);
+        UseController(controller => SetDefaultDevice(controller, deviceId));
     }
 
     public AudioVolumeInfo GetDefaultPlaybackVolume()
     {
-        return CreateVolumeInfo(GetDefaultPlaybackDevice());
+        return UseController(controller =>
+            CreateVolumeInfo(GetDefaultPlaybackDevice(controller)));
     }
 
     public AudioVolumeInfo GetDefaultCaptureVolume()
     {
-        return CreateVolumeInfo(GetDefaultCaptureDevice());
+        return UseController(controller =>
+            CreateVolumeInfo(GetDefaultCaptureDevice(controller)));
     }
 
     public AudioVolumeInfo SetDefaultPlaybackVolume(double volume)
     {
-        return SetDeviceVolume(GetDefaultPlaybackDevice(), volume);
+        return UseController(controller =>
+            SetDeviceVolume(GetDefaultPlaybackDevice(controller), volume));
     }
 
     public AudioVolumeInfo SetDefaultCaptureVolume(double volume)
     {
-        return SetDeviceVolume(GetDefaultCaptureDevice(), volume);
+        return UseController(controller =>
+            SetDeviceVolume(GetDefaultCaptureDevice(controller), volume));
     }
 
     public AudioVolumeInfo AdjustDefaultPlaybackVolume(double delta)
     {
-        return AdjustDeviceVolume(GetDefaultPlaybackDevice(), delta);
+        return UseController(controller =>
+            AdjustDeviceVolume(GetDefaultPlaybackDevice(controller), delta));
     }
 
     public AudioVolumeInfo AdjustDefaultCaptureVolume(double delta)
     {
-        return AdjustDeviceVolume(GetDefaultCaptureDevice(), delta);
+        return UseController(controller =>
+            AdjustDeviceVolume(GetDefaultCaptureDevice(controller), delta));
     }
 
     public AudioVolumeInfo ToggleDefaultPlaybackMute()
     {
-        var device = GetDefaultPlaybackDevice();
-        device.ToggleMute();
-        return CreateVolumeInfo(device);
+        return UseController(controller =>
+        {
+            var device = GetDefaultPlaybackDevice(controller);
+            device.ToggleMute();
+            return CreateVolumeInfo(device);
+        });
     }
 
     public AudioVolumeInfo ToggleDefaultCaptureMute()
     {
-        var device = GetDefaultCaptureDevice();
-        device.ToggleMute();
-        return CreateVolumeInfo(device);
+        return UseController(controller =>
+        {
+            var device = GetDefaultCaptureDevice(controller);
+            device.ToggleMute();
+            return CreateVolumeInfo(device);
+        });
     }
 
     public AudioDashboardSnapshot GetDashboardSnapshot()
     {
-        var playbackDevice = TryGetDefaultPlaybackDevice();
-        var captureDevice = TryGetDefaultCaptureDevice();
+        return UseController(controller =>
+        {
+            var playbackDevice = TryGetDefaultPlaybackDevice(controller);
+            var captureDevice = TryGetDefaultCaptureDevice(controller);
 
-        return new AudioDashboardSnapshot(
-            playbackDevice is null ? null : CreateVolumeInfo(playbackDevice),
-            captureDevice is null ? null : CreateVolumeInfo(captureDevice),
-            GetPlaybackDevices(),
-            GetCaptureDevices(),
-            playbackDevice is null
-                ? Array.Empty<AudioMixerSessionInfo>()
-                : GetMixerSessionGroups(playbackDevice)
-                    .Select(group => group.Info)
-                    .ToArray());
+            return new AudioDashboardSnapshot(
+                playbackDevice is null ? null : CreateVolumeInfo(playbackDevice),
+                captureDevice is null ? null : CreateVolumeInfo(captureDevice),
+                CreateDeviceList(controller.GetPlaybackDevices(DeviceState.Active)),
+                CreateDeviceList(controller.GetCaptureDevices(DeviceState.Active)),
+                playbackDevice is null
+                    ? Array.Empty<AudioMixerSessionInfo>()
+                    : GetMixerSessionGroups(playbackDevice)
+                        .Select(group => group.Info)
+                        .ToArray());
+        });
     }
 
     public IReadOnlyList<AudioMixerSessionInfo> GetActiveMixerSessions()
     {
-        var playbackDevice = TryGetDefaultPlaybackDevice();
-        if (playbackDevice is null)
+        return UseController(controller =>
         {
-            return Array.Empty<AudioMixerSessionInfo>();
-        }
+            var playbackDevice = TryGetDefaultPlaybackDevice(controller);
+            if (playbackDevice is null)
+            {
+                return Array.Empty<AudioMixerSessionInfo>();
+            }
 
-        return GetMixerSessionGroups(playbackDevice)
-            .Select(group => group.Info)
-            .ToArray();
+            return GetMixerSessionGroups(playbackDevice)
+                .Select(group => group.Info)
+                .ToArray();
+        });
     }
 
     public AudioMixerSessionInfo SetMixerSessionVolume(string sessionId, double volume)
     {
-        var group = GetMixerSessionGroup(GetDefaultPlaybackDevice(), sessionId);
-        var nextVolume = Math.Clamp(volume, 0d, 100d);
-
-        foreach (var session in group.Sessions)
+        return UseController(controller =>
         {
-            session.Volume = nextVolume;
-            if (nextVolume > 0d)
-            {
-                session.IsMuted = false;
-            }
-        }
+            var group = GetMixerSessionGroup(GetDefaultPlaybackDevice(controller), sessionId);
+            var nextVolume = Math.Clamp(volume, 0d, 100d);
 
-        return BuildMixerSessionInfo(group);
+            foreach (var session in group.Sessions)
+            {
+                session.Volume = nextVolume;
+                if (nextVolume > 0d)
+                {
+                    session.IsMuted = false;
+                }
+            }
+
+            return BuildMixerSessionInfo(group);
+        });
     }
 
     public AudioMixerSessionInfo ToggleMixerSessionMute(string sessionId)
     {
-        var group = GetMixerSessionGroup(GetDefaultPlaybackDevice(), sessionId);
-        var shouldMute = !AreAllSessionsMuted(group.Sessions);
-
-        foreach (var session in group.Sessions)
+        return UseController(controller =>
         {
-            session.IsMuted = shouldMute;
-        }
+            var group = GetMixerSessionGroup(GetDefaultPlaybackDevice(controller), sessionId);
+            var shouldMute = !AreAllSessionsMuted(group.Sessions);
 
-        return BuildMixerSessionInfo(group);
+            foreach (var session in group.Sessions)
+            {
+                session.IsMuted = shouldMute;
+            }
+
+            return BuildMixerSessionInfo(group);
+        });
     }
 
     private static AudioVolumeInfo CreateVolumeInfo(CoreAudioDevice device)
@@ -160,14 +194,33 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
             .ToArray();
     }
 
-    private void SetDefaultDevice(string deviceId)
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _controllerIdleTimer?.Dispose();
+            _controllerIdleTimer = null;
+            _controller?.Dispose();
+            _controller = null;
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    private static void SetDefaultDevice(CoreAudioController controller, string deviceId)
     {
         if (string.IsNullOrWhiteSpace(deviceId))
         {
             throw new ArgumentException("Device ID is required.", nameof(deviceId));
         }
 
-        var device = _controller.GetDevice(Guid.Parse(deviceId));
+        var device = controller.GetDevice(Guid.Parse(deviceId));
         if (device is null)
         {
             throw new InvalidOperationException("The requested device was not found.");
@@ -199,9 +252,9 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
         return CreateVolumeInfo(device);
     }
 
-    private CoreAudioDevice GetDefaultPlaybackDevice()
+    private static CoreAudioDevice GetDefaultPlaybackDevice(CoreAudioController controller)
     {
-        var device = TryGetDefaultPlaybackDevice();
+        var device = TryGetDefaultPlaybackDevice(controller);
         if (device is null)
         {
             throw new InvalidOperationException("No default playback device is available.");
@@ -210,9 +263,9 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
         return device;
     }
 
-    private CoreAudioDevice GetDefaultCaptureDevice()
+    private static CoreAudioDevice GetDefaultCaptureDevice(CoreAudioController controller)
     {
-        var device = TryGetDefaultCaptureDevice();
+        var device = TryGetDefaultCaptureDevice(controller);
         if (device is null)
         {
             throw new InvalidOperationException("No default capture device is available.");
@@ -221,14 +274,14 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
         return device;
     }
 
-    private CoreAudioDevice? TryGetDefaultPlaybackDevice()
+    private static CoreAudioDevice? TryGetDefaultPlaybackDevice(CoreAudioController controller)
     {
-        return _controller.DefaultPlaybackDevice;
+        return controller.DefaultPlaybackDevice;
     }
 
-    private CoreAudioDevice? TryGetDefaultCaptureDevice()
+    private static CoreAudioDevice? TryGetDefaultCaptureDevice(CoreAudioController controller)
     {
-        return _controller.DefaultCaptureDevice;
+        return controller.DefaultCaptureDevice;
     }
 
     private static MixerSessionGroup GetMixerSessionGroup(CoreAudioDevice device, string sessionId)
@@ -463,6 +516,97 @@ public sealed class CoreAudioOutputDeviceService : IAudioOutputDeviceService
     private static string NormalizeKey(string value)
     {
         return value.Trim().ToLowerInvariant();
+    }
+
+    private T UseController<T>(Func<CoreAudioController, T> action)
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            var controller = _controller ??= CreateController();
+            DisableUnusedPeakMeterPolling(controller);
+
+            try
+            {
+                return action(controller);
+            }
+            finally
+            {
+                _lastControllerUseUtc = DateTimeOffset.UtcNow;
+                _controllerIdleTimer ??= new System.Threading.Timer(
+                    DisposeIdleController,
+                    null,
+                    Timeout.InfiniteTimeSpan,
+                    Timeout.InfiniteTimeSpan);
+                _controllerIdleTimer.Change(ControllerIdleTimeout, Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    private void UseController(Action<CoreAudioController> action)
+    {
+        UseController(controller =>
+        {
+            action(controller);
+            return true;
+        });
+    }
+
+    private static CoreAudioController CreateController()
+    {
+        var controller = new CoreAudioController();
+        DisableUnusedPeakMeterPolling(controller);
+        return controller;
+    }
+
+    private static void DisableUnusedPeakMeterPolling(CoreAudioController controller)
+    {
+        if (PeakTimerSubscriptionField is null)
+        {
+            return;
+        }
+
+        // AudioSwitcher 3.0.3 starts a peak meter timer for every cached device even
+        // though TFS never consumes PeakValueChanged. Some drivers then throw and
+        // catch hundreds of NullReferenceExceptions per second in that timer.
+        foreach (var device in controller.GetDevices(DeviceState.All))
+        {
+            try
+            {
+                if (PeakTimerSubscriptionField.GetValue(device) is IDisposable subscription)
+                {
+                    subscription.Dispose();
+                }
+            }
+            catch
+            {
+                // Peak metering is optional; core volume and device controls stay usable.
+            }
+        }
+    }
+
+    private void DisposeIdleController(object? state)
+    {
+        lock (_sync)
+        {
+            if (_disposed || _controller is null)
+            {
+                return;
+            }
+
+            var idleFor = DateTimeOffset.UtcNow - _lastControllerUseUtc;
+            if (idleFor < ControllerIdleTimeout)
+            {
+                _controllerIdleTimer?.Change(
+                    ControllerIdleTimeout - idleFor,
+                    Timeout.InfiniteTimeSpan);
+                return;
+            }
+
+            _controller.Dispose();
+            _controller = null;
+        }
     }
 
     private sealed record MixerSessionGroup(

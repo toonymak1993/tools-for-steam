@@ -2,8 +2,13 @@ namespace SteamLoader.App.Infrastructure.Helpers;
 
 internal sealed class GamepadHelperSupervisor
 {
-    private static readonly TimeSpan HealthyCheckInterval = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan RecoveryCheckInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan HealthyCheckInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan[] RecoveryCheckIntervals =
+    [
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromMinutes(5),
+    ];
     private static readonly TimeSpan StartupConfirmationDelay = TimeSpan.FromMilliseconds(750);
 
     private readonly Func<bool> _isRegistered;
@@ -44,6 +49,7 @@ internal sealed class GamepadHelperSupervisor
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         bool? previousRunning = null;
+        var consecutiveFailures = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -58,8 +64,14 @@ internal sealed class GamepadHelperSupervisor
                 previousRunning = running;
             }
 
+            consecutiveFailures = running
+                ? 0
+                : Math.Min(consecutiveFailures + 1, RecoveryCheckIntervals.Length);
+            var checkInterval = running
+                ? HealthyCheckInterval
+                : RecoveryCheckIntervals[Math.Max(0, consecutiveFailures - 1)];
             await _delay(
-                    running ? HealthyCheckInterval : RecoveryCheckInterval,
+                    checkInterval,
                     cancellationToken)
                 .ConfigureAwait(false);
         }

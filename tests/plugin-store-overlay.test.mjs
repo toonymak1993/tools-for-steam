@@ -166,10 +166,10 @@ test("full-screen overlay hosts are injected before the Quick Access opener", as
     "utf8",
   );
   const themeSurfaceSetup = source.indexOf(
-    "var themeSurfaceTargets = await _devToolsClient.GetThemeSurfaceTargetsAsync",
+    "var themeSurfaceTargets = SteamDevToolsClient.FindThemeSurfaceTargets(targets)",
   );
   const quickAccessSetup = source.indexOf(
-    "var quickAccessTarget = await _devToolsClient.GetQuickAccessTargetAsync",
+    "var quickAccessTarget = SteamDevToolsClient.FindQuickAccessTarget(targets)",
   );
 
   assert.notEqual(themeSurfaceSetup, -1, "theme surface setup should be present");

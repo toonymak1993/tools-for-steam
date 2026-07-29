@@ -10,12 +10,10 @@ public sealed class QuickAccessShellInjector
 {
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SteamLoaderHostState _hostState;
-    private readonly Uri _apiBaseUri;
-    private readonly string _apiSessionToken;
     private readonly SteamClientLaunchService _steamClientLaunchService;
-    private readonly string _sharedScriptTemplate;
-    private readonly string _popupScriptTemplate;
-    private readonly string _themeSurfaceScriptTemplate;
+    private readonly string _sharedScript;
+    private readonly string _popupScript;
+    private readonly string _themeSurfaceScript;
     private readonly string _sharedScriptVersion;
     private readonly string _popupScriptVersion;
     private readonly string _themeSurfaceScriptVersion;
@@ -37,15 +35,28 @@ public sealed class QuickAccessShellInjector
         SteamLoaderHostState hostState)
     {
         _devToolsClient = devToolsClient;
-        _apiBaseUri = apiBaseUri;
-        _apiSessionToken = apiSessionToken;
         _steamClientLaunchService = steamClientLaunchService;
-        _sharedScriptTemplate = sharedScriptTemplate;
-        _popupScriptTemplate = popupScriptTemplate;
-        _themeSurfaceScriptTemplate = themeSurfaceScriptTemplate;
         _sharedScriptVersion = ComputeScriptVersion($"{sharedScriptTemplate}\n{apiSessionToken}");
         _popupScriptVersion = ComputeScriptVersion($"{popupScriptTemplate}\n{apiSessionToken}");
         _themeSurfaceScriptVersion = ComputeScriptVersion($"{themeSurfaceScriptTemplate}\n{apiSessionToken}");
+        _sharedScript = BuildInjectedScript(
+            sharedScriptTemplate,
+            "__steamLoaderSharedScriptVersion",
+            _sharedScriptVersion,
+            apiBaseUri,
+            apiSessionToken);
+        _popupScript = BuildInjectedScript(
+            popupScriptTemplate,
+            "__steamLoaderPopupScriptVersion",
+            _popupScriptVersion,
+            apiBaseUri,
+            apiSessionToken);
+        _themeSurfaceScript = BuildInjectedScript(
+            themeSurfaceScriptTemplate,
+            "__steamLoaderThemeSurfaceScriptVersion",
+            _themeSurfaceScriptVersion,
+            apiBaseUri,
+            apiSessionToken);
         _hostState = hostState;
     }
 
@@ -80,7 +91,8 @@ public sealed class QuickAccessShellInjector
             return;
         }
 
-        var sharedTarget = await _devToolsClient.GetSharedJsContextTargetAsync(cancellationToken);
+        var targets = await _devToolsClient.GetTargetsAsync(cancellationToken);
+        var sharedTarget = SteamDevToolsClient.FindSharedJsContextTarget(targets);
         if (sharedTarget is null)
         {
             _sharedReadyLogged = false;
@@ -98,9 +110,7 @@ public sealed class QuickAccessShellInjector
         {
             _sharedReadyLogged = await InjectIntoTargetAsync(
                 sharedTarget,
-                _sharedScriptTemplate,
-                "__steamLoaderSharedScriptVersion",
-                _sharedScriptVersion,
+                _sharedScript,
                 "SharedJSContext attached.",
                 _sharedReadyLogged,
                 (message) => _hostState.UpdateSharedContext(true, message),
@@ -116,7 +126,7 @@ public sealed class QuickAccessShellInjector
             _hostState.UpdateSharedContext(true, "SharedJSContext attached.");
         }
 
-        var themeSurfaceTargets = await _devToolsClient.GetThemeSurfaceTargetsAsync(cancellationToken);
+        var themeSurfaceTargets = SteamDevToolsClient.FindThemeSurfaceTargets(targets);
         if (themeSurfaceTargets.Count == 0)
         {
             _themeSurfaceReadyLogged = false;
@@ -144,9 +154,7 @@ public sealed class QuickAccessShellInjector
                     ? _themeSurfaceReadyLogged
                     : await InjectIntoTargetAsync(
                         themeSurfaceTarget,
-                        _themeSurfaceScriptTemplate,
-                        "__steamLoaderThemeSurfaceScriptVersion",
-                        _themeSurfaceScriptVersion,
+                        _themeSurfaceScript,
                         "Theme surface attached.",
                         _themeSurfaceReadyLogged,
                         (_) => { },
@@ -163,7 +171,7 @@ public sealed class QuickAccessShellInjector
         // Prepare the stable full-screen hosts before exposing the Quick Access
         // controls that can open an overlay. This avoids a first-click race where
         // the popup closes before the Store has been injected into the main surface.
-        var quickAccessTarget = await _devToolsClient.GetQuickAccessTargetAsync(cancellationToken);
+        var quickAccessTarget = SteamDevToolsClient.FindQuickAccessTarget(targets);
         if (quickAccessTarget is null)
         {
             _popupReadyLogged = false;
@@ -181,9 +189,7 @@ public sealed class QuickAccessShellInjector
         {
             _popupReadyLogged = await InjectIntoTargetAsync(
                 quickAccessTarget,
-                _popupScriptTemplate,
-                "__steamLoaderPopupScriptVersion",
-                _popupScriptVersion,
+                _popupScript,
                 "Quick Access attached.",
                 _popupReadyLogged,
                 (message) => _hostState.UpdateQuickAccess(true, message),
@@ -202,19 +208,51 @@ public sealed class QuickAccessShellInjector
 
     private async Task<bool> InjectIntoTargetAsync(
         SteamDevToolsTarget target,
-        string scriptTemplate,
-        string scriptVersionProperty,
-        string scriptVersion,
+        string script,
         string readyMessage,
         bool readyLogged,
         Action<string> setReadyState,
         CancellationToken cancellationToken)
     {
-        var apiBase = _apiBaseUri.ToString();
+        var result = await _devToolsClient.EvaluateAsync(
+            target.WebSocketDebuggerUrl,
+            script,
+            cancellationToken);
+
+        if (!result.Success)
+        {
+            _hostState.UpdateError($"Injection failed: {result.ErrorMessage}");
+            return readyLogged;
+        }
+
+        if (string.Equals(result.Value?.ToString(), "injected", StringComparison.Ordinal))
+        {
+            if (!readyLogged)
+            {
+                setReadyState(readyMessage);
+                readyLogged = true;
+            }
+            else
+            {
+                setReadyState(readyMessage);
+            }
+        }
+
+        return readyLogged;
+    }
+
+    private static string BuildInjectedScript(
+        string scriptTemplate,
+        string scriptVersionProperty,
+        string scriptVersion,
+        Uri apiBaseUri,
+        string apiSessionToken)
+    {
+        var apiBase = apiBaseUri.ToString();
         var authenticatedFetchBootstrap = $$"""
             (() => {
               const apiBase = {{JsonSerializer.Serialize(apiBase)}};
-              const apiToken = {{JsonSerializer.Serialize(_apiSessionToken)}};
+              const apiToken = {{JsonSerializer.Serialize(apiSessionToken)}};
               window.__steamLoaderApiBase = apiBase;
               window.__steamLoaderApiToken = apiToken;
               window.__steamLoaderApiUrl = (path) => {
@@ -243,32 +281,7 @@ public sealed class QuickAccessShellInjector
             scriptBody,
             $"window[{JsonSerializer.Serialize(scriptVersionProperty)}] = {JsonSerializer.Serialize(scriptVersion)};",
             "\"injected\";");
-
-        var result = await _devToolsClient.EvaluateAsync(
-            target.WebSocketDebuggerUrl,
-            script,
-            cancellationToken);
-
-        if (!result.Success)
-        {
-            _hostState.UpdateError($"Injection failed: {result.ErrorMessage}");
-            return readyLogged;
-        }
-
-        if (string.Equals(result.Value?.ToString(), "injected", StringComparison.Ordinal))
-        {
-            if (!readyLogged)
-            {
-                setReadyState(readyMessage);
-                readyLogged = true;
-            }
-            else
-            {
-                setReadyState(readyMessage);
-            }
-        }
-
-        return readyLogged;
+        return script;
     }
 
     private async Task<bool> IsTargetScriptCurrentAsync(
@@ -283,7 +296,12 @@ public sealed class QuickAccessShellInjector
             expression,
             cancellationToken);
 
-        return result.Success && result.Value is bool isCurrent && isCurrent;
+        return result.Success && IsCurrentScriptVersionValue(result.Value);
+    }
+
+    internal static bool IsCurrentScriptVersionValue(object? value)
+    {
+        return SteamDevToolsClient.TryReadBoolean(value, out var isCurrent) && isCurrent;
     }
 
     private static string ComputeScriptVersion(string script)

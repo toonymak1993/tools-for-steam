@@ -8,6 +8,47 @@ namespace SteamLoader.App.Tests;
 public sealed class HandheldDeviceCatalogTests
 {
     [Fact]
+    public void UnsupportedDevice_OemSnapshotRemainsInactive()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"tfs-unsupported-oem-{Guid.NewGuid():N}");
+        try
+        {
+            var service = new HandheldSystemControlService(root);
+            var snapshot = service.GetOemSoftware(
+                HandheldDeviceCatalog.CreateMsiClawA8(detected: false));
+
+            Assert.False(snapshot.Supported);
+            Assert.False(snapshot.Detected);
+            Assert.False(snapshot.Running);
+            Assert.False(snapshot.ControlActive);
+            Assert.Equal("OEM control is not available for this device.", snapshot.StatusText);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("System", false)]
+    [InlineData("lsass", false)]
+    [InlineData("steamwebhelper", false)]
+    [InlineData("MSI.CentralServer", true)]
+    [InlineData("GamingCenter", true)]
+    [InlineData("DCv2", true)]
+    public void MsiProcessMetadata_IsReadOnlyForPlausibleCandidates(
+        string processName,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            HandheldSystemControlService.ShouldInspectMsiCenterProcessMetadata(processName));
+    }
+
+    [Fact]
     public void MsiClawDirectInputState_MapsTheCompleteXboxLayoutWithoutConsumingBackPaddles()
     {
         var buttons = new bool[128];

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
@@ -23,14 +24,13 @@ public sealed class SteamDevToolsClient
     public async Task<SteamDevToolsTarget?> GetSharedJsContextTargetAsync(CancellationToken cancellationToken)
     {
         var targets = await GetTargetsAsync(cancellationToken);
-        return targets.FirstOrDefault(target =>
-            string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase));
+        return FindSharedJsContextTarget(targets);
     }
 
     public async Task<SteamDevToolsTarget?> GetQuickAccessTargetAsync(CancellationToken cancellationToken)
     {
         var targets = await GetTargetsAsync(cancellationToken);
-        return targets.FirstOrDefault(target => IsQuickAccessTarget(target));
+        return FindQuickAccessTarget(targets);
     }
 
     public async Task<SteamDevToolsTarget?> GetBigPictureTargetAsync(CancellationToken cancellationToken)
@@ -48,6 +48,25 @@ public sealed class SteamDevToolsClient
     public async Task<IReadOnlyList<SteamDevToolsTarget>> GetThemeSurfaceTargetsAsync(CancellationToken cancellationToken)
     {
         var targets = await GetTargetsAsync(cancellationToken);
+        return FindThemeSurfaceTargets(targets);
+    }
+
+    internal static SteamDevToolsTarget? FindSharedJsContextTarget(
+        IReadOnlyList<SteamDevToolsTarget> targets)
+    {
+        return targets.FirstOrDefault(target =>
+            string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static SteamDevToolsTarget? FindQuickAccessTarget(
+        IReadOnlyList<SteamDevToolsTarget> targets)
+    {
+        return targets.FirstOrDefault(IsQuickAccessTarget);
+    }
+
+    internal static IReadOnlyList<SteamDevToolsTarget> FindThemeSurfaceTargets(
+        IReadOnlyList<SteamDevToolsTarget> targets)
+    {
         return targets
             .Where(target =>
                 string.Equals(target.Type, "page", StringComparison.OrdinalIgnoreCase) &&
@@ -114,14 +133,12 @@ public sealed class SteamDevToolsClient
 
         var commandId = Interlocked.Increment(ref _nextCommandId);
 
-        var payload = JsonSerializer.Serialize(
+        var payloadBytes = JsonSerializer.SerializeToUtf8Bytes(
             new DevToolsCommand(
                 commandId,
                 "Runtime.evaluate",
                 new DevToolsCommandParameters(expression, true, true)),
             JsonOptions);
-
-        var payloadBytes = Encoding.UTF8.GetBytes(payload);
         await webSocket.SendAsync(
             payloadBytes,
             WebSocketMessageType.Text,
@@ -525,27 +542,36 @@ public sealed class SteamDevToolsClient
 
     private static async Task<string> ReceiveMessageAsync(ClientWebSocket webSocket, CancellationToken cancellationToken)
     {
-        var buffer = new byte[64 * 1024];
-        using var memory = new MemoryStream();
-
-        while (true)
+        var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        try
         {
-            var result = await webSocket.ReceiveAsync(buffer, cancellationToken);
+            using var memory = new MemoryStream();
 
-            if (result.MessageType == WebSocketMessageType.Close)
+            while (true)
             {
-                break;
+                var result = await webSocket.ReceiveAsync(buffer, cancellationToken);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    break;
+                }
+
+                memory.Write(buffer, 0, result.Count);
+
+                if (result.EndOfMessage)
+                {
+                    break;
+                }
             }
 
-            memory.Write(buffer, 0, result.Count);
-
-            if (result.EndOfMessage)
-            {
-                break;
-            }
+            return memory.TryGetBuffer(out var message)
+                ? Encoding.UTF8.GetString(message.Array!, message.Offset, message.Count)
+                : Encoding.UTF8.GetString(memory.ToArray());
         }
-
-        return Encoding.UTF8.GetString(memory.ToArray());
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private static DevToolsResponse? TryDeserializeMatchingResponse(string responseText, int expectedCommandId)
@@ -652,7 +678,7 @@ public sealed class SteamDevToolsClient
         return 5;
     }
 
-    private static bool TryReadBoolean(object? value, out bool boolean)
+    internal static bool TryReadBoolean(object? value, out bool boolean)
     {
         switch (value)
         {

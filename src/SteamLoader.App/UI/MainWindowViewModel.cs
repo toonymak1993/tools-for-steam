@@ -62,6 +62,7 @@ public sealed class MainWindowViewModel : BindableBase
     private string _splashDebugText = string.Empty;
     private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
     private Task _splashCoversTask = Task.CompletedTask;
+    private bool _splashArtworkReleased;
     private int _windowsShellStartDelaySeconds;
     private UpdateCheckSnapshot? _updateSnapshot;
 
@@ -270,6 +271,20 @@ public sealed class MainWindowViewModel : BindableBase
     public Task AwaitSplashCoversAsync(int timeoutMs = 2500) =>
         Task.WhenAny(_splashCoversTask, Task.Delay(timeoutMs));
 
+    public void ReleaseSplashArtwork()
+    {
+        if (_splashArtworkReleased)
+        {
+            return;
+        }
+
+        _splashArtworkReleased = true;
+        _splashCoversTask = Task.CompletedTask;
+        SplashGameCovers = [];
+        SplashCustomImagePath = string.Empty;
+        SplashDebugText = string.Empty;
+    }
+
     public string SplashDebugText
     {
         get => _splashDebugText;
@@ -351,6 +366,7 @@ public sealed class MainWindowViewModel : BindableBase
 
     public void StartSplashPreview(TimeSpan duration)
     {
+        _splashArtworkReleased = false;
         ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
         _splashCoversTask = string.IsNullOrWhiteSpace(SplashCustomImagePath)
             ? LoadSplashGameCoversAsync()
@@ -1044,6 +1060,11 @@ public sealed class MainWindowViewModel : BindableBase
 
         await _dispatcher.InvokeAsync(() =>
         {
+            if (_splashArtworkReleased)
+            {
+                return;
+            }
+
             SplashGameCovers = thumbnails;
             SplashDebugText = $"loaded: {thumbnails.Count}";
         });
@@ -1052,10 +1073,14 @@ public sealed class MainWindowViewModel : BindableBase
     private void ApplyGeneralSettingsSnapshot(SteamLoaderGeneralSettingsSnapshot settings)
     {
         var splashScreen = settings.SplashScreen;
-        SplashCustomImagePath =
-            splashScreen.ArtworkMode == StartupSplashArtworkMode.Custom && splashScreen.CustomImageExists
-                ? splashScreen.CustomImagePath
-                : string.Empty;
+        if (!_splashArtworkReleased)
+        {
+            SplashCustomImagePath =
+                splashScreen.ArtworkMode == StartupSplashArtworkMode.Custom && splashScreen.CustomImageExists
+                    ? splashScreen.CustomImagePath
+                    : string.Empty;
+        }
+
         WindowsShellStartDelaySeconds = settings.WindowsShellStartDelaySeconds;
     }
 

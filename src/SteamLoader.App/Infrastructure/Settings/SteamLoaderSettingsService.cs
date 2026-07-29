@@ -17,6 +17,8 @@ public sealed class SteamLoaderSettingsService
     };
     private const int MaximumWindowsShellStartDelaySeconds = 30;
     private const string StartupModeMutexName = @"Local\ToolsForSteam.StartupMode";
+    private const string StoreSyncPluginId = "store-sync";
+    private const string OmniLibraryPluginId = "omnilibrary";
 
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
@@ -503,27 +505,36 @@ public sealed class SteamLoaderSettingsService
 
     public SteamLoaderGeneralSettingsSnapshot SetPluginEnabled(string pluginId, bool enabled)
     {
-        var definition = SteamLoaderPluginCatalog.Find(pluginId);
-        if (definition is null)
+        lock (_gate)
         {
-            throw new InvalidOperationException("Unknown plugin.");
+            var definition = SteamLoaderPluginCatalog.Find(pluginId);
+            if (definition is null)
+            {
+                throw new InvalidOperationException("Unknown plugin.");
+            }
+
+            if (!definition.CanDisable && !enabled)
+            {
+                throw new InvalidOperationException("This plugin cannot be disabled.");
+            }
+
+            var settings = LoadSettings();
+            var pluginStates = NormalizePluginStates(settings.PluginEnabled);
+            pluginStates[definition.Id] = enabled || !definition.CanDisable;
+
+            if (enabled &&
+                TryGetAlternativeLibraryPluginId(definition.Id, out var alternativePluginId))
+            {
+                pluginStates[alternativePluginId] = false;
+            }
+
+            SaveSettings(settings with
+            {
+                PluginEnabled = pluginStates
+            });
+
+            return CreateSnapshot(settings with { PluginEnabled = pluginStates });
         }
-
-        if (!definition.CanDisable && !enabled)
-        {
-            throw new InvalidOperationException("This plugin cannot be disabled.");
-        }
-
-        var settings = LoadSettings();
-        var pluginStates = NormalizePluginStates(settings.PluginEnabled);
-        pluginStates[definition.Id] = enabled || !definition.CanDisable;
-
-        SaveSettings(settings with
-        {
-            PluginEnabled = pluginStates
-        });
-
-        return GetSnapshot();
     }
 
     public SteamLoaderGeneralSettingsSnapshot SetPluginOrder(IReadOnlyList<string>? pluginIds)
@@ -558,7 +569,9 @@ public sealed class SteamLoaderSettingsService
 
         var settings = LoadSettings();
         var pluginStates = NormalizePluginStates(settings.PluginEnabled);
-        return pluginStates.TryGetValue(definition.Id, out var enabled) ? enabled : true;
+        return pluginStates.TryGetValue(definition.Id, out var enabled)
+            ? enabled
+            : definition.DefaultEnabled;
     }
 
     public SteamLoaderGeneralSettingsSnapshot CompleteFirstRunSetup()
@@ -802,26 +815,47 @@ public sealed class SteamLoaderSettingsService
             plugin => plugin.DefaultEnabled,
             StringComparer.OrdinalIgnoreCase);
 
-        if (savedStates is null)
+        if (savedStates is not null)
         {
-            return normalized;
+            foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
+            {
+                if (!plugin.CanDisable)
+                {
+                    normalized[plugin.Id] = true;
+                    continue;
+                }
+
+                if (savedStates.TryGetValue(plugin.Id, out var enabled))
+                {
+                    normalized[plugin.Id] = enabled;
+                }
+            }
         }
 
-        foreach (var plugin in SteamLoaderPluginCatalog.Definitions)
+        if (normalized[StoreSyncPluginId] && normalized[OmniLibraryPluginId])
         {
-            if (!plugin.CanDisable)
-            {
-                normalized[plugin.Id] = true;
-                continue;
-            }
-
-            if (savedStates.TryGetValue(plugin.Id, out var enabled))
-            {
-                normalized[plugin.Id] = enabled;
-            }
+            normalized[OmniLibraryPluginId] = false;
         }
 
         return normalized;
+    }
+
+    private static bool TryGetAlternativeLibraryPluginId(string pluginId, out string alternativePluginId)
+    {
+        if (string.Equals(pluginId, StoreSyncPluginId, StringComparison.OrdinalIgnoreCase))
+        {
+            alternativePluginId = OmniLibraryPluginId;
+            return true;
+        }
+
+        if (string.Equals(pluginId, OmniLibraryPluginId, StringComparison.OrdinalIgnoreCase))
+        {
+            alternativePluginId = StoreSyncPluginId;
+            return true;
+        }
+
+        alternativePluginId = string.Empty;
+        return false;
     }
 
     private static IReadOnlyList<string> NormalizePluginOrder(IReadOnlyList<string>? savedOrder)

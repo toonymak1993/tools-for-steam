@@ -13,6 +13,7 @@ dist/
 !sdk/full-trust-plugin-template/dist/
 !sdk/full-trust-plugin-template/dist/index.js
 .codex_probe/
+.codex-build/
 sdk/catalog.local.json
 sdk/catalog.online.json
 sdk/images/

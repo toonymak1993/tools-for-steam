@@ -10,8 +10,9 @@ public static class SteamLoaderPluginCatalog
         var definitions = new List<SteamLoaderPluginDefinition>
         {
         new("processes", "Processes", "Window switcher for visible app windows.", true),
-        new("app-start", "App Start", "One-click launcher for installed Windows apps.", true),
-        new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true),
+        new("app-start", "Apps", "One-click launcher for installed Windows apps.", true),
+        new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true, false),
+        new("omnilibrary", "OmniLibrary", "Bring Xbox and Epic libraries into dedicated Steam tabs with download, play, and safe uninstall actions.", true, false),
         new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),
