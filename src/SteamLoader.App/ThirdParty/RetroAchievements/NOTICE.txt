@@ -1,0 +1,19 @@
+RetroAchievements RAHasher
+===========================
+
+OmniLibrary can download the official RAHasher 1.8.3 utility on demand from
+the RetroAchievements RALibretro release. RAHasher is not embedded in the
+Tools for Steam source tree or installer.
+
+Project: https://github.com/RetroAchievements/RALibretro
+Release asset:
+https://github.com/RetroAchievements/RALibretro/releases/download/1.8.3/RAHasher-x64-Windows-1.8.3.zip
+Expected archive SHA-256:
+d79be62a6d6a4b938c71fb2e7534fe3e1802ee7d97411fde2ee10b8e330dd93c
+License: GNU General Public License v3.0
+License text and corresponding source:
+https://github.com/RetroAchievements/RALibretro/tree/1.8.3
+
+RAHasher calculates the platform-specific content hash used by
+RetroAchievements. OmniLibrary caches only the resulting hash-to-game mapping;
+it does not upload or redistribute the user's ROM file.

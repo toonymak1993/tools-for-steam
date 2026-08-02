@@ -112,6 +112,26 @@ public sealed class SteamLoaderProcessManager
         response.EnsureSuccessStatusCode();
     }
 
+    public async Task<bool> RequestSteamStartupRepairAsync(CancellationToken cancellationToken = default)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = ExecutablePath,
+            Arguments = SteamLoaderRuntime.RepairSteamStartupArgument,
+            WorkingDirectory = WorkingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        });
+        if (process is null)
+        {
+            return false;
+        }
+
+        await process.WaitForExitAsync(cancellationToken);
+        return process.ExitCode == 0;
+    }
+
     private static async Task WaitUntilAsync(
         Func<Task<bool>> check,
         bool expectedValue,

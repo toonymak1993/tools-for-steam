@@ -85,13 +85,21 @@ public sealed class QuickAccessShellInjector
     private async Task EnsureInjectedAsync(CancellationToken cancellationToken)
     {
         var launchState = await _steamClientLaunchService.EnsureDevToolsReadyAsync(cancellationToken);
+        _hostState.UpdateSteamStartup(launchState.StartupStage, launchState.Message);
         if (!launchState.DevToolsReady)
         {
+            _hostState.UpdateSteamUiState(launchState.StartupStage switch
+            {
+                SteamClientStartupStage.Updating => SteamUiState.Updating,
+                SteamClientStartupStage.Failed => SteamUiState.Error,
+                _ => SteamUiState.Starting
+            });
             ResetAttachedTargets(launchState.Message);
             return;
         }
 
         var targets = await _devToolsClient.GetTargetsAsync(cancellationToken);
+        _hostState.UpdateSteamUiState(SteamUiStateClassifier.Classify(targets));
         var sharedTarget = SteamDevToolsClient.FindSharedJsContextTarget(targets);
         if (sharedTarget is null)
         {
@@ -274,7 +282,9 @@ public sealed class QuickAccessShellInjector
               window.__steamLoaderAuthenticatedFetchToken = apiToken;
             })();
             """;
-        var scriptBody = scriptTemplate.Replace("__STEAMLOADER_API_BASE__", apiBase, StringComparison.Ordinal);
+        var scriptBody = scriptTemplate
+            .Replace("__STEAMLOADER_API_BASE__", apiBase, StringComparison.Ordinal)
+            .Replace("__STEAMLOADER_SCRIPT_VERSION__", scriptVersion, StringComparison.Ordinal);
         var script = string.Join(
             Environment.NewLine,
             authenticatedFetchBootstrap,

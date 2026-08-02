@@ -7,6 +7,28 @@ namespace SteamLoader.App.Tests;
 public sealed class UnifySteamEpicLaunchTests
 {
     [Theory]
+    [InlineData("xbox-game-pass", false, "", false, true)]
+    [InlineData("xbox-game-pass", true, "", false, false)]
+    [InlineData("gog-galaxy", false, "", false, true)]
+    [InlineData("epic-games", false, "epic", true, true)]
+    [InlineData("epic-games", false, "ea-app", false, false)]
+    public void CanInstallDirectly_UsesStoreSpecificCapabilities(
+        string storeId,
+        bool cloudPlayable,
+        string deliveryProvider,
+        bool hasInstallableAsset,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            UnifySteamService.CanInstallDirectly(
+                storeId,
+                cloudPlayable,
+                deliveryProvider,
+                hasInstallableAsset));
+    }
+
+    [Theory]
     [InlineData("Heather")]
     [InlineData("heather")]
     [InlineData("9d2d0eb64d5c44529cece33fe2a46482")]
@@ -106,5 +128,163 @@ public sealed class UnifySteamEpicLaunchTests
                 thirdPartyApp,
                 thirdPartyProvider,
                 partnerLinkType));
+    }
+
+    [Theory]
+    [InlineData("ubisoft-connect", true, false, true)]
+    [InlineData("ubisoft-connect", false, true, false)]
+    [InlineData("ea-app", true, true, false)]
+    [InlineData("epic", true, false, true)]
+    [InlineData("epic", false, false, false)]
+    public void EpicDeliveryCapabilities_KeepPublisherLaunchersExternal(
+        string provider,
+        bool hasInstallableAsset,
+        bool requiresExternalLauncher,
+        bool canInstallDirectly)
+    {
+        Assert.Equal(
+            requiresExternalLauncher,
+            UnifySteamService.RequiresEpicExternalLauncher(
+                provider,
+                hasInstallableAsset));
+        Assert.Equal(
+            canInstallDirectly,
+            UnifySteamService.CanInstallEpicDirectly(
+                provider,
+                hasInstallableAsset));
+    }
+
+    [Theory]
+    [InlineData(
+        "",
+        "LinkRequired")]
+    [InlineData(
+        "not-json",
+        "LinkRequired")]
+    [InlineData(
+        "{\"activated\":[{\"app_name\":\"crew\"}],\"redeemable\":[]}",
+        "Activated")]
+    [InlineData(
+        "{\"activated\":[],\"redeemable\":[{\"app_name\":\"crew\"}]}",
+        "Redeemable")]
+    [InlineData(
+        "{\"activated\":[],\"redeemable\":[]}",
+        "NotEligible")]
+    public void UbisoftAccountLinkSummary_TracksTheExactEpicTitle(
+        string summary,
+        string expected)
+    {
+        Assert.Equal(
+            expected,
+            UnifySteamLauncher
+                .GetUbisoftAccountLinkState(summary, "crew")
+                .ToString());
+    }
+
+    [Theory]
+    [InlineData("ubisoft-connect", false, true)]
+    [InlineData("ubisoft-connect", true, false)]
+    [InlineData("epic", false, false)]
+    public void UbisoftAccountLink_IsRequiredOnlyBeforeThePublisherInstall(
+        string provider,
+        bool installed,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            UnifySteamLauncher.ShouldEnsureUbisoftAccountLink(
+                new UnifySteamGameCacheEntry
+                {
+                    DeliveryProvider = provider,
+                    Installed = installed,
+                }));
+    }
+
+    [Fact]
+    public void NormalizeEpicDeliveryCapabilities_PreservesInstallableUbisoftEpicAsset()
+    {
+        var game = new UnifySteamGameCacheEntry
+        {
+            DeliveryProvider = "ubisoft-connect",
+            HasInstallableAsset = true,
+            RequiresAccountLink = false,
+            RequiresExternalLauncher = false,
+        };
+
+        UnifySteamService.NormalizeEpicDeliveryCapabilities(game);
+
+        Assert.True(game.RequiresAccountLink);
+        Assert.False(game.RequiresExternalLauncher);
+        Assert.True(UnifySteamService.CanInstallEpicDirectly(
+            game.DeliveryProvider,
+            game.HasInstallableAsset));
+    }
+
+    [Fact]
+    public void EaHandoff_AcceptsOnlyTheExpectedLegendaryLink2EaTarget()
+    {
+        const string json =
+            """{"uri":"link2ea://launchgame/bobcat?AUTH_PASSWORD=short-lived-secret"}""";
+
+        Assert.True(EaAppIntegration.TryParseHandoffUri(
+            json,
+            "bobcat",
+            out var handoffUri));
+        Assert.Equal("link2ea", handoffUri.Scheme);
+        Assert.Equal("launchgame", handoffUri.Host);
+        Assert.Equal("/bobcat", handoffUri.AbsolutePath);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("not-json")]
+    [InlineData("""{"uri":"https://example.com/bobcat"}""")]
+    [InlineData("""{"uri":"link2ea://other/bobcat?AUTH_PASSWORD=secret"}""")]
+    [InlineData("""{"uri":"link2ea://launchgame/another-game?AUTH_PASSWORD=secret"}""")]
+    [InlineData("""{"uri":"link2ea://launchgame/bobcat"}""")]
+    [InlineData("""{"uri":"link2ea://launchgame/bobcat?AUTH_PASSWORD="}""")]
+    public void EaHandoff_RejectsMalformedOrMisdirectedTargets(string json)
+    {
+        Assert.False(EaAppIntegration.TryParseHandoffUri(
+            json,
+            "bobcat",
+            out _));
+    }
+
+    [Theory]
+    [InlineData(
+        "\"C:\\Program Files\\Electronic Arts\\EA Desktop\\EA Desktop\\EADesktop.exe\" \"%1\"",
+        "C:\\Program Files\\Electronic Arts\\EA Desktop\\EA Desktop\\EADesktop.exe")]
+    [InlineData(
+        "C:\\EA\\EADesktop.exe %1",
+        "C:\\EA\\EADesktop.exe")]
+    [InlineData("", "")]
+    public void EaProtocolCommand_ExtractsOnlyItsExecutableToken(
+        string command,
+        string expected)
+    {
+        Assert.Equal(
+            expected,
+            EaAppIntegration.ExtractExecutablePathFromCommand(command));
+    }
+
+    [Theory]
+    [InlineData(true, false, "idle", "")]
+    [InlineData(false, false, "idle", "install-client")]
+    [InlineData(false, true, "idle", "link-account")]
+    [InlineData(false, true, "action-required", "continue-provider")]
+    [InlineData(false, true, "failed", "link-account")]
+    public void EaExternalAction_ExposesTheNextHonestUserStep(
+        bool installed,
+        bool eaAppAvailable,
+        string operationStatus,
+        string expected)
+    {
+        Assert.Equal(
+            expected,
+            EaAppIntegration.GetExternalAction(
+                installed,
+                eaAppAvailable,
+                operationStatus));
     }
 }

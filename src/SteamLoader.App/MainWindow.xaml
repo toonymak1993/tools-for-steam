@@ -360,6 +360,16 @@
                                   GameCovers="{Binding SplashGameCovers}"
                                   CustomImagePath="{Binding SplashCustomImagePath}"
                                   DetailText="{Binding ServiceDetailText}"
-                                  StateText="{Binding SteamStateText}" />
+                                  StateText="{Binding SteamStateText}"
+                                  HeadlineText="{Binding SplashHeadlineText}"
+                                  ShowRecoveryActions="{Binding ShowSplashRecoveryActions}"
+                                  CanRestartSteam="{Binding CanRestartSteamFromSplash}"
+                                  ContinueCommand="{Binding ContinueWaitingFromSplashCommand}"
+                                  RestartCommand="{Binding RestartSteamFromSplashCommand}"
+                                  DesktopCommand="{Binding OpenDesktopFromSplashCommand}"
+                                  ContinueLabel="{Binding SplashContinueLabel}"
+                                  RestartLabel="{Binding SplashRestartLabel}"
+                                  DesktopLabel="{Binding SplashDesktopLabel}"
+                                  RecoveryHeadlineText="{Binding SplashRecoveryHeadline}" />
     </Grid>
 </Window>

@@ -75,4 +75,51 @@ public sealed class UnifySteamDownloadStatusStoreTests
                 out _,
                 out _));
     }
+
+    [Theory]
+    [InlineData("preparing", true)]
+    [InlineData("queued", true)]
+    [InlineData("downloading", true)]
+    [InlineData("reconnecting", true)]
+    [InlineData("finalizing", true)]
+    [InlineData("paused", true)]
+    [InlineData("failed", true)]
+    [InlineData("cancel-failed", true)]
+    [InlineData("canceling", false)]
+    [InlineData("completed", false)]
+    public void ManagedDownloads_AreCancelableAcrossEverySafePhase(
+        string status,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            StoreSyncService.CanCancelManagedDownload(
+                managedByToolsForSteam: true,
+                status));
+        Assert.False(
+            StoreSyncService.CanCancelManagedDownload(
+                managedByToolsForSteam: false,
+                status));
+    }
+
+    [Theory]
+    [InlineData(false, "preparing", true)]
+    [InlineData(false, "downloading", true)]
+    [InlineData(false, "finalizing", true)]
+    [InlineData(false, "paused", true)]
+    [InlineData(true, "action-required", true)]
+    [InlineData(false, "uninstall-action-required", true)]
+    [InlineData(true, "downloading", false)]
+    [InlineData(false, "completed", false)]
+    public void ExternalOrActionRequiredEntries_CanAlwaysStopTracking(
+        bool managedByToolsForSteam,
+        string status,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            StoreSyncService.CanStopTrackingDownload(
+                managedByToolsForSteam,
+                status));
+    }
 }

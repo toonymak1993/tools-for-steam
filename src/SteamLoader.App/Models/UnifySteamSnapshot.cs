@@ -4,7 +4,43 @@ public sealed record UnifySteamSnapshot(
     string StatusText,
     string DetailText,
     DateTimeOffset? LastRefreshedAtUtc,
-    IReadOnlyList<UnifySteamStoreState> Stores);
+    IReadOnlyList<UnifySteamStoreState> Stores)
+{
+    public OmniLibraryGameDataState GameData { get; init; } =
+        OmniLibraryGameDataState.Disabled;
+}
+
+public sealed record OmniLibraryGameDataState(
+    bool Enabled,
+    int EnabledProviderCount,
+    int ConfiguredProviderCount,
+    IReadOnlyList<OmniLibraryGameDataProviderState> Providers)
+{
+    public static OmniLibraryGameDataState Disabled { get; } =
+        new(false, 0, 0, []);
+}
+
+public sealed record OmniLibraryGameDataProviderState(
+    string Id,
+    string Title,
+    string Description,
+    bool RuntimeAvailable,
+    bool Enabled,
+    bool Configured,
+    string Status,
+    string Detail,
+    string ConnectionStatus,
+    string ConnectionDetail,
+    DateTimeOffset? ConnectionCheckedAtUtc,
+    string SetupKind,
+    string CredentialPreview,
+    string AccountName,
+    string AccountId,
+    string Region,
+    string Locale,
+    string DataPath,
+    IReadOnlyList<string> Capabilities,
+    IReadOnlyList<string> StoreIds);
 
 public sealed record UnifySteamStateSnapshot(
     long Revision,
@@ -35,6 +71,8 @@ public sealed record UnifySteamLibraryStoreSummary(
     public IReadOnlyList<uint> ActiveDownloadAppIds { get; init; } = [];
 
     public IReadOnlyList<uint> RepairableAppIds { get; init; } = [];
+
+    public IReadOnlyList<OmniLibraryRomSystemState> RomSystems { get; init; } = [];
 }
 
 public sealed record UnifySteamLibraryTabSummary(
@@ -47,6 +85,15 @@ public sealed record UnifySteamGameDetailSnapshot(
     long Revision,
     string StoreId,
     UnifySteamGameState? Game);
+
+public sealed record OmniLibraryGameArtworkRepairResult(
+    uint SteamAppId,
+    string StoreId,
+    string GameId,
+    string Title,
+    bool Queued,
+    IReadOnlyList<string> MissingArtworkSlots,
+    string Message);
 
 public sealed record OmniLibraryDownloadCenterSnapshot(
     long Revision,
@@ -71,9 +118,12 @@ public sealed record OmniLibraryDownloadCenterEntry(
     double DiskWriteBytesPerSecond,
     double DiskReadBytesPerSecond,
     int Attempt,
+    string TransferOwner,
+    bool ManagedByToolsForSteam,
     bool CanPause,
     bool CanResume,
     bool CanCancel,
+    bool CanStopTracking,
     bool CanDismiss,
     bool CanPlay,
     bool CanManageExternally,
@@ -129,6 +179,39 @@ public sealed record UnifySteamStoreState(
     public bool GogDlcEnabled { get; init; } = true;
 
     public bool GogGalaxyLaunchEnabled { get; init; }
+
+    public bool AchievementsEnabled { get; init; } = true;
+
+    public bool AchievementProviderConfigured { get; init; }
+
+    public string AchievementProviderName { get; init; } = string.Empty;
+
+    public string AchievementProviderDetail { get; init; } = string.Empty;
+
+    public string AchievementCredentialPreview { get; init; } = string.Empty;
+
+    public IReadOnlyList<OmniLibraryRomSystemState> RomSystems { get; init; } = [];
+
+    public string ToolPath { get; init; } = string.Empty;
+}
+
+public sealed record OmniLibraryRomSystemState(
+    string Id,
+    string Title,
+    string EmulatorTitle,
+    int GameCount,
+    string IconId,
+    IReadOnlyList<uint> AppIds)
+{
+    public string EmulatorPath { get; init; } = string.Empty;
+
+    public string ExecutableName { get; init; } = string.Empty;
+
+    public string FolderPath { get; init; } = string.Empty;
+
+    public bool EmulatorDetected { get; init; }
+
+    public bool Fullscreen { get; init; } = true;
 }
 
 public sealed record OmniLibraryLifecycleSnapshot(
@@ -168,11 +251,23 @@ public sealed record UnifySteamGameState(
 
     public bool CanInstallDirectly { get; init; } = true;
 
+    public string ExternalAction { get; init; } = string.Empty;
+
     public bool SupportsCloudSaves { get; init; }
 
     public bool IsPreloaded { get; init; }
 
     public bool UpdateAvailable { get; init; }
+
+    public string StoreTitleId { get; init; } = string.Empty;
+
+    public string StoreNamespace { get; init; } = string.Empty;
+
+    public string PlatformId { get; init; } = string.Empty;
+
+    public string PlatformTitle { get; init; } = string.Empty;
+
+    public string RomPath { get; init; } = string.Empty;
 }
 
 public sealed record UnifySteamDownloadState(

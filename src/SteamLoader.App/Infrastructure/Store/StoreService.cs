@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Xml.Linq;
 using SteamLoader.App.Infrastructure.Processes;
 using SteamLoader.App.Models;
@@ -12,14 +13,25 @@ namespace SteamLoader.App.Infrastructure.Store;
 
 public sealed class StoreService
 {
+    private static readonly JsonSerializerOptions BackupJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true
+    };
     private static readonly TimeSpan MinimumRefreshAge = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan OfferCacheLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan AlertFlatSampleInterval = TimeSpan.FromDays(1);
+    private static readonly TimeSpan ArtworkMissLifetime = TimeSpan.FromHours(6);
+    private static readonly TimeSpan ArtworkTouchInterval = TimeSpan.FromHours(6);
+    private static readonly TimeSpan ArtworkMetricsCacheLifetime = TimeSpan.FromSeconds(10);
     private const int MaxAlertHistoryPoints = 180;
+    private const int MaxRememberedArtworkMisses = 4096;
+    private const int MaxImportedWishlistItems = 2000;
+    private const int MaxImportedAlerts = 2000;
     private const long MaxArtworkFileBytes = 12L * 1024 * 1024;
-    private const long MaxArtworkCacheBytes = 256L * 1024 * 1024;
-    private const long ArtworkCacheTrimTargetBytes = 192L * 1024 * 1024;
-    private static readonly TimeSpan ArtworkCacheLifetime = TimeSpan.FromDays(45);
+    private const int MinimumArtworkCacheMegabytes = 64;
+    private const int MaximumArtworkCacheMegabytes = 2048;
+    private const int MinimumArtworkRetentionDays = 7;
+    private const int MaximumArtworkRetentionDays = 365;
     private static readonly HashSet<string> AllowedArtworkHosts = new(StringComparer.OrdinalIgnoreCase)
     {
         "shared.fastly.steamstatic.com",
@@ -58,12 +70,17 @@ public sealed class StoreService
     private readonly string? _artworkCacheDirectory;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _artworkCacheLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _artworkMisses = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CachedOffers> _offerCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<StoreOfferState>>>> _offerFetches =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, StoreGameState> _searchCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _backgroundGate = new();
+    private readonly object _artworkMetricsGate = new();
     private Task<StoreSnapshot>? _backgroundRefresh;
+    private DateTimeOffset _artworkMetricsAtUtc = DateTimeOffset.MinValue;
+    private int _artworkMetricsFileCount;
+    private long _artworkMetricsTotalBytes;
 
     public StoreService(
         HttpClient httpClient,
@@ -100,6 +117,10 @@ public sealed class StoreService
             TouchArtwork(cached.Path);
             return cached;
         }
+        if (_artworkMisses.TryGetValue(cacheKey, out var missedAtUtc) &&
+            DateTimeOffset.UtcNow - missedAtUtc < ArtworkMissLifetime)
+            return null;
+        _artworkMisses.TryRemove(cacheKey, out _);
 
         var cacheLock = _artworkCacheLocks.GetOrAdd(cacheKey, static _ => new SemaphoreSlim(1, 1));
         await cacheLock.WaitAsync(cancellationToken);
@@ -121,12 +142,18 @@ public sealed class StoreService
                 cancellationToken);
             if (!response.IsSuccessStatusCode ||
                 !TryNormalizeArtworkUri(response.RequestMessage?.RequestUri?.AbsoluteUri, out _))
+            {
+                RememberArtworkMiss(cacheKey);
                 return null;
+            }
 
             var contentType = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
             if (!ArtworkExtensionsByContentType.TryGetValue(contentType, out var extension) ||
                 response.Content.Headers.ContentLength is > MaxArtworkFileBytes)
+            {
+                RememberArtworkMiss(cacheKey);
                 return null;
+            }
 
             var targetPath = Path.Combine(_artworkCacheDirectory, cacheKey + extension);
             var temporaryPath = Path.Combine(_artworkCacheDirectory, $"{cacheKey}.{Guid.NewGuid():N}.tmp");
@@ -148,7 +175,11 @@ public sealed class StoreService
                         var read = await input.ReadAsync(buffer, cancellationToken);
                         if (read == 0) break;
                         totalBytes += read;
-                        if (totalBytes > MaxArtworkFileBytes) return null;
+                        if (totalBytes > MaxArtworkFileBytes)
+                        {
+                            RememberArtworkMiss(cacheKey);
+                            return null;
+                        }
                         await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
                     }
 
@@ -156,8 +187,10 @@ public sealed class StoreService
                 }
 
                 File.Move(temporaryPath, targetPath, overwrite: true);
+                _artworkMisses.TryRemove(cacheKey, out _);
                 TouchArtwork(targetPath);
                 TrimArtworkCache(targetPath);
+                InvalidateArtworkCacheMetrics();
                 return new StoreArtworkCacheFile(targetPath, contentType);
             }
             finally
@@ -167,6 +200,7 @@ public sealed class StoreService
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            RememberArtworkMiss(cacheKey);
             Debug.WriteLine($"Store artwork cache failed for {sourceUri}: {exception.Message}");
             return null;
         }
@@ -242,7 +276,7 @@ public sealed class StoreService
                 }
             }
 
-            var trendingProducts = await trendingTask;
+            var trendingProducts = FilterProductsByPreferences(await trendingTask, configuration.IncludeKeyshops);
             var usdPerEur = await exchangeRateTask ?? cached?.UsdPerEur;
             var steamWishlistGames = wishlistError is null
                 ? BuildWishlistGames(wishlistProducts, usdPerEur)
@@ -256,6 +290,7 @@ public sealed class StoreService
                     .ToArray(),
                 usdPerEur,
                 region,
+                configuration.IncludeKeyshops,
                 cancellationToken);
             var wishlistGames = MergeWishlistGames(steamWishlistGames, savedGames);
             var trendingGames = trendingProducts.Count > 0
@@ -266,6 +301,7 @@ public sealed class StoreService
                 wishlistGames,
                 usdPerEur,
                 region,
+                configuration.IncludeKeyshops,
                 cancellationToken);
             var featuredDeals = trendingGames
                 .Where(game => game.DiscountPercent >= 35)
@@ -322,6 +358,11 @@ public sealed class StoreService
                     })
                     .ToArray();
                 var committedWishlist = MergeWishlistGames(latestSteamGames, latestSavedGames);
+                TrackWishlistGames(
+                    latest,
+                    SanitizeCachedSnapshot(latest.CachedSnapshot)?.Wishlist ?? [],
+                    committedWishlist,
+                    snapshot.RefreshedAtUtc ?? DateTimeOffset.UtcNow);
                 var committedSnapshot = snapshot with
                 {
                     DisplayCurrencyCode = NormalizeDisplayCurrency(latest.DisplayCurrencyCode),
@@ -391,7 +432,12 @@ public sealed class StoreService
             game = ClearGamePrices(game);
         }
 
-        var offers = await GetOrFetchOffersAsync(game, snapshot?.UsdPerEur, region, cancellationToken);
+        var offers = await GetOrFetchOffersAsync(
+            game,
+            snapshot?.UsdPerEur,
+            region,
+            configuration.IncludeKeyshops,
+            cancellationToken);
         PersistUpdatedGameOffers(normalizedId, offers, region.Code);
         return offers;
     }
@@ -409,7 +455,9 @@ public sealed class StoreService
         var configuration = _settingsStore.Load();
         var region = StoreRegionCatalog.Resolve(configuration.StoreRegionCode);
         var snapshot = SanitizeCachedSnapshot(configuration.CachedSnapshot);
-        var products = await _catalogClient.SearchAsync(normalizedQuery, region, cancellationToken);
+        var products = FilterProductsByPreferences(
+            await _catalogClient.SearchAsync(normalizedQuery, region, cancellationToken),
+            configuration.IncludeKeyshops);
         var requested = DirectStoreCatalogClient.NormalizeTitle(normalizedQuery);
         var wishlist = snapshot?.Wishlist ?? [];
         var savedIds = configuration.SavedGames.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -481,6 +529,12 @@ public sealed class StoreService
             if (enabled)
             {
                 configuration.SavedGames[normalized.Id] = normalized;
+                if (!configuration.WishlistMetadata.TryGetValue(normalized.Id, out var metadata))
+                {
+                    metadata = new StoreWishlistMetadataData();
+                    configuration.WishlistMetadata[normalized.Id] = metadata;
+                }
+                metadata.AddedAtUtc ??= DateTimeOffset.UtcNow;
             }
 
             var cached = SanitizeCachedSnapshot(configuration.CachedSnapshot) ?? EmptySnapshot("TFS wishlist updated.");
@@ -512,6 +566,352 @@ public sealed class StoreService
                     .ThenBy(item => item.Title, StringComparer.CurrentCultureIgnoreCase)
                     .ToArray()
             };
+            TrackWishlistGames(
+                configuration,
+                cached.Wishlist,
+                configuration.CachedSnapshot.Wishlist,
+                DateTimeOffset.UtcNow);
+            if (!enabled && existingSteamGame is null)
+            {
+                configuration.WishlistMetadata.Remove(normalized.Id);
+            }
+            return AttachAlerts(configuration.CachedSnapshot, configuration);
+        });
+    }
+
+    public StoreSnapshot SetWishlistMetadata(
+        string gameId,
+        bool? isPinned,
+        IReadOnlyList<string>? tags)
+    {
+        var normalizedGameId = gameId?.Trim() ?? string.Empty;
+        if (normalizedGameId.Length is < 1 or > 200)
+            throw new InvalidOperationException("A valid wishlist game is required.");
+
+        return _settingsStore.Update(configuration =>
+        {
+            var snapshot = SanitizeCachedSnapshot(configuration.CachedSnapshot) ??
+                EmptySnapshot("Wishlist organization updated.");
+            var game = snapshot.Wishlist.FirstOrDefault(candidate =>
+                candidate.Id.Equals(normalizedGameId, StringComparison.OrdinalIgnoreCase));
+            if (game is null)
+                throw new InvalidOperationException("The selected game is no longer in the wishlist.");
+
+            if (!configuration.WishlistMetadata.TryGetValue(game.Id, out var metadata))
+            {
+                metadata = new StoreWishlistMetadataData { AddedAtUtc = DateTimeOffset.UtcNow };
+                configuration.WishlistMetadata[game.Id] = metadata;
+            }
+
+            if (isPinned.HasValue) metadata.IsPinned = isPinned.Value;
+            if (tags is not null)
+            {
+                metadata.Tags = tags
+                    .Select(tag => tag?.Trim() ?? string.Empty)
+                    .Where(tag => tag.Length is > 0 and <= 32)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(8)
+                    .ToList();
+            }
+
+            return AttachAlerts(snapshot, configuration);
+        });
+    }
+
+    public StoreSnapshot ApplyWishlistBulkAction(
+        IReadOnlyList<string>? gameIds,
+        bool? isPinned,
+        string? addTag,
+        bool removeLocal,
+        decimal? alertMultiplier,
+        string? alertCurrencyCode)
+    {
+        var ids = (gameIds ?? [])
+            .Select(id => id?.Trim() ?? string.Empty)
+            .Where(id => id.Length is > 0 and <= 200)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(500)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0) throw new InvalidOperationException("Select at least one wishlist game.");
+        var tag = addTag?.Trim() ?? string.Empty;
+        if (tag.Length > 32) throw new InvalidOperationException("Wishlist tags can contain up to 32 characters.");
+        var createAlerts = alertMultiplier.HasValue;
+        var multiplier = createAlerts ? Math.Clamp(alertMultiplier!.Value, 0.05m, 1m) : 0m;
+        var currency = alertCurrencyCode?.Trim().Equals("USD", StringComparison.OrdinalIgnoreCase) == true
+            ? "USD"
+            : "EUR";
+        if (!isPinned.HasValue && tag.Length == 0 && !removeLocal && !createAlerts)
+            throw new InvalidOperationException("Choose a wishlist action first.");
+
+        return _settingsStore.Update(configuration =>
+        {
+            var snapshot = SanitizeCachedSnapshot(configuration.CachedSnapshot) ??
+                EmptySnapshot("Wishlist bulk action completed.");
+            var selected = snapshot.Wishlist.Where(game => ids.Contains(game.Id)).ToArray();
+            if (selected.Length == 0) throw new InvalidOperationException("The selected games are no longer in the wishlist.");
+
+            foreach (var game in selected)
+            {
+                if (isPinned.HasValue || tag.Length > 0)
+                {
+                    if (!configuration.WishlistMetadata.TryGetValue(game.Id, out var metadata))
+                    {
+                        metadata = new StoreWishlistMetadataData { AddedAtUtc = DateTimeOffset.UtcNow };
+                        configuration.WishlistMetadata[game.Id] = metadata;
+                    }
+                    if (isPinned.HasValue) metadata.IsPinned = isPinned.Value;
+                    if (tag.Length > 0 && !metadata.Tags.Contains(tag, StringComparer.OrdinalIgnoreCase) && metadata.Tags.Count < 8)
+                        metadata.Tags.Add(tag);
+                }
+
+                if (removeLocal && game.IsLocallyWishlisted)
+                {
+                    var normalizedTitle = DirectStoreCatalogClient.NormalizeTitle(game.Title);
+                    foreach (var savedKey in configuration.SavedGames
+                        .Where(item => item.Key.Equals(game.Id, StringComparison.OrdinalIgnoreCase) ||
+                            DirectStoreCatalogClient.NormalizeTitle(item.Value.Title).Equals(normalizedTitle, StringComparison.Ordinal))
+                        .Select(item => item.Key)
+                        .ToArray())
+                    {
+                        configuration.SavedGames.Remove(savedKey);
+                    }
+                    if (!game.IsSteamWishlisted) configuration.WishlistMetadata.Remove(game.Id);
+                }
+
+                if (createAlerts)
+                {
+                    var current = currency == "USD" ? game.CheapestPrice : game.CheapestPriceEur;
+                    if (current is not > 0) continue;
+                    var steamAppId = game.SteamAppId is > 0 ? game.SteamAppId.Value : 0;
+                    var gameId = NormalizeAlertGameId(game.Id, steamAppId);
+                    var storageKey = steamAppId > 0 ? steamAppId : CreateLocalAlertStorageKey(gameId);
+                    configuration.Alerts.TryGetValue(storageKey, out var alert);
+                    alert ??= new StorePriceAlertData();
+                    alert.SteamAppId = steamAppId;
+                    alert.GameId = gameId;
+                    alert.Title = game.Title;
+                    alert.TargetPrice = Math.Max(0.01m, decimal.Round(current.Value * multiplier, 2));
+                    alert.CurrencyCode = currency;
+                    alert.Enabled = true;
+                    alert.Mode = "price";
+                    alert.TargetDiscountPercent = 0;
+                    alert.SnoozedUntilUtc = null;
+                    alert.LastNotifiedPrice = null;
+                    alert.WasReached = current.Value <= alert.TargetPrice;
+                    TrackAlertPrice(alert, game, DateTimeOffset.UtcNow);
+                    configuration.Alerts[storageKey] = alert;
+                }
+            }
+
+            if (removeLocal)
+            {
+                var previousWishlist = snapshot.Wishlist;
+                var updatedWishlist = previousWishlist
+                    .Where(game => !ids.Contains(game.Id) || game.IsSteamWishlisted || !game.IsLocallyWishlisted)
+                    .Select(game => ids.Contains(game.Id) && game.IsSteamWishlisted
+                        ? game with { IsWishlisted = true, IsLocallyWishlisted = false }
+                        : game)
+                    .ToArray();
+                snapshot = snapshot with
+                {
+                    StatusText = $"Updated {selected.Length} wishlist games.",
+                    Wishlist = updatedWishlist
+                };
+                configuration.CachedSnapshot = snapshot;
+                TrackWishlistGames(configuration, previousWishlist, updatedWishlist, DateTimeOffset.UtcNow);
+            }
+
+            return AttachAlerts(snapshot, configuration);
+        });
+    }
+
+    public StoreSnapshot MarkWishlistChangesSeen()
+    {
+        return _settingsStore.Update(configuration =>
+        {
+            configuration.LastSeenChangesUtc = DateTimeOffset.UtcNow;
+            return AttachAlerts(
+                SanitizeCachedSnapshot(configuration.CachedSnapshot) ?? EmptySnapshot("Wishlist changes marked as seen."),
+                configuration);
+        });
+    }
+
+    public StoreSnapshot SetStorePreferences(
+        bool? includeKeyshops,
+        int? refreshIntervalMinutes,
+        bool? notificationsEnabled = null)
+    {
+        var invalidateOfferCaches = false;
+        var snapshot = _settingsStore.Update(configuration =>
+        {
+            if (includeKeyshops.HasValue && configuration.IncludeKeyshops != includeKeyshops.Value)
+            {
+                invalidateOfferCaches = true;
+                configuration.IncludeKeyshops = includeKeyshops.Value;
+                configuration.LastRefreshUtc = null;
+                var cached = SanitizeCachedSnapshot(configuration.CachedSnapshot);
+                if (cached is not null)
+                {
+                    configuration.CachedSnapshot = RemoveExcludedOffers(cached, configuration.IncludeKeyshops) with
+                    {
+                        IsRefreshing = true,
+                        StatusText = "Store preference saved. Direct prices will refresh in the background."
+                    };
+                }
+            }
+
+            if (refreshIntervalMinutes.HasValue)
+            {
+                configuration.RefreshIntervalMinutes = Math.Clamp(refreshIntervalMinutes.Value, 10, 240);
+            }
+
+            if (notificationsEnabled.HasValue)
+            {
+                configuration.NotificationsEnabled = notificationsEnabled.Value;
+            }
+
+            return AttachAlerts(
+                SanitizeCachedSnapshot(configuration.CachedSnapshot) ?? EmptySnapshot("Store preferences saved."),
+                configuration);
+        });
+        if (invalidateOfferCaches)
+        {
+            _offerCache.Clear();
+            _offerFetches.Clear();
+            _searchCache.Clear();
+        }
+        return snapshot;
+    }
+
+    public StoreSnapshot SetArtworkCachePolicy(int maximumMegabytes, int retentionDays)
+    {
+        var snapshot = _settingsStore.Update(configuration =>
+        {
+            configuration.ArtworkCacheMaximumMegabytes = Math.Clamp(
+                maximumMegabytes,
+                MinimumArtworkCacheMegabytes,
+                MaximumArtworkCacheMegabytes);
+            configuration.ArtworkCacheRetentionDays = Math.Clamp(
+                retentionDays,
+                MinimumArtworkRetentionDays,
+                MaximumArtworkRetentionDays);
+            return SanitizeCachedSnapshot(configuration.CachedSnapshot) ?? EmptySnapshot("Artwork cache policy saved.");
+        });
+        TrimArtworkCache();
+        return AttachAlerts(snapshot, _settingsStore.Load());
+    }
+
+    public StoreSnapshot ClearArtworkCache()
+    {
+        if (_artworkCacheDirectory is not null && Directory.Exists(_artworkCacheDirectory))
+        {
+            foreach (var path in Directory.EnumerateFiles(_artworkCacheDirectory, "*", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+
+        _artworkMisses.Clear();
+        InvalidateArtworkCacheMetrics();
+
+        return GetCachedSnapshot();
+    }
+
+    public string ExportBackup()
+    {
+        var configuration = _settingsStore.Load();
+        var backup = new StoreBackupData
+        {
+            Version = 1,
+            ExportedAtUtc = DateTimeOffset.UtcNow,
+            DisplayCurrencyCode = NormalizeDisplayCurrency(configuration.DisplayCurrencyCode),
+            StoreRegionCode = StoreRegionCatalog.Resolve(configuration.StoreRegionCode).Code,
+            RefreshIntervalMinutes = Math.Clamp(configuration.RefreshIntervalMinutes, 10, 240),
+            IncludeKeyshops = configuration.IncludeKeyshops,
+            NotificationsEnabled = configuration.NotificationsEnabled,
+            SavedGames = configuration.SavedGames,
+            Alerts = configuration.Alerts,
+            WishlistMetadata = configuration.WishlistMetadata,
+            GameHistory = configuration.GameHistory
+        };
+        return JsonSerializer.Serialize(backup, BackupJsonOptions);
+    }
+
+    public StoreSnapshot ImportBackup(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json) || json.Length > 8_000_000)
+            throw new InvalidOperationException("The Wishlist backup is empty or too large.");
+        StoreBackupData backup;
+        try
+        {
+            backup = JsonSerializer.Deserialize<StoreBackupData>(json, BackupJsonOptions)
+                ?? throw new InvalidOperationException("The Wishlist backup is empty.");
+        }
+        catch (JsonException exception)
+        {
+            throw new InvalidOperationException("The clipboard does not contain a valid Wishlist backup.", exception);
+        }
+        if (backup.Version != 1)
+            throw new InvalidOperationException("This Wishlist backup version is not supported.");
+
+        return _settingsStore.Update(configuration =>
+        {
+            configuration.DisplayCurrencyCode = NormalizeDisplayCurrency(backup.DisplayCurrencyCode);
+            configuration.StoreRegionCode = StoreRegionCatalog.Resolve(backup.StoreRegionCode).Code;
+            configuration.RefreshIntervalMinutes = Math.Clamp(backup.RefreshIntervalMinutes, 10, 240);
+            configuration.IncludeKeyshops = backup.IncludeKeyshops;
+            configuration.NotificationsEnabled = backup.NotificationsEnabled;
+            foreach (var item in (backup.SavedGames ?? new(StringComparer.OrdinalIgnoreCase))
+                .Take(MaxImportedWishlistItems))
+            {
+                var game = SanitizeImportedGame(item.Value);
+                if (game is null) continue;
+                game = game with { IsWishlisted = true, IsLocallyWishlisted = true };
+                configuration.SavedGames[game.Id] = game;
+            }
+            foreach (var item in (backup.Alerts ?? []).Take(MaxImportedAlerts))
+            {
+                var alert = SanitizeImportedAlert(item.Value);
+                if (alert is null) continue;
+                var storageKey = alert.SteamAppId > 0
+                    ? alert.SteamAppId
+                    : CreateLocalAlertStorageKey(alert.GameId);
+                configuration.Alerts[storageKey] = alert;
+            }
+            foreach (var item in (backup.WishlistMetadata ?? new(StringComparer.OrdinalIgnoreCase))
+                .Take(MaxImportedWishlistItems))
+            {
+                var gameId = item.Key?.Trim() ?? string.Empty;
+                if (gameId.Length is < 1 or > 200 || item.Value is null) continue;
+                configuration.WishlistMetadata[gameId] = SanitizeImportedMetadata(item.Value);
+            }
+            foreach (var item in (backup.GameHistory ?? new(StringComparer.OrdinalIgnoreCase))
+                .Take(MaxImportedWishlistItems))
+            {
+                var gameId = item.Key?.Trim() ?? string.Empty;
+                var history = SanitizeImportedHistory(item.Value, gameId);
+                if (history is not null) configuration.GameHistory[gameId] = history;
+            }
+            configuration.LastRefreshUtc = null;
+            var cached = SanitizeCachedSnapshot(configuration.CachedSnapshot) ?? EmptySnapshot("Wishlist backup imported.");
+            var steamGames = cached.Wishlist.Where(game => game.IsSteamWishlisted).ToArray();
+            var wishlist = MergeWishlistGames(steamGames, configuration.SavedGames.Values.ToArray());
+            configuration.CachedSnapshot = cached with
+            {
+                StatusText = "Wishlist backup imported. Direct prices will refresh in the background.",
+                IsRefreshing = true,
+                Wishlist = wishlist
+            };
+            TrackWishlistGames(configuration, cached.Wishlist, wishlist, DateTimeOffset.UtcNow);
             return AttachAlerts(configuration.CachedSnapshot, configuration);
         });
     }
@@ -530,14 +930,20 @@ public sealed class StoreService
         string title,
         decimal targetPrice,
         string currencyCode,
-        bool enabled)
+        bool enabled,
+        string? mode = null,
+        int targetDiscountPercent = 0,
+        DateTimeOffset? snoozedUntilUtc = null)
     {
         var normalizedSteamAppId = steamAppId is > 0 ? steamAppId.Value : 0;
         var normalizedGameId = NormalizeAlertGameId(gameId, normalizedSteamAppId);
+        var normalizedMode = NormalizeAlertMode(mode);
         if (normalizedSteamAppId <= 0 && string.IsNullOrWhiteSpace(normalizedGameId))
             throw new InvalidOperationException("A valid wishlist game is required for a price alert.");
-        if (enabled && (targetPrice <= 0 || targetPrice > 10000))
+        if (enabled && normalizedMode == "price" && (targetPrice <= 0 || targetPrice > 10000))
             throw new InvalidOperationException("Choose a target price greater than 0.");
+        if (enabled && normalizedMode == "discount" && targetDiscountPercent is < 1 or > 100)
+            throw new InvalidOperationException("Choose a discount target between 1 and 100 percent.");
 
         var storageKey = normalizedSteamAppId > 0
             ? normalizedSteamAppId
@@ -561,11 +967,26 @@ public sealed class StoreService
                 alert.TargetPrice = decimal.Round(targetPrice, 2);
                 alert.CurrencyCode = normalizedCurrency;
                 alert.Enabled = true;
+                alert.Mode = normalizedMode;
+                alert.TargetDiscountPercent = normalizedMode == "discount"
+                    ? Math.Clamp(targetDiscountPercent, 1, 100)
+                    : 0;
+                alert.SnoozedUntilUtc = snoozedUntilUtc > DateTimeOffset.UtcNow
+                    ? snoozedUntilUtc
+                    : null;
                 alert.LastNotifiedPrice = null;
                 alert.WasReached = false;
                 var currentGame = SanitizeCachedSnapshot(configuration.CachedSnapshot)?.Wishlist
                     .FirstOrDefault(game => AlertMatchesGame(alert, game));
                 TrackAlertPrice(alert, currentGame, DateTimeOffset.UtcNow);
+                alert.WasReached = currentGame is not null && (normalizedMode switch
+                {
+                    "discount" => currentGame.DiscountPercent >= alert.TargetDiscountPercent,
+                    "release" => !IsUnreleasedGame(currentGame),
+                    "new-low" => false,
+                    _ => (normalizedCurrency == "USD" ? currentGame.CheapestPrice : currentGame.CheapestPriceEur) is decimal currentPrice &&
+                         currentPrice <= alert.TargetPrice
+                });
                 configuration.Alerts[storageKey] = alert;
             }
 
@@ -672,9 +1093,10 @@ public sealed class StoreService
         StoreGameState game,
         decimal? usdPerEur,
         StoreRegionDefinition region,
+        bool includeKeyshops,
         CancellationToken cancellationToken)
     {
-        var cacheKey = BuildOfferCacheKey(region.Code, game.PriceProviderGameId ?? game.Id);
+        var cacheKey = BuildOfferCacheKey(region.Code, game.PriceProviderGameId ?? game.Id, includeKeyshops);
         if (_offerCache.TryGetValue(cacheKey, out var cached) &&
             DateTimeOffset.UtcNow - cached.FetchedAtUtc < OfferCacheLifetime)
         {
@@ -689,7 +1111,11 @@ public sealed class StoreService
                     game.Title,
                     region,
                     CancellationToken.None);
-                var offers = MergeOffers(game.Offers, products, usdPerEur);
+                products = FilterProductsByPreferences(products, includeKeyshops);
+                var existingOffers = includeKeyshops
+                    ? game.Offers
+                    : game.Offers.Where(offer => !IsKeyshop(offer.StoreName)).ToArray();
+                var offers = MergeOffers(existingOffers, products, usdPerEur);
                 _offerCache[cacheKey] = new CachedOffers(DateTimeOffset.UtcNow, offers);
                 return offers;
             },
@@ -749,6 +1175,11 @@ public sealed class StoreService
 
             var updated = ApplyBestOffer(game, offers);
             var updatedSnapshot = ReplaceGame(snapshot, updated);
+            TrackWishlistGames(
+                configuration,
+                snapshot.Wishlist,
+                updatedSnapshot.Wishlist,
+                observedAtUtc);
             configuration.CachedSnapshot = updatedSnapshot;
             configuration.SavedGames = configuration.SavedGames.ToDictionary(
                 item => item.Key,
@@ -765,8 +1196,8 @@ public sealed class StoreService
         }
     }
 
-    private static string BuildOfferCacheKey(string regionCode, string gameId) =>
-        $"{StoreRegionCatalog.Resolve(regionCode).Code}:{gameId.Trim()}";
+    private static string BuildOfferCacheKey(string regionCode, string gameId, bool includeKeyshops) =>
+        $"{StoreRegionCatalog.Resolve(regionCode).Code}:{(includeKeyshops ? "all" : "official")}:{gameId.Trim()}";
 
     private static IReadOnlyList<StoreGameState> ReconcileSavedGames(
         IEnumerable<StoreGameState> latestSavedGames,
@@ -844,6 +1275,7 @@ public sealed class StoreService
         IReadOnlyList<StoreGameState> games,
         decimal? usdPerEur,
         StoreRegionDefinition region,
+        bool includeKeyshops,
         CancellationToken cancellationToken)
     {
         if (games.Count == 0) return games;
@@ -855,7 +1287,7 @@ public sealed class StoreService
             {
                 try
                 {
-                    var offers = await GetOrFetchOffersAsync(game, usdPerEur, region, token);
+                    var offers = await GetOrFetchOffersAsync(game, usdPerEur, region, includeKeyshops, token);
                     enriched[game.Id] = ApplyBestOffer(game, offers);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -878,6 +1310,7 @@ public sealed class StoreService
         IReadOnlyList<StoreGameState> savedGames,
         decimal? usdPerEur,
         StoreRegionDefinition region,
+        bool includeKeyshops,
         CancellationToken cancellationToken)
     {
         if (savedGames.Count == 0) return [];
@@ -891,7 +1324,7 @@ public sealed class StoreService
                 var current = saved;
                 try
                 {
-                    var offers = await GetOrFetchOffersAsync(saved, usdPerEur, region, token);
+                    var offers = await GetOrFetchOffersAsync(saved, usdPerEur, region, includeKeyshops, token);
                     current = ApplyBestOffer(saved, offers);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -1092,7 +1525,12 @@ public sealed class StoreService
             "USD",
             directUrl,
             $"{product.StoreName}:{product.ProductId}",
-            false);
+            false)
+        {
+            StoreKind = IsKeyshop(product.StoreName) ? "keyshop" : "official",
+            MatchConfidence = "exact",
+            CheckedAtUtc = DateTimeOffset.UtcNow
+        };
     }
 
     private static IReadOnlyList<StoreOfferState> MergeOffers(
@@ -1205,6 +1643,215 @@ public sealed class StoreService
         return -Math.Max(1, value);
     }
 
+    private static string NormalizeAlertMode(string? mode) => mode?.Trim().ToLowerInvariant() switch
+    {
+        "discount" => "discount",
+        "new-low" => "new-low",
+        "release" => "release",
+        _ => "price"
+    };
+
+    private static IReadOnlyList<DirectStoreProduct> FilterProductsByPreferences(
+        IReadOnlyList<DirectStoreProduct> products,
+        bool includeKeyshops) =>
+        includeKeyshops ? products : products.Where(product => !IsKeyshop(product.StoreName)).ToArray();
+
+    private static bool IsKeyshop(string? storeName) =>
+        storeName?.Equals("Instant Gaming", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static StoreSnapshot RemoveExcludedOffers(StoreSnapshot snapshot, bool includeKeyshops)
+    {
+        if (includeKeyshops) return snapshot;
+        StoreGameState Filter(StoreGameState game)
+        {
+            var offers = MarkBest(game.Offers.Where(offer => !IsKeyshop(offer.StoreName)));
+            return offers.Count > 0 ? ApplyBestOffer(game, offers) : ClearGamePrices(game);
+        }
+
+        return snapshot with
+        {
+            Wishlist = snapshot.Wishlist.Select(Filter).ToArray(),
+            Trending = snapshot.Trending.Select(Filter).Where(game => game.Offers.Count > 0).ToArray(),
+            FeaturedDeals = snapshot.FeaturedDeals.Select(Filter).Where(game => game.Offers.Count > 0).ToArray()
+        };
+    }
+
+    private static void TrackWishlistGames(
+        StoreConfiguration configuration,
+        IReadOnlyList<StoreGameState> previousGames,
+        IReadOnlyList<StoreGameState> currentGames,
+        DateTimeOffset observedAtUtc)
+    {
+        foreach (var game in currentGames)
+        {
+            if (!configuration.WishlistMetadata.TryGetValue(game.Id, out var metadata))
+            {
+                metadata = new StoreWishlistMetadataData();
+                configuration.WishlistMetadata[game.Id] = metadata;
+            }
+            metadata.AddedAtUtc ??= observedAtUtc;
+
+            var price = NormalizeTrackedPrice(game.CheapestPrice);
+            var priceEur = NormalizeTrackedPrice(game.CheapestPriceEur);
+            var unreleased = IsUnreleasedGame(game);
+            if (!configuration.GameHistory.TryGetValue(game.Id, out var history))
+            {
+                history = new StoreGameHistoryData
+                {
+                    GameId = game.Id,
+                    Title = game.Title,
+                    StartedAtUtc = observedAtUtc,
+                    OriginalPrice = price,
+                    OriginalPriceEur = priceEur,
+                    LowestPrice = price,
+                    LowestPriceEur = priceEur,
+                    LastPrice = price,
+                    LastPriceEur = priceEur,
+                    LastDiscountPercent = game.DiscountPercent,
+                    LastOfferCount = game.Offers.Count,
+                    LastBestStoreName = game.BestStoreName,
+                    WasOnSale = game.IsOnSale,
+                    WasUnreleased = unreleased,
+                    LastCheckedAtUtc = observedAtUtc
+                };
+                AddGameHistoryPoint(history, observedAtUtc, price, priceEur, force: true);
+                configuration.GameHistory[game.Id] = history;
+                continue;
+            }
+
+            history.Title = game.Title;
+            history.StartedAtUtc ??= observedAtUtc;
+            history.OriginalPrice ??= price;
+            history.OriginalPriceEur ??= priceEur;
+            history.LowestPrice = MinPositive(history.LowestPrice, price);
+            history.LowestPriceEur = MinPositive(history.LowestPriceEur, priceEur);
+
+            var previous = previousGames.FirstOrDefault(candidate => GamesMatch(candidate, game));
+            var changeKind = string.Empty;
+            if (history.WasUnreleased && !unreleased)
+                changeKind = "released";
+            else if (price.HasValue && history.LastPrice.HasValue && price.Value < history.LastPrice.Value)
+                changeKind = "price-drop";
+            else if (priceEur.HasValue && history.LastPriceEur.HasValue && priceEur.Value < history.LastPriceEur.Value)
+                changeKind = "price-drop";
+            else if (!history.WasOnSale && game.IsOnSale)
+                changeKind = history.PriceHistory.Count > 1 ? "back-on-sale" : "new-deal";
+            else if (game.Offers.Count > history.LastOfferCount ||
+                (!string.IsNullOrWhiteSpace(history.LastBestStoreName) &&
+                 !history.LastBestStoreName.Equals(game.BestStoreName, StringComparison.OrdinalIgnoreCase) &&
+                 previous?.CheapestPrice >= game.CheapestPrice))
+                changeKind = "new-store";
+
+            if (!string.IsNullOrWhiteSpace(changeKind))
+            {
+                history.ChangeKind = changeKind;
+                history.ChangedAtUtc = observedAtUtc;
+            }
+
+            AddGameHistoryPoint(history, observedAtUtc, price, priceEur, force: false);
+            history.LastPrice = price;
+            history.LastPriceEur = priceEur;
+            history.LastDiscountPercent = game.DiscountPercent;
+            history.LastOfferCount = game.Offers.Count;
+            history.LastBestStoreName = game.BestStoreName;
+            history.WasOnSale = game.IsOnSale;
+            history.WasUnreleased = unreleased;
+            history.LastCheckedAtUtc = observedAtUtc;
+        }
+
+        var activeIds = currentGames.Select(game => game.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var staleId in configuration.GameHistory.Keys.Where(id => !activeIds.Contains(id)).ToArray())
+        {
+            if (!configuration.SavedGames.ContainsKey(staleId)) configuration.GameHistory.Remove(staleId);
+        }
+    }
+
+    private static void AddGameHistoryPoint(
+        StoreGameHistoryData history,
+        DateTimeOffset observedAtUtc,
+        decimal? price,
+        decimal? priceEur,
+        bool force)
+    {
+        if (!price.HasValue && !priceEur.HasValue) return;
+        history.PriceHistory ??= [];
+        var last = history.PriceHistory.LastOrDefault();
+        var changed = last is null ||
+            NormalizeTrackedPrice(last.Price) != price ||
+            NormalizeTrackedPrice(last.PriceEur) != priceEur;
+        var dailySampleDue = last is null || observedAtUtc - last.RecordedAtUtc >= AlertFlatSampleInterval;
+        if (!force && !changed && !dailySampleDue) return;
+        history.PriceHistory.Add(new StorePriceHistoryData
+        {
+            RecordedAtUtc = observedAtUtc,
+            Price = price,
+            PriceEur = priceEur
+        });
+        if (history.PriceHistory.Count > MaxAlertHistoryPoints)
+            history.PriceHistory.RemoveRange(1, history.PriceHistory.Count - MaxAlertHistoryPoints);
+    }
+
+    private static decimal? MinPositive(decimal? left, decimal? right)
+    {
+        if (!left.HasValue) return right;
+        if (!right.HasValue) return left;
+        return Math.Min(left.Value, right.Value);
+    }
+
+    private static bool IsUnreleasedGame(StoreGameState game) =>
+        !NormalizeTrackedPrice(game.CheapestPrice).HasValue &&
+        !NormalizeTrackedPrice(game.CheapestPriceEur).HasValue &&
+        !NormalizeTrackedPrice(game.RegionalPrice).HasValue;
+
+    private static StoreSnapshot AttachWishlistData(StoreSnapshot snapshot, StoreConfiguration configuration)
+    {
+        var lastSeen = configuration.LastSeenChangesUtc;
+        var wishlist = snapshot.Wishlist.Select(game =>
+        {
+            configuration.WishlistMetadata.TryGetValue(game.Id, out var metadata);
+            configuration.GameHistory.TryGetValue(game.Id, out var history);
+            var historyPoints = (history?.PriceHistory ?? [])
+                .OrderBy(point => point.RecordedAtUtc)
+                .Select(point => new StorePriceHistoryPoint(
+                    point.RecordedAtUtc,
+                    NormalizeTrackedPrice(point.Price),
+                    NormalizeTrackedPrice(point.PriceEur)))
+                .ToArray();
+            var hasUnseenChange = history?.ChangedAtUtc.HasValue == true &&
+                (!lastSeen.HasValue || history.ChangedAtUtc.Value > lastSeen.Value);
+            var hasOffers = game.Offers.Count > 0;
+            return game with
+            {
+                IsPinned = metadata?.IsPinned == true,
+                Tags = (metadata?.Tags ?? []).OrderBy(tag => tag, StringComparer.CurrentCultureIgnoreCase).ToArray(),
+                AddedAtUtc = metadata?.AddedAtUtc,
+                PriceCheckedAtUtc = history?.LastCheckedAtUtc ?? snapshot.RefreshedAtUtc,
+                TrackingStartedAtUtc = history?.StartedAtUtc,
+                TrackingStartPrice = NormalizeTrackedPrice(history?.OriginalPrice),
+                TrackingStartPriceEur = NormalizeTrackedPrice(history?.OriginalPriceEur),
+                TrackedLowPrice = NormalizeTrackedPrice(history?.LowestPrice),
+                TrackedLowPriceEur = NormalizeTrackedPrice(history?.LowestPriceEur),
+                PriceHistory = historyPoints,
+                ChangeKind = history?.ChangeKind ?? string.Empty,
+                ChangedAtUtc = history?.ChangedAtUtc,
+                HasUnseenChange = hasUnseenChange,
+                MatchConfidence = hasOffers ? "exact" : "unpriced",
+                MatchNote = hasOffers
+                    ? "Exact title, PC platform and selected-region match"
+                    : "No verified priced offer for the selected region yet",
+                IsUnreleased = IsUnreleasedGame(game)
+            };
+        }).ToArray();
+        return snapshot with
+        {
+            Wishlist = wishlist,
+            UnseenChangeCount = wishlist.Count(game => game.HasUnseenChange),
+            IncludeKeyshops = configuration.IncludeKeyshops,
+            NotificationsEnabled = configuration.NotificationsEnabled,
+            RefreshIntervalMinutes = Math.Clamp(configuration.RefreshIntervalMinutes, 10, 240)
+        };
+    }
+
     private static bool AlertMatchesGame(StorePriceAlertData alert, StoreGameState game)
     {
         if (alert.SteamAppId > 0 && game.SteamAppId == alert.SteamAppId) return true;
@@ -1227,41 +1874,63 @@ public sealed class StoreService
         {
             var game = snapshot.Wishlist.FirstOrDefault(candidate => AlertMatchesGame(alert, candidate));
             if (game is null) continue;
-            TrackAlertPrice(alert, game, observedAtUtc ?? snapshot.RefreshedAtUtc ?? DateTimeOffset.UtcNow);
+            var normalizedMode = NormalizeAlertMode(alert.Mode);
             var currentPrice = alert.CurrencyCode.Equals("USD", StringComparison.OrdinalIgnoreCase)
                 ? game.CheapestPrice
                 : game.CheapestPriceEur;
-            if (!currentPrice.HasValue) continue;
-
-            var reached = currentPrice.Value <= alert.TargetPrice;
+            var previousLow = (alert.PriceHistory ?? [])
+                .Select(point => alert.CurrencyCode.Equals("USD", StringComparison.OrdinalIgnoreCase)
+                    ? NormalizeTrackedPrice(point.Price)
+                    : NormalizeTrackedPrice(point.PriceEur))
+                .Where(price => price.HasValue)
+                .Select(price => price!.Value)
+                .DefaultIfEmpty(decimal.MaxValue)
+                .Min();
+            var reached = normalizedMode switch
+            {
+                "discount" => game.DiscountPercent >= Math.Clamp(alert.TargetDiscountPercent, 1, 100),
+                "new-low" => currentPrice.HasValue && previousLow < decimal.MaxValue && currentPrice.Value < previousLow,
+                "release" => !IsUnreleasedGame(game),
+                _ => currentPrice.HasValue && currentPrice.Value <= alert.TargetPrice
+            };
+            TrackAlertPrice(alert, game, observedAtUtc ?? snapshot.RefreshedAtUtc ?? DateTimeOffset.UtcNow);
+            var snoozed = alert.SnoozedUntilUtc > DateTimeOffset.UtcNow;
             var shouldNotify = configuration.NotificationsEnabled && reached &&
-                (!alert.WasReached || !alert.LastNotifiedPrice.HasValue || currentPrice < alert.LastNotifiedPrice);
+                !snoozed &&
+                (!alert.WasReached ||
+                 currentPrice.HasValue &&
+                 (!alert.LastNotifiedPrice.HasValue || currentPrice < alert.LastNotifiedPrice));
             if (shouldNotify)
             {
+                var criterion = normalizedMode switch
+                {
+                    "discount" => $"reached -{alert.TargetDiscountPercent}%",
+                    "new-low" => "reached a new TFS low",
+                    "release" => "is now released",
+                    _ => $"reached your {alert.TargetPrice:0.00} {alert.CurrencyCode} target"
+                };
                 notifications.Add(new StorePriceAlertNotification(
-                    $"Price alert · {game.Title}",
-                    $"{game.BestStoreName}: {currentPrice.Value:0.00} {alert.CurrencyCode} reached your {alert.TargetPrice:0.00} {alert.CurrencyCode} target.",
+                    $"Price alert - {game.Title}",
+                    $"{game.BestStoreName}: {criterion}.",
                     game.BestDealUrl));
                 alert.LastNotifiedPrice = currentPrice;
             }
 
-            alert.WasReached = reached;
+            alert.WasReached = snoozed ? false : reached;
         }
 
         return notifications;
     }
 
-    private static StoreSnapshot AttachAlerts(StoreSnapshot snapshot, StoreConfiguration configuration)
+    private StoreSnapshot AttachAlerts(StoreSnapshot snapshot, StoreConfiguration configuration)
     {
+        snapshot = AttachWishlistData(snapshot, configuration);
         var alerts = configuration.Alerts.Values
             .OrderByDescending(alert => alert.WasReached)
             .ThenBy(alert => alert.Title, StringComparer.CurrentCultureIgnoreCase)
             .Select(alert =>
             {
                 var game = snapshot.Wishlist.FirstOrDefault(candidate => AlertMatchesGame(alert, candidate));
-                var current = alert.CurrencyCode.Equals("USD", StringComparison.OrdinalIgnoreCase)
-                    ? game?.CheapestPrice
-                    : game?.CheapestPriceEur;
                 var history = (alert.PriceHistory ?? [])
                     .OrderBy(point => point.RecordedAtUtc)
                     .Select(point => new StorePriceHistoryPoint(
@@ -1285,13 +1954,22 @@ public sealed class StoreService
                     alert.CreatedAtUtc ?? firstHistory?.RecordedAtUtc,
                     "USD",
                     alert.Enabled,
-                    current.HasValue && current.Value <= alert.TargetPrice,
+                    alert.WasReached,
                     game?.BestDealUrl ?? string.Empty,
                     game?.ImageUrl ?? string.Empty,
-                    history);
+                    history)
+                {
+                    Mode = NormalizeAlertMode(alert.Mode),
+                    TargetDiscountPercent = alert.TargetDiscountPercent,
+                    SnoozedUntilUtc = alert.SnoozedUntilUtc
+                };
             })
             .ToArray();
-        return snapshot with { Alerts = alerts };
+        return snapshot with
+        {
+            Alerts = alerts,
+            ArtworkCache = GetArtworkCacheState(configuration)
+        };
     }
 
     private static void TrackAlertPrice(
@@ -1329,6 +2007,129 @@ public sealed class StoreService
 
     private static decimal? NormalizeTrackedPrice(decimal? price) =>
         price is > 0 ? decimal.Round(price.Value, 2) : null;
+
+    private static StoreGameState? SanitizeImportedGame(StoreGameState? game)
+    {
+        if (game is null) return null;
+        var id = game.Id?.Trim() ?? string.Empty;
+        var title = game.Title?.Trim() ?? string.Empty;
+        if (id.Length is < 1 or > 200 || title.Length is < 1 or > 240) return null;
+        var steamAppId = game.SteamAppId is > 0 ? game.SteamAppId : null;
+        var providerId = game.PriceProviderGameId?.Trim() ?? string.Empty;
+        if (providerId.Length > 200) providerId = string.Empty;
+        var normalized = game with
+        {
+            Id = id,
+            SteamAppId = steamAppId,
+            PriceProviderGameId = string.IsNullOrWhiteSpace(providerId) ? id : providerId,
+            Title = title,
+            ImageUrl = NormalizeImportedArtworkUrl(game.ImageUrl),
+            HeaderImageUrl = NormalizeImportedArtworkUrl(game.HeaderImageUrl),
+            FallbackImageUrl = NormalizeImportedArtworkUrl(game.FallbackImageUrl),
+            ReleaseText = (game.ReleaseText ?? string.Empty).Trim()[..Math.Min((game.ReleaseText ?? string.Empty).Trim().Length, 80)],
+            Offers = (game.Offers ?? [])
+                .Where(offer => offer is not null)
+                .Take(24)
+                .ToArray()
+        };
+        return SanitizeCachedGame(normalized);
+    }
+
+    private static string NormalizeImportedArtworkUrl(string? value) =>
+        TryNormalizeArtworkUri(value, out var uri) ? uri.AbsoluteUri : string.Empty;
+
+    private static StoreWishlistMetadataData SanitizeImportedMetadata(StoreWishlistMetadataData metadata) => new()
+    {
+        AddedAtUtc = metadata.AddedAtUtc,
+        IsPinned = metadata.IsPinned,
+        Tags = (metadata.Tags ?? [])
+            .Select(tag => tag?.Trim() ?? string.Empty)
+            .Where(tag => tag.Length is > 0 and <= 32)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToList()
+    };
+
+    private static StorePriceAlertData? SanitizeImportedAlert(StorePriceAlertData? alert)
+    {
+        if (alert is null) return null;
+        var steamAppId = alert.SteamAppId > 0 ? alert.SteamAppId : 0;
+        var gameId = NormalizeAlertGameId(alert.GameId, steamAppId);
+        if (gameId.Length is < 1 or > 200) return null;
+        var mode = NormalizeAlertMode(alert.Mode);
+        var targetPrice = NormalizeTrackedPrice(alert.TargetPrice) ?? 0;
+        if (mode == "price" && targetPrice <= 0) return null;
+        var title = (alert.Title ?? string.Empty).Trim();
+        if (title.Length > 240) title = title[..240];
+        if (title.Length == 0) title = steamAppId > 0 ? $"Steam app {steamAppId}" : "TFS wishlist game";
+        var history = SanitizeImportedPriceHistory(alert.PriceHistory);
+        return new StorePriceAlertData
+        {
+            SteamAppId = steamAppId,
+            GameId = gameId,
+            Title = title,
+            TargetPrice = targetPrice,
+            CurrencyCode = alert.CurrencyCode?.Equals("USD", StringComparison.OrdinalIgnoreCase) == true ? "USD" : "EUR",
+            Enabled = alert.Enabled,
+            CreatedAtUtc = alert.CreatedAtUtc,
+            OriginalPrice = NormalizeTrackedPrice(alert.OriginalPrice),
+            OriginalPriceEur = NormalizeTrackedPrice(alert.OriginalPriceEur),
+            PriceHistory = history,
+            LastNotifiedPrice = NormalizeTrackedPrice(alert.LastNotifiedPrice),
+            WasReached = alert.WasReached,
+            Mode = mode,
+            TargetDiscountPercent = mode == "discount" ? Math.Clamp(alert.TargetDiscountPercent, 1, 100) : 0,
+            SnoozedUntilUtc = alert.SnoozedUntilUtc > DateTimeOffset.UtcNow &&
+                alert.SnoozedUntilUtc < DateTimeOffset.UtcNow.AddYears(1)
+                    ? alert.SnoozedUntilUtc
+                    : null
+        };
+    }
+
+    private static StoreGameHistoryData? SanitizeImportedHistory(StoreGameHistoryData? history, string gameId)
+    {
+        if (history is null || gameId.Length is < 1 or > 200) return null;
+        var title = (history.Title ?? string.Empty).Trim();
+        if (title.Length > 240) title = title[..240];
+        return new StoreGameHistoryData
+        {
+            GameId = gameId,
+            Title = title,
+            StartedAtUtc = history.StartedAtUtc,
+            OriginalPrice = NormalizeTrackedPrice(history.OriginalPrice),
+            OriginalPriceEur = NormalizeTrackedPrice(history.OriginalPriceEur),
+            LowestPrice = NormalizeTrackedPrice(history.LowestPrice),
+            LowestPriceEur = NormalizeTrackedPrice(history.LowestPriceEur),
+            LastPrice = NormalizeTrackedPrice(history.LastPrice),
+            LastPriceEur = NormalizeTrackedPrice(history.LastPriceEur),
+            LastDiscountPercent = Math.Clamp(history.LastDiscountPercent, 0, 100),
+            LastOfferCount = Math.Clamp(history.LastOfferCount, 0, 100),
+            LastBestStoreName = (history.LastBestStoreName ?? string.Empty).Trim()[..Math.Min((history.LastBestStoreName ?? string.Empty).Trim().Length, 80)],
+            WasOnSale = history.WasOnSale,
+            WasUnreleased = history.WasUnreleased,
+            ChangeKind = history.ChangeKind is "price-drop" or "new-deal" or "back-on-sale" or "released" or "new-store"
+                ? history.ChangeKind
+                : string.Empty,
+            ChangedAtUtc = history.ChangedAtUtc,
+            LastCheckedAtUtc = history.LastCheckedAtUtc,
+            PriceHistory = SanitizeImportedPriceHistory(history.PriceHistory)
+        };
+    }
+
+    private static List<StorePriceHistoryData> SanitizeImportedPriceHistory(
+        IEnumerable<StorePriceHistoryData>? history) =>
+        (history ?? [])
+            .Where(point => point is not null && point.RecordedAtUtc != default)
+            .OrderBy(point => point.RecordedAtUtc)
+            .TakeLast(MaxAlertHistoryPoints)
+            .Select(point => new StorePriceHistoryData
+            {
+                RecordedAtUtc = point.RecordedAtUtc,
+                Price = NormalizeTrackedPrice(point.Price),
+                PriceEur = NormalizeTrackedPrice(point.PriceEur)
+            })
+            .Where(point => point.Price.HasValue || point.PriceEur.HasValue)
+            .ToList();
 
     private static StoreSnapshot? SanitizeCachedSnapshot(StoreSnapshot? snapshot)
     {
@@ -1466,6 +2267,7 @@ public sealed class StoreService
     {
         try
         {
+            if (DateTime.UtcNow - File.GetLastWriteTimeUtc(path) < ArtworkTouchInterval) return;
             File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
         }
         catch (IOException)
@@ -1476,18 +2278,97 @@ public sealed class StoreService
         }
     }
 
+    private void RememberArtworkMiss(string cacheKey)
+    {
+        var now = DateTimeOffset.UtcNow;
+        _artworkMisses[cacheKey] = now;
+        if (_artworkMisses.Count <= MaxRememberedArtworkMisses) return;
+        foreach (var stale in _artworkMisses
+            .OrderBy(item => item.Value)
+            .Take(Math.Max(1, _artworkMisses.Count - MaxRememberedArtworkMisses)))
+        {
+            _artworkMisses.TryRemove(stale.Key, out _);
+        }
+    }
+
+    private StoreArtworkCacheState GetArtworkCacheState(StoreConfiguration configuration)
+    {
+        var maximumMegabytes = Math.Clamp(
+            configuration.ArtworkCacheMaximumMegabytes,
+            MinimumArtworkCacheMegabytes,
+            MaximumArtworkCacheMegabytes);
+        var retentionDays = Math.Clamp(
+            configuration.ArtworkCacheRetentionDays,
+            MinimumArtworkRetentionDays,
+            MaximumArtworkRetentionDays);
+        if (_artworkCacheDirectory is null || !Directory.Exists(_artworkCacheDirectory))
+            return new StoreArtworkCacheState(0, 0, maximumMegabytes, retentionDays);
+        lock (_artworkMetricsGate)
+        {
+            if (DateTimeOffset.UtcNow - _artworkMetricsAtUtc < ArtworkMetricsCacheLifetime)
+            {
+                return new StoreArtworkCacheState(
+                    _artworkMetricsFileCount,
+                    _artworkMetricsTotalBytes,
+                    maximumMegabytes,
+                    retentionDays);
+            }
+        }
+        try
+        {
+            var files = Directory.EnumerateFiles(_artworkCacheDirectory, "*", SearchOption.TopDirectoryOnly)
+                .Where(path => !path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+                .Select(path => new FileInfo(path))
+                .ToArray();
+            var totalBytes = files.Sum(file => file.Length);
+            lock (_artworkMetricsGate)
+            {
+                _artworkMetricsFileCount = files.Length;
+                _artworkMetricsTotalBytes = totalBytes;
+                _artworkMetricsAtUtc = DateTimeOffset.UtcNow;
+            }
+            return new StoreArtworkCacheState(files.Length, totalBytes, maximumMegabytes, retentionDays);
+        }
+        catch (IOException)
+        {
+            return new StoreArtworkCacheState(0, 0, maximumMegabytes, retentionDays);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new StoreArtworkCacheState(0, 0, maximumMegabytes, retentionDays);
+        }
+    }
+
+    private void InvalidateArtworkCacheMetrics()
+    {
+        lock (_artworkMetricsGate)
+        {
+            _artworkMetricsAtUtc = DateTimeOffset.MinValue;
+        }
+    }
+
     private void TrimArtworkCache(string? preservedPath = null)
     {
         if (_artworkCacheDirectory is null || !Directory.Exists(_artworkCacheDirectory)) return;
         try
         {
+            var configuration = _settingsStore.Load();
+            var maximumBytes = (long)Math.Clamp(
+                configuration.ArtworkCacheMaximumMegabytes,
+                MinimumArtworkCacheMegabytes,
+                MaximumArtworkCacheMegabytes) * 1024L * 1024L;
+            var trimTargetBytes = maximumBytes * 3 / 4;
+            var retention = TimeSpan.FromDays(Math.Clamp(
+                configuration.ArtworkCacheRetentionDays,
+                MinimumArtworkRetentionDays,
+                MaximumArtworkRetentionDays));
             var files = Directory.EnumerateFiles(_artworkCacheDirectory, "*", SearchOption.TopDirectoryOnly)
                 .Where(path => !path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
                 .Select(path => new FileInfo(path))
                 .OrderBy(file => file.LastWriteTimeUtc)
                 .ToArray();
             var totalBytes = files.Sum(file => file.Length);
-            var expirationThreshold = DateTime.UtcNow - ArtworkCacheLifetime;
+            var expirationThreshold = DateTime.UtcNow - retention;
 
             foreach (var file in files)
             {
@@ -1498,10 +2379,10 @@ public sealed class StoreService
                 totalBytes -= length;
             }
 
-            if (totalBytes <= MaxArtworkCacheBytes) return;
+            if (totalBytes <= maximumBytes) return;
             foreach (var file in files)
             {
-                if (totalBytes <= ArtworkCacheTrimTargetBytes) break;
+                if (totalBytes <= trimTargetBytes) break;
                 if (!file.Exists) continue;
                 if (file.FullName.Equals(preservedPath, StringComparison.OrdinalIgnoreCase)) continue;
                 var length = file.Length;
@@ -1587,6 +2468,31 @@ public sealed class StoreService
         eur.HasValue && usdPerEur is > 0
             ? decimal.Round(eur.Value * usdPerEur.Value, 2)
             : null;
+
+    private sealed class StoreBackupData
+    {
+        public int Version { get; set; }
+
+        public DateTimeOffset ExportedAtUtc { get; set; }
+
+        public string DisplayCurrencyCode { get; set; } = "USD";
+
+        public string StoreRegionCode { get; set; } = "US";
+
+        public int RefreshIntervalMinutes { get; set; } = 30;
+
+        public bool IncludeKeyshops { get; set; } = true;
+
+        public bool NotificationsEnabled { get; set; } = true;
+
+        public Dictionary<string, StoreGameState>? SavedGames { get; set; }
+
+        public Dictionary<long, StorePriceAlertData>? Alerts { get; set; }
+
+        public Dictionary<string, StoreWishlistMetadataData>? WishlistMetadata { get; set; }
+
+        public Dictionary<string, StoreGameHistoryData>? GameHistory { get; set; }
+    }
 
     private sealed record CachedOffers(
         DateTimeOffset FetchedAtUtc,

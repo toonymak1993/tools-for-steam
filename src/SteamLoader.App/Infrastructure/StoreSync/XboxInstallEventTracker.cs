@@ -30,7 +30,8 @@ internal sealed record XboxInstallTrackingResult(
 
 internal sealed record XboxInstallEventBatch(
     long Cursor,
-    IReadOnlyList<XboxInstallEventObservation> Observations);
+    IReadOnlyList<XboxInstallEventObservation> Observations,
+    bool BacklogRemaining = false);
 
 internal sealed record XboxInstallEventRecordSnapshot(
     string Message,
@@ -48,9 +49,11 @@ internal static partial class XboxInstallEventTracker
     private const int InstallAgentEventId = 2006;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(900);
     private static readonly TimeSpan InstalledProbeInterval = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan MaximumEventReadDuration = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan TerminalGracePeriod = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan RegistrationTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MaximumTrackingTime = TimeSpan.FromHours(24);
+    private const int MaximumEventsPerPoll = 256;
     private static readonly object ReconcileGate = new();
     private static readonly Dictionary<string, DateTimeOffset> LastInstalledProbeAtUtc =
         new(StringComparer.OrdinalIgnoreCase);
@@ -489,7 +492,13 @@ internal static partial class XboxInstallEventTracker
                     Canceled: terminalKind == XboxInstallEventKind.Canceled);
             }
 
-            Thread.Sleep(PollInterval);
+            // Drain a busy Store log in short bounded slices. Sleeping the
+            // normal poll interval while a backlog remains would make the UI
+            // percentage fall farther behind on fast connections.
+            Thread.Sleep(
+                batch.BacklogRemaining
+                    ? TimeSpan.FromMilliseconds(25)
+                    : PollInterval);
         }
 
         return new XboxInstallTrackingResult(
@@ -567,8 +576,11 @@ internal static partial class XboxInstallEventTracker
         long afterRecordId,
         HashSet<string> acceptedProductIds)
     {
-        var observations = new List<XboxInstallEventObservation>();
+        XboxInstallEventObservation? latestObservation = null;
         var cursor = afterRecordId;
+        var recordsRead = 0;
+        var backlogRemaining = false;
+        var readStartedAt = Stopwatch.GetTimestamp();
         try
         {
             var query = CreateQuery(reverseDirection: false, afterRecordId);
@@ -581,6 +593,7 @@ internal static partial class XboxInstallEventTracker
                     break;
                 }
 
+                recordsRead++;
                 cursor = Math.Max(cursor, record.RecordId ?? 0);
                 var snapshot = CreateSnapshot(record);
                 if (TryExtractProductRelation(
@@ -598,7 +611,19 @@ internal static partial class XboxInstallEventTracker
 
                 if (TryParse(snapshot, acceptedProductIds, out var observation))
                 {
-                    observations.Add(observation);
+                    // The Store log can emit hundreds of heartbeat records per
+                    // second on fast downloads. Only the newest state in this
+                    // bounded batch is useful to the UI; persisting every
+                    // intermediate heartbeat can itself starve completion.
+                    latestObservation = observation;
+                }
+
+                if (ShouldYieldEventBatch(
+                        recordsRead,
+                        Stopwatch.GetElapsedTime(readStartedAt)))
+                {
+                    backlogRemaining = true;
+                    break;
                 }
             }
         }
@@ -607,7 +632,18 @@ internal static partial class XboxInstallEventTracker
             Debug.WriteLine($"Xbox event-log poll failed: {exception.Message}");
         }
 
-        return new XboxInstallEventBatch(cursor, observations);
+        return new XboxInstallEventBatch(
+            cursor,
+            latestObservation is null ? [] : [latestObservation],
+            backlogRemaining);
+    }
+
+    internal static bool ShouldYieldEventBatch(
+        int recordsRead,
+        TimeSpan elapsed)
+    {
+        return recordsRead >= MaximumEventsPerPoll ||
+               elapsed >= MaximumEventReadDuration;
     }
 
     private static EventLogQuery CreateQuery(

@@ -46,4 +46,5 @@ test("Quick Access header actions participate in focus restoration", async () =>
     "only the first plugin row should move up into the horizontal header action group",
   );
   assert.match(popupSource, /fallbackSlotKey: "header-action:settings"/);
+  assert.doesNotMatch(frontendLibSource, /deck_ui_navigation/);
 });

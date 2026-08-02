@@ -25,6 +25,23 @@ public sealed class UnifySteamXboxTests
         Assert.Equal("9N683TDT5M7R", packageProductId);
     }
 
+    [Theory]
+    [InlineData(255, 249, false)]
+    [InlineData(256, 0, true)]
+    [InlineData(1, 250, true)]
+    [InlineData(1024, 1000, true)]
+    public void ShouldYieldEventBatch_BoundsBusyXboxEventStreams(
+        int recordsRead,
+        int elapsedMilliseconds,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            XboxInstallEventTracker.ShouldYieldEventBatch(
+                recordsRead,
+                TimeSpan.FromMilliseconds(elapsedMilliseconds)));
+    }
+
     [Fact]
     public void TryResolveXboxInstalledGame_MatchesUniqueStandardEditionPackage()
     {
@@ -128,6 +145,95 @@ public sealed class UnifySteamXboxTests
             out _);
 
         Assert.False(resolved);
+    }
+
+    [Fact]
+    public void MergeXboxInstallState_PreservesStoreMetadataIdentifiers()
+    {
+        var catalogGame = new UnifySteamGameCacheEntry
+        {
+            Id = "9NTESTMETADATA",
+            Title = "Metadata game",
+            StoreTitleId = "1668241504",
+            StoreNamespace = "xbox-retail",
+        };
+
+        var merged = UnifySteamService.MergeXboxInstallState(
+            catalogGame,
+            new Dictionary<string, UnifySteamGameCacheEntry>(
+                StringComparer.OrdinalIgnoreCase),
+            new UnifySteamDownloadStatus(
+                "idle",
+                0,
+                string.Empty,
+                DateTimeOffset.MinValue));
+
+        Assert.Equal(catalogGame.StoreTitleId, merged.StoreTitleId);
+        Assert.Equal(catalogGame.StoreNamespace, merged.StoreNamespace);
+    }
+
+    [Fact]
+    public void MergeXboxInstallState_UsesInstalledManifestTitleIdForCatalogBundle()
+    {
+        var catalogGame = new UnifySteamGameCacheEntry
+        {
+            Id = "9NTESTHALOPARENT",
+            ProviderGameId = "9NTESTHALOCHILD",
+            Title = "Halo bundle",
+        };
+        var installedPackage = new UnifySteamGameCacheEntry
+        {
+            Id = catalogGame.ProviderGameId,
+            Title = "Halo package",
+            Installed = true,
+            StoreTitleId = "2082978535",
+            ExecutablePath = @"C:\XboxGames\Halo\Content\Halo.exe",
+        };
+
+        var merged = UnifySteamService.MergeXboxInstallState(
+            catalogGame,
+            new Dictionary<string, UnifySteamGameCacheEntry>(
+                StringComparer.OrdinalIgnoreCase)
+            {
+                [installedPackage.Id] = installedPackage,
+            },
+            new UnifySteamDownloadStatus(
+                "idle",
+                0,
+                string.Empty,
+                DateTimeOffset.MinValue));
+
+        Assert.True(merged.Installed);
+        Assert.Equal(installedPackage.StoreTitleId, merged.StoreTitleId);
+    }
+
+    [Theory]
+    [InlineData("7c27bae7", "2082978535")]
+    [InlineData("0x7C27BAE7", "2082978535")]
+    public void TryNormalizeXboxManifestTitleId_ConvertsOfficialHexValue(
+        string input,
+        string expected)
+    {
+        var parsed = UnifySteamService.TryNormalizeXboxManifestTitleId(
+            input,
+            out var titleId);
+
+        Assert.True(parsed);
+        Assert.Equal(expected, titleId);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("FFFFFFFF")]
+    [InlineData("not-a-title")]
+    [InlineData("123")]
+    public void TryNormalizeXboxManifestTitleId_RejectsMissingOrPlaceholderValues(
+        string input)
+    {
+        Assert.False(UnifySteamService.TryNormalizeXboxManifestTitleId(
+            input,
+            out var titleId));
+        Assert.Empty(titleId);
     }
 
     [Fact]

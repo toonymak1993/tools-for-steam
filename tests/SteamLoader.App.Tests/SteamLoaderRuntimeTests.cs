@@ -45,11 +45,26 @@ public sealed class SteamLoaderRuntimeTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public void ShouldStartShellHandOffMonitor_ReturnsFalse_OutsideShellMode(
+    public void ShouldStartShellHandOffMonitor_FollowsSplash_OutsideShellMode(
         bool startupSplashVisible)
     {
-        Assert.False(SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
+        Assert.Equal(startupSplashVisible, SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
             shellBootstrapMode: false,
             startupSplashVisible: startupSplashVisible));
+    }
+
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    public void ShouldShowStartupSplash_RequiresAnUnhostedConsoleBootstrap(
+        bool consoleBootstrapMode,
+        bool xboxHostedSplash,
+        bool expected)
+    {
+        Assert.Equal(expected, SteamLoaderRuntime.ShouldShowStartupSplash(
+            consoleBootstrapMode,
+            xboxHostedSplash));
     }
 }

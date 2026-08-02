@@ -1,11 +1,12 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const version = 19;
+  const version = 22;
   const maxConcurrentArtworkLoads = 3;
   const rootId = "steamloader-store-root";
   const styleId = "steamloader-store-style";
   const inputStorageKey = "ToolsForSteamPluginStoreInput";
   const overlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
+  const wishlistViewStorageKey = "ToolsForSteamWishlistView";
   const channelName = "ToolsForSteamPluginStoreChannel";
   const tabs = ["discover", "search", "wishlist", "alerts", "settings"];
   const searchKeyboardRows = [
@@ -39,6 +40,7 @@
   document.getElementById(rootId)?.remove();
   document.getElementById(styleId)?.remove();
 
+  const savedWishlistView = loadWishlistViewPreferences();
   const state = {
     open: false,
     loading: false,
@@ -54,6 +56,19 @@
     searchLoading: false,
     searchKeyboardOpen: false,
     searchKeyboardDraft: "",
+    searchKeyboardPurpose: "store",
+    wishlistQuery: "",
+    wishlistFilter: savedWishlistView.filter,
+    wishlistSort: savedWishlistView.sort,
+    wishlistManageMode: false,
+    selectedWishlistIds: new Set(),
+    recentlyRemovedGames: [],
+    undoRemoveTimer: 0,
+    statusTimer: 0,
+    statusTimerMessage: "",
+    settingsBusy: false,
+    snapshotSyncing: false,
+    lastSnapshotPollAt: 0,
     alertUpdatingId: "",
     discoverySeed: Date.now(),
     regionMenuOpen: false,
@@ -66,6 +81,7 @@
     broadcastTimer: 0,
     buttonState: {},
     lastActionAt: {},
+    navigationSoundLastAt: 0,
     inputReadyAt: 0,
     keyHandler: null,
     storageHandler: null,
@@ -87,6 +103,29 @@
 
   function normalizeApiPath(path) {
     return `${apiBase}${String(path || "").replace(/^\/+/, "")}`.replace(/([^:]\/)\/+/g, "$1");
+  }
+
+  function loadWishlistViewPreferences() {
+    const validFilters = ["all", "changes", "sale", "alerts", "unreleased", "unpriced", "pinned"];
+    const validSorts = ["smart", "discount", "price", "added", "changed", "title"];
+    try {
+      const value = JSON.parse(window.localStorage?.getItem(wishlistViewStorageKey) || "{}");
+      return {
+        filter: validFilters.includes(value?.filter) || String(value?.filter || "").startsWith("tag:") ? value.filter : "all",
+        sort: validSorts.includes(value?.sort) ? value.sort : "smart",
+      };
+    } catch {
+      return { filter: "all", sort: "smart" };
+    }
+  }
+
+  function persistWishlistViewPreferences() {
+    try {
+      window.localStorage?.setItem(wishlistViewStorageKey, JSON.stringify({
+        filter: state.wishlistFilter,
+        sort: state.wishlistSort,
+      }));
+    } catch {}
   }
 
   async function fetchJson(path, options = {}) {
@@ -112,6 +151,14 @@
         window.clearInterval(state[timerName]);
         state[timerName] = 0;
       }
+    }
+    if (state.undoRemoveTimer) {
+      window.clearTimeout(state.undoRemoveTimer);
+      state.undoRemoveTimer = 0;
+    }
+    if (state.statusTimer) {
+      window.clearTimeout(state.statusTimer);
+      state.statusTimer = 0;
     }
     if (state.keyHandler) {
       window.removeEventListener("keydown", state.keyHandler, true);
@@ -200,11 +247,31 @@
       }
       if (isOpen !== state.open) setOpen(isOpen);
       if (isOpen && !state.snapshot && !state.loading) void loadStore(false);
+      else if (isOpen && state.snapshot?.isRefreshing && !state.snapshotSyncing && !state.loading && !state.refreshing && !state.settingsBusy &&
+        Date.now() - state.lastSnapshotPollAt >= 2500) void syncRefreshingSnapshot();
     } catch {
       if (state.open) {
         state.error = "The local Store service is not reachable.";
         render();
       }
+    }
+  }
+
+  async function syncRefreshingSnapshot() {
+    state.snapshotSyncing = true;
+    state.lastSnapshotPollAt = Date.now();
+    try {
+      const snapshot = await fetchJson("api/store/state");
+      const changed = snapshot?.refreshedAtUtc !== state.snapshot?.refreshedAtUtc ||
+        Boolean(snapshot?.isRefreshing) !== Boolean(state.snapshot?.isRefreshing);
+      state.snapshot = snapshot;
+      if (changed && !snapshot?.isRefreshing) {
+        state.status = "Wishlist prices and availability are up to date.";
+        render();
+      }
+    } catch {}
+    finally {
+      state.snapshotSyncing = false;
     }
   }
 
@@ -294,6 +361,9 @@
           targetPrice: Number(existingAlert?.targetPrice ?? current ?? 10).toFixed(2),
           currencyCode: existingAlert?.targetCurrencyCode || currency,
           enabled: Boolean(existingAlert),
+          mode: existingAlert?.mode || "price",
+          targetDiscountPercent: Number(existingAlert?.targetDiscountPercent) || 0,
+          snoozedUntilUtc: existingAlert?.snoozedUntilUtc || null,
           edited: false,
         }
       : null;
@@ -442,6 +512,8 @@
           isWishlisted: enabled || Boolean(state.selectedGame.isSteamWishlisted),
         };
       }
+      if (!enabled && game.isLocallyWishlisted) rememberRemovedGames([game]);
+      else if (enabled) clearRememberedRemovedGames([game.id]);
       state.status = enabled ? `${game.title} added to the TFS wishlist.` : `${game.title} removed from the TFS wishlist.`;
     } catch (error) {
       state.error = error instanceof Error ? error.message : String(error);
@@ -449,6 +521,154 @@
       state.refreshing = false;
       render();
     }
+  }
+
+  async function setWishlistMetadata(game, changes) {
+    if (!game || state.refreshing) return;
+    state.refreshing = true;
+    state.error = "";
+    render();
+    try {
+      state.snapshot = await fetchJson("api/store/wishlist/metadata", {
+        method: "POST",
+        body: JSON.stringify({ gameId: game.id, ...changes }),
+      });
+      state.selectedGame = getWishlist().find((item) => item.id === game.id) || state.selectedGame;
+      state.status = "Wishlist organization saved.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.refreshing = false;
+      render();
+    }
+  }
+
+  async function markWishlistChangesSeen() {
+    try {
+      state.snapshot = await fetchJson("api/store/wishlist/seen", { method: "POST", body: "{}" });
+      state.status = "Wishlist changes marked as seen.";
+      render();
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+      render();
+    }
+  }
+
+  async function bulkSetPinned(games, isPinned) {
+    await runWishlistBulkAction(games, () => fetchJson("api/store/wishlist/bulk", {
+      method: "POST",
+      body: JSON.stringify({ gameIds: games.map((game) => game.id), isPinned }),
+    }), `${games.length} games ${isPinned ? "pinned" : "unpinned"}.`);
+  }
+
+  async function bulkAddTag(games, tag) {
+    await runWishlistBulkAction(games, () => fetchJson("api/store/wishlist/bulk", {
+      method: "POST",
+      body: JSON.stringify({ gameIds: games.map((game) => game.id), addTag: tag }),
+    }), `${tag} added to ${games.length} games.`);
+  }
+
+  async function bulkCreateAlerts(games, multiplier) {
+    const currencyCode = getPreferredAlertCurrencyCode();
+    const priced = games.filter((game) => Number(currencyCode === "EUR" ? game.cheapestPriceEur : game.cheapestPrice) > 0);
+    if (!priced.length) {
+      state.status = "None of the selected games has a verified price for this alert yet.";
+      render();
+      return;
+    }
+    await runWishlistBulkAction(priced, () => fetchJson("api/store/wishlist/bulk", {
+      method: "POST",
+      body: JSON.stringify({
+        gameIds: priced.map((game) => game.id),
+        alertMultiplier: multiplier,
+        alertCurrencyCode: currencyCode,
+      }),
+    }), `${priced.length} price alerts created.`);
+  }
+
+  async function bulkRemoveLocal(games) {
+    const localGames = games.filter((game) => game.isLocallyWishlisted);
+    if (!localGames.length) {
+      state.status = "The selected games only belong to Steam; no local TFS entry was removed.";
+      render();
+      return;
+    }
+    const completed = await runWishlistBulkAction(localGames, () => fetchJson("api/store/wishlist/bulk", {
+      method: "POST",
+      body: JSON.stringify({ gameIds: localGames.map((game) => game.id), removeLocal: true }),
+    }), `${localGames.length} TFS wishlist entries removed.`);
+    if (completed) rememberRemovedGames(localGames);
+  }
+
+  async function runWishlistBulkAction(games, action, successMessage) {
+    if (!games.length || state.refreshing) return false;
+    state.refreshing = true;
+    state.error = "";
+    render();
+    try {
+      state.snapshot = await action();
+      state.selectedWishlistIds.clear();
+      state.status = successMessage;
+      return true;
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      state.refreshing = false;
+      render();
+    }
+  }
+
+  function rememberRemovedGames(games) {
+    const merged = new Map(state.recentlyRemovedGames.map((game) => [game.id, game]));
+    games.forEach((game) => { if (game?.id) merged.set(game.id, game); });
+    state.recentlyRemovedGames = [...merged.values()].slice(-50);
+    if (state.undoRemoveTimer) window.clearTimeout(state.undoRemoveTimer);
+    state.undoRemoveTimer = window.setTimeout(() => {
+      state.recentlyRemovedGames = [];
+      state.undoRemoveTimer = 0;
+      if (state.open && state.activeTab === "wishlist") render();
+    }, 15000);
+  }
+
+  function clearRememberedRemovedGames(gameIds = []) {
+    const ids = new Set(gameIds);
+    state.recentlyRemovedGames = ids.size
+      ? state.recentlyRemovedGames.filter((game) => !ids.has(game.id))
+      : [];
+    if (!state.recentlyRemovedGames.length && state.undoRemoveTimer) {
+      window.clearTimeout(state.undoRemoveTimer);
+      state.undoRemoveTimer = 0;
+    }
+  }
+
+  async function restoreRecentlyRemovedGames() {
+    const games = [...state.recentlyRemovedGames];
+    if (!games.length) return;
+    const completed = await runWishlistBulkAction(games, async () => {
+      let snapshot = state.snapshot;
+      for (const game of games) {
+        snapshot = await fetchJson("api/store/wishlist", {
+          method: "POST",
+          body: JSON.stringify({ game, enabled: true }),
+        });
+      }
+      return snapshot;
+    }, `${games.length} removed game${games.length === 1 ? "" : "s"} restored.`);
+    if (completed) {
+      clearRememberedRemovedGames();
+      render();
+    }
+  }
+
+  function formatChangeKind(kind) {
+    return {
+      "price-drop": "PRICE DROP",
+      "new-deal": "NEW DEAL",
+      "back-on-sale": "BACK ON SALE",
+      released: "RELEASED",
+      "new-store": "NEW STORE",
+    }[String(kind || "").toLowerCase()] || "UPDATED";
   }
 
   async function saveAlert(enabled = true) {
@@ -466,6 +686,9 @@
           targetPrice,
           currencyCode: state.alertDraft.currencyCode,
           enabled,
+          mode: state.alertDraft.mode || "price",
+          targetDiscountPercent: Number(state.alertDraft.targetDiscountPercent) || 0,
+          snoozedUntilUtc: state.alertDraft.snoozedUntilUtc || null,
         }),
       });
       state.alertDraft.enabled = enabled;
@@ -495,6 +718,9 @@
           targetPrice,
           currencyCode: alert.targetCurrencyCode,
           enabled: true,
+          mode: alert.mode || "price",
+          targetDiscountPercent: Number(alert.targetDiscountPercent) || 0,
+          snoozedUntilUtc: alert.snoozedUntilUtc || null,
         }),
       });
       state.status = `Price target updated to ${formatSinglePrice(targetPrice, alert.targetCurrencyCode)}.`;
@@ -522,6 +748,9 @@
           targetPrice: Number(alert.targetPrice) || 0,
           currencyCode: alert.targetCurrencyCode,
           enabled: false,
+          mode: alert.mode || "price",
+          targetDiscountPercent: Number(alert.targetDiscountPercent) || 0,
+          snoozedUntilUtc: null,
         }),
       });
       state.status = `${alert.title} price alert removed.`;
@@ -531,6 +760,127 @@
       state.alertUpdatingId = "";
       render();
     }
+  }
+
+  async function snoozeSavedAlert(alert, days = 7) {
+    const alertIdentity = getStoredAlertIdentity(alert);
+    if (!alertIdentity || state.alertUpdatingId) return;
+    state.alertUpdatingId = alertIdentity;
+    state.error = "";
+    render();
+    try {
+      const snoozedUntilUtc = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
+      state.snapshot = await fetchJson("api/store/alerts", {
+        method: "POST",
+        body: JSON.stringify({
+          steamAppId: Number(alert?.steamAppId) > 0 ? Number(alert.steamAppId) : null,
+          gameId: alert.gameId,
+          title: alert.title,
+          targetPrice: Number(alert.targetPrice) || 0,
+          currencyCode: alert.targetCurrencyCode,
+          enabled: true,
+          mode: alert.mode || "price",
+          targetDiscountPercent: Number(alert.targetDiscountPercent) || 0,
+          snoozedUntilUtc,
+        }),
+      });
+      state.status = days > 0
+        ? `${alert.title} notifications snoozed for ${days} days.`
+        : `${alert.title} notifications resumed.`;
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.alertUpdatingId = "";
+      render();
+    }
+  }
+
+  async function setStorePreferences(changes) {
+    if (state.settingsBusy) return;
+    state.settingsBusy = true;
+    state.error = "";
+    render();
+    try {
+      state.snapshot = await fetchJson("api/store/settings/preferences", {
+        method: "POST",
+        body: JSON.stringify(changes || {}),
+      });
+      if (Object.prototype.hasOwnProperty.call(changes || {}, "includeKeyshops")) {
+        state.snapshot = await fetchJson("api/store/refresh", { method: "POST", body: "{}" });
+      }
+      state.status = "Wishlist preferences saved.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.settingsBusy = false;
+      render();
+    }
+  }
+
+  async function setArtworkCachePolicy(maximumMegabytes, retentionDays) {
+    if (state.settingsBusy) return;
+    state.settingsBusy = true;
+    render();
+    try {
+      state.snapshot = await fetchJson("api/store/settings/cache", {
+        method: "POST",
+        body: JSON.stringify({ maximumMegabytes, retentionDays }),
+      });
+      state.status = "Artwork cache policy saved.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.settingsBusy = false;
+      render();
+    }
+  }
+
+  async function clearArtworkCache() {
+    if (state.settingsBusy) return;
+    state.settingsBusy = true;
+    render();
+    try {
+      state.snapshot = await fetchJson("api/store/cache/clear", { method: "POST", body: "{}" });
+      state.status = "Artwork cache cleared. Visible images will be loaded again as needed.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.settingsBusy = false;
+      render();
+    }
+  }
+
+  async function copyWishlistBackup() {
+    try {
+      const backup = await fetchJson("api/store/backup");
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable in this Steam surface.");
+      await navigator.clipboard.writeText(String(backup?.json || ""));
+      state.status = "Wishlist backup copied to the clipboard.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    }
+    render();
+  }
+
+  async function importWishlistBackup() {
+    try {
+      if (!navigator.clipboard?.readText) throw new Error("Clipboard access is unavailable in this Steam surface.");
+      const json = await navigator.clipboard.readText();
+      state.snapshot = await fetchJson("api/store/backup/import", {
+        method: "POST",
+        body: JSON.stringify({ json }),
+      });
+      state.status = "Wishlist backup imported. Prices will refresh in the background.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    }
+    render();
+  }
+
+  function formatBytes(bytes) {
+    const value = Math.max(0, Number(bytes) || 0);
+    if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+    return `${(value / (1024 * 1024)).toFixed(value >= 100 * 1024 * 1024 ? 0 : 1)} MB`;
   }
 
   async function setCurrency(value) {
@@ -705,11 +1055,28 @@
   function setFocus(index, direction = "") {
     const elements = getFocusables();
     if (!elements.length) return;
+    const previousIndex = state.focusIndex;
     state.focusIndex = Math.max(0, Math.min(index, elements.length - 1));
     elements.forEach((element, elementIndex) => element.classList.toggle("is-controller-focus", elementIndex === state.focusIndex));
     const focused = elements[state.focusIndex];
     if (document.activeElement !== focused) focused.focus({ preventScroll: true });
+    if (direction && previousIndex !== state.focusIndex) playNavigationSound();
     scrollFocusedElementIntoView(focused, direction);
+  }
+
+  function playNavigationSound() {
+    const now = performance.now();
+    if (now - Number(state.navigationSoundLastAt || 0) < 36) return false;
+    state.navigationSoundLastAt = now;
+    try {
+      const audio = new Audio("/sounds/deck_ui_navigation.wav");
+      audio.volume = 0.72;
+      const promise = audio.play();
+      if (promise && typeof promise.catch === "function") promise.catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   function getFocusables() {
@@ -881,17 +1248,53 @@
 
   function render() {
     const root = ensureMounted();
+    const previousTab = root.dataset.storeActiveTab || "";
+    const previousGameId = root.dataset.storeGameId || "";
+    const previousMainScrollTop = root.querySelector(".steamloader-store-main")?.scrollTop || 0;
+    const previousModalScrollTop = root.querySelector(".steamloader-store-modal-body")?.scrollTop || 0;
+    const preserveMainScroll = previousTab === state.activeTab;
+    const preserveModalScroll = previousGameId && previousGameId === String(state.selectedGame?.id || "");
     resetArtworkLoading();
     root.classList.toggle("is-open", state.open);
     root.replaceChildren();
     if (!state.open) return;
+    root.dataset.storeActiveTab = state.activeTab;
+    root.dataset.storeGameId = String(state.selectedGame?.id || "");
 
     const shell = el("div", "steamloader-store-shell");
     shell.append(renderHeader(), renderTabs(), renderMain(), renderFooter());
     root.append(shell);
+    if (state.status) root.append(renderStatusToast());
     if (state.selectedGame) root.append(renderDetails());
     if (state.searchKeyboardOpen) root.append(renderSearchKeyboard());
-    window.requestAnimationFrame(() => setFocus(Math.min(state.focusIndex, Math.max(0, getFocusables().length - 1))));
+    window.requestAnimationFrame(() => {
+      if (preserveMainScroll) {
+        const main = root.querySelector(".steamloader-store-main");
+        if (main) main.scrollTop = Math.min(previousMainScrollTop, Math.max(0, main.scrollHeight - main.clientHeight));
+      }
+      if (preserveModalScroll) {
+        const modalBody = root.querySelector(".steamloader-store-modal-body");
+        if (modalBody) modalBody.scrollTop = Math.min(previousModalScrollTop, Math.max(0, modalBody.scrollHeight - modalBody.clientHeight));
+      }
+      setFocus(Math.min(state.focusIndex, Math.max(0, getFocusables().length - 1)));
+    });
+  }
+
+  function renderStatusToast() {
+    const toast = el("div", "steamloader-store-status-toast");
+    toast.setAttribute("role", "status");
+    toast.append(textEl("span", "", state.status));
+    if (state.statusTimerMessage !== state.status) {
+      if (state.statusTimer) window.clearTimeout(state.statusTimer);
+      state.statusTimerMessage = state.status;
+      state.statusTimer = window.setTimeout(() => {
+        state.status = "";
+        state.statusTimer = 0;
+        state.statusTimerMessage = "";
+        document.querySelector(`#${rootId} .steamloader-store-status-toast`)?.remove();
+      }, 4200);
+    }
+    return toast;
   }
 
   function renderHeader() {
@@ -918,7 +1321,8 @@
     const nav = el("nav", "steamloader-store-tabs");
     nav.append(textEl("span", "steamloader-store-bumper", "LB"));
     for (const tab of tabs) {
-      const label = tab === "discover" ? "Discover" : tab === "search" ? "Search" : tab === "wishlist" ? "Wishlist" : tab === "alerts" ? "Price Alerts" : "Settings";
+      let label = tab === "discover" ? "Discover" : tab === "search" ? "Search" : tab === "wishlist" ? "Wishlist" : tab === "alerts" ? "Price Alerts" : "Settings";
+      if (tab === "wishlist" && Number(state.snapshot?.unseenChangeCount) > 0) label += ` (${state.snapshot.unseenChangeCount})`;
       const button = buttonEl(label, `steamloader-store-tab${state.activeTab === tab ? " is-active" : ""}`, () => {
         state.activeTab = tab;
         state.focusIndex = 0;
@@ -1016,19 +1420,25 @@
     main.append(renderGameGrid(state.searchResults));
   }
 
-  function openSearchKeyboard() {
-    state.searchKeyboardDraft = state.searchQuery;
+  function openSearchKeyboard(purpose = "store") {
+    state.searchKeyboardPurpose = purpose === "wishlist" ? "wishlist" : "store";
+    state.searchKeyboardDraft = state.searchKeyboardPurpose === "wishlist"
+      ? state.wishlistQuery
+      : state.searchQuery;
     state.searchKeyboardOpen = true;
     state.focusIndex = 0;
     render();
   }
 
   function closeSearchKeyboard(commit) {
-    if (commit) state.searchQuery = state.searchKeyboardDraft.trim();
+    if (commit) {
+      if (state.searchKeyboardPurpose === "wishlist") state.wishlistQuery = state.searchKeyboardDraft.trim();
+      else state.searchQuery = state.searchKeyboardDraft.trim();
+    }
     state.searchKeyboardOpen = false;
     state.focusIndex = 0;
     render();
-    if (commit && state.searchQuery) void searchStore();
+    if (commit && state.searchKeyboardPurpose === "store" && state.searchQuery) void searchStore();
   }
 
   function handleSearchKeyboardKey(key) {
@@ -1049,7 +1459,7 @@
     panel.setAttribute("aria-label", "Game search keyboard");
     const header = el("div", "steamloader-store-search-keyboard-header");
     header.append(
-      textEl("div", "steamloader-store-search-keyboard-title", "Search games"),
+      textEl("div", "steamloader-store-search-keyboard-title", state.searchKeyboardPurpose === "wishlist" ? "Filter wishlist" : "Search games"),
       textEl("div", "steamloader-store-search-keyboard-value", state.searchKeyboardDraft || "Enter a game title"),
     );
     const grid = el("div", "steamloader-store-search-keyboard-grid");
@@ -1094,19 +1504,205 @@
   }
 
   function renderWishlist(main) {
-    const wishlist = getWishlist();
-    const head = renderPageHead(
+    const allGames = getWishlist();
+    if (state.wishlistFilter.startsWith("tag:")) {
+      const activeTag = state.wishlistFilter.slice(4);
+      const tagStillExists = allGames.some((game) => (game.tags || []).some((tag) => tag.toLowerCase() === activeTag.toLowerCase()));
+      if (!tagStillExists) {
+        state.wishlistFilter = "all";
+        persistWishlistViewPreferences();
+      }
+    }
+    const wishlist = getVisibleWishlist();
+    main.append(renderPageHead(
       "Your Steam + TFS wishlist",
-      state.snapshot?.wishlistAvailable
-        ? `${wishlist.length} combined games · sale items are shown first`
-        : `${wishlist.length} local TFS games · Steam needs Public profile and game details for sync.`,
-    );
-    main.append(head);
+      `${wishlist.length} of ${allGames.length} games shown`,
+    ));
+    if (state.recentlyRemovedGames.length) main.append(renderWishlistUndoBanner());
+    if (Number(state.snapshot?.unseenChangeCount) > 0) main.append(renderWishlistActivityBanner());
+    main.append(renderWishlistToolbar(allGames));
+    if (state.wishlistManageMode) main.append(renderWishlistManageBar(allGames));
+    if (!allGames.length) {
+      const empty = el("div", "steamloader-store-empty is-actionable");
+      empty.append(
+        textEl("strong", "", "Your combined wishlist is empty"),
+        textEl("span", "", "Search Steam, GOG, Xbox, Epic Games and verified Instant Gaming matches, or make Steam profile and game details public."),
+        buttonEl("Search games", "steamloader-store-button is-primary", () => { state.activeTab = "search"; state.focusIndex = 0; render(); }),
+      );
+      main.append(empty);
+      return;
+    }
     if (!wishlist.length) {
-      main.append(textEl("div", "steamloader-store-empty", "No wishlist games yet. Search any store to add one locally, or make Steam profile and game details public."));
+      const empty = el("div", "steamloader-store-empty is-actionable");
+      empty.append(
+        textEl("strong", "", "No games match this view"),
+        textEl("span", "", "Your games are still safe. Clear the search and filters to show everything again."),
+        buttonEl("Clear filters", "steamloader-store-button is-primary", () => {
+          state.wishlistQuery = "";
+          state.wishlistFilter = "all";
+          persistWishlistViewPreferences();
+          state.focusIndex = 0;
+          render();
+        }),
+      );
+      main.append(empty);
       return;
     }
     main.append(renderGameGrid(wishlist));
+  }
+
+  function renderWishlistUndoBanner() {
+    const count = state.recentlyRemovedGames.length;
+    const banner = el("section", "steamloader-store-undo-banner");
+    banner.append(
+      textEl("strong", "", `${count} TFS wishlist game${count === 1 ? "" : "s"} removed`),
+      textEl("span", "", "Undo is available briefly. Steam wishlist entries were never deleted."),
+      buttonEl("Undo remove", "steamloader-store-button is-primary", () => void restoreRecentlyRemovedGames()),
+      buttonEl("Dismiss", "steamloader-store-button is-soft", () => { clearRememberedRemovedGames(); render(); }),
+    );
+    return banner;
+  }
+
+  function renderWishlistActivityBanner() {
+    const banner = el("section", "steamloader-store-activity-banner");
+    const count = Number(state.snapshot?.unseenChangeCount) || 0;
+    banner.append(
+      textEl("strong", "", `${count} change${count === 1 ? "" : "s"} since your last visit`),
+      textEl("span", "", "Price drops, returning sales, releases and newly verified stores are highlighted."),
+      buttonEl("Mark seen", "steamloader-store-button is-soft", () => void markWishlistChangesSeen()),
+    );
+    return banner;
+  }
+
+  function renderWishlistToolbar(allGames) {
+    const toolbar = el("section", "steamloader-store-wishlist-toolbar");
+    const searchButton = buttonEl(
+      state.wishlistQuery ? `Search: ${state.wishlistQuery}` : "Filter titles",
+      `steamloader-store-filter-search${state.wishlistQuery ? " is-active" : ""}`,
+      () => openSearchKeyboard("wishlist"),
+    );
+    const filters = [
+      ["all", "All"], ["changes", "New changes"], ["sale", "On sale"],
+      ["alerts", "With alert"], ["unreleased", "Unreleased"],
+      ["unpriced", "No price"], ["pinned", "Pinned"],
+    ];
+    const filterRail = el("div", "steamloader-store-filter-rail");
+    for (const [value, label] of filters) {
+      filterRail.append(buttonEl(
+        `${label} ${countWishlistFilter(allGames, value)}`,
+        `steamloader-store-filter-chip${state.wishlistFilter === value ? " is-active" : ""}`,
+        () => { state.wishlistFilter = value; persistWishlistViewPreferences(); state.focusIndex = 0; render(); },
+      ));
+    }
+    const tags = [...new Set(allGames.flatMap((game) => Array.isArray(game.tags) ? game.tags : []))]
+      .sort((left, right) => left.localeCompare(right))
+      .slice(0, 8);
+    for (const tag of tags) {
+      const value = `tag:${tag}`;
+      filterRail.append(buttonEl(
+        tag,
+        `steamloader-store-filter-chip is-tag${state.wishlistFilter === value ? " is-active" : ""}`,
+        () => { state.wishlistFilter = value; persistWishlistViewPreferences(); state.focusIndex = 0; render(); },
+      ));
+    }
+    const actions = el("div", "steamloader-store-wishlist-toolbar-actions");
+    actions.append(
+      buttonEl(`Sort: ${wishlistSortLabel()}`, "steamloader-store-button is-soft", () => {
+        const modes = ["smart", "discount", "price", "added", "changed", "title"];
+        state.wishlistSort = modes[(modes.indexOf(state.wishlistSort) + 1) % modes.length];
+        persistWishlistViewPreferences();
+        render();
+      }),
+      buttonEl("Reset", "steamloader-store-button is-soft", () => {
+        state.wishlistQuery = "";
+        state.wishlistFilter = "all";
+        state.wishlistSort = "smart";
+        persistWishlistViewPreferences();
+        state.focusIndex = 0;
+        render();
+      }, { disabled: !state.wishlistQuery && state.wishlistFilter === "all" && state.wishlistSort === "smart" }),
+      buttonEl(state.wishlistManageMode ? "Done" : "Manage", `steamloader-store-button ${state.wishlistManageMode ? "is-primary" : "is-soft"}`, () => {
+        state.wishlistManageMode = !state.wishlistManageMode;
+        state.selectedWishlistIds.clear();
+        render();
+      }),
+    );
+    toolbar.append(searchButton, filterRail, actions);
+    return toolbar;
+  }
+
+  function renderWishlistManageBar(allGames) {
+    const bar = el("section", "steamloader-store-manage-bar");
+    const selected = getSelectedWishlistGames(allGames);
+    const visible = getVisibleWishlist();
+    bar.append(
+      textEl("strong", "", `${selected.length} selected`),
+      buttonEl(selected.length === visible.length && selected.length ? "Clear" : "Select visible", "steamloader-store-button is-soft", () => {
+        if (selected.length === visible.length && selected.length) state.selectedWishlistIds.clear();
+        else visible.forEach((game) => state.selectedWishlistIds.add(game.id));
+        render();
+      }),
+      buttonEl("Pin", "steamloader-store-button is-soft", () => void bulkSetPinned(selected, true), { disabled: !selected.length }),
+      buttonEl("Unpin", "steamloader-store-button is-soft", () => void bulkSetPinned(selected, false), { disabled: !selected.length }),
+      buttonEl("Must Buy", "steamloader-store-button is-soft", () => void bulkAddTag(selected, "Must Buy"), { disabled: !selected.length }),
+      buttonEl("Later", "steamloader-store-button is-soft", () => void bulkAddTag(selected, "Later"), { disabled: !selected.length }),
+      buttonEl("Co-op", "steamloader-store-button is-soft", () => void bulkAddTag(selected, "Co-op"), { disabled: !selected.length }),
+      buttonEl("Alert -25%", "steamloader-store-button is-soft", () => void bulkCreateAlerts(selected, 0.75), { disabled: !selected.length }),
+      buttonEl("Remove TFS", "steamloader-store-button is-danger", () => void bulkRemoveLocal(selected), { disabled: !selected.length }),
+    );
+    return bar;
+  }
+
+  function getVisibleWishlist() {
+    const query = normalizeArtworkTitle(state.wishlistQuery);
+    const alertIds = new Set(getAlerts().map(getStoredAlertIdentity));
+    const filtered = getWishlist().filter((game) => {
+      if (query && !normalizeArtworkTitle(game.title).includes(query)) return false;
+      const filter = state.wishlistFilter;
+      if (filter === "changes") return Boolean(game.hasUnseenChange);
+      if (filter === "sale") return Boolean(game.isOnSale);
+      if (filter === "alerts") return alertIds.has(getGameAlertIdentity(game));
+      if (filter === "unreleased") return Boolean(game.isUnreleased);
+      if (filter === "unpriced") return !getDisplayPriceParts(game).length;
+      if (filter === "pinned") return Boolean(game.isPinned);
+      if (filter.startsWith("tag:")) return (game.tags || []).some((tag) => tag.toLowerCase() === filter.slice(4).toLowerCase());
+      return true;
+    });
+    const price = (game) => Number(getDisplayPriceParts(game)[0]?.value ?? Number.MAX_SAFE_INTEGER);
+    return filtered.sort((left, right) => {
+      if (state.wishlistSort === "discount") return Number(right.discountPercent || 0) - Number(left.discountPercent || 0) || left.title.localeCompare(right.title);
+      if (state.wishlistSort === "price") return price(left) - price(right) || left.title.localeCompare(right.title);
+      if (state.wishlistSort === "added") return Date.parse(right.addedAtUtc || 0) - Date.parse(left.addedAtUtc || 0);
+      if (state.wishlistSort === "changed") return Date.parse(right.changedAtUtc || 0) - Date.parse(left.changedAtUtc || 0);
+      if (state.wishlistSort === "title") return left.title.localeCompare(right.title);
+      return Number(right.isPinned) - Number(left.isPinned) ||
+        Number(right.hasUnseenChange) - Number(left.hasUnseenChange) ||
+        Number(right.isOnSale) - Number(left.isOnSale) ||
+        Number(right.discountPercent || 0) - Number(left.discountPercent || 0) ||
+        left.title.localeCompare(right.title);
+    });
+  }
+
+  function countWishlistFilter(games, filter) {
+    if (filter === "all") return games.length;
+    if (filter === "changes") return games.filter((game) => game.hasUnseenChange).length;
+    if (filter === "sale") return games.filter((game) => game.isOnSale).length;
+    if (filter === "alerts") {
+      const ids = new Set(getAlerts().map(getStoredAlertIdentity));
+      return games.filter((game) => ids.has(getGameAlertIdentity(game))).length;
+    }
+    if (filter === "unreleased") return games.filter((game) => game.isUnreleased).length;
+    if (filter === "unpriced") return games.filter((game) => !getDisplayPriceParts(game).length).length;
+    if (filter === "pinned") return games.filter((game) => game.isPinned).length;
+    return games.length;
+  }
+
+  function wishlistSortLabel() {
+    return { smart: "Smart", discount: "Discount", price: "Lowest price", added: "Recently added", changed: "Recently changed", title: "A-Z" }[state.wishlistSort] || "Smart";
+  }
+
+  function getSelectedWishlistGames(games = getWishlist()) {
+    return games.filter((game) => state.selectedWishlistIds.has(game.id));
   }
 
   function renderAlerts(main) {
@@ -1137,21 +1733,29 @@
           : "Tracking starts with the first price"),
       );
       const target = el("div", "steamloader-store-alert-target");
-      target.append(textEl("span", "steamloader-store-alert-label", "ALERT AT"));
+      const isPriceAlert = !alert.mode || alert.mode === "price";
+      const isSnoozed = Date.parse(alert.snoozedUntilUtc || "") > Date.now();
+      target.append(textEl("span", "steamloader-store-alert-label", isPriceAlert ? "ALERT AT" : "SMART ALERT"));
       const controls = el("div", "steamloader-store-alert-target-controls");
       const updating = state.alertUpdatingId === getStoredAlertIdentity(alert);
-      controls.append(
-        buttonEl("−", "steamloader-store-mini-button", () => void adjustSavedAlert(alert, -1), { disabled: updating, navRow: 30 + alertIndex }),
-        textEl("strong", "steamloader-store-alert-target-value", formatSinglePrice(alert.targetPrice, alert.targetCurrencyCode)),
-        buttonEl("+", "steamloader-store-mini-button", () => void adjustSavedAlert(alert, 1), { disabled: updating, navRow: 30 + alertIndex }),
-      );
+      if (isPriceAlert) {
+        controls.append(
+          buttonEl("−", "steamloader-store-mini-button", () => void adjustSavedAlert(alert, -1), { disabled: updating, navRow: 30 + alertIndex }),
+          textEl("strong", "steamloader-store-alert-target-value", describeAlertTarget(alert)),
+          buttonEl("+", "steamloader-store-mini-button", () => void adjustSavedAlert(alert, 1), { disabled: updating, navRow: 30 + alertIndex }),
+        );
+      } else {
+        controls.append(textEl("strong", "steamloader-store-alert-target-value", describeAlertTarget(alert)));
+      }
       target.append(
         controls,
         textEl("span", `steamloader-store-alert-state${alert.reached ? " is-reached" : ""}`, updating
           ? "Saving…"
-          : alert.reached ? "Below target" : "Watching"),
+          : isSnoozed ? `Snoozed until ${new Date(alert.snoozedUntilUtc).toLocaleDateString()}`
+            : alert.reached ? "Below target" : "Watching"),
       );
       const actions = el("div", "steamloader-store-alert-actions");
+      actions.append(buttonEl(isSnoozed ? "Resume now" : "Snooze 7d", "steamloader-store-button is-soft", () => void snoozeSavedAlert(alert, isSnoozed ? 0 : 7), { disabled: updating, navRow: 30 + alertIndex }));
       if (alert.dealUrl) {
         actions.append(buttonEl("Open deal", "steamloader-store-button is-primary", () => void openDeal(alert.dealUrl), { disabled: updating, navRow: 30 + alertIndex }));
       }
@@ -1160,6 +1764,13 @@
       list.append(card);
     });
     main.append(list);
+  }
+
+  function describeAlertTarget(alert) {
+    if (alert?.mode === "discount") return `-${Number(alert.targetDiscountPercent) || 0}%`;
+    if (alert?.mode === "new-low") return "New TFS low";
+    if (alert?.mode === "release") return "On release";
+    return formatSinglePrice(alert?.targetPrice, alert?.targetCurrencyCode);
   }
 
   function renderAlertTrend(alert) {
@@ -1247,6 +1858,7 @@
       choices.append(button);
     });
     panel.append(choices);
+    panel.append(renderSourcePreferences(), renderArtworkCacheSettings(), renderWishlistBackupSettings());
     const note = el("div", "steamloader-store-data-note");
     note.append(
       textEl("strong", "", "No API key required"),
@@ -1257,6 +1869,79 @@
     );
     panel.append(note);
     main.append(panel);
+  }
+
+  function renderSourcePreferences() {
+    const section = el("section", "steamloader-store-qol-settings");
+    section.append(textEl("h3", "", "Deal sources and refresh"));
+    const rows = el("div", "steamloader-store-setting-rows");
+    const notifications = buttonEl("", `steamloader-store-setting-row${state.snapshot?.notificationsEnabled !== false ? " is-active" : ""}`, () => void setStorePreferences({ notificationsEnabled: state.snapshot?.notificationsEnabled === false }));
+    notifications.append(
+      textEl("strong", "", "Price notifications"),
+      textEl("span", "", state.snapshot?.notificationsEnabled !== false ? "Windows alerts are shown when an enabled target is newly reached." : "Alerts keep tracking silently without desktop notifications."),
+      textEl("em", "", state.snapshot?.notificationsEnabled !== false ? "ON" : "OFF"),
+    );
+    rows.append(notifications);
+    const keyshops = buttonEl("", `steamloader-store-setting-row${state.snapshot?.includeKeyshops !== false ? " is-active" : ""}`, () => void setStorePreferences({ includeKeyshops: state.snapshot?.includeKeyshops === false }));
+    keyshops.append(
+      textEl("strong", "", "Verified keyshops"),
+      textEl("span", "", state.snapshot?.includeKeyshops !== false ? "Instant Gaming exact regional PC matches are included." : "Only official storefronts are compared."),
+      textEl("em", "", state.snapshot?.includeKeyshops !== false ? "ON" : "OFF"),
+    );
+    rows.append(keyshops);
+    const interval = Number(state.snapshot?.refreshIntervalMinutes) || 30;
+    const intervalRow = el("div", "steamloader-store-setting-row is-static");
+    intervalRow.append(textEl("strong", "", "Background refresh"), textEl("span", "", `Every ${interval} minutes`));
+    const intervalActions = el("div", "steamloader-store-setting-inline-actions");
+    [15, 30, 60, 120].forEach((minutes) => intervalActions.append(buttonEl(
+      `${minutes}m`,
+      `steamloader-store-filter-chip${interval === minutes ? " is-active" : ""}`,
+      () => void setStorePreferences({ refreshIntervalMinutes: minutes }),
+    )));
+    intervalRow.append(intervalActions);
+    rows.append(intervalRow);
+    section.append(rows);
+    return section;
+  }
+
+  function renderArtworkCacheSettings() {
+    const cache = state.snapshot?.artworkCache || {};
+    const maximum = Number(cache.maximumMegabytes) || 256;
+    const retention = Number(cache.retentionDays) || 45;
+    const section = el("section", "steamloader-store-qol-settings");
+    section.append(
+      textEl("h3", "", "Artwork cache"),
+      textEl("p", "steamloader-store-setting-copy", `${Number(cache.fileCount) || 0} images - ${formatBytes(Number(cache.totalBytes) || 0)} used. Visible artwork loads first; nearby rows are prefetched quietly.`),
+    );
+    const choices = el("div", "steamloader-store-setting-inline-actions");
+    [128, 256, 512, 1024].forEach((size) => choices.append(buttonEl(
+      `${size} MB`,
+      `steamloader-store-filter-chip${maximum === size ? " is-active" : ""}`,
+      () => void setArtworkCachePolicy(size, retention),
+    )));
+    [15, 45, 90].forEach((days) => choices.append(buttonEl(
+      `${days} days`,
+      `steamloader-store-filter-chip${retention === days ? " is-active" : ""}`,
+      () => void setArtworkCachePolicy(maximum, days),
+    )));
+    choices.append(buttonEl("Clear cache", "steamloader-store-button is-danger", () => void clearArtworkCache()));
+    section.append(choices);
+    return section;
+  }
+
+  function renderWishlistBackupSettings() {
+    const section = el("section", "steamloader-store-qol-settings");
+    section.append(
+      textEl("h3", "", "Backup and restore"),
+      textEl("p", "steamloader-store-setting-copy", "Copy your local wishlist, alerts, tags and TFS price history as portable JSON. Store credentials are never included."),
+    );
+    const actions = el("div", "steamloader-store-setting-inline-actions");
+    actions.append(
+      buttonEl("Copy backup", "steamloader-store-button is-soft", () => void copyWishlistBackup()),
+      buttonEl("Import clipboard", "steamloader-store-button is-soft", () => void importWishlistBackup()),
+    );
+    section.append(actions);
+    return section;
   }
 
   function renderRegionSelector() {
@@ -1321,14 +2006,31 @@
   }
 
   function renderGameCard(game, mode) {
-    const card = buttonEl("", `steamloader-store-card is-${mode}`, () => void openDetails(game));
+    const selectable = state.activeTab === "wishlist" && state.wishlistManageMode;
+    const selected = selectable && state.selectedWishlistIds.has(game.id);
+    const card = buttonEl("", `steamloader-store-card is-${mode}${selected ? " is-selected" : ""}`, () => {
+      if (selectable) {
+        if (selected) state.selectedWishlistIds.delete(game.id);
+        else state.selectedWishlistIds.add(game.id);
+        render();
+      } else {
+        void openDetails(game);
+      }
+    });
     const art = el("div", "steamloader-store-card-art");
     art.append(createArtworkImage(game, mode === "portrait" ? "poster" : "header"));
     if (game.reviewPercent) art.append(textEl("div", "steamloader-store-rating", `● ${game.reviewPercent}%`));
     if (game.isWishlisted) art.append(textEl("div", "steamloader-store-heart", "♥"));
+    if (selectable) art.append(textEl("div", `steamloader-store-select-check${selected ? " is-selected" : ""}`, selected ? "OK" : ""));
+    if (game.hasUnseenChange) art.append(textEl("div", "steamloader-store-change-badge", formatChangeKind(game.changeKind)));
+    else if (game.isPinned) art.append(textEl("div", "steamloader-store-pin-badge", "PINNED"));
     const info = el("div", "steamloader-store-card-info");
+    const wishlistSource = game.isSteamWishlisted && game.isLocallyWishlisted
+      ? "Steam + TFS"
+      : game.isSteamWishlisted ? "Steam wishlist" : game.isLocallyWishlisted ? "TFS wishlist" : "";
     info.append(
       textEl("div", "steamloader-store-card-title", game.title),
+      wishlistSource ? textEl("div", "steamloader-store-card-source", wishlistSource) : document.createTextNode(""),
       textEl("div", "steamloader-store-card-store", game.bestStoreName || "Compare stores"),
       renderPrice(game, "steamloader-store-card-price"),
     );
@@ -1406,12 +2108,61 @@
     if (game.isSteamWishlisted) summaryActions.prepend(textEl("span", "steamloader-store-steam-wishlist-badge", "♥ Steam wishlist"));
     summary.append(summaryCopy, summaryActions);
     body.append(summary);
+    if (game.isWishlisted) body.append(renderWishlistGameTools(game), renderGameTracking(game));
     if (getGameAlertIdentity(game) && game.isWishlisted) body.append(renderAlertEditor(game));
     body.append(renderOfferList());
     modal.append(banner, body);
     backdrop.append(modal);
     backdrop.addEventListener("click", (event) => { if (event.target === backdrop) closeDetails(); });
     return backdrop;
+  }
+
+  function renderWishlistGameTools(game) {
+    const panel = el("section", "steamloader-store-game-tools");
+    const copy = el("div", "steamloader-store-game-tools-copy");
+    copy.append(
+      textEl("strong", "", game.matchConfidence === "exact" ? "Verified exact match" : "Price match pending"),
+      textEl("span", "", game.matchNote || "TFS verifies title, PC platform and selected region before comparing a price."),
+      textEl("span", "", game.priceCheckedAtUtc ? `Prices checked ${formatRelativeTime(game.priceCheckedAtUtc)}` : "Waiting for the first verified price check"),
+    );
+    const actions = el("div", "steamloader-store-game-tools-actions");
+    actions.append(buttonEl(game.isPinned ? "Unpin" : "Pin", "steamloader-store-button is-soft", () => void setWishlistMetadata(game, { isPinned: !game.isPinned, tags: null }), { navRow: 15 }));
+    for (const tag of ["Must Buy", "Later", "Co-op"]) {
+      const active = (game.tags || []).some((value) => value.toLowerCase() === tag.toLowerCase());
+      actions.append(buttonEl(tag, `steamloader-store-filter-chip${active ? " is-active" : ""}`, () => {
+        const tags = active
+          ? (game.tags || []).filter((value) => value.toLowerCase() !== tag.toLowerCase())
+          : [...(game.tags || []), tag];
+        void setWishlistMetadata(game, { isPinned: null, tags });
+      }, { navRow: 15 }));
+    }
+    panel.append(copy, actions);
+    return panel;
+  }
+
+  function renderGameTracking(game) {
+    const currency = getPreferredAlertCurrencyCode();
+    const current = currency === "EUR" ? game.cheapestPriceEur : game.cheapestPrice;
+    const original = currency === "EUR" ? game.trackingStartPriceEur : game.trackingStartPrice;
+    const low = currency === "EUR" ? game.trackedLowPriceEur : game.trackedLowPrice;
+    const panel = el("section", "steamloader-store-game-tracking");
+    const stats = el("div", "steamloader-store-game-tracking-stats");
+    [["STARTED AT", original], ["CURRENT", current], ["TFS LOW", low]].forEach(([label, value]) => {
+      const stat = el("div", "steamloader-store-game-tracking-stat");
+      stat.append(textEl("span", "", label), textEl("strong", "", formatSinglePrice(value, currency)));
+      stats.append(stat);
+    });
+    const chart = renderAlertTrend({
+      targetCurrencyCode: currency,
+      originalPrice: game.trackingStartPrice,
+      originalPriceEur: game.trackingStartPriceEur,
+      currentPrice: game.cheapestPrice,
+      currentPriceEur: game.cheapestPriceEur,
+      createdAtUtc: game.trackingStartedAtUtc,
+      priceHistory: game.priceHistory,
+    });
+    panel.append(stats, chart);
+    return panel;
   }
 
   function renderAlertEditor(game) {
@@ -1425,6 +2176,7 @@
     const adjust = (delta) => {
       const next = Math.max(0.01, (Number(state.alertDraft.targetPrice) || 0) + delta);
       state.alertDraft.targetPrice = next.toFixed(2);
+      state.alertDraft.mode = "price";
       state.alertDraft.edited = true;
       render();
     };
@@ -1436,13 +2188,42 @@
         state.alertDraft.currencyCode = state.alertDraft.currencyCode === "USD" ? "EUR" : "USD";
         const value = state.alertDraft.currencyCode === "EUR" ? game.cheapestPriceEur : game.cheapestPrice;
         if (value) state.alertDraft.targetPrice = Number(value).toFixed(2);
+        state.alertDraft.mode = "price";
         state.alertDraft.edited = true;
         render();
       }, { navRow: 20 }),
       buttonEl(state.alertDraft?.enabled ? "Update" : "Save alert", "steamloader-store-button is-primary", () => void saveAlert(true), { navRow: 20 }),
     );
     if (state.alertDraft?.enabled) controls.append(buttonEl("Remove", "steamloader-store-button is-danger", () => void saveAlert(false), { navRow: 20 }));
-    editor.append(copy, controls);
+    const presets = el("div", "steamloader-store-alert-presets");
+    const setPricePreset = (multiplier) => {
+      const current = Number(state.alertDraft.currencyCode === "EUR" ? game.cheapestPriceEur : game.cheapestPrice);
+      if (current > 0) state.alertDraft.targetPrice = Math.max(0.01, Math.round(current * multiplier * 100) / 100).toFixed(2);
+      state.alertDraft.mode = "price";
+      state.alertDraft.edited = true;
+      render();
+    };
+    presets.append(
+      buttonEl("Price -10%", `steamloader-store-filter-chip${state.alertDraft?.mode === "price" ? " is-active" : ""}`, () => setPricePreset(0.9), { navRow: 21 }),
+      buttonEl("Price -25%", "steamloader-store-filter-chip", () => setPricePreset(0.75), { navRow: 21 }),
+      buttonEl("At least -50%", `steamloader-store-filter-chip${state.alertDraft?.mode === "discount" ? " is-active" : ""}`, () => {
+        state.alertDraft.mode = "discount";
+        state.alertDraft.targetDiscountPercent = 50;
+        state.alertDraft.edited = true;
+        render();
+      }, { navRow: 21 }),
+      buttonEl("New TFS low", `steamloader-store-filter-chip${state.alertDraft?.mode === "new-low" ? " is-active" : ""}`, () => {
+        state.alertDraft.mode = "new-low";
+        state.alertDraft.edited = true;
+        render();
+      }, { navRow: 21 }),
+      buttonEl("On release", `steamloader-store-filter-chip${state.alertDraft?.mode === "release" ? " is-active" : ""}`, () => {
+        state.alertDraft.mode = "release";
+        state.alertDraft.edited = true;
+        render();
+      }, { navRow: 21 }),
+    );
+    editor.append(copy, controls, presets);
     return editor;
   }
 
@@ -1463,7 +2244,12 @@
     state.offers.forEach((offer, index) => {
       const row = el("div", `steamloader-store-offer${index === 0 ? " is-best" : ""}`);
       const store = el("div", "steamloader-store-offer-store");
-      store.append(textEl("strong", "", offer.storeName), index === 0 ? textEl("span", "", "BEST PRICE") : document.createTextNode(""));
+      store.append(
+        textEl("strong", "", offer.storeName),
+        index === 0 ? textEl("span", "", "BEST PRICE") : document.createTextNode(""),
+        offer.storeKind === "keyshop" ? textEl("span", "steamloader-store-kind-badge", "KEYSHOP") : textEl("span", "steamloader-store-kind-badge is-official", "OFFICIAL"),
+        offer.checkedAtUtc ? textEl("small", "", `Checked ${formatRelativeTime(offer.checkedAtUtc)}`) : document.createTextNode(""),
+      );
       const price = el("div", "steamloader-store-offer-price");
       const mode = state.snapshot?.displayCurrencyCode || "USD";
       if (mode === "EUR") price.append(textEl("strong", "", formatSinglePrice(offer.priceEur, "EUR")));
@@ -1949,6 +2735,11 @@
       .steamloader-store-main::-webkit-scrollbar-thumb { background: rgba(102,192,244,.34); border-radius: 999px; }
       .steamloader-store-notice, .steamloader-store-empty { padding: 24px; border: 1px solid rgba(255,255,255,.08); border-radius: 18px; color: var(--store-muted); background: rgba(255,255,255,.035); }
       .steamloader-store-notice.is-error { margin-bottom: 18px; color: #ffc0c5; border-color: rgba(255,91,106,.28); background: rgba(255,91,106,.08); }
+      .steamloader-store-status-toast { position: fixed; left: 50%; bottom: 70px; z-index: 2147483646; max-width: min(720px, calc(100vw - 80px)); padding: 12px 18px; border: 1px solid rgba(102,192,244,.42); border-radius: 14px; color: var(--store-text); background: rgba(12,28,39,.96); box-shadow: 0 18px 55px rgba(0,0,0,.48); font-size: 12px; font-weight: 800; transform: translateX(-50%); pointer-events: none; animation: steamloader-store-toast-in .18s ease-out; }
+      @keyframes steamloader-store-toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+      .steamloader-store-empty.is-actionable { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-top: 18px; }
+      .steamloader-store-empty.is-actionable > strong { color: var(--store-text); font-size: 16px; }
+      .steamloader-store-empty.is-actionable > span { flex: 1 1 360px; }
       .steamloader-store-empty.is-compact { padding: 18px; }
       .steamloader-store-hero { position: relative; isolation: isolate; min-height: min(36vh, 390px); overflow: hidden; border: 1px solid rgba(255,255,255,.1); border-radius: 30px; background: #111b22; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
       .steamloader-store-hero::before { content: ""; position: absolute; inset: 0; z-index: -2; background-image: var(--store-hero-image); background-size: cover; background-position: center 30%; transform: scale(1.02); }
@@ -1992,7 +2783,8 @@
       .steamloader-store-heart { right: 10px; color: var(--store-accent); background: rgba(4,13,18,.75); font-size: 18px; }
       .steamloader-store-card-info { position: relative; min-height: 116px; padding: 14px; }
       .steamloader-store-card-title { min-height: 38px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 15px; font-weight: 900; line-height: 1.25; }
-      .steamloader-store-card-store { margin-top: 5px; padding-right: 50px; color: var(--store-muted); font-size: 11px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .steamloader-store-card-source { margin-top: 4px; color: var(--store-blue); font-size: 9px; font-weight: 900; letter-spacing: .07em; text-transform: uppercase; }
+      .steamloader-store-card-store { margin-top: 4px; padding-right: 50px; color: var(--store-muted); font-size: 11px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .steamloader-store-card-price { display: flex; align-items: baseline; gap: 7px; margin-top: 8px; }
       .steamloader-store-card-price strong { font-size: 17px; }
       .steamloader-store-card-price span { color: var(--store-muted); font-size: 11px; }
@@ -2109,6 +2901,46 @@
       .steamloader-store-retailer-shortcuts > span { color: var(--store-muted); font-size: 11px; }
       .steamloader-store-retailer-actions { display: flex; flex-wrap: wrap; gap: 8px; }
       .steamloader-store-retailer-actions .steamloader-store-button { min-height: 38px; padding: 0 14px; font-size: 11px; }
+      .steamloader-store-activity-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 14px; margin-top: 20px; padding: 14px 16px 14px 20px; border: 1px solid rgba(102,192,244,.3); border-radius: 17px; background: rgba(26,159,255,.1); }
+      .steamloader-store-activity-banner > span { color: var(--store-muted); font-size: 12px; }
+      .steamloader-store-undo-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 12px; margin-top: 18px; padding: 13px 14px 13px 18px; border: 1px solid rgba(102,192,244,.34); border-radius: 17px; background: rgba(17,48,70,.92); box-shadow: 0 14px 34px rgba(0,0,0,.25); }
+      .steamloader-store-undo-banner > span { color: var(--store-muted); font-size: 12px; }
+      .steamloader-store-wishlist-toolbar { display: grid; grid-template-columns: minmax(170px,.45fr) minmax(0,1fr) auto; align-items: center; gap: 12px; margin-top: 16px; padding: 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 19px; background: rgba(8,17,24,.72); }
+      .steamloader-store-filter-search, .steamloader-store-filter-chip, .steamloader-store-setting-row { min-height: 40px; padding: 0 14px; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; outline: none; color: var(--store-text); background: rgba(255,255,255,.055); font: inherit; font-size: 11px; font-weight: 850; white-space: nowrap; }
+      .steamloader-store-filter-search { overflow: hidden; text-align: left; text-overflow: ellipsis; }
+      .steamloader-store-filter-search.is-active, .steamloader-store-filter-chip.is-active { border-color: var(--store-accent); color: #061522; background: var(--store-accent); }
+      .steamloader-store-filter-chip.is-tag { color: #c5eaff; background: rgba(102,192,244,.1); }
+      .steamloader-store-filter-search:hover, .steamloader-store-filter-search.is-controller-focus, .steamloader-store-filter-chip:hover, .steamloader-store-filter-chip.is-controller-focus, .steamloader-store-setting-row:hover, .steamloader-store-setting-row.is-controller-focus { border-color: var(--store-accent); box-shadow: 0 0 0 3px rgba(102,192,244,.18); }
+      .steamloader-store-filter-rail { display: flex; gap: 7px; overflow-x: auto; padding: 3px; scrollbar-width: none; }
+      .steamloader-store-filter-rail::-webkit-scrollbar { display: none; }
+      .steamloader-store-wishlist-toolbar-actions, .steamloader-store-setting-inline-actions, .steamloader-store-alert-presets, .steamloader-store-game-tools-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+      .steamloader-store-manage-bar { position: sticky; top: -18px; z-index: 4; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding: 11px 14px; border: 1px solid rgba(102,192,244,.35); border-radius: 16px; background: rgba(12,28,39,.96); box-shadow: 0 14px 36px rgba(0,0,0,.34); backdrop-filter: blur(18px); }
+      .steamloader-store-manage-bar > strong { margin-right: auto; }
+      .steamloader-store-card.is-selected { border-color: var(--store-accent); box-shadow: 0 0 0 4px rgba(102,192,244,.2), 0 18px 48px rgba(0,0,0,.4); }
+      .steamloader-store-select-check, .steamloader-store-change-badge, .steamloader-store-pin-badge { position: absolute; z-index: 2; left: 10px; bottom: 10px; padding: 6px 8px; border-radius: 8px; color: #061522; background: var(--store-accent); font-size: 9px; font-weight: 950; letter-spacing: .06em; }
+      .steamloader-store-select-check { bottom: auto; top: 10px; width: 34px; height: 34px; display: grid; place-items: center; padding: 0; border: 2px solid rgba(255,255,255,.55); border-radius: 50%; color: transparent; background: rgba(5,12,17,.75); }
+      .steamloader-store-select-check.is-selected { color: #061522; background: var(--store-accent); }
+      .steamloader-store-pin-badge { color: #c5eaff; background: rgba(5,12,17,.82); }
+      .steamloader-store-game-tools, .steamloader-store-game-tracking { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 18px; margin-top: 12px; padding: 16px 20px; border: 1px solid rgba(255,255,255,.08); border-radius: 18px; background: rgba(255,255,255,.03); }
+      .steamloader-store-game-tools-copy { display: grid; gap: 4px; }
+      .steamloader-store-game-tools-copy > span, .steamloader-store-setting-copy { color: var(--store-muted); font-size: 11px; line-height: 1.45; }
+      .steamloader-store-game-tracking { grid-template-columns: minmax(280px,.8fr) minmax(280px,1fr); }
+      .steamloader-store-game-tracking-stats { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
+      .steamloader-store-game-tracking-stat { display: grid; gap: 5px; padding: 12px; border-radius: 13px; background: rgba(0,0,0,.18); }
+      .steamloader-store-game-tracking-stat > span { color: var(--store-dim); font-size: 9px; font-weight: 950; letter-spacing: .1em; }
+      .steamloader-store-game-tracking-stat > strong { font-size: 16px; }
+      .steamloader-store-alert-editor { flex-wrap: wrap; }
+      .steamloader-store-alert-presets { flex-basis: 100%; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.06); }
+      .steamloader-store-kind-badge { color: #ffd8a8 !important; background: rgba(255,153,61,.13) !important; }
+      .steamloader-store-kind-badge.is-official { color: #bfe8ff !important; background: rgba(102,192,244,.12) !important; }
+      .steamloader-store-offer-store small { color: var(--store-dim); font-size: 9px; }
+      .steamloader-store-qol-settings { margin-top: 22px; padding: 20px; border: 1px solid rgba(255,255,255,.08); border-radius: 20px; background: rgba(8,17,24,.62); }
+      .steamloader-store-qol-settings h3 { margin-bottom: 8px; }
+      .steamloader-store-setting-rows { display: grid; gap: 10px; }
+      .steamloader-store-setting-row { width: 100%; min-height: 68px; display: grid; grid-template-columns: minmax(180px,.4fr) minmax(0,1fr) auto; align-items: center; gap: 14px; text-align: left; white-space: normal; }
+      .steamloader-store-setting-row > span { color: var(--store-muted); font-weight: 650; }
+      .steamloader-store-setting-row > em { color: var(--store-accent); font-style: normal; }
+      .steamloader-store-setting-row.is-static { padding: 12px 14px; }
       .steamloader-store-offer-skeleton, .steamloader-store-card-skeleton, .steamloader-store-hero-skeleton { overflow: hidden; background: linear-gradient(100deg, rgba(255,255,255,.035) 25%, rgba(255,255,255,.09) 45%, rgba(255,255,255,.035) 65%); background-size: 300% 100%; animation: steamloader-store-shimmer 1.4s infinite; }
       .steamloader-store-offer-skeleton { height: 72px; margin-top: 9px; border-radius: 16px; }
       .steamloader-store-hero-skeleton { height: min(36vh, 390px); border-radius: 30px; }
@@ -2136,6 +2968,12 @@
         .steamloader-store-summary { align-items: flex-start; flex-direction: column; }
         .steamloader-store-summary-actions { justify-content: flex-start; }
         .steamloader-store-search { grid-template-columns: 1fr; }
+        .steamloader-store-wishlist-toolbar { grid-template-columns: 1fr; }
+        .steamloader-store-activity-banner { grid-template-columns: 1fr; }
+        .steamloader-store-undo-banner { grid-template-columns: 1fr 1fr; }
+        .steamloader-store-undo-banner > span { grid-column: 1 / -1; }
+        .steamloader-store-game-tools, .steamloader-store-game-tracking { grid-template-columns: 1fr; }
+        .steamloader-store-setting-row { grid-template-columns: 1fr; }
         .steamloader-store-keyboard-backdrop { padding: 18px; }
         .steamloader-store-search-keyboard { width: calc(100vw - 36px); padding: 16px; }
         .steamloader-store-search-keyboard-header { grid-template-columns: 1fr; }

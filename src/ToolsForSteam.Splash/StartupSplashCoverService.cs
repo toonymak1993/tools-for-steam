@@ -5,10 +5,36 @@ namespace ToolsForSteam.Splash;
 
 public static class StartupSplashCoverService
 {
+    private static readonly SemaphoreSlim CacheLock = new(1, 1);
+    private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(5);
+    private static string _cachedSteamRoot = string.Empty;
+    private static DateTimeOffset _cachedAt;
+    private static IReadOnlyList<BitmapSource> _cachedThumbnails = [];
+
     public static async Task<IReadOnlyList<BitmapSource>> LoadAsync(string? steamRoot)
     {
-        var paths = await Task.Run(() => CollectCoverPaths(steamRoot)).ConfigureAwait(false);
-        return await Task.Run(() => CreateThumbnails(paths)).ConfigureAwait(false);
+        var normalizedRoot = NormalizeRoot(steamRoot);
+        await CacheLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_cachedThumbnails.Count > 0 &&
+                string.Equals(_cachedSteamRoot, normalizedRoot, StringComparison.OrdinalIgnoreCase) &&
+                DateTimeOffset.UtcNow - _cachedAt < CacheLifetime)
+            {
+                return _cachedThumbnails;
+            }
+
+            var paths = await Task.Run(() => CollectCoverPaths(normalizedRoot)).ConfigureAwait(false);
+            var thumbnails = await Task.Run(() => CreateThumbnails(paths)).ConfigureAwait(false);
+            _cachedSteamRoot = normalizedRoot;
+            _cachedAt = DateTimeOffset.UtcNow;
+            _cachedThumbnails = thumbnails;
+            return thumbnails;
+        }
+        finally
+        {
+            CacheLock.Release();
+        }
     }
 
     private static IReadOnlyList<BitmapSource> CreateThumbnails(IReadOnlyList<string> paths)
@@ -96,7 +122,7 @@ public static class StartupSplashCoverService
                 return [];
             }
 
-            covers = [.. covers.OrderBy(_ => Random.Shared.Next())];
+            Shuffle(covers, HashCode.Combine(DateTime.UtcNow.Date, steamRoot));
             const int targetCount = 84;
             if (covers.Count < targetCount)
             {
@@ -114,6 +140,33 @@ public static class StartupSplashCoverService
         catch
         {
             return [];
+        }
+    }
+
+    private static void Shuffle<T>(IList<T> items, int seed)
+    {
+        var random = new Random(seed);
+        for (var index = items.Count - 1; index > 0; index--)
+        {
+            var swapIndex = random.Next(index + 1);
+            (items[index], items[swapIndex]) = (items[swapIndex], items[index]);
+        }
+    }
+
+    private static string NormalizeRoot(string? steamRoot)
+    {
+        if (string.IsNullOrWhiteSpace(steamRoot))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return Path.GetFullPath(steamRoot);
+        }
+        catch
+        {
+            return steamRoot.Trim();
         }
     }
 

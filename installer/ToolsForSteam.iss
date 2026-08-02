@@ -15,6 +15,12 @@
 #ifndef VariantCustomPages
   #define VariantCustomPages "1"
 #endif
+#ifndef VariantFreshInstallPreview
+  #define VariantFreshInstallPreview "0"
+#endif
+#ifndef VariantUiPreview
+  #define VariantUiPreview "0"
+#endif
 #ifndef XboxHostBuildVersion
   #error XboxHostBuildVersion must match the signed MSIX manifest and be supplied by the build script.
 #endif
@@ -44,6 +50,7 @@ VersionInfoTextVersion={#MyAppVersion}
 VersionInfoVersion={#MyAppBinaryVersion}
 DefaultDirName={localappdata}\Programs\ToolsForSteam
 DefaultGroupName={#MyAppName}
+DisableWelcomePage=no
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=..\LICENSE.txt
@@ -51,8 +58,22 @@ OutputDir=..\dist\installer
 OutputBaseFilename={#VariantOutputBaseFilename}
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle={#VariantWizardStyle}
+WizardStyle={#VariantWizardStyle} dynamic polar includetitlebar hidebevels
+WizardSizePercent=110
+SetupIconFile=..\src\ToolsForSteam.XboxHost\Package\Assets\AppIcon.ico
+WizardImageFile=Assets\WizardHero.png
+WizardImageFileDynamicDark=Assets\WizardHero.png
+WizardImageBackColor=#10161F
+WizardImageBackColorDynamicDark=#10161F
+WizardSmallImageFile=..\src\ToolsForSteam.XboxHost\Package\Assets\Square44x44Logo.targetsize-256.png
+WizardSmallImageFileDynamicDark=..\src\ToolsForSteam.XboxHost\Package\Assets\Square44x44Logo.targetsize-256.png
+WizardSmallImageBackColor=#10161F
+WizardSmallImageBackColorDynamicDark=#10161F
+#if VariantUiPreview == "1"
+PrivilegesRequired=lowest
+#else
 PrivilegesRequired=admin
+#endif
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -63,6 +84,103 @@ SetupLogging=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "german"; MessagesFile: "compiler:Languages\German.isl"
+
+[CustomMessages]
+english.TfsSystemCheckCaption=System ready
+german.TfsSystemCheckCaption=System bereit
+english.TfsSystemCheckDescription=Everything important at a glance. Technical details stay available when you need them.
+german.TfsSystemCheckDescription=Alles Wichtige auf einen Blick. Technische Details bleiben bei Bedarf verfügbar.
+english.TfsSystemCheckSummary=Setup checks Windows, Steam, and an existing Tools for Steam installation before making any changes.
+german.TfsSystemCheckSummary=Setup prüft Windows, Steam und eine vorhandene Tools-for-Steam-Installation, bevor Änderungen vorgenommen werden.
+english.TfsStatusReady=READY
+german.TfsStatusReady=BEREIT
+english.TfsStatusNotice=NOTICE
+german.TfsStatusNotice=HINWEIS
+english.TfsWindowsReady=Windows %1.%2 supports Tools for Steam and Xbox Mode.
+german.TfsWindowsReady=Windows %1.%2 unterstützt Tools for Steam und den Xbox Mode.
+english.TfsWindowsLimited=Windows %1.%2 supports Tools for Steam. Xbox Mode needs build 26100.7019 or newer.
+german.TfsWindowsLimited=Windows %1.%2 unterstützt Tools for Steam. Der Xbox Mode benötigt Build 26100.7019 oder neuer.
+english.TfsSteamFound=Steam was detected automatically at %1.
+german.TfsSteamFound=Steam wurde automatisch unter %1 gefunden.
+english.TfsSteamMissing=Steam was not detected yet. You can select it later inside Tools for Steam.
+german.TfsSteamMissing=Steam wurde noch nicht erkannt. Der Pfad kann später in Tools for Steam ausgewählt werden.
+english.TfsInstallFound=Existing installation found at %1. Current startup mode: %2.
+german.TfsInstallFound=Vorhandene Installation unter %1 gefunden. Aktueller Startmodus: %2.
+english.TfsInstallFresh=No existing installation was found. This will be a clean installation.
+german.TfsInstallFresh=Keine vorhandene Installation gefunden. Dies wird eine Neuinstallation.
+english.TfsShowDetails=Show technical details
+german.TfsShowDetails=Technische Details anzeigen
+english.TfsHideDetails=Hide technical details
+german.TfsHideDetails=Technische Details ausblenden
+english.TfsPerformanceDetails=Performance support reuses existing RTSS files and settings. Setup downloads RTSS 7.3.7 only when it is missing and configures per-user profile access.
+german.TfsPerformanceDetails=Die Performance-Unterstützung verwendet vorhandene RTSS-Dateien und Einstellungen. Setup lädt RTSS 7.3.7 nur herunter, wenn es fehlt, und richtet den Profilzugriff pro Benutzer ein.
+english.TfsRollbackDetails=A rollback snapshot and recovery script are created before any Windows startup settings are changed.
+german.TfsRollbackDetails=Bevor Windows-Starteinstellungen geändert werden, werden ein Wiederherstellungspunkt und ein Rollback-Skript erstellt.
+english.TfsModeCaption=Choose your experience
+german.TfsModeCaption=Nutzungserlebnis auswählen
+english.TfsModeDescription=Choose how Tools for Steam should start. You can change this later in the app.
+german.TfsModeDescription=Lege fest, wie Tools for Steam starten soll. Dies kann später in der App geändert werden.
+english.TfsModeSummary=Shell Mode is recommended for a console-like couch setup. The other modes remain available whenever they are supported.
+german.TfsModeSummary=Der Shell Mode wird für ein konsolenähnliches Wohnzimmer-Erlebnis empfohlen. Die anderen Modi bleiben verfügbar, sofern sie unterstützt werden.
+english.TfsModeSummaryLimited=Shell Mode is recommended. Xbox Mode is unavailable on this Windows build, while eTray remains available.
+german.TfsModeSummaryLimited=Der Shell Mode wird empfohlen. Der Xbox Mode ist auf diesem Windows-Build nicht verfügbar; eTray bleibt verfügbar.
+english.TfsShellTitle=Shell Mode  ·  RECOMMENDED
+german.TfsShellTitle=Shell Mode  ·  EMPFOHLEN
+english.TfsShellDescription=Starts TFS before Explorer, synchronizes launchers, opens Steam Big Picture, and restores the normal Windows shell behind Steam.
+german.TfsShellDescription=Startet TFS vor dem Explorer, synchronisiert Launcher, öffnet Steam Big Picture und stellt die normale Windows-Oberfläche hinter Steam wieder her.
+english.TfsTrayTitle=eTray
+german.TfsTrayTitle=eTray
+english.TfsTrayDescription=Keeps the normal Windows desktop and starts TFS quietly in the background with Windows.
+german.TfsTrayDescription=Behält den normalen Windows-Desktop bei und startet TFS unauffällig mit Windows im Hintergrund.
+english.TfsXboxTitle=Xbox Mode
+german.TfsXboxTitle=Xbox Mode
+english.TfsXboxTitleUnavailable=Xbox Mode  ·  NOT AVAILABLE
+german.TfsXboxTitleUnavailable=Xbox Mode  ·  NICHT VERFÜGBAR
+english.TfsXboxDescriptionUnavailable=This Windows build does not provide the required Gaming FSE support. Tools for Steam can still use Shell Mode or eTray.
+german.TfsXboxDescriptionUnavailable=Dieser Windows-Build bietet nicht die erforderliche Gaming-FSE-Unterstützung. Tools for Steam kann weiterhin den Shell Mode oder eTray verwenden.
+english.TfsXboxDescriptionDeveloper=Uses the TFS Gaming Home package. This enables Windows Developer Mode system-wide, as required for the custom Gaming Home capability.
+german.TfsXboxDescriptionDeveloper=Verwendet das TFS-Gaming-Home-Paket. Der Windows-Entwicklermodus wird aktiviert, da er für die benutzerdefinierte Gaming-Home-Funktion erforderlich ist.
+english.TfsXboxDescriptionAuthorized=Uses the Microsoft-authorized TFS Gaming Home package while Explorer remains the Windows shell.
+german.TfsXboxDescriptionAuthorized=Verwendet das von Microsoft autorisierte TFS-Gaming-Home-Paket, während der Explorer die Windows-Oberfläche bleibt.
+english.TfsWelcomeTitle=Welcome to Tools for Steam
+german.TfsWelcomeTitle=Willkommen bei Tools for Steam
+english.TfsWelcomeBody=Turn Windows into a controller-friendly Steam console experience. Setup will check compatibility, protect your current configuration, and guide you through the startup mode.
+german.TfsWelcomeBody=Verwandle Windows in ein controllerfreundliches Steam-Konsolenerlebnis. Setup prüft die Kompatibilität, schützt die vorhandene Konfiguration und führt durch die Auswahl des Startmodus.
+english.TfsUpdateWelcomeTitle=Update Tools for Steam
+german.TfsUpdateWelcomeTitle=Tools for Steam aktualisieren
+english.TfsUpdateWelcomeBody=Your current startup mode and settings will be preserved. Setup creates a rollback snapshot before replacing files.
+german.TfsUpdateWelcomeBody=Der aktuelle Startmodus und alle Einstellungen bleiben erhalten. Vor dem Ersetzen von Dateien erstellt Setup einen Wiederherstellungspunkt.
+english.TfsFinishedTitle=Tools for Steam is ready
+german.TfsFinishedTitle=Tools for Steam ist bereit
+english.TfsFinishedBody=Installation completed successfully. Your selected startup mode is configured and can be changed later inside Tools for Steam.
+german.TfsFinishedBody=Die Installation wurde erfolgreich abgeschlossen. Der gewählte Startmodus ist eingerichtet und kann später in Tools for Steam geändert werden.
+english.TfsUpdateFinishedBody=The update completed successfully. Your startup mode and settings were preserved, and a rollback snapshot was created before files were replaced.
+german.TfsUpdateFinishedBody=Das Update wurde erfolgreich abgeschlossen. Startmodus und Einstellungen wurden beibehalten; vor dem Ersetzen der Dateien wurde ein Wiederherstellungspunkt erstellt.
+english.TfsReadyCaption=Ready to install
+german.TfsReadyCaption=Bereit zur Installation
+english.TfsReadyDescription=Review your choices below. Setup will not change Windows startup settings until you select Install now.
+german.TfsReadyDescription=Prüfe unten die Auswahl. Windows-Starteinstellungen werden erst nach „Jetzt installieren“ geändert.
+english.TfsUpdateReadyCaption=Ready to update
+german.TfsUpdateReadyCaption=Bereit zum Update
+english.TfsUpdateReadyDescription=Your existing installation was detected. Settings and the current startup mode will be preserved.
+german.TfsUpdateReadyDescription=Die vorhandene Installation wurde erkannt. Einstellungen und aktueller Startmodus bleiben erhalten.
+english.TfsReadyPrompt=Tools for Steam is ready to be installed with the choices shown below.
+german.TfsReadyPrompt=Tools for Steam kann jetzt mit der unten angezeigten Auswahl installiert werden.
+english.TfsUpdateReadyPrompt=Tools for Steam is ready to update. No existing settings will be reset.
+german.TfsUpdateReadyPrompt=Tools for Steam kann jetzt aktualisiert werden. Vorhandene Einstellungen werden nicht zurückgesetzt.
+english.TfsInstallNow=Install now
+german.TfsInstallNow=Jetzt installieren
+english.TfsUpdateNow=Update now
+german.TfsUpdateNow=Jetzt aktualisieren
+english.TfsContinue=Continue
+german.TfsContinue=Weiter
+english.TfsInstallingCaption=Setting up Tools for Steam
+german.TfsInstallingCaption=Tools for Steam wird eingerichtet
+english.TfsUpdatingCaption=Updating Tools for Steam
+german.TfsUpdatingCaption=Tools for Steam wird aktualisiert
+english.TfsPreviewStop=UI preview complete. This preview cannot install or change anything on your system.
+german.TfsPreviewStop=UI-Vorschau abgeschlossen. Diese Vorschau kann nichts installieren oder an deinem System ändern.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -75,7 +193,6 @@ Source: "{#XboxHostPayloadDir}\ToolsForSteam.XboxHost.cer"; DestDir: "{app}\Xbox
 Source: "XboxModePackage.ps1"; DestDir: "{app}\XboxMode"; Flags: ignoreversion
 Source: "XboxModeSession.ps1"; Flags: dontcopy
 Source: "XboxModeDiagnostics.ps1"; Flags: dontcopy
-Source: "Assets\ControllerGuide.png"; Flags: dontcopy
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\src\SteamLoader.App\ThirdParty\PawnIO\COPYING"; DestDir: "{app}\ThirdParty\PawnIO"; DestName: "COPYING-LGPL-2.1.txt"; Flags: ignoreversion
@@ -145,13 +262,17 @@ const
 var
   SystemCheckPage: TWizardPage;
   StartupModePage: TWizardPage;
-  GuidePage: TWizardPage;
+  SystemCheckWindowsPanel: TPanel;
+  SystemCheckSteamPanel: TPanel;
+  SystemCheckInstallPanel: TPanel;
   SystemCheckSummaryLabel: TNewStaticText;
   SystemCheckWindowsLabel: TNewStaticText;
   SystemCheckSteamLabel: TNewStaticText;
   SystemCheckInstallLabel: TNewStaticText;
-  SystemCheckHelperLabel: TNewStaticText;
-  SystemCheckRollbackLabel: TNewStaticText;
+  SystemCheckDetailsButton: TNewButton;
+  ShellModePanel: TPanel;
+  TrayModePanel: TPanel;
+  XboxModePanel: TPanel;
   StartupModeSummaryLabel: TNewStaticText;
   ShellModeRadio: TNewRadioButton;
   ShellModeDescriptionLabel: TNewStaticText;
@@ -159,7 +280,6 @@ var
   TrayModeDescriptionLabel: TNewStaticText;
   ExternalModeRadio: TNewRadioButton;
   ExternalModeDescriptionLabel: TNewStaticText;
-  GuideControllerImage: TBitmapImage;
   LaunchSettingsAfterSetup: Boolean;
   PostInstallSettingsArguments: string;
   ExistingInstallPath: string;
@@ -174,6 +294,7 @@ var
   XboxModeSuspendedForInstall: Boolean;
   XboxModeSessionStatePath: string;
   UpdateInstallRequested: Boolean;
+  InitialInstallWasUpdate: Boolean;
   UpdateStartupModeToRestore: string;
   StartupModeFinalized: Boolean;
   FinalizedStartupMode: string;
@@ -187,6 +308,7 @@ var
 
 function IsMsiClawA8: Boolean; forward;
 function SelectedStartupMode: string; forward;
+function IsUpdateOrUpgradeInstall: Boolean; forward;
 
 function GetRegistryStringValue(RootKey: Integer; SubKey: string; ValueName: string): string;
 begin
@@ -1742,63 +1864,245 @@ begin
     CurrentMode := 'clean install';
   end;
 
-  SystemCheckSummaryLabel.Caption :=
-    'Choose Shell, Xbox Mode, or eTray, then let the installer keep a rollback snapshot ' +
-    'before it changes any Windows startup hooks.';
-
+  SystemCheckSummaryLabel.Caption := CustomMessage('TfsSystemCheckSummary');
   if IsXboxModePlatformSupported then
   begin
     SystemCheckWindowsLabel.Caption :=
-      'Windows build: ' + IntToStr(GetWindowsBuildNumber()) + '.' + IntToStr(GetWindowsBuildRevision()) +
-      ' - ready for TFS and Xbox Mode.';
+      CustomMessage('TfsStatusReady') + '   ' +
+      FmtMessage(
+        CustomMessage('TfsWindowsReady'), [
+          IntToStr(GetWindowsBuildNumber()), IntToStr(GetWindowsBuildRevision())]);
   end
   else
   begin
     SystemCheckWindowsLabel.Caption :=
-      'Windows build: ' + IntToStr(GetWindowsBuildNumber()) + '.' + IntToStr(GetWindowsBuildRevision()) +
-      ' - Xbox Mode requires Windows 26100.7019 or newer and will not be installed or shown.';
+      CustomMessage('TfsStatusNotice') + '   ' +
+      FmtMessage(
+        CustomMessage('TfsWindowsLimited'), [
+          IntToStr(GetWindowsBuildNumber()), IntToStr(GetWindowsBuildRevision())]);
   end;
 
   if SteamInstallPath <> '' then
   begin
-    SystemCheckSteamLabel.Caption := 'Steam: detected automatically at ' + SteamInstallPath + '.';
+    SystemCheckSteamLabel.Caption :=
+      CustomMessage('TfsStatusReady') + '   ' +
+      FmtMessage(CustomMessage('TfsSteamFound'), [SteamInstallPath]);
   end
   else
   begin
-    SystemCheckSteamLabel.Caption := 'Steam: not detected from Windows yet. TFS can still be installed and pointed at Steam later.';
+    SystemCheckSteamLabel.Caption :=
+      CustomMessage('TfsStatusNotice') + '   ' +
+      CustomMessage('TfsSteamMissing');
   end;
 
   if ExistingInstallPath <> '' then
   begin
-    SystemCheckInstallLabel.Caption := 'Existing TFS install: found at ' + ExistingInstallPath + ' (' + DescribeStartupMode(CurrentMode) + ' mode).';
+    SystemCheckInstallLabel.Caption :=
+      CustomMessage('TfsStatusReady') + '   ' +
+      FmtMessage(
+        CustomMessage('TfsInstallFound'), [
+          ExistingInstallPath, DescribeStartupMode(CurrentMode)]);
   end
   else
   begin
-    SystemCheckInstallLabel.Caption := 'Existing TFS install: not found. This will be a fresh install.';
+    SystemCheckInstallLabel.Caption :=
+      CustomMessage('TfsStatusReady') + '   ' +
+      CustomMessage('TfsInstallFresh');
   end;
 
-  SystemCheckHelperLabel.Caption :=
-    'Performance: existing RTSS binaries and settings are reused; Setup only configures per-user game-profile access, and downloads RTSS 7.3.7 when missing. The elevated helper is only used for Xbox Mode. ' +
-    'This check is deferred so the setup window always opens cleanly on fresh Windows installs.';
+end;
 
-  SystemCheckRollbackLabel.Caption := 'Rollback: a snapshot and rollback script will be written before startup settings are changed.';
+procedure SystemCheckDetailsButtonClick(Sender: TObject);
+begin
+  MsgBox(
+    CustomMessage('TfsPerformanceDetails') + #13#10#13#10 +
+    CustomMessage('TfsRollbackDetails'),
+    mbInformation,
+    MB_OK);
 end;
 
 procedure UpdateStartupModePageState;
 begin
-  TrayModeRadio.Visible := True;
-  TrayModeDescriptionLabel.Visible := True;
-  ExternalModeRadio.Visible := IsXboxModePlatformSupported;
-  ExternalModeDescriptionLabel.Visible := IsXboxModePlatformSupported;
+  TrayModeRadio.Enabled := True;
+  ExternalModeRadio.Enabled := IsXboxModePlatformSupported;
   if not IsXboxModePlatformSupported and ExternalModeRadio.Checked then
   begin
     ShellModeRadio.Checked := True;
   end;
+
+  if IsXboxModePlatformSupported then
+  begin
+    ExternalModeRadio.Caption := CustomMessage('TfsXboxTitle');
+    if XboxHostRequiresDeveloperMode = 1 then
+    begin
+      ExternalModeDescriptionLabel.Caption :=
+        CustomMessage('TfsXboxDescriptionDeveloper');
+    end
+    else
+    begin
+      ExternalModeDescriptionLabel.Caption :=
+        CustomMessage('TfsXboxDescriptionAuthorized');
+    end;
+  end
+  else
+  begin
+    ExternalModeRadio.Caption := CustomMessage('TfsXboxTitleUnavailable');
+    ExternalModeDescriptionLabel.Caption :=
+      CustomMessage('TfsXboxDescriptionUnavailable');
+  end;
+end;
+
+procedure FitWrappedLabel(ALabel: TNewStaticText; MinimumHeight: Integer);
+begin
+  ALabel.Height := MinimumHeight;
+  WizardForm.AdjustLabelHeight(ALabel);
+  if ALabel.Height < MinimumHeight then
+  begin
+    ALabel.Height := MinimumHeight;
+  end;
+end;
+
+procedure LayoutSystemCheckPage;
+var
+  ContentWidth: Integer;
+  CardTop: Integer;
+  CardGap: Integer;
+  CardPaddingX: Integer;
+  CardPaddingY: Integer;
+begin
+  ContentWidth := SystemCheckPage.SurfaceWidth;
+  CardGap := ScaleY(6);
+  CardPaddingX := ScaleX(14);
+  CardPaddingY := ScaleY(8);
+
+  SystemCheckSummaryLabel.Width := ContentWidth - ScaleX(4);
+  FitWrappedLabel(SystemCheckSummaryLabel, ScaleY(18));
+  CardTop :=
+    SystemCheckSummaryLabel.Top +
+    SystemCheckSummaryLabel.Height +
+    ScaleY(10);
+
+  SystemCheckWindowsPanel.Top := CardTop;
+  SystemCheckWindowsPanel.Width := ContentWidth;
+  SystemCheckWindowsLabel.Left := CardPaddingX;
+  SystemCheckWindowsLabel.Top := CardTop + CardPaddingY;
+  SystemCheckWindowsLabel.Width := ContentWidth - (CardPaddingX * 2);
+  FitWrappedLabel(SystemCheckWindowsLabel, ScaleY(20));
+  SystemCheckWindowsPanel.Height :=
+    SystemCheckWindowsLabel.Height + (CardPaddingY * 2);
+  CardTop :=
+    SystemCheckWindowsPanel.Top +
+    SystemCheckWindowsPanel.Height +
+    CardGap;
+
+  SystemCheckSteamPanel.Top := CardTop;
+  SystemCheckSteamPanel.Width := ContentWidth;
+  SystemCheckSteamLabel.Left := CardPaddingX;
+  SystemCheckSteamLabel.Top := CardTop + CardPaddingY;
+  SystemCheckSteamLabel.Width := ContentWidth - (CardPaddingX * 2);
+  FitWrappedLabel(SystemCheckSteamLabel, ScaleY(20));
+  SystemCheckSteamPanel.Height :=
+    SystemCheckSteamLabel.Height + (CardPaddingY * 2);
+  CardTop :=
+    SystemCheckSteamPanel.Top +
+    SystemCheckSteamPanel.Height +
+    CardGap;
+
+  SystemCheckInstallPanel.Top := CardTop;
+  SystemCheckInstallPanel.Width := ContentWidth;
+  SystemCheckInstallLabel.Left := CardPaddingX;
+  SystemCheckInstallLabel.Top := CardTop + CardPaddingY;
+  SystemCheckInstallLabel.Width := ContentWidth - (CardPaddingX * 2);
+  FitWrappedLabel(SystemCheckInstallLabel, ScaleY(20));
+  SystemCheckInstallPanel.Height :=
+    SystemCheckInstallLabel.Height + (CardPaddingY * 2);
+
+  SystemCheckDetailsButton.Top :=
+    SystemCheckInstallPanel.Top +
+    SystemCheckInstallPanel.Height +
+    ScaleY(10);
+  SystemCheckDetailsButton.Width :=
+    WizardForm.CalculateButtonWidth([SystemCheckDetailsButton.Caption]);
+end;
+
+procedure LayoutStartupModePage;
+var
+  ContentWidth: Integer;
+  CardTop: Integer;
+  CardGap: Integer;
+  CardPaddingX: Integer;
+  CardPaddingY: Integer;
+begin
+  ContentWidth := StartupModePage.SurfaceWidth;
+  CardGap := ScaleY(6);
+  CardPaddingX := ScaleX(14);
+  CardPaddingY := ScaleY(8);
+
+  StartupModeSummaryLabel.Width := ContentWidth - ScaleX(4);
+  FitWrappedLabel(StartupModeSummaryLabel, ScaleY(18));
+  CardTop :=
+    StartupModeSummaryLabel.Top +
+    StartupModeSummaryLabel.Height +
+    ScaleY(8);
+
+  ShellModePanel.Top := CardTop;
+  ShellModePanel.Width := ContentWidth;
+  ShellModeRadio.Left := CardPaddingX;
+  ShellModeRadio.Top := CardTop + CardPaddingY;
+  ShellModeRadio.Width := ContentWidth - (CardPaddingX * 2);
+  ShellModeDescriptionLabel.Left := CardPaddingX + ScaleX(22);
+  ShellModeDescriptionLabel.Top :=
+    ShellModeRadio.Top + ShellModeRadio.Height + ScaleY(4);
+  ShellModeDescriptionLabel.Width :=
+    ContentWidth - ShellModeDescriptionLabel.Left - CardPaddingX;
+  FitWrappedLabel(ShellModeDescriptionLabel, ScaleY(18));
+  ShellModePanel.Height :=
+    ShellModeDescriptionLabel.Top +
+    ShellModeDescriptionLabel.Height +
+    CardPaddingY -
+    ShellModePanel.Top;
+  CardTop := ShellModePanel.Top + ShellModePanel.Height + CardGap;
+
+  TrayModePanel.Top := CardTop;
+  TrayModePanel.Width := ContentWidth;
+  TrayModeRadio.Left := CardPaddingX;
+  TrayModeRadio.Top := CardTop + CardPaddingY;
+  TrayModeRadio.Width := ContentWidth - (CardPaddingX * 2);
+  TrayModeDescriptionLabel.Left := CardPaddingX + ScaleX(22);
+  TrayModeDescriptionLabel.Top :=
+    TrayModeRadio.Top + TrayModeRadio.Height + ScaleY(4);
+  TrayModeDescriptionLabel.Width :=
+    ContentWidth - TrayModeDescriptionLabel.Left - CardPaddingX;
+  FitWrappedLabel(TrayModeDescriptionLabel, ScaleY(18));
+  TrayModePanel.Height :=
+    TrayModeDescriptionLabel.Top +
+    TrayModeDescriptionLabel.Height +
+    CardPaddingY -
+    TrayModePanel.Top;
+  CardTop := TrayModePanel.Top + TrayModePanel.Height + CardGap;
+
+  XboxModePanel.Top := CardTop;
+  XboxModePanel.Width := ContentWidth;
+  ExternalModeRadio.Left := CardPaddingX;
+  ExternalModeRadio.Top := CardTop + CardPaddingY;
+  ExternalModeRadio.Width := ContentWidth - (CardPaddingX * 2);
+  ExternalModeDescriptionLabel.Left := CardPaddingX + ScaleX(22);
+  ExternalModeDescriptionLabel.Top :=
+    ExternalModeRadio.Top + ExternalModeRadio.Height + ScaleY(4);
+  ExternalModeDescriptionLabel.Width :=
+    ContentWidth - ExternalModeDescriptionLabel.Left - CardPaddingX;
+  FitWrappedLabel(ExternalModeDescriptionLabel, ScaleY(18));
+  XboxModePanel.Height :=
+    ExternalModeDescriptionLabel.Top +
+    ExternalModeDescriptionLabel.Height +
+    CardPaddingY -
+    XboxModePanel.Top;
 end;
 
 procedure StartupModeSelectionChanged(Sender: TObject);
 begin
   UpdateStartupModePageState;
+  LayoutStartupModePage;
 end;
 
 function SelectedStartupMode: string;
@@ -1843,7 +2147,6 @@ end;
 procedure InitializeWizard;
 var
   CurrentMode: string;
-  ControlTop: Integer;
 begin
   UpdateInstallRequested := CompareText(ExpandConstant('{param:TFSUPDATE|0}'), '1') = 0;
 #if VariantCustomPages == "0"
@@ -1855,185 +2158,199 @@ begin
   ExistingInstallPath := GetExistingInstallLocation;
   SteamInstallPath := GetSteamInstallLocation;
   UpdateStartupModeToRestore := CurrentMode;
+#if VariantFreshInstallPreview == "1"
+  CurrentMode := '';
+  ExistingInstallPath := '';
+  UpdateStartupModeToRestore := '';
+#endif
 
   SystemCheckPage := CreateCustomPage(
     wpWelcome,
-    'System check',
-    'Make sure this install lands on the right footing.');
+    CustomMessage('TfsSystemCheckCaption'),
+    CustomMessage('TfsSystemCheckDescription'));
 
   SystemCheckSummaryLabel := TNewStaticText.Create(WizardForm);
   SystemCheckSummaryLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckSummaryLabel.Left := 0;
+  SystemCheckSummaryLabel.Left := ScaleX(2);
   SystemCheckSummaryLabel.Top := ScaleY(4);
-  SystemCheckSummaryLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckSummaryLabel.Height := ScaleY(56);
+  SystemCheckSummaryLabel.Width := SystemCheckPage.SurfaceWidth - ScaleX(4);
+  SystemCheckSummaryLabel.Height := ScaleY(36);
   SystemCheckSummaryLabel.AutoSize := False;
   SystemCheckSummaryLabel.WordWrap := True;
 
-  ControlTop := ScaleY(74);
+  SystemCheckWindowsPanel := TPanel.Create(WizardForm);
+  SystemCheckWindowsPanel.Parent := SystemCheckPage.Surface;
+  SystemCheckWindowsPanel.Left := 0;
+  SystemCheckWindowsPanel.Top := ScaleY(56);
+  SystemCheckWindowsPanel.Width := SystemCheckPage.SurfaceWidth;
+  SystemCheckWindowsPanel.Height := ScaleY(54);
+  SystemCheckWindowsPanel.Caption := '';
+  SystemCheckWindowsPanel.BevelOuter := bvLowered;
 
   SystemCheckWindowsLabel := TNewStaticText.Create(WizardForm);
   SystemCheckWindowsLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckWindowsLabel.Left := 0;
-  SystemCheckWindowsLabel.Top := ControlTop;
-  SystemCheckWindowsLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckWindowsLabel.Height := ScaleY(26);
+  SystemCheckWindowsLabel.Left := ScaleX(14);
+  SystemCheckWindowsLabel.Top := ScaleY(66);
+  SystemCheckWindowsLabel.Width := SystemCheckPage.SurfaceWidth - ScaleX(28);
+  SystemCheckWindowsLabel.Height := ScaleY(38);
   SystemCheckWindowsLabel.AutoSize := False;
   SystemCheckWindowsLabel.WordWrap := True;
+  SystemCheckWindowsLabel.Font.Style := [fsBold];
 
-  ControlTop := ControlTop + ScaleY(34);
+  SystemCheckSteamPanel := TPanel.Create(WizardForm);
+  SystemCheckSteamPanel.Parent := SystemCheckPage.Surface;
+  SystemCheckSteamPanel.Left := 0;
+  SystemCheckSteamPanel.Top := ScaleY(116);
+  SystemCheckSteamPanel.Width := SystemCheckPage.SurfaceWidth;
+  SystemCheckSteamPanel.Height := ScaleY(54);
+  SystemCheckSteamPanel.Caption := '';
+  SystemCheckSteamPanel.BevelOuter := bvLowered;
 
   SystemCheckSteamLabel := TNewStaticText.Create(WizardForm);
   SystemCheckSteamLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckSteamLabel.Left := 0;
-  SystemCheckSteamLabel.Top := ControlTop;
-  SystemCheckSteamLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckSteamLabel.Height := ScaleY(34);
+  SystemCheckSteamLabel.Left := ScaleX(14);
+  SystemCheckSteamLabel.Top := ScaleY(126);
+  SystemCheckSteamLabel.Width := SystemCheckPage.SurfaceWidth - ScaleX(28);
+  SystemCheckSteamLabel.Height := ScaleY(38);
   SystemCheckSteamLabel.AutoSize := False;
   SystemCheckSteamLabel.WordWrap := True;
+  SystemCheckSteamLabel.Font.Style := [fsBold];
 
-  ControlTop := ControlTop + ScaleY(42);
+  SystemCheckInstallPanel := TPanel.Create(WizardForm);
+  SystemCheckInstallPanel.Parent := SystemCheckPage.Surface;
+  SystemCheckInstallPanel.Left := 0;
+  SystemCheckInstallPanel.Top := ScaleY(176);
+  SystemCheckInstallPanel.Width := SystemCheckPage.SurfaceWidth;
+  SystemCheckInstallPanel.Height := ScaleY(62);
+  SystemCheckInstallPanel.Caption := '';
+  SystemCheckInstallPanel.BevelOuter := bvLowered;
 
   SystemCheckInstallLabel := TNewStaticText.Create(WizardForm);
   SystemCheckInstallLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckInstallLabel.Left := 0;
-  SystemCheckInstallLabel.Top := ControlTop;
-  SystemCheckInstallLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckInstallLabel.Height := ScaleY(34);
+  SystemCheckInstallLabel.Left := ScaleX(14);
+  SystemCheckInstallLabel.Top := ScaleY(186);
+  SystemCheckInstallLabel.Width := SystemCheckPage.SurfaceWidth - ScaleX(28);
+  SystemCheckInstallLabel.Height := ScaleY(46);
   SystemCheckInstallLabel.AutoSize := False;
   SystemCheckInstallLabel.WordWrap := True;
+  SystemCheckInstallLabel.Font.Style := [fsBold];
 
-  ControlTop := ControlTop + ScaleY(42);
-
-  SystemCheckHelperLabel := TNewStaticText.Create(WizardForm);
-  SystemCheckHelperLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckHelperLabel.Left := 0;
-  SystemCheckHelperLabel.Top := ControlTop;
-  SystemCheckHelperLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckHelperLabel.Height := ScaleY(34);
-  SystemCheckHelperLabel.AutoSize := False;
-  SystemCheckHelperLabel.WordWrap := True;
-
-  ControlTop := ControlTop + ScaleY(42);
-
-  SystemCheckRollbackLabel := TNewStaticText.Create(WizardForm);
-  SystemCheckRollbackLabel.Parent := SystemCheckPage.Surface;
-  SystemCheckRollbackLabel.Left := 0;
-  SystemCheckRollbackLabel.Top := ControlTop;
-  SystemCheckRollbackLabel.Width := SystemCheckPage.SurfaceWidth;
-  SystemCheckRollbackLabel.Height := ScaleY(34);
-  SystemCheckRollbackLabel.AutoSize := False;
-  SystemCheckRollbackLabel.WordWrap := True;
+  SystemCheckDetailsButton := TNewButton.Create(WizardForm);
+  SystemCheckDetailsButton.Parent := SystemCheckPage.Surface;
+  SystemCheckDetailsButton.Left := 0;
+  SystemCheckDetailsButton.Top := ScaleY(248);
+  SystemCheckDetailsButton.Width := ScaleX(164);
+  SystemCheckDetailsButton.Height := ScaleY(28);
+  SystemCheckDetailsButton.Caption := CustomMessage('TfsShowDetails');
+  SystemCheckDetailsButton.OnClick := @SystemCheckDetailsButtonClick;
 
   StartupModePage := CreateCustomPage(
     SystemCheckPage.ID,
-    'Choose startup mode',
-    'Pick the startup style you want now. You can still switch later inside TFS.');
+    CustomMessage('TfsModeCaption'),
+    CustomMessage('TfsModeDescription'));
 
   StartupModeSummaryLabel := TNewStaticText.Create(WizardForm);
   StartupModeSummaryLabel.Parent := StartupModePage.Surface;
-  StartupModeSummaryLabel.Left := 0;
+  StartupModeSummaryLabel.Left := ScaleX(2);
   StartupModeSummaryLabel.Top := ScaleY(4);
-  StartupModeSummaryLabel.Width := StartupModePage.SurfaceWidth;
-  StartupModeSummaryLabel.Height := ScaleY(42);
+  StartupModeSummaryLabel.Width := StartupModePage.SurfaceWidth - ScaleX(4);
+  StartupModeSummaryLabel.Height := ScaleY(36);
   StartupModeSummaryLabel.AutoSize := False;
   StartupModeSummaryLabel.WordWrap := True;
   if IsXboxModePlatformSupported then
   begin
-    StartupModeSummaryLabel.Caption :=
-      'Shell Mode (Recommended) gives the cleanest couch setup, so it is preselected. ' +
-      'Xbox Mode and eTray stay available below it and all three modes cleanly replace each other.';
+    StartupModeSummaryLabel.Caption := CustomMessage('TfsModeSummary');
   end
   else
   begin
-    StartupModeSummaryLabel.Caption :=
-      'Shell Mode (Recommended) and eTray are available. Xbox Mode is hidden because this Windows build does not provide the required Gaming FSE support.';
+    StartupModeSummaryLabel.Caption := CustomMessage('TfsModeSummaryLimited');
   end;
+
+  ShellModePanel := TPanel.Create(WizardForm);
+  ShellModePanel.Parent := StartupModePage.Surface;
+  ShellModePanel.Left := 0;
+  ShellModePanel.Top := ScaleY(48);
+  ShellModePanel.Width := StartupModePage.SurfaceWidth;
+  ShellModePanel.Height := ScaleY(70);
+  ShellModePanel.Caption := '';
+  ShellModePanel.BevelOuter := bvLowered;
 
   ShellModeRadio := TNewRadioButton.Create(WizardForm);
   ShellModeRadio.Parent := StartupModePage.Surface;
-  ShellModeRadio.Left := 0;
-  ShellModeRadio.Top := ScaleY(60);
-  ShellModeRadio.Width := StartupModePage.SurfaceWidth;
-  ShellModeRadio.Caption := 'Shell Mode (Recommended)';
+  ShellModeRadio.Left := ScaleX(14);
+  ShellModeRadio.Top := ScaleY(58);
+  ShellModeRadio.Width := StartupModePage.SurfaceWidth - ScaleX(28);
+  ShellModeRadio.Caption := CustomMessage('TfsShellTitle');
   ShellModeRadio.Checked := (CurrentMode = '') or (CurrentMode = 'shell');
   ShellModeRadio.OnClick := @StartupModeSelectionChanged;
+  ShellModeRadio.Font.Style := [fsBold];
 
   ShellModeDescriptionLabel := TNewStaticText.Create(WizardForm);
   ShellModeDescriptionLabel.Parent := StartupModePage.Surface;
-  ShellModeDescriptionLabel.Left := ScaleX(20);
-  ShellModeDescriptionLabel.Top := ScaleY(84);
-  ShellModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
-  ShellModeDescriptionLabel.Height := ScaleY(34);
+  ShellModeDescriptionLabel.Left := ScaleX(36);
+  ShellModeDescriptionLabel.Top := ScaleY(82);
+  ShellModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(50);
+  ShellModeDescriptionLabel.Height := ScaleY(30);
   ShellModeDescriptionLabel.AutoSize := False;
   ShellModeDescriptionLabel.WordWrap := True;
-  ShellModeDescriptionLabel.Caption :=
-    'Boot TFS before Explorer, sync launchers, open Steam Big Picture, then put the normal Windows shell back behind Steam.';
+  ShellModeDescriptionLabel.Caption := CustomMessage('TfsShellDescription');
+
+  TrayModePanel := TPanel.Create(WizardForm);
+  TrayModePanel.Parent := StartupModePage.Surface;
+  TrayModePanel.Left := 0;
+  TrayModePanel.Top := ScaleY(124);
+  TrayModePanel.Width := StartupModePage.SurfaceWidth;
+  TrayModePanel.Height := ScaleY(70);
+  TrayModePanel.Caption := '';
+  TrayModePanel.BevelOuter := bvLowered;
 
   TrayModeRadio := TNewRadioButton.Create(WizardForm);
   TrayModeRadio.Parent := StartupModePage.Surface;
-  TrayModeRadio.Left := 0;
-  TrayModeRadio.Top := ScaleY(128);
-  TrayModeRadio.Width := StartupModePage.SurfaceWidth;
-  TrayModeRadio.Caption := 'eTray mode';
+  TrayModeRadio.Left := ScaleX(14);
+  TrayModeRadio.Top := ScaleY(134);
+  TrayModeRadio.Width := StartupModePage.SurfaceWidth - ScaleX(28);
+  TrayModeRadio.Caption := CustomMessage('TfsTrayTitle');
   TrayModeRadio.Checked := CurrentMode = 'tray';
   TrayModeRadio.OnClick := @StartupModeSelectionChanged;
+  TrayModeRadio.Font.Style := [fsBold];
 
   TrayModeDescriptionLabel := TNewStaticText.Create(WizardForm);
   TrayModeDescriptionLabel.Parent := StartupModePage.Surface;
-  TrayModeDescriptionLabel.Left := ScaleX(20);
-  TrayModeDescriptionLabel.Top := ScaleY(152);
-  TrayModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
-  TrayModeDescriptionLabel.Height := ScaleY(36);
+  TrayModeDescriptionLabel.Left := ScaleX(36);
+  TrayModeDescriptionLabel.Top := ScaleY(158);
+  TrayModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(50);
+  TrayModeDescriptionLabel.Height := ScaleY(30);
   TrayModeDescriptionLabel.AutoSize := False;
   TrayModeDescriptionLabel.WordWrap := True;
-  TrayModeDescriptionLabel.Caption :=
-    'Keep the normal Windows shell and start TFS quietly with Windows as a tray-style launcher service.';
+  TrayModeDescriptionLabel.Caption := CustomMessage('TfsTrayDescription');
+
+  XboxModePanel := TPanel.Create(WizardForm);
+  XboxModePanel.Parent := StartupModePage.Surface;
+  XboxModePanel.Left := 0;
+  XboxModePanel.Top := ScaleY(200);
+  XboxModePanel.Width := StartupModePage.SurfaceWidth;
+  XboxModePanel.Height := ScaleY(86);
+  XboxModePanel.Caption := '';
+  XboxModePanel.BevelOuter := bvLowered;
 
   ExternalModeRadio := TNewRadioButton.Create(WizardForm);
   ExternalModeRadio.Parent := StartupModePage.Surface;
-  ExternalModeRadio.Left := 0;
-  ExternalModeRadio.Top := ScaleY(194);
-  ExternalModeRadio.Width := StartupModePage.SurfaceWidth;
-  ExternalModeRadio.Caption := 'Xbox Mode';
+  ExternalModeRadio.Left := ScaleX(14);
+  ExternalModeRadio.Top := ScaleY(210);
+  ExternalModeRadio.Width := StartupModePage.SurfaceWidth - ScaleX(28);
+  ExternalModeRadio.Caption := CustomMessage('TfsXboxTitle');
   ExternalModeRadio.Checked := (CurrentMode = 'xbox') or (CurrentMode = 'external');
   ExternalModeRadio.OnClick := @StartupModeSelectionChanged;
+  ExternalModeRadio.Font.Style := [fsBold];
 
   ExternalModeDescriptionLabel := TNewStaticText.Create(WizardForm);
   ExternalModeDescriptionLabel.Parent := StartupModePage.Surface;
-  ExternalModeDescriptionLabel.Left := ScaleX(20);
-  ExternalModeDescriptionLabel.Top := ScaleY(218);
-  ExternalModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(20);
-  ExternalModeDescriptionLabel.Height := ScaleY(60);
+  ExternalModeDescriptionLabel.Left := ScaleX(36);
+  ExternalModeDescriptionLabel.Top := ScaleY(234);
+  ExternalModeDescriptionLabel.Width := StartupModePage.SurfaceWidth - ScaleX(50);
+  ExternalModeDescriptionLabel.Height := ScaleY(46);
   ExternalModeDescriptionLabel.AutoSize := False;
   ExternalModeDescriptionLabel.WordWrap := True;
-  if XboxHostRequiresDeveloperMode = 1 then
-  begin
-    ExternalModeDescriptionLabel.Caption :=
-      'Use the TFS Gaming Home package. This enables Windows Developer Mode system-wide, as required for the custom Xbox Home capability. Explorer remains the shell.';
-  end
-  else
-  begin
-    ExternalModeDescriptionLabel.Caption :=
-      'Use the Microsoft-authorized TFS Gaming Home package. Explorer remains the Windows shell and eTray startup is disabled.';
-  end;
-
-  GuidePage := CreateCustomPage(
-    wpSelectDir,
-    'Controller guide',
-    'Steam and in-game controller shortcuts at a glance.');
-
-  ExtractTemporaryFile('ControllerGuide.png');
-  GuideControllerImage := TBitmapImage.Create(WizardForm);
-  GuideControllerImage.Parent := GuidePage.Surface;
-  GuideControllerImage.Left := 0;
-  GuideControllerImage.Width := GuidePage.SurfaceWidth;
-  GuideControllerImage.Height := (GuideControllerImage.Width * 9) div 16;
-  GuideControllerImage.Top := (GuidePage.SurfaceHeight - GuideControllerImage.Height) div 2;
-  GuideControllerImage.Stretch := True;
-  GuideControllerImage.Center := True;
-  GuideControllerImage.BackColor := clNone;
-  GuideControllerImage.PngImage.LoadFromFile(ExpandConstant('{tmp}\ControllerGuide.png'));
 
   if not (ShellModeRadio.Checked or TrayModeRadio.Checked or ExternalModeRadio.Checked) then
   begin
@@ -2041,8 +2358,22 @@ begin
   end;
 
   UpdateSystemCheckPage;
+  LayoutSystemCheckPage;
   UpdateStartupModePageState;
+  LayoutStartupModePage;
 #endif
+
+  InitialInstallWasUpdate :=
+    UpdateInstallRequested or (ExistingInstallPath <> '');
+  WizardForm.NextButton.Width :=
+    WizardForm.CalculateButtonWidth([CustomMessage('TfsContinue'),
+      CustomMessage('TfsInstallNow'),
+      CustomMessage('TfsUpdateNow')]);
+  WizardForm.NextButton.Left :=
+    WizardForm.CancelButton.Left - WizardForm.NextButton.Width - ScaleX(8);
+  WizardForm.BackButton.Left :=
+    WizardForm.NextButton.Left - WizardForm.BackButton.Width - ScaleX(8);
+  WizardForm.StatusLabel.Font.Style := [fsBold];
 end;
 
 function ShouldSuspendXboxModeForInstall: Boolean;
@@ -2279,21 +2610,94 @@ begin
     False);
 end;
 
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+#if VariantUiPreview == "1"
+  if CurPageID = wpReady then
+  begin
+    MsgBox(CustomMessage('TfsPreviewStop'), mbInformation, MB_OK);
+    Result := False;
+    Exit;
+  end;
+#endif
+  Result := True;
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if CurPageID = wpWelcome then
+  begin
+    if InitialInstallWasUpdate then
+    begin
+      WizardForm.WelcomeLabel1.Caption := CustomMessage('TfsUpdateWelcomeTitle');
+      WizardForm.WelcomeLabel2.Caption := CustomMessage('TfsUpdateWelcomeBody');
+    end
+    else
+    begin
+      WizardForm.WelcomeLabel1.Caption := CustomMessage('TfsWelcomeTitle');
+      WizardForm.WelcomeLabel2.Caption := CustomMessage('TfsWelcomeBody');
+    end;
+    WizardForm.NextButton.Caption := CustomMessage('TfsContinue');
+  end;
+
 #if VariantCustomPages == "1"
   if CurPageID = SystemCheckPage.ID then
   begin
     UpdateSystemCheckPage;
+    LayoutSystemCheckPage;
+    WizardForm.NextButton.Caption := CustomMessage('TfsContinue');
   end;
 
   if CurPageID = StartupModePage.ID then
   begin
     UpdateStartupModePageState;
+    LayoutStartupModePage;
+    WizardForm.NextButton.Caption := CustomMessage('TfsContinue');
   end;
-
 #endif
 
+  if CurPageID = wpReady then
+  begin
+    if InitialInstallWasUpdate then
+    begin
+      WizardForm.PageNameLabel.Caption := CustomMessage('TfsUpdateReadyCaption');
+      WizardForm.PageDescriptionLabel.Caption := CustomMessage('TfsUpdateReadyDescription');
+      WizardForm.ReadyLabel.Caption := CustomMessage('TfsUpdateReadyPrompt');
+      WizardForm.NextButton.Caption := CustomMessage('TfsUpdateNow');
+    end
+    else
+    begin
+      WizardForm.PageNameLabel.Caption := CustomMessage('TfsReadyCaption');
+      WizardForm.PageDescriptionLabel.Caption := CustomMessage('TfsReadyDescription');
+      WizardForm.ReadyLabel.Caption := CustomMessage('TfsReadyPrompt');
+      WizardForm.NextButton.Caption := CustomMessage('TfsInstallNow');
+    end;
+  end;
+
+  if CurPageID = wpInstalling then
+  begin
+    if InitialInstallWasUpdate then
+    begin
+      WizardForm.PageNameLabel.Caption := CustomMessage('TfsUpdatingCaption');
+    end
+    else
+    begin
+      WizardForm.PageNameLabel.Caption := CustomMessage('TfsInstallingCaption');
+    end;
+  end;
+
+  if CurPageID = wpFinished then
+  begin
+    WizardForm.FinishedHeadingLabel.Caption := CustomMessage('TfsFinishedTitle');
+    if InitialInstallWasUpdate then
+    begin
+      WizardForm.FinishedLabel.Caption := CustomMessage('TfsUpdateFinishedBody');
+    end
+    else
+    begin
+      WizardForm.FinishedLabel.Caption := CustomMessage('TfsFinishedBody');
+    end;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -2452,6 +2856,32 @@ end;
 function IsUpdateOrUpgradeInstall: Boolean;
 begin
   Result := UpdateInstallRequested or (GetExistingInstallLocation <> '');
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if not InitialInstallWasUpdate then
+  begin
+    Exit;
+  end;
+
+  { Updates keep the existing directory, tasks, and startup mode. The ready
+    page remains visible for interactive installs so nothing starts without
+    an explicit confirmation. Silent update behavior is unchanged. }
+  if (PageID = wpLicense) or
+     (PageID = wpSelectDir) or
+     (PageID = wpSelectTasks) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+#if VariantCustomPages == "1"
+  Result :=
+    (PageID = SystemCheckPage.ID) or
+    (PageID = StartupModePage.ID);
+#endif
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

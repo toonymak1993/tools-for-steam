@@ -70,6 +70,8 @@ internal static class UnifySteamDownloadStatusStore
                      age > TimeSpan.FromHours(6)) ||
                     (entries[key].Status == "uninstall-action-required" &&
                      age > TimeSpan.FromHours(24)) ||
+                    (entries[key].Status == "tracking-stopped" &&
+                     age > TimeSpan.FromHours(24)) ||
                     (entries[key].Status is "canceled" && age > TimeSpan.FromHours(24)) ||
                     (entries[key].Status is "failed" or "cancel-failed" or "uninstall-failed" &&
                      age > TimeSpan.FromDays(7)))

@@ -65,6 +65,13 @@ const stores = [
       { id: "tfs-gog", title: "GOG", filter: "all", requiresCloudSource: false },
     ],
   },
+  {
+    id: "rom-library",
+    title: "Emulation",
+    libraryTabs: [
+      { id: "tfs-emulation-psp", title: "PSP", filter: "platform:psp", requiresCloudSource: false },
+    ],
+  },
 ];
 const nativeTabs = [
   { id: "AllGames" },
@@ -77,8 +84,30 @@ test("backend descriptors produce one stable ordered topology", () => {
   const definitions = topology.buildDefinitionsFromSummary(stores, fallback);
   assert.deepEqual(
     Array.from(definitions, (definition) => definition.tabId),
-    ["tfs-xbox", "tfs-xbox-cloud", "tfs-epic", "tfs-gog"],
+    ["tfs-xbox", "tfs-xbox-cloud", "tfs-epic", "tfs-gog", "tfs-emulation-psp"],
   );
+});
+
+test("duplicate backend tab ids are ignored even when sources disagree", () => {
+  const definitions = topology.buildDefinitionsFromSummary(
+    [
+      {
+        id: "rom-library",
+        libraryTabs: [
+          { id: "tfs-emulation-psp", title: "PSP", filter: "platform:psp" },
+        ],
+      },
+      {
+        id: "unexpected-source",
+        libraryTabs: [
+          { id: "tfs-emulation-psp", title: "Duplicate", filter: "all" },
+        ],
+      },
+    ],
+    [],
+  );
+  assert.equal(definitions.length, 1);
+  assert.equal(definitions[0].title, "PSP");
 });
 
 test("every enabled store combination is inserted once after Non-Steam", () => {
@@ -92,6 +121,7 @@ test("every enabled store combination is inserted once after Non-Steam", () => {
         { id: "tfs-xbox" },
         { id: "tfs-epic" },
         { id: "tfs-gog" },
+        { id: "tfs-emulation-psp" },
       ],
       enabled,
       definitions,
@@ -109,6 +139,20 @@ test("every enabled store combination is inserted once after Non-Steam", () => {
       ],
     );
   }
+});
+
+test("hidden native tabs are restored as internal templates without duplicating visible tabs", () => {
+  const visible = [
+    { id: "AllGames" },
+    { id: "Installed" },
+    { id: "Soundtracks" },
+  ];
+  const restored = topology.restoreMissingTabs(visible, nativeTabs);
+  assert.deepEqual(
+    Array.from(restored, (tab) => tab.id),
+    ["AllGames", "Installed", "DesktopApps", "Soundtracks"],
+  );
+  assert.equal(new Set(restored.map((tab) => tab.id)).size, restored.length);
 });
 
 test("LB and RB traverse and wrap through all canonical tabs in both directions", () => {
@@ -132,6 +176,49 @@ test("LB and RB traverse and wrap through all canonical tabs in both directions"
     left.push(current);
   }
   assert.deepEqual(left, [...ids.slice(1).reverse(), ids[0]]);
+});
+
+test("virtual tabs never reuse the currently selected native backing route", () => {
+  const routes = ["Installed", "AllGames"];
+  assert.equal(
+    topology.chooseDistinctBackingRoute(routes, 0, "Installed"),
+    "AllGames",
+  );
+  assert.equal(
+    topology.chooseDistinctBackingRoute(routes, 1, "AllGames"),
+    "Installed",
+  );
+  assert.equal(
+    topology.chooseDistinctBackingRoute(["AllGames"], 0, "AllGames"),
+    "AllGames",
+  );
+});
+
+test("large platform libraries remain ordered, unique, and fully traversable", () => {
+  const platforms = Array.from({ length: 80 }, (_, index) => ({
+    id: `platform-${index}`,
+    sourceStoreId: "rom-library",
+    tabId: `tfs-emulation-platform-${index}`,
+    title: `Platform ${index}`,
+    appFilter: `platform:platform-${index}`,
+  }));
+  const tabs = topology.buildCanonicalTabOrder(
+    nativeTabs,
+    [...platforms, platforms[0]],
+    platforms,
+  );
+  const ids = Array.from(tabs, (tab) => tab.id);
+  assert.equal(ids.length, nativeTabs.length + platforms.length);
+  assert.equal(new Set(ids).size, ids.length);
+
+  let current = ids[0];
+  const visited = new Set();
+  for (let index = 0; index < ids.length; index += 1) {
+    visited.add(current);
+    current = topology.getAdjacentTabId(tabs, current, 1, true);
+  }
+  assert.equal(visited.size, ids.length);
+  assert.equal(current, ids[0]);
 });
 
 test("the synchronous navigation cursor wins over stale Steam route echoes", () => {

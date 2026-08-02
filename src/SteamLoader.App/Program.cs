@@ -294,8 +294,28 @@ public static class Program
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
         if (consoleBootstrapMode)
         {
-            var launchState = SteamClientLaunchService.PrepareConsoleStartup(steamInstallationService);
-            SteamStartupDiagnostics.Write($"console bootstrap result={launchState.Message}");
+            var existingSteamSession = SteamClientLaunchService.IsSteamRunningForStartup();
+            var initialLaunchState = SteamClientLaunchService.RequestSteamStartForTools(
+                steamInstallationService);
+            SteamStartupDiagnostics.Write(
+                $"console bootstrap initial request={initialLaunchState.Message}");
+
+            // Steam's official shutdown can take several seconds when replacing
+            // an incompatible startup. Keep that serialized recovery off the UI
+            // startup path so the splash appears immediately and can explain the
+            // current state instead of leaving a blank screen.
+            if (existingSteamSession)
+            {
+                _ = Task.Run(async () =>
+                {
+                    // Let an already-running client react to the Gamepad UI
+                    // request before checking whether a controlled restart is needed.
+                    await Task.Delay(TimeSpan.FromMilliseconds(500));
+                    var launchState = SteamClientLaunchService.PrepareConsoleStartup(
+                        steamInstallationService);
+                    SteamStartupDiagnostics.Write($"console bootstrap result={launchState.Message}");
+                });
+            }
         }
 
         if (shellBootstrapMode)
@@ -306,7 +326,9 @@ public static class Program
 
         var runStartupSync = shellBootstrapMode || xboxBootstrapMode || args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleStartupMode = !xboxHostedSplash;
+        var consoleStartupMode = SteamLoaderRuntime.ShouldShowStartupSplash(
+            consoleBootstrapMode,
+            xboxHostedSplash);
 
         var startHiddenInTray = true;
 
@@ -473,7 +495,9 @@ public static class Program
                 new Uri("http://127.0.0.1:8080"),
                 steamInstallationService,
                 isHandheld: true);
-            var result = service.RestartSteamForSteamTools();
+            var result = service.RestartSteamForSteamTools(
+                clearWebCache: true,
+                respectProtectedActivity: true);
             SteamStartupDiagnostics.Write($"external hard Steam startup repair result={result.Message}");
             return result.Message.StartsWith("Steam is restarting", StringComparison.OrdinalIgnoreCase) ? 0 : 1;
         }

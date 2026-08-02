@@ -16,6 +16,7 @@ internal enum OmniLibraryStoreCapabilities
     ProductPageInstallFallback = 1 << 7,
     ManagedUninstall = 1 << 8,
     ProductPageUninstall = 1 << 9,
+    LocalLibrary = 1 << 10,
 }
 
 internal sealed record OmniLibraryStoreDescriptor(
@@ -95,6 +96,18 @@ internal static class OmniLibraryStoreRegistry
             [
                 new("tfs-gog", "GOG", "all"),
             ]),
+        new(
+            OmniLibraryRomSystemRegistry.StoreId,
+            "Emulation",
+            400,
+            "PPSSPP",
+            "PPSSPPWindows64.exe",
+            OmniLibraryStoreCapabilities.InstallPath |
+            OmniLibraryStoreCapabilities.PcCatalogSource |
+            OmniLibraryStoreCapabilities.LocalLibrary,
+            // ROM systems are data-driven. BuildLibraryTabSummaries emits one
+            // native tab only for each platform that currently has games.
+            []),
     ];
 
     private static readonly IReadOnlyDictionary<string, OmniLibraryStoreDescriptor> StoresById =
@@ -127,8 +140,26 @@ internal static class OmniLibraryStoreRegistry
     }
 
     public static IReadOnlyList<UnifySteamLibraryTabSummary> BuildLibraryTabSummaries(
-        OmniLibraryStoreDescriptor descriptor)
+        OmniLibraryStoreDescriptor descriptor,
+        IReadOnlyList<OmniLibraryRomSystemState>? romSystems = null)
     {
+        if (descriptor.Id.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return (romSystems ?? [])
+                .Where(system =>
+                    system.GameCount > 0 &&
+                    system.AppIds.Any(appId => appId != 0))
+                .OrderBy(system => system.Title, StringComparer.OrdinalIgnoreCase)
+                .Select(system => new UnifySteamLibraryTabSummary(
+                    OmniLibraryRomSystemRegistry.BuildLibraryTabId(system.Id),
+                    system.Title,
+                    $"platform:{system.Id}",
+                    RequiresCloudSource: false))
+                .ToArray();
+        }
+
         return descriptor.LibraryTabs
             .Select(tab => new UnifySteamLibraryTabSummary(
                 tab.Id,
@@ -157,6 +188,7 @@ internal static class OmniLibraryStoreRegistry
                 OmniLibraryStoreCapabilities.ProductPageInstallFallback => "product-page-install-fallback",
                 OmniLibraryStoreCapabilities.ManagedUninstall => "managed-uninstall",
                 OmniLibraryStoreCapabilities.ProductPageUninstall => "product-page-uninstall",
+                OmniLibraryStoreCapabilities.LocalLibrary => "local-library",
                 _ => capability.ToString().ToLowerInvariant(),
             })
             .ToArray();

@@ -10,7 +10,7 @@ namespace SteamLoader.App.Services;
 /// button behaves differently depending on what is in the foreground:
 /// <list type="bullet">
 /// <item>in Steam Big Picture: independent one-to-three-button combinations open the left STEAM menu or the right Quick Access menu, and</item>
-/// <item>in a game: independent held combinations open the overlay or Quick Access. Store Sync games without an injected overlay open Big Picture Quick Access in front of the game; all other games retain the Steam overlay shortcuts.</item>
+/// <item>in a game: independent held combinations open the overlay or Quick Access. Games without an injected overlay open Big Picture Quick Access in front of the game; games with a renderer retain the Steam overlay shortcuts.</item>
 /// </list>
 /// XInput supplies every configurable digital button. A separate Raw Input HID
 /// monitor reinforces View / Back and Menu / Start while games are in front so
@@ -70,8 +70,8 @@ public sealed class ControllerShortcutService
     /// fallback.
     /// </param>
     /// <param name="tryOpenExternalGameQuickAccessAsync">
-    /// Attempts the Store Sync fallback before sending in-game Steam shortcuts.
-    /// Returns false when the game has a native Steam overlay or is not managed by Store Sync.
+    /// Attempts the external-game fallback before sending in-game Steam shortcuts.
+    /// Returns false only when the foreground game should use its native Steam overlay.
     /// </param>
     /// <param name="settingsProvider">Returns the current persisted button and hold-time configuration.</param>
     public ControllerShortcutService(

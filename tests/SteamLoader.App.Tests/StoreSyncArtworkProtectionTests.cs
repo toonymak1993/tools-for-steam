@@ -7,6 +7,76 @@ namespace SteamLoader.App.Tests;
 public sealed class StoreSyncArtworkProtectionTests
 {
     [Fact]
+    public void CompleteArtworkSet_RequiresEverySteamLibrarySlot()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            const uint appId = 2362688489;
+            var gridDirectory = Path.Combine(root, "grid");
+            Directory.CreateDirectory(gridDirectory);
+            var gridId = SteamShortcutIds.BuildGridId(appId);
+
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}.png"), ValidPngBytes());
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}p.png"), ValidPngBytes());
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_hero.png"), ValidPngBytes());
+
+            Assert.True(SteamGridDbArtworkDownloader.HasPrimaryArtworkSet(gridDirectory, appId));
+            Assert.False(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.Equal(
+                ["logo", "icon"],
+                SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_logo.png"), ValidPngBytes());
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}-icon.png"), ValidPngBytes());
+
+            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.Empty(SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public void CompleteArtworkSet_RejectsTruncatedOrInvalidCacheFiles()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            const uint appId = 2377733344;
+            var gridDirectory = Path.Combine(root, "grid");
+            Directory.CreateDirectory(gridDirectory);
+            var gridId = SteamShortcutIds.BuildGridId(appId);
+            foreach (var stem in new[]
+                     {
+                         gridId,
+                         $"{gridId}p",
+                         $"{gridId}_hero",
+                         $"{gridId}_logo",
+                         $"{gridId}-icon",
+                     })
+            {
+                File.WriteAllBytes(Path.Combine(gridDirectory, $"{stem}.png"), ValidPngBytes());
+            }
+
+            File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_hero.png"), new byte[512]);
+
+            Assert.False(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.Contains(
+                "hero",
+                SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public void ShouldUpdateArtworkForItem_DelaysRetryAfterIncompleteArtworkAttempt()
     {
         var root = CreateTempRoot();
@@ -194,6 +264,14 @@ public sealed class StoreSyncArtworkProtectionTests
         var root = Path.Combine(Path.GetTempPath(), "steamloader-tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         return root;
+    }
+
+    private static byte[] ValidPngBytes()
+    {
+        var bytes = new byte[256];
+        byte[] signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        signature.CopyTo(bytes, 0);
+        return bytes;
     }
 
     private static void DeleteTempRoot(string root)

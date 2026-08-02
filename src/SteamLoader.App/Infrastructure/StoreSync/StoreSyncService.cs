@@ -540,7 +540,9 @@ public sealed class StoreSyncService
                     SupportsUninstall =
                         descriptor.Supports(OmniLibraryStoreCapabilities.ManagedUninstall) ||
                         descriptor.Supports(OmniLibraryStoreCapabilities.ProductPageUninstall),
-                    LibraryTabs = OmniLibraryStoreRegistry.BuildLibraryTabSummaries(descriptor),
+                    LibraryTabs = OmniLibraryStoreRegistry.BuildLibraryTabSummaries(
+                        descriptor,
+                        store.RomSystems),
                     ActiveDownloadAppIds = store.Games
                         .Where(game =>
                             UnifySteamDownloadStatusStore.IsBusyOperation(
@@ -566,6 +568,7 @@ public sealed class StoreSyncService
                             .Distinct()
                             .ToArray()
                         : [],
+                    RomSystems = store.RomSystems,
                 };
             })
             .ToArray();
@@ -641,6 +644,99 @@ public sealed class StoreSyncService
         }
 
         return new UnifySteamGameDetailSnapshot(revision, string.Empty, null);
+    }
+
+    public OmniLibraryGameArtworkRepairResult RepairOmniLibraryGameArtwork(
+        uint appId)
+    {
+        var detail = GetUnifySteamGame(appId);
+        var game = detail.Game;
+        if (game is null || string.IsNullOrWhiteSpace(detail.StoreId))
+        {
+            throw new InvalidOperationException(
+                "The selected game is not managed by OmniLibrary.");
+        }
+
+        var profile = ResolveSteamProfile() ??
+            throw new InvalidOperationException("Steam profile could not be resolved.");
+        var gridDirectory = BuildGridDirectory(profile);
+        var missing = SteamGridDbArtworkDownloader.GetMissingArtworkSlots(
+            gridDirectory,
+            appId);
+        if (missing.Count == 0)
+        {
+            return new OmniLibraryGameArtworkRepairResult(
+                appId,
+                detail.StoreId,
+                game.Id,
+                game.Title,
+                false,
+                [],
+                "All five Steam artwork slots are already complete.");
+        }
+
+        var configuration = _settingsStore.Load();
+        var cachedGame = configuration.UnifySteam.Stores.TryGetValue(
+                detail.StoreId,
+                out var configuredStore)
+            ? configuredStore?.Cache?.Games?.FirstOrDefault(candidate =>
+                candidate is not null &&
+                candidate.Id.Equals(game.Id, StringComparison.OrdinalIgnoreCase))
+            : null;
+        configuration.UnifySteam.GameData.Providers.TryGetValue(
+            "retroachievements",
+            out var retroProvider);
+        var retroApiKey =
+            configuration.UnifySteam.GameData.Enabled &&
+            retroProvider?.Enabled == true
+                ? retroProvider.Credential?.Trim() ?? string.Empty
+                : string.Empty;
+        var target = new StoreSyncArtworkTarget(
+            $"{detail.StoreId}:{game.Id}",
+            game.Title,
+            appId,
+            [game.Title],
+            null,
+            string.Empty,
+            detail.StoreId,
+            cachedGame?.ImageUrl ?? game.ImageUrl,
+            cachedGame?.HeroImageUrl ?? string.Empty,
+            game.RomPath,
+            game.PlatformId,
+            retroApiKey,
+            ResolveRetroAchievementsArtworkGameId(
+                configuration,
+                cachedGame?.Id ?? game.Id,
+                cachedGame?.RomPath ?? game.RomPath));
+        var steamGridDbApiKey = _artworkDownloader.GetEffectiveApiKey(
+            configuration.SteamGridDbApiKey);
+        lock (_gate)
+        {
+            _pendingOmniArtworkGridDirectory = gridDirectory;
+            _pendingOmniArtworkApiKey = steamGridDbApiKey;
+            if (!_pendingOmniArtworkTargets.TryGetValue(
+                    detail.StoreId,
+                    out var storeTargets))
+            {
+                storeTargets = new Dictionary<uint, StoreSyncArtworkTarget>();
+                _pendingOmniArtworkTargets[detail.StoreId] = storeTargets;
+            }
+            storeTargets[appId] = target;
+            _omniArtworkRetryAtUtc.Remove(detail.StoreId);
+            if (_activeOmniArtworkTask is not { IsCompleted: false })
+            {
+                _activeOmniArtworkTask = Task.Run(ProcessQueuedOmniLibraryArtworkAsync);
+            }
+        }
+
+        return new OmniLibraryGameArtworkRepairResult(
+            appId,
+            detail.StoreId,
+            game.Id,
+            game.Title,
+            true,
+            missing,
+            $"Repairing {string.Join(", ", missing)} in the background.");
     }
 
     public OmniLibraryDownloadCenterSnapshot GetOmniLibraryDownloadCenter()
@@ -735,15 +831,14 @@ public sealed class StoreSyncService
             descriptor.Supports(OmniLibraryStoreCapabilities.ManagedInstall) &&
             game?.CanInstallDirectly != false;
         var externalProviderTransfer =
-            game?.RequiresExternalLauncher == true;
+            game?.RequiresExternalLauncher == true ||
+            (game?.RequiresAccountLink == true &&
+             normalizedStatus == "action-required");
         var supportsUninstall =
             descriptor.Supports(OmniLibraryStoreCapabilities.ManagedUninstall) ||
             descriptor.Supports(OmniLibraryStoreCapabilities.ProductPageUninstall);
         var active =
             UnifySteamDownloadStatusStore.IsActivelyTransferring(normalizedStatus);
-        var canMutateManagedTransfer =
-            managedTransfer &&
-            normalizedStatus is not ("finalizing" or "canceling");
         var catalogEntryAvailable = game is not null;
         var stalledThreshold = descriptor.Id.Equals(
             "xbox-game-pass",
@@ -753,6 +848,51 @@ public sealed class StoreSyncService
         var isStalled =
             normalizedStatus == "downloading" &&
             DateTimeOffset.UtcNow - download.UpdatedAtUtc > stalledThreshold;
+        var canManageExternally =
+            (descriptor.Id.Equals(
+                 "xbox-game-pass",
+                 StringComparison.OrdinalIgnoreCase) &&
+             normalizedStatus is not "completed") ||
+            (descriptor.Id.Equals(
+                 "gog-galaxy",
+                 StringComparison.OrdinalIgnoreCase) &&
+             (normalizedStatus == "action-required" ||
+              normalizedStatus is
+                  ("uninstall-action-required" or "uninstall-failed") &&
+              descriptor.Supports(
+                  OmniLibraryStoreCapabilities.ProductPageUninstall))) ||
+            (descriptor.Id.Equals(
+                 "epic-games",
+                 StringComparison.OrdinalIgnoreCase) &&
+             (game?.RequiresExternalLauncher == true ||
+              game?.RequiresAccountLink == true) &&
+             normalizedStatus is
+                 ("action-required" or
+                  "uninstall-action-required" or
+                  "uninstall-failed"));
+        var managedByToolsForSteam =
+            managedTransfer &&
+            !(
+                canManageExternally &&
+                normalizedStatus is
+                    ("action-required" or
+                     "uninstall-action-required" or
+                     "uninstall-failed")
+            );
+        var transferOwner = managedByToolsForSteam
+            ? "Tools for Steam"
+            : descriptor.Id.Equals(
+                "xbox-game-pass",
+                StringComparison.OrdinalIgnoreCase)
+                ? "Xbox app"
+                : externalProviderTransfer &&
+                  !string.IsNullOrWhiteSpace(game?.ProviderDisplayName)
+                    ? game.ProviderDisplayName
+                    : descriptor.Id.Equals(
+                        "gog-galaxy",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? "GOG Galaxy"
+                        : descriptor.Title;
         return new OmniLibraryDownloadCenterEntry(
             descriptor.Id,
             descriptor.Title,
@@ -774,9 +914,12 @@ public sealed class StoreSyncService
             download.DiskWriteBytesPerSecond,
             download.DiskReadBytesPerSecond,
             download.Attempt,
+            transferOwner,
+            managedByToolsForSteam,
             CanPause:
-                canMutateManagedTransfer &&
-                active,
+                managedByToolsForSteam &&
+                active &&
+                normalizedStatus != "finalizing",
             CanResume:
                 catalogEntryAvailable &&
                 (
@@ -792,9 +935,13 @@ public sealed class StoreSyncService
                      normalizedStatus is ("failed" or "canceled"))
                 ),
             CanCancel:
-                canMutateManagedTransfer &&
-                (active ||
-                 normalizedStatus is "paused" or "failed" or "cancel-failed"),
+                CanCancelManagedDownload(
+                    managedByToolsForSteam,
+                    normalizedStatus),
+            CanStopTracking:
+                CanStopTrackingDownload(
+                    managedByToolsForSteam,
+                    normalizedStatus),
             CanDismiss:
                 normalizedStatus is
                     "completed" or
@@ -805,27 +952,7 @@ public sealed class StoreSyncService
             CanPlay:
                 game?.Installed == true &&
                 normalizedStatus == "completed",
-            CanManageExternally:
-                (descriptor.Id.Equals(
-                     "xbox-game-pass",
-                     StringComparison.OrdinalIgnoreCase) &&
-                 normalizedStatus is not "completed") ||
-                (descriptor.Id.Equals(
-                     "gog-galaxy",
-                     StringComparison.OrdinalIgnoreCase) &&
-                 (normalizedStatus == "action-required" ||
-                  normalizedStatus is
-                      ("uninstall-action-required" or "uninstall-failed") &&
-                  descriptor.Supports(
-                      OmniLibraryStoreCapabilities.ProductPageUninstall))) ||
-                (descriptor.Id.Equals(
-                     "epic-games",
-                     StringComparison.OrdinalIgnoreCase) &&
-                 game?.RequiresExternalLauncher == true &&
-                 normalizedStatus is
-                     ("action-required" or
-                      "uninstall-action-required" or
-                      "uninstall-failed")),
+            CanManageExternally: canManageExternally,
             CanRetryUninstall:
                 catalogEntryAvailable &&
                 game?.Installed == true &&
@@ -833,6 +960,40 @@ public sealed class StoreSyncService
                 normalizedStatus == "uninstall-failed",
             IsStalled: isStalled,
             CatalogEntryAvailable: catalogEntryAvailable);
+    }
+
+    internal static bool CanCancelManagedDownload(
+        bool managedByToolsForSteam,
+        string? status)
+    {
+        return managedByToolsForSteam &&
+               status?.Trim().ToLowerInvariant() is
+                   "preparing" or
+                   "queued" or
+                   "downloading" or
+                   "reconnecting" or
+                   "finalizing" or
+                   "paused" or
+                   "failed" or
+                   "cancel-failed";
+    }
+
+    internal static bool CanStopTrackingDownload(
+        bool managedByToolsForSteam,
+        string? status)
+    {
+        var normalizedStatus = status?.Trim().ToLowerInvariant();
+        return normalizedStatus is
+                   "action-required" or
+                   "uninstall-action-required" ||
+               (!managedByToolsForSteam &&
+                normalizedStatus is
+                    "preparing" or
+                    "queued" or
+                    "downloading" or
+                    "reconnecting" or
+                    "finalizing" or
+                    "paused");
     }
 
     private UnifySteamStateSnapshot ReconcilePendingXboxRemovals(
@@ -910,16 +1071,50 @@ public sealed class StoreSyncService
     private UnifySteamStateSnapshot GetCachedUnifySteamCatalogState()
     {
         var settingsRevision = _settingsStore.GetRevision();
+        var downloadsRevision = UnifySteamDownloadStatusStore.GetRevision();
+        UnifySteamStateSnapshot? cachedState = null;
         lock (_gate)
         {
             if (_cachedUnifySteamState is not null &&
                 _cachedUnifySteamSettingsRevision == settingsRevision)
             {
-                return _cachedUnifySteamState;
+                if (_cachedUnifySteamDownloadsRevision == downloadsRevision)
+                {
+                    return _cachedUnifySteamState;
+                }
+
+                cachedState = _cachedUnifySteamState;
+            }
+        }
+
+        if (cachedState is not null)
+        {
+            var downloadStatuses = UnifySteamDownloadStatusStore.GetAll();
+            if (!RequiresLifecycleCatalogRefresh(
+                    cachedState.GeneratedAtUtc,
+                    downloadStatuses.Values))
+            {
+                // Percentage-only updates are overlaid by the game/detail
+                // endpoints and must not rebuild the full catalog. A newly
+                // completed install is different: its Installed flag,
+                // executable and Installed tab membership must be rebuilt
+                // together before this cached catalog can be reused.
+                return cachedState;
             }
         }
 
         return GetUnifySteamState();
+    }
+
+    internal static bool RequiresLifecycleCatalogRefresh(
+        DateTimeOffset catalogGeneratedAtUtc,
+        IEnumerable<UnifySteamDownloadStatus> downloadStatuses)
+    {
+        return downloadStatuses.Any(status =>
+            status.UpdatedAtUtc > catalogGeneratedAtUtc &&
+            status.Status.Equals(
+                "completed",
+                StringComparison.OrdinalIgnoreCase));
     }
 
     private static long CombineUnifySteamRevisions(
@@ -1209,6 +1404,10 @@ public sealed class StoreSyncService
                         game.ExecutablePath,
                         game.Version,
                         game.ImageUrl,
+                        game.PreparationSignature,
+                        game.PlatformId,
+                        game.PlatformTitle,
+                        game.RomPath,
                         game.SteamAppId);
                 },
                 StringComparer.OrdinalIgnoreCase);
@@ -1246,7 +1445,12 @@ public sealed class StoreSyncService
             store.IncludeXboxCloudGaming,
             store.ToolPath,
             store.AuthPath,
-            store.InstallPath);
+            store.InstallPath,
+            string.Join(
+                '\u001e',
+                (store.RomSystems ?? [])
+                    .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(pair => $"{pair.Key}:{pair.Value?.EmulatorPath}:{pair.Value?.Fullscreen}")));
     }
 
     private static void MergeUnifySteamRuntimeState(
@@ -1632,6 +1836,16 @@ public sealed class StoreSyncService
                     storeConfiguration.PreparedCatalogSignature = string.Empty;
                     storeConfiguration.PreparedAtUtc = null;
                 }
+                if (enabled && descriptor.Id.Equals(
+                        OmniLibraryRomSystemRegistry.StoreId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // Activation is the only point at which TFS creates the
+                    // user's deterministic ROM directory structure.
+                    storeConfiguration.InstallPath =
+                        OmniLibraryRomSystemRegistry.EnsureFolderStructure(
+                            storeConfiguration.InstallPath);
+                }
                 storeConfiguration.Enabled = enabled;
                 OmniLibraryLifecycle.SetStage(
                     storeConfiguration,
@@ -1932,6 +2146,258 @@ public sealed class StoreSyncService
         return snapshot;
     }
 
+    public StoreSyncSnapshot SetUnifySteamAchievementOptions(
+        string storeId,
+        bool enabled,
+        string? credential)
+    {
+        var descriptor = OmniLibraryStoreRegistry.GetRequired(storeId);
+        var provider = OmniLibraryGameDataProviderRegistry.ResolveForStore(
+            descriptor.Id) ??
+            throw new InvalidOperationException(
+                "This OmniLibrary store has no game-data provider.");
+        return SetOmniLibraryGameDataProviderOptions(
+            provider.Id,
+            enabled,
+            credential,
+            secondaryCredential: null,
+            accountId: null,
+            accountName: null,
+            region: null,
+            locale: null,
+            dataPath: null);
+    }
+
+    public StoreSyncSnapshot SetOmniLibraryGameDataProviderOptions(
+        string providerId,
+        bool enabled,
+        string? credential,
+        string? secondaryCredential,
+        string? accountId,
+        string? accountName,
+        string? region,
+        string? locale,
+        string? dataPath)
+    {
+        var descriptor = OmniLibraryGameDataProviderRegistry.GetRequired(providerId);
+        providerId = descriptor.Id;
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                var gameData = latest.UnifySteam.GameData;
+                var provider = gameData.Providers[providerId];
+                provider.Enabled = enabled;
+                if (credential is not null)
+                {
+                    provider.Credential = credential.Trim();
+                }
+                if (secondaryCredential is not null)
+                {
+                    provider.SecondaryCredential = secondaryCredential.Trim();
+                }
+                if (accountId is not null)
+                {
+                    provider.AccountId = accountId.Trim();
+                }
+                if (accountName is not null)
+                {
+                    provider.AccountName = accountName.Trim();
+                }
+                if (region is not null)
+                {
+                    provider.Region = region.Trim();
+                }
+                if (locale is not null)
+                {
+                    provider.Locale = locale.Trim();
+                }
+                if (dataPath is not null)
+                {
+                    provider.DataPath = dataPath.Trim();
+                }
+                provider.ConnectionStatus = string.Empty;
+                provider.ConnectionDetail = string.Empty;
+                provider.ConnectionCheckedAtUtc = null;
+                provider.UpdatedAtUtc = DateTimeOffset.UtcNow;
+
+                // Keep the old fields synchronized for downgrade safety and for
+                // older frontend builds that may still call the store endpoint.
+                if (providerId.Equals("xbox-live", StringComparison.OrdinalIgnoreCase))
+                {
+                    var xbox = GetUnifySteamStoreConfiguration(
+                        latest,
+                        "xbox-game-pass");
+                    xbox.AchievementsEnabled = enabled;
+                    var nextKey = provider.Credential;
+                    if (!string.Equals(
+                            xbox.OpenXblApiKey,
+                            nextKey,
+                            StringComparison.Ordinal))
+                    {
+                        xbox.OpenXblApiKey = nextKey;
+                        xbox.OpenXblAccountId = string.Empty;
+                        xbox.OpenXblAccountName = string.Empty;
+                        xbox.OpenXblAccountCheckedAtUtc = null;
+                        xbox.OpenXblTitleIds.Clear();
+                        provider.AccountId = string.Empty;
+                        provider.AccountName = string.Empty;
+                        provider.GameIdOverrides.Clear();
+                    }
+                }
+                else if (providerId.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
+                {
+                    GetUnifySteamStoreConfiguration(latest, "epic-games")
+                        .AchievementsEnabled = enabled;
+                }
+                else if (providerId.Equals("gog", StringComparison.OrdinalIgnoreCase))
+                {
+                    GetUnifySteamStoreConfiguration(latest, "gog-galaxy")
+                        .AchievementsEnabled = enabled;
+                }
+            });
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public async Task<StoreSyncSnapshot> TestOmniLibraryGameDataProviderAsync(
+        string providerId,
+        CancellationToken cancellationToken)
+    {
+        var descriptor = OmniLibraryGameDataProviderRegistry.GetRequired(providerId);
+        providerId = descriptor.Id;
+        var configuration = _settingsStore.Load();
+        if (!configuration.UnifySteam.GameData.Providers.TryGetValue(
+                providerId,
+                out var provider) ||
+            provider is null)
+        {
+            throw new InvalidOperationException("The game-data provider is not configured.");
+        }
+
+        var status = "ready";
+        var detail = "The saved provider configuration is ready.";
+        var resolvedAccountName = provider.AccountName;
+        try
+        {
+            if (!configuration.UnifySteam.GameData.Enabled || !provider.Enabled)
+            {
+                throw new InvalidOperationException(
+                    "Enable Achievements & Metadata and this provider before testing it.");
+            }
+
+            if (providerId.Equals("retroachievements", StringComparison.OrdinalIgnoreCase))
+            {
+                var username = provider.AccountName?.Trim() ?? string.Empty;
+                var apiKey = provider.Credential?.Trim() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(apiKey))
+                {
+                    throw new InvalidOperationException(
+                        "Enter a RetroAchievements username and Web API key first.");
+                }
+
+                using var client = new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(12),
+                };
+                client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                    "ToolsForSteam-OmniLibrary/0.4.1");
+                var uri =
+                    $"https://retroachievements.org/API/API_GetUserProfile.php?u={Uri.EscapeDataString(username)}&y={Uri.EscapeDataString(apiKey)}";
+                using var response = await client.GetAsync(uri, cancellationToken)
+                    .ConfigureAwait(false);
+                await using var stream = await response.Content
+                    .ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                using var document = await JsonDocument.ParseAsync(
+                    stream,
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
+                var root = document.RootElement;
+                var returnedUser = FirstNonEmpty(
+                    GetJsonString(root, "User"),
+                    GetJsonString(root, "user"));
+                if (!response.IsSuccessStatusCode || string.IsNullOrWhiteSpace(returnedUser))
+                {
+                    var providerError = FirstNonEmpty(
+                        GetJsonString(root, "Error"),
+                        GetJsonString(root, "error"));
+                    throw new InvalidOperationException(
+                        string.IsNullOrWhiteSpace(providerError)
+                            ? "RetroAchievements rejected the username or Web API key."
+                            : providerError);
+                }
+
+                resolvedAccountName = returnedUser;
+                detail = $"Connected as {returnedUser}. ROM hashes, artwork, and achievement progress are available on demand.";
+            }
+            else if (descriptor.Supports(OmniLibraryGameDataCapabilities.StoreAccount))
+            {
+                var connectedStore = configuration.UnifySteam.Stores
+                    .Where(pair => descriptor.StoreIds.Contains(
+                        pair.Key,
+                        StringComparer.OrdinalIgnoreCase))
+                    .Select(pair => pair.Value)
+                    .FirstOrDefault(store => store?.Cache is not null &&
+                        string.IsNullOrWhiteSpace(store.Cache.LastError));
+                if (connectedStore?.Cache is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Connect the matching {descriptor.Title} library first.");
+                }
+                resolvedAccountName = FirstNonEmpty(
+                    connectedStore.Cache.AccountName,
+                    provider.AccountName);
+                detail = string.IsNullOrWhiteSpace(resolvedAccountName)
+                    ? $"The connected {descriptor.Title} store session is ready."
+                    : $"Connected as {resolvedAccountName}.";
+            }
+            else
+            {
+                var configured = !string.IsNullOrWhiteSpace(provider.Credential) ||
+                    !string.IsNullOrWhiteSpace(provider.SecondaryCredential) ||
+                    !string.IsNullOrWhiteSpace(provider.AccountId) ||
+                    !string.IsNullOrWhiteSpace(provider.AccountName) ||
+                    !string.IsNullOrWhiteSpace(provider.DataPath);
+                if (!configured)
+                {
+                    throw new InvalidOperationException(
+                        "Complete this provider's setup before testing it.");
+                }
+                detail = "The provider setup is complete. Its first matching title will perform the remote or local title-scoped check.";
+            }
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            status = "failed";
+            detail = error.Message;
+        }
+
+        var checkedAtUtc = DateTimeOffset.UtcNow;
+        var updated = _settingsStore.Update(latest =>
+        {
+            var target = latest.UnifySteam.GameData.Providers[providerId];
+            target.ConnectionStatus = status;
+            target.ConnectionDetail = detail;
+            target.ConnectionCheckedAtUtc = checkedAtUtc;
+            if (status == "ready" && !string.IsNullOrWhiteSpace(resolvedAccountName))
+            {
+                target.AccountName = resolvedAccountName.Trim();
+            }
+        });
+        return BuildSnapshot(updated);
+    }
+
+    public StoreSyncSnapshot SetOmniLibraryGameDataEnabled(bool enabled)
+    {
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                latest.UnifySteam.GameData.Enabled = enabled;
+            });
+            return BuildSnapshot(configuration);
+        }
+    }
+
     public StoreSyncSnapshot RefreshUnifySteam(string? storeId)
     {
         return RefreshUnifySteamCore(storeId, includeIncompleteRepair: true);
@@ -2136,7 +2602,7 @@ public sealed class StoreSyncService
                 !string.IsNullOrWhiteSpace(game.Id) &&
                 (game.SteamAppId == 0 ||
                  (!string.IsNullOrWhiteSpace(gridDirectory) &&
-                  !SteamGridDbArtworkDownloader.HasPrimaryArtworkSet(
+                  !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
                       gridDirectory,
                       game.SteamAppId))))
             .Select(game => game.Id)
@@ -2182,14 +2648,175 @@ public sealed class StoreSyncService
             else
             {
                 installPath = Path.GetFullPath(value.Trim());
-                if (!Directory.Exists(installPath))
+                if (descriptor.Id.Equals(
+                        OmniLibraryRomSystemRegistry.StoreId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    installPath = OmniLibraryRomSystemRegistry.EnsureFolderStructure(
+                        installPath);
+                }
+                else if (!Directory.Exists(installPath))
                 {
                     throw new InvalidOperationException("The selected store library folder does not exist.");
                 }
             }
 
+            if (descriptor.Id.Equals(
+                    OmniLibraryRomSystemRegistry.StoreId,
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(installPath))
+            {
+                installPath = OmniLibraryRomSystemRegistry.DefaultRootPath;
+            }
+
             var configuration = _settingsStore.Update(latest =>
                 GetUnifySteamStoreConfiguration(latest, storeId).InstallPath = installPath);
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot OpenUnifySteamLibraryFolder(string storeId)
+    {
+        var descriptor = OmniLibraryStoreRegistry.GetRequired(storeId);
+        if (!descriptor.Id.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Opening the library folder is available only for local libraries.");
+        }
+
+        StoreSyncSnapshot snapshot;
+        string root;
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                var store = GetUnifySteamStoreConfiguration(latest, descriptor.Id);
+                store.InstallPath = OmniLibraryRomSystemRegistry.EnsureFolderStructure(
+                    store.InstallPath);
+            });
+            root = GetUnifySteamStoreConfiguration(configuration, descriptor.Id).InstallPath;
+            snapshot = BuildSnapshot(configuration);
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "explorer.exe",
+            ArgumentList = { root },
+            UseShellExecute = false,
+        })?.Dispose();
+        return snapshot;
+    }
+
+    public StoreSyncSnapshot OpenOmniLibraryRomSystemFolder(string systemId)
+    {
+        var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
+        StoreSyncSnapshot snapshot;
+        string folder;
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                var store = GetUnifySteamStoreConfiguration(
+                    latest,
+                    OmniLibraryRomSystemRegistry.StoreId);
+                store.InstallPath = OmniLibraryRomSystemRegistry.EnsureFolderStructure(
+                    store.InstallPath);
+            });
+            var store = GetUnifySteamStoreConfiguration(
+                configuration,
+                OmniLibraryRomSystemRegistry.StoreId);
+            folder = Path.Combine(store.InstallPath, system.FolderName);
+            snapshot = BuildSnapshot(configuration);
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "explorer.exe",
+            ArgumentList = { folder },
+            UseShellExecute = false,
+        })?.Dispose();
+        return snapshot;
+    }
+
+    public StoreSyncSnapshot SetUnifySteamToolPath(string storeId, string? value)
+    {
+        var descriptor = OmniLibraryStoreRegistry.GetRequired(storeId);
+        if (!descriptor.Id.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "A custom tool path is available only for the Emulator library.");
+        }
+
+        var toolPath = value?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(toolPath))
+        {
+            toolPath = Path.GetFullPath(toolPath);
+            if (!File.Exists(toolPath) ||
+                !Path.GetFileName(toolPath).Equals(
+                    "PPSSPPWindows64.exe",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Select the 64-bit PPSSPP executable (PPSSPPWindows64.exe).");
+            }
+        }
+
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                var store = GetUnifySteamStoreConfiguration(latest, descriptor.Id);
+                store.ToolPath = toolPath;
+                store.RomSystems.TryGetValue("psp", out var pspSettings);
+                pspSettings ??= new OmniLibraryRomSystemConfiguration();
+                pspSettings.EmulatorPath = toolPath;
+                store.RomSystems["psp"] = pspSettings;
+            });
+            return BuildSnapshot(configuration);
+        }
+    }
+
+    public StoreSyncSnapshot SetOmniLibraryRomSystemSettings(
+        string systemId,
+        string? emulatorPathValue,
+        bool fullscreen)
+    {
+        var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
+        var emulatorPath = emulatorPathValue?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(emulatorPath))
+        {
+            emulatorPath = Path.GetFullPath(emulatorPath);
+            if (!File.Exists(emulatorPath) ||
+                !Path.GetFileName(emulatorPath).Equals(
+                    system.EmulatorExecutableName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Select {system.EmulatorExecutableName} for {system.Title}.");
+            }
+        }
+
+        lock (_gate)
+        {
+            var configuration = _settingsStore.Update(latest =>
+            {
+                var store = GetUnifySteamStoreConfiguration(
+                    latest,
+                    OmniLibraryRomSystemRegistry.StoreId);
+                store.RomSystems.TryGetValue(system.Id, out var settings);
+                settings ??= new OmniLibraryRomSystemConfiguration();
+                settings.EmulatorPath = emulatorPath;
+                settings.Fullscreen = fullscreen;
+                store.RomSystems[system.Id] = settings;
+                if (system.Id.Equals("psp", StringComparison.OrdinalIgnoreCase))
+                {
+                    store.ToolPath = emulatorPath;
+                }
+            });
             return BuildSnapshot(configuration);
         }
     }
@@ -3250,6 +3877,16 @@ public sealed class StoreSyncService
 
         addFileTarget(profile?.ShortcutsPath);
 
+        var romLibrary = GetUnifySteamStoreConfiguration(
+            configuration,
+            OmniLibraryRomSystemRegistry.StoreId);
+        if (romLibrary.Enabled)
+        {
+            addDirectoryTarget(
+                OmniLibraryRomSystemRegistry.ResolveRootPath(
+                    romLibrary.InstallPath));
+        }
+
         foreach (var definition in StoreDefinitions)
         {
             var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
@@ -3398,6 +4035,62 @@ public sealed class StoreSyncService
             .OrderBy(target => target.DirectoryPath, StringComparer.OrdinalIgnoreCase)
             .ThenBy(target => target.Filter, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    internal bool TryQueueLocalLibraryDelta(string? changedPath)
+    {
+        if (string.IsNullOrWhiteSpace(changedPath) ||
+            !StorefrontFeatureFlags.AutomaticRefreshEnabled)
+        {
+            return false;
+        }
+
+        try
+        {
+            var configuration = _settingsStore.Load();
+            var store = GetUnifySteamStoreConfiguration(
+                configuration,
+                OmniLibraryRomSystemRegistry.StoreId);
+            if (!store.Enabled)
+            {
+                return false;
+            }
+
+            var root = OmniLibraryRomSystemRegistry.ResolveRootPath(
+                    store.InstallPath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            var fullPath = Path.GetFullPath(changedPath);
+            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var relativePath = Path.GetRelativePath(root, fullPath);
+            var systemFolder = relativePath
+                .Split(
+                    [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                    StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
+            if (!OmniLibraryRomSystemRegistry.Supported.Any(system =>
+                    system.FolderName.Equals(
+                        systemFolder,
+                        StringComparison.OrdinalIgnoreCase)))
+            {
+                // BIOS and placeholder folders do not affect the imported game
+                // set. Consume those watcher events without scheduling a costly
+                // Steam shortcut reconciliation.
+                return true;
+            }
+
+            _ = Task.Run(() => CheckUnifySteamStoreForChanges(
+                OmniLibraryRomSystemRegistry.StoreId));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static StoreSyncDetectedTitleState ToDetectedTitleState(StoreSyncAnalysisItem item)
@@ -6706,6 +7399,14 @@ public sealed class StoreSyncService
         cancellationToken.ThrowIfCancellationRequested();
         var gridDirectory = BuildGridDirectory(profile);
         var apiKey = _artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
+        configuration.UnifySteam.GameData.Providers.TryGetValue(
+            "retroachievements",
+            out var retroAchievementsProvider);
+        var retroAchievementsApiKey =
+            configuration.UnifySteam.GameData.Enabled &&
+            retroAchievementsProvider?.Enabled == true
+                ? retroAchievementsProvider.Credential?.Trim() ?? string.Empty
+                : string.Empty;
         var analyzedStoreIds = analysis.Items
             .Select(item => TryResolveOmniLibraryGameIdentity(item.Game.StoreItemId, out var storeId, out _)
                 ? storeId
@@ -6744,7 +7445,7 @@ public sealed class StoreSyncService
                             game.Id.Equals(gameId, StringComparison.OrdinalIgnoreCase))
                         : null;
                 return appId == 0 ||
-                       SteamGridDbArtworkDownloader.HasPrimaryArtworkSet(gridDirectory, appId)
+                       SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId)
                     ? null
                     : new StoreSyncArtworkTarget(
                         item.TitleId,
@@ -6755,7 +7456,14 @@ public sealed class StoreSyncService
                         item.ArtworkCache?.MatchName ?? string.Empty,
                         storeId,
                         cachedGame?.ImageUrl ?? string.Empty,
-                        cachedGame?.HeroImageUrl ?? string.Empty);
+                        cachedGame?.HeroImageUrl ?? string.Empty,
+                        cachedGame?.RomPath ?? string.Empty,
+                        cachedGame?.PlatformId ?? string.Empty,
+                        retroAchievementsApiKey,
+                        ResolveRetroAchievementsArtworkGameId(
+                            configuration,
+                            cachedGame?.Id,
+                            cachedGame?.RomPath));
             })
             .Where(target => target is not null)
             .Cast<StoreSyncArtworkTarget>()
@@ -6905,7 +7613,7 @@ public sealed class StoreSyncService
                         .Select(target => new
                         {
                             Target = target,
-                            MissingSlots = SteamGridDbArtworkDownloader.GetMissingPrimaryArtworkSlots(
+                            MissingSlots = SteamGridDbArtworkDownloader.GetMissingArtworkSlots(
                                 gridDirectory,
                                 target.AppId),
                         })
@@ -6997,6 +7705,8 @@ public sealed class StoreSyncService
             var score = 0;
             score += string.IsNullOrWhiteSpace(target.FallbackPortraitUrl) ? 0 : 4;
             score += string.IsNullOrWhiteSpace(target.FallbackHeroUrl) ? 0 : 4;
+            score += string.IsNullOrWhiteSpace(target.RomPath) ? 0 : 3;
+            score += string.IsNullOrWhiteSpace(target.RetroAchievementsApiKey) ? 0 : 2;
             score += target.CachedGameId.HasValue && target.CachedGameId.Value > 0 ? 2 : 0;
             score += target.SearchHints.Count > 1 ? 1 : 0;
             return score;
@@ -7026,7 +7736,7 @@ public sealed class StoreSyncService
                          game.SteamAppId != 0 &&
                          !string.IsNullOrWhiteSpace(game.Id) &&
                          !string.IsNullOrWhiteSpace(game.Title) &&
-                         !SteamGridDbArtworkDownloader.HasPrimaryArtworkSet(
+                         !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
                              gridDirectory,
                              game.SteamAppId)))
             {
@@ -7039,11 +7749,54 @@ public sealed class StoreSyncService
                     string.Empty,
                     storeId,
                     game.ImageUrl,
-                    game.HeroImageUrl));
+                    game.HeroImageUrl,
+                    game.RomPath,
+                    game.PlatformId,
+                    configuration.UnifySteam.GameData.Enabled &&
+                    configuration.UnifySteam.GameData.Providers.TryGetValue(
+                        "retroachievements",
+                        out var retroProvider) &&
+                    retroProvider?.Enabled == true
+                        ? retroProvider.Credential?.Trim() ?? string.Empty
+                        : string.Empty,
+                    ResolveRetroAchievementsArtworkGameId(
+                        configuration,
+                        game.Id,
+                        game.RomPath)));
             }
         }
 
         return targets;
+    }
+
+    private static uint? ResolveRetroAchievementsArtworkGameId(
+        StoreSyncConfiguration configuration,
+        string? localGameId,
+        string? romPath)
+    {
+        if (string.IsNullOrWhiteSpace(localGameId) ||
+            !configuration.UnifySteam.GameData.Enabled ||
+            !configuration.UnifySteam.GameData.Providers.TryGetValue(
+                "retroachievements",
+                out var provider) ||
+            provider?.Enabled != true ||
+            !provider.GameIdOverrides.TryGetValue(localGameId, out var mapping) ||
+            !OmniLibraryRetroAchievementsSource.TryResolveCachedHashMapping(
+                romPath,
+                mapping,
+                out _,
+                out var gameId) ||
+            !uint.TryParse(
+                gameId,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed) ||
+            parsed == 0)
+        {
+            return null;
+        }
+
+        return parsed;
     }
 
     private void MarkOmniLibraryArtworkPreparationStarted(IReadOnlyDictionary<string, int> totalsByStore)

@@ -2,8 +2,7 @@
              x:Name="Root"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             Background="#081019"
-             IsHitTestVisible="False">
+             Background="#081019">
     <Grid ClipToBounds="True">
         <Viewbox Stretch="Fill">
             <ItemsControl Width="1920"
@@ -64,7 +63,7 @@
                            FontSize="52"
                            FontWeight="Bold" />
 
-                <TextBlock Text="Preparing Steam"
+                <TextBlock Text="{Binding HeadlineText, ElementName=Root}"
                            Margin="0,18,0,0"
                            HorizontalAlignment="Center"
                            Foreground="#D8E3EE"
@@ -72,6 +71,7 @@
                            FontWeight="SemiBold" />
 
                 <TextBlock Text="{Binding DetailText, ElementName=Root}"
+                           AutomationProperties.LiveSetting="Polite"
                            Margin="0,14,0,0"
                            HorizontalAlignment="Center"
                            Foreground="#AAB8C6"
@@ -80,6 +80,7 @@
                            TextWrapping="Wrap" />
 
                 <TextBlock Text="{Binding StateText, ElementName=Root}"
+                           AutomationProperties.LiveSetting="Polite"
                            Margin="0,10,0,0"
                            HorizontalAlignment="Center"
                            Foreground="#8091A3"
@@ -87,7 +88,8 @@
                            TextAlignment="Center"
                            TextWrapping="Wrap" />
 
-                <StackPanel Orientation="Horizontal"
+                <StackPanel x:Name="ProgressDots"
+                            Orientation="Horizontal"
                             HorizontalAlignment="Center"
                             Margin="0,32,0,0">
                     <StackPanel.Triggers>
@@ -120,6 +122,51 @@
                     <Ellipse x:Name="Dot2" Width="9" Height="9" Fill="#6A93B5" Margin="7,0" Opacity="0.2" />
                     <Ellipse x:Name="Dot3" Width="9" Height="9" Fill="#6A93B5" Margin="7,0" Opacity="0.2" />
                 </StackPanel>
+
+                <Border Margin="0,30,0,0"
+                        Padding="18"
+                        Background="#CC101A25"
+                        BorderBrush="#40566D"
+                        BorderThickness="1"
+                        CornerRadius="12">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding ShowRecoveryActions, ElementName=Root}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <StackPanel>
+                        <TextBlock Text="{Binding RecoveryHeadlineText, ElementName=Root}"
+                                   HorizontalAlignment="Center"
+                                   Foreground="#F1F6FB"
+                                   FontSize="16"
+                                   FontWeight="SemiBold" />
+                        <StackPanel Orientation="Horizontal"
+                                    HorizontalAlignment="Center"
+                                    Margin="0,14,0,0">
+                            <Button Content="{Binding ContinueLabel, ElementName=Root}"
+                                    Command="{Binding ContinueCommand, ElementName=Root}"
+                                    MinWidth="150"
+                                    Margin="4"
+                                    Padding="12,8" />
+                            <Button Content="{Binding RestartLabel, ElementName=Root}"
+                                    Command="{Binding RestartCommand, ElementName=Root}"
+                                    IsEnabled="{Binding CanRestartSteam, ElementName=Root}"
+                                    MinWidth="170"
+                                    Margin="4"
+                                    Padding="12,8" />
+                            <Button Content="{Binding DesktopLabel, ElementName=Root}"
+                                    Command="{Binding DesktopCommand, ElementName=Root}"
+                                    MinWidth="150"
+                                    Margin="4"
+                                    Padding="12,8" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
             </StackPanel>
         </Grid>
     </Grid>

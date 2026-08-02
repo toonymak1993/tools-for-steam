@@ -9,9 +9,10 @@ using SteamLoader.App.Models;
 namespace SteamLoader.App.Services;
 
 /// <summary>
-/// Opens Steam's real Big Picture Quick Access surface in front of a Store Sync
-/// game when the game process has no injected Steam overlay renderer. Closing the
-/// Quick Access surface restores the exact game window that was active before it.
+/// Opens Steam's real Big Picture Quick Access surface in front of any game whose
+/// process has no injected Steam overlay renderer. Store Sync metadata is used
+/// when available, but is never required for the fallback. Closing the Quick
+/// Access surface restores the exact game window that was active before it.
 /// </summary>
 public sealed class ExternalGameQuickAccessService
 {
@@ -93,29 +94,46 @@ public sealed class ExternalGameQuickAccessService
             return false;
         }
 
-        var managedGame = _storeSyncService.TryMatchManagedGame(executablePath, processName);
-        if (managedGame is null)
-        {
-            Log(
-                $"fallback-rejected reason=store-sync-match-missing pid={processId} name={processName} " +
-                $"title={windowTitle} executable={executablePath}");
-            return false;
-        }
-
         var overlayRendererMissing = suppliedTarget?.OverlayRendererMissing ??
             XboxStoreLaunchHost.IsSteamOverlayRendererMissing((uint)processId);
         if (!overlayRendererMissing)
         {
             Log(
-                $"native-overlay-path pid={processId} title={managedGame.Title} " +
+                $"native-overlay-path pid={processId} title={ResolveFallbackGameTitle(null, windowTitle, processName, executablePath)} " +
                 "reason=renderer-present-or-unavailable");
             return false;
         }
 
+        StoreSyncManagedGameMatch? managedGame = null;
+        try
+        {
+            managedGame = _storeSyncService.TryMatchManagedGame(executablePath, processName);
+        }
+        catch (Exception exception)
+        {
+            // Store metadata is cosmetic for this flow. A stale or unreadable
+            // catalog must never disable Quick Access for a renderer-less game.
+            Log(
+                $"fallback-metadata-match-failed pid={processId} name={processName} " +
+                $"error={exception.GetType().Name}:{exception.Message}");
+        }
+
+        var metadata = ResolveSessionMetadata(
+            managedGame,
+            windowTitle,
+            processName,
+            executablePath);
+        if (managedGame is null)
+        {
+            Log(
+                $"fallback-metadata-unmatched pid={processId} name={processName} " +
+                $"title={windowTitle} executable={executablePath}");
+        }
+
         var session = new ActiveSession(
             Guid.NewGuid(),
-            managedGame.Title,
-            managedGame.StoreId,
+            metadata.GameTitle,
+            metadata.StoreId,
             processId,
             windowHandle,
             SuppressGameRestore: false,
@@ -384,6 +402,44 @@ public sealed class ExternalGameQuickAccessService
         }
     }
 
+    internal static ExternalGameQuickAccessSessionMetadata ResolveSessionMetadata(
+        StoreSyncManagedGameMatch? managedGame,
+        string? windowTitle,
+        string? processName,
+        string? executablePath)
+    {
+        return new ExternalGameQuickAccessSessionMetadata(
+            ResolveFallbackGameTitle(
+                managedGame?.Title,
+                windowTitle,
+                processName,
+                executablePath),
+            managedGame?.StoreId?.Trim() ?? string.Empty);
+    }
+
+    private static string ResolveFallbackGameTitle(
+        string? managedTitle,
+        string? windowTitle,
+        string? processName,
+        string? executablePath)
+    {
+        foreach (var candidate in new[] { managedTitle, windowTitle, processName })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate.Trim();
+            }
+        }
+
+        var executableTitle = Path.GetFileNameWithoutExtension(executablePath);
+        if (!string.IsNullOrWhiteSpace(executableTitle))
+        {
+            return executableTitle.Trim();
+        }
+
+        return "External game";
+    }
+
     private static ExternalGameQuickAccessState BuildState(ActiveSession? session)
     {
         return session is null
@@ -430,6 +486,10 @@ public sealed class ExternalGameQuickAccessService
         bool SuppressGameRestore,
         bool QuickAccessReady);
 }
+
+internal sealed record ExternalGameQuickAccessSessionMetadata(
+    string GameTitle,
+    string StoreId);
 
 internal sealed class ExternalGameQuickAccessObservation
 {

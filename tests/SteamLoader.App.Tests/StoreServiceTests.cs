@@ -512,6 +512,259 @@ public sealed class StoreServiceTests
         }
     }
 
+    [Fact]
+    public async Task ArtworkCache_RemembersMissingSourcesWithoutRepeatedNetworkRequests()
+    {
+        var root = CreateTempRoot();
+        var source = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/999999999/header.jpg";
+        try
+        {
+            var handler = new MissingArtworkHandler();
+            var service = new StoreService(
+                new HttpClient(handler),
+                new StoreSettingsStore(Path.Combine(root, "store.json")),
+                () => null,
+                null,
+                Path.Combine(root, "artwork-cache"));
+
+            Assert.Null(await service.GetCachedArtworkAsync(source, CancellationToken.None));
+            Assert.Null(await service.GetCachedArtworkAsync(source, CancellationToken.None));
+            Assert.Equal(1, handler.RequestCount);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void WishlistQualityOfLifeMetadataAndGameHistoryPersistAcrossReopen()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var settingsPath = Path.Combine(root, "store.json");
+            var settings = new StoreSettingsStore(settingsPath);
+            var service = new StoreService(new HttpClient(new RejectingHandler()), settings, () => null);
+            var original = CreateWishlistGame(19.99m, 39.99m);
+
+            service.SetLocalWishlist(original, enabled: true);
+            var organized = service.SetWishlistMetadata(original.Id, isPinned: true, ["Must Buy", "Later", "Must Buy"]);
+            var organizedGame = Assert.Single(organized.Wishlist);
+            Assert.True(organizedGame.IsPinned);
+            Assert.Equal(["Later", "Must Buy"], organizedGame.Tags);
+            Assert.Equal(19.99m, organizedGame.TrackingStartPrice);
+
+            var reduced = CreateWishlistGame(9.99m, 39.99m);
+            var changed = service.SetLocalWishlist(reduced, enabled: true);
+            var changedGame = Assert.Single(changed.Wishlist);
+            Assert.Equal("price-drop", changedGame.ChangeKind);
+            Assert.True(changedGame.HasUnseenChange);
+            Assert.Equal(9.99m, changedGame.TrackedLowPrice);
+            Assert.Equal(2, changedGame.PriceHistory.Count);
+
+            Assert.False(Assert.Single(service.MarkWishlistChangesSeen().Wishlist).HasUnseenChange);
+            var reopened = new StoreService(new HttpClient(new RejectingHandler()), settings, () => null);
+            var persisted = Assert.Single(reopened.GetCachedSnapshot().Wishlist);
+            Assert.True(persisted.IsPinned);
+            Assert.Equal(9.99m, persisted.TrackedLowPrice);
+            Assert.False(persisted.HasUnseenChange);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void WishlistSettingsRecoverTheLastGoodSnapshotWhenTheMainFileIsCorrupted()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var settingsPath = Path.Combine(root, "store.json");
+            var settings = new StoreSettingsStore(settingsPath);
+            var service = new StoreService(new HttpClient(new RejectingHandler()), settings, () => null);
+            var game = CreateWishlistGame(14.99m, 39.99m);
+            service.SetLocalWishlist(game, enabled: true);
+            service.SetWishlistMetadata(game.Id, isPinned: true, ["Later"]);
+            Assert.True(File.Exists(settingsPath + ".bak"));
+
+            File.WriteAllText(settingsPath, "{not valid json");
+            var recovered = new StoreService(
+                new HttpClient(new RejectingHandler()),
+                new StoreSettingsStore(settingsPath),
+                () => null).GetCachedSnapshot();
+
+            Assert.Equal(game.Id, Assert.Single(recovered.Wishlist).Id);
+            Assert.DoesNotContain("not valid json", File.ReadAllText(settingsPath));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void WishlistBackupRestoresLocalGamesAlertsTagsAndHistory()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var source = new StoreService(
+                new HttpClient(new RejectingHandler()),
+                new StoreSettingsStore(Path.Combine(root, "source.json")),
+                () => null);
+            var game = CreateWishlistGame(12.49m, 29.99m);
+            source.SetLocalWishlist(game, enabled: true);
+            source.SetWishlistMetadata(game.Id, isPinned: true, ["Co-op"]);
+            source.SetAlert(null, game.Id, game.Title, 9.99m, "EUR", enabled: true, mode: "new-low");
+            var backup = source.ExportBackup();
+
+            var restored = new StoreService(
+                new HttpClient(new RejectingHandler()),
+                new StoreSettingsStore(Path.Combine(root, "restored.json")),
+                () => null);
+            var snapshot = restored.ImportBackup(backup);
+
+            var restoredGame = Assert.Single(snapshot.Wishlist);
+            Assert.True(restoredGame.IsLocallyWishlisted);
+            Assert.True(restoredGame.IsPinned);
+            Assert.Equal(["Co-op"], restoredGame.Tags);
+            Assert.Equal(12.49m, restoredGame.TrackingStartPrice);
+            Assert.Equal("new-low", Assert.Single(snapshot.Alerts).Mode);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task KeyshopPreferenceCanRestrictResultsToOfficialStores()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var service = new StoreService(
+                new HttpClient(new InstantGamingHandler()),
+                new StoreSettingsStore(Path.Combine(root, "store.json")),
+                () => null);
+            service.SetStoreRegion("DE");
+            Assert.Single(await service.SearchAsync("RoboCop Rogue City", CancellationToken.None));
+
+            var restricted = service.SetStorePreferences(
+                includeKeyshops: false,
+                refreshIntervalMinutes: 60,
+                notificationsEnabled: false);
+            Assert.False(restricted.IncludeKeyshops);
+            Assert.False(restricted.NotificationsEnabled);
+            Assert.Equal(60, restricted.RefreshIntervalMinutes);
+            Assert.Empty(await service.SearchAsync("RoboCop Rogue City", CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void WishlistBulkActionsUpdateManyGamesInOneConsistentSnapshot()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var settings = new StoreSettingsStore(Path.Combine(root, "store.json"));
+            var service = new StoreService(new HttpClient(new RejectingHandler()), settings, () => null);
+            var first = CreateWishlistGame(20m, 40m);
+            var second = CreateWishlistGame(10m, 40m) with
+            {
+                Id = "direct:gog:quality-of-life-game-2",
+                PriceProviderGameId = "direct:gog:quality-of-life-game-2",
+                Title = "Quality of Life Game 2"
+            };
+            service.SetLocalWishlist(first, enabled: true);
+            service.SetLocalWishlist(second, enabled: true);
+
+            var organized = service.ApplyWishlistBulkAction(
+                [first.Id, second.Id],
+                isPinned: true,
+                addTag: "Co-op",
+                removeLocal: false,
+                alertMultiplier: 0.75m,
+                alertCurrencyCode: "EUR");
+
+            Assert.Equal(2, organized.Wishlist.Count);
+            Assert.All(organized.Wishlist, game =>
+            {
+                Assert.True(game.IsPinned);
+                Assert.Contains("Co-op", game.Tags);
+            });
+            Assert.Equal(2, organized.Alerts.Count);
+            Assert.All(organized.Alerts, alert => Assert.True(alert.TargetPrice > 0));
+
+            var removed = service.ApplyWishlistBulkAction(
+                [first.Id, second.Id],
+                isPinned: null,
+                addTag: null,
+                removeLocal: true,
+                alertMultiplier: null,
+                alertCurrencyCode: null);
+            Assert.Empty(removed.Wishlist);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static StoreGameState CreateWishlistGame(decimal price, decimal regularPrice)
+    {
+        var discount = Math.Clamp((int)decimal.Round((regularPrice - price) / regularPrice * 100m), 0, 100);
+        var offer = new StoreOfferState(
+            "GOG",
+            price,
+            regularPrice,
+            price,
+            regularPrice,
+            price,
+            regularPrice,
+            "EUR",
+            discount,
+            "USD",
+            "https://www.gog.com/en/game/quality_of_life_game",
+            "GOG:quality-of-life-game",
+            true);
+        return new StoreGameState(
+            "direct:gog:quality-of-life-game",
+            null,
+            "direct:gog:quality-of-life-game",
+            "Quality of Life Game",
+            "https://images.gog.com/quality.jpg",
+            "https://images.gog.com/quality-wide.jpg",
+            string.Empty,
+            price,
+            regularPrice,
+            price,
+            regularPrice,
+            price,
+            regularPrice,
+            "EUR",
+            discount,
+            "USD",
+            "GOG",
+            offer.DealUrl,
+            null,
+            80m,
+            true,
+            price < regularPrice,
+            string.Empty,
+            [offer])
+        {
+            IsLocallyWishlisted = true
+        };
+    }
+
     private static string CreateTempRoot()
     {
         var root = Path.Combine(Path.GetTempPath(), $"tfs-store-tests-{Guid.NewGuid():N}");
@@ -544,6 +797,23 @@ public sealed class StoreServiceTests
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = content,
+                RequestMessage = request
+            });
+        }
+    }
+
+    private sealed class MissingArtworkHandler : HttpMessageHandler
+    {
+        private int _requestCount;
+        public int RequestCount => _requestCount;
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _requestCount);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
                 RequestMessage = request
             });
         }

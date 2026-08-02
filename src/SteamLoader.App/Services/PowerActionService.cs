@@ -34,6 +34,14 @@ public sealed class PowerActionService
         return new PowerActionResult(_steamClientLaunchService.RestartSteamForSteamTools().Message);
     }
 
+    public PowerActionResult RestartSteamAfterDriverUpdate()
+    {
+        return new PowerActionResult(
+            _steamClientLaunchService
+                .RestartSteamForSteamTools(clearWebCache: false)
+                .Message);
+    }
+
     public PowerActionResult RestartSteamTools()
     {
         ScheduleBackgroundHostRestart();

@@ -95,6 +95,7 @@
     contextActivationHandler: null,
     uninstallRequests: new Set(),
     repairRequests: new Set(),
+    dataRefreshRequests: new Set(),
     omniLibraryStateUnsubscribe: null,
     omniLibraryUninstallNoticeTimer: null,
   };
@@ -1191,7 +1192,7 @@
 
   function removeOmniLibraryUninstallContextRows(root = document) {
     for (const row of root.querySelectorAll(
-      ".steamtools-omnilibrary-uninstall-context-row, .steamtools-omnilibrary-repair-context-row",
+      ".steamtools-omnilibrary-uninstall-context-row, .steamtools-omnilibrary-repair-context-row, .steamtools-omnilibrary-data-context-row",
     )) {
       row.remove();
     }
@@ -1205,7 +1206,7 @@
     document.getElementById(omniLibraryUninstallNoticeId)?.remove();
   }
 
-  function showOmniLibraryUninstallNotice(storeId, errorMessage = "") {
+  function showOmniLibraryUninstallNotice(storeId, errorMessage = "", override = null) {
     removeOmniLibraryUninstallNotice();
 
     const payload = {
@@ -1266,6 +1267,7 @@
     // Last-resort fallback for Steam builds that isolate the context menu from
     // both its opener and BroadcastChannel.
     const failed = Boolean(errorMessage);
+    const isRefreshNotice = override?.kind === "refresh";
     const notice = document.createElement("div");
     notice.id = omniLibraryUninstallNoticeId;
     notice.setAttribute("role", failed ? "alert" : "status");
@@ -1308,16 +1310,18 @@
       "align-items:center",
       "justify-content:center",
       "border-radius:50%",
-      `background:${failed ? "rgba(255,102,117,.16)" : storeId === "xbox-game-pass" ? "rgba(74,181,65,.18)" : "rgba(102,192,244,.16)"}`,
-      `border:1px solid ${failed ? "rgba(255,102,117,.52)" : storeId === "xbox-game-pass" ? "rgba(107,206,95,.48)" : "rgba(102,192,244,.5)"}`,
-      `color:${failed ? "#ff8994" : storeId === "xbox-game-pass" ? "#7bd56f" : "#76c9f6"}`,
+      `background:${failed ? "rgba(255,102,117,.16)" : isRefreshNotice ? "rgba(102,192,244,.16)" : storeId === "xbox-game-pass" ? "rgba(74,181,65,.18)" : "rgba(102,192,244,.16)"}`,
+      `border:1px solid ${failed ? "rgba(255,102,117,.52)" : isRefreshNotice ? "rgba(102,192,244,.5)" : storeId === "xbox-game-pass" ? "rgba(107,206,95,.48)" : "rgba(102,192,244,.5)"}`,
+      `color:${failed ? "#ff8994" : isRefreshNotice ? "#76c9f6" : storeId === "xbox-game-pass" ? "#7bd56f" : "#76c9f6"}`,
       "font-size:17px",
       "font-weight:800",
       "line-height:1",
     ].join(";");
     icon.textContent = failed
       ? "!"
-      : storeId === "xbox-game-pass"
+      : isRefreshNotice
+        ? "\u21bb"
+        : storeId === "xbox-game-pass"
         ? "X"
         : "\u2193";
 
@@ -1327,24 +1331,24 @@
     const title = document.createElement("div");
     title.style.cssText =
       "font-size:14px;font-weight:800;line-height:1.25;letter-spacing:.35px";
-    title.textContent = failed
+    title.textContent = override?.title || (failed
       ? "Uninstall failed"
       : storeId === "xbox-game-pass"
         ? "Continue in Xbox"
         : storeId === "gog-galaxy"
           ? "Uninstalling GOG game"
-          : "Uninstalling Epic game";
+          : "Uninstalling Epic game");
 
     const message = document.createElement("div");
     message.style.cssText =
       "margin-top:4px;color:rgba(215,226,237,.76);font-size:13px;font-weight:500;line-height:1.4";
-    message.textContent = failed
+    message.textContent = override?.message || (failed
       ? errorMessage
       : storeId === "xbox-game-pass"
         ? "Please finish uninstalling this game in the Xbox window."
         : storeId === "gog-galaxy"
           ? "Please wait. Managed installs are removed automatically; GOG Galaxy opens only when it owns the installation."
-          : "Please wait while OmniLibrary uninstalls this game automatically.";
+          : "Please wait while OmniLibrary uninstalls this game automatically.");
 
     content.append(title, message);
     notice.append(accent, icon, content);
@@ -1514,6 +1518,77 @@
         normalizeSteamAppId(candidate) === normalizedAppId)) || null;
   }
 
+  function getManagedOmniLibraryStore(appId) {
+    const normalizedAppId = normalizeSteamAppId(appId);
+    if (!normalizedAppId) {
+      return null;
+    }
+    const snapshot = getOmniLibraryStateStore()?.snapshot;
+    if (snapshot?.pluginEnabled !== true) {
+      return null;
+    }
+    return (snapshot?.stores || []).find((store) =>
+      store?.enabled === true &&
+      (store?.appIds || []).some((candidate) =>
+        normalizeSteamAppId(candidate) === normalizedAppId)) || null;
+  }
+
+  async function requestOmniLibraryDataRefresh(context, storeId) {
+    const appId = normalizeSteamAppId(context?.appId);
+    const requestKey = `${storeId}:${appId}`;
+    if (!appId || !storeId || state.dataRefreshRequests.has(requestKey)) {
+      return;
+    }
+
+    state.dataRefreshRequests.add(requestKey);
+    showOmniLibraryUninstallNotice(storeId, "", {
+      kind: "refresh",
+      title: "Refreshing OmniLibrary data",
+      message: "Rechecking metadata and achievements while missing artwork is repaired in the background.",
+    });
+    try {
+      const [metadataResponse, artworkResponse] = await Promise.all([
+        fetch(
+          `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}`,
+          { method: "POST", cache: "no-store" },
+        ),
+        fetch(`${apiBase}api/unifystore/games/artwork/repair`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ steamAppId: appId }),
+        }),
+      ]);
+      const metadata = await metadataResponse.json().catch(() => null);
+      const artwork = await artworkResponse.json().catch(() => null);
+      if (!metadataResponse.ok) {
+        throw new Error(
+          metadata?.message || `Metadata refresh failed (${metadataResponse.status}).`,
+        );
+      }
+      if (!artworkResponse.ok) {
+        throw new Error(
+          artwork?.message || `Artwork repair failed (${artworkResponse.status}).`,
+        );
+      }
+
+      showOmniLibraryUninstallNotice(storeId, "", {
+        kind: "refresh",
+        title: "OmniLibrary refresh started",
+        message: artwork?.message ||
+          "Metadata and achievements are current. Missing artwork continues in the background.",
+      });
+      publishOmniLibraryLifecycleStatus(appId, "updating");
+    } catch (error) {
+      showOmniLibraryUninstallNotice(
+        storeId,
+        error instanceof Error ? error.message : String(error),
+        { kind: "refresh", title: "OmniLibrary refresh failed" },
+      );
+    } finally {
+      state.dataRefreshRequests.delete(requestKey);
+    }
+  }
+
   function isRepairableOmniLibraryGame(store, appId) {
     const normalizedAppId = normalizeSteamAppId(appId);
     return (
@@ -1664,6 +1739,42 @@
     };
   }
 
+  function createReactOmniLibraryDataMenuItem(template, context, storeId) {
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) {
+        return;
+      }
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      void requestOmniLibraryDataRefresh(context, storeId);
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-omnilibrary-data-refresh",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [
+          templateProps.className,
+          "steamtools-omnilibrary-data-context-row",
+        ].filter(Boolean).join(" "),
+        "data-steamtools-omnilibrary-data-row": "true",
+        "data-steamtools-omnilibrary-app-id": String(
+          normalizeSteamAppId(context?.appId) || "",
+        ),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: "Refresh OmniLibrary Data...",
+      },
+    };
+  }
+
 
   function createReactUninstallMenuItem(template, context, storeId) {
     let lastActivationAt = 0;
@@ -1764,6 +1875,7 @@
     for (let index = items.length - 1; index >= 0; index -= 1) {
       if (
         items[index]?.key === "tfs-change-artwork" ||
+        items[index]?.key === "tfs-omnilibrary-data-refresh" ||
         items[index]?.key === "tfs-omnilibrary-repair" ||
         items[index]?.key === "tfs-omnilibrary-uninstall"
       ) {
@@ -1796,6 +1908,16 @@
     const additions = [];
     if (state.contextMenuEnabled) {
       additions.push(createReactArtworkMenuItem(template, resolvedContext));
+    }
+    const managedStore = getManagedOmniLibraryStore(resolvedContext.appId);
+    if (managedStore) {
+      additions.push(
+        createReactOmniLibraryDataMenuItem(
+          template,
+          resolvedContext,
+          managedStore.id,
+        ),
+      );
     }
     if (installedStore) {
       if (isRepairableOmniLibraryGame(installedStore, resolvedContext.appId)) {
@@ -2532,6 +2654,49 @@
     return row;
   }
 
+  function createOmniLibraryDataContextRow(
+    propertiesRow,
+    menu,
+    context,
+    storeId,
+  ) {
+    const row = propertiesRow.cloneNode(true);
+    sanitizeClonedRow(row);
+    row.classList.add("steamtools-omnilibrary-data-context-row");
+    row.setAttribute("role", propertiesRow.getAttribute("role") || "menuitem");
+    row.setAttribute("tabindex", propertiesRow.getAttribute("tabindex") || "0");
+    row.setAttribute("data-steamtools-omnilibrary-data-row", "true");
+    replaceRowText(row, "Refresh OmniLibrary Data...");
+    let lastActivationAt = 0;
+    const refresh = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) {
+        return;
+      }
+      lastActivationAt = now;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      void requestOmniLibraryDataRefresh(
+        getArtworkContextFromRow(row, menu) || context,
+        storeId,
+      );
+    };
+    row.addEventListener("click", refresh, true);
+    row.addEventListener("keydown", (event) => {
+      if (
+        event.key === "Enter" ||
+        event.key === " " ||
+        event.key === "GamepadA" ||
+        event.code === "Enter" ||
+        event.code === "Space"
+      ) {
+        refresh(event);
+      }
+    }, true);
+    return row;
+  }
+
   function findArtworkContextRow(target) {
     if (!(target instanceof Element)) {
       return null;
@@ -2671,6 +2836,21 @@
       }
 
       const installedStore = getInstalledOmniLibraryStore(menuContext?.appId);
+      const managedStore = getManagedOmniLibraryStore(menuContext?.appId);
+      const dataRow = menu.querySelector(
+        ".steamtools-omnilibrary-data-context-row",
+      );
+      if (!managedStore) {
+        dataRow?.remove();
+      } else if (!dataRow) {
+        const row = createOmniLibraryDataContextRow(
+          propertiesRow,
+          menu,
+          menuContext,
+          managedStore.id,
+        );
+        parent.insertBefore(row, propertiesRow);
+      }
       const repairRow = menu.querySelector(
         ".steamtools-omnilibrary-repair-context-row",
       );
