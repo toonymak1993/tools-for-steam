@@ -61,9 +61,17 @@ internal static class SteamLoaderRuntime
         bool shellBootstrapMode,
         bool startupSplashVisible)
     {
-        // Restoring Explorer is a Shell Mode safety requirement. The splash is
-        // presentation only and must never suppress the Windows shell hand-off.
-        _ = startupSplashVisible;
-        return shellBootstrapMode;
+        // Shell Mode must always restore Explorer, while Xbox/bootstrap modes
+        // need the same monitor whenever this process owns the WPF splash.
+        return shellBootstrapMode || startupSplashVisible;
+    }
+
+    internal static bool ShouldShowStartupSplash(
+        bool consoleBootstrapMode,
+        bool xboxHostedSplash)
+    {
+        // A normal tray/manager/debug launch must never open a splash that has no
+        // console bootstrap to complete. The Xbox host supplies its own splash.
+        return consoleBootstrapMode && !xboxHostedSplash;
     }
 }

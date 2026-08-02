@@ -45,6 +45,95 @@ public sealed class NvidiaDriverUpdateServiceTests
     }
 
     [Fact]
+    public void GameReadyCheckStartInfo_IsDryRunAndCapturesOutput()
+    {
+        const string toolPath = @"C:\Tools for Steam\TinyNvidiaUpdateChecker.exe";
+        const string configPath =
+            @"C:\Tools for Steam\data\system\driver\silent-game-ready.config";
+
+        var startInfo = NvidiaDriverUpdateService.CreateGameReadyCheckStartInfo(
+            toolPath,
+            configPath);
+
+        Assert.False(startInfo.UseShellExecute);
+        Assert.True(startInfo.RedirectStandardOutput);
+        Assert.True(startInfo.RedirectStandardError);
+        Assert.True(startInfo.CreateNoWindow);
+        Assert.Equal(
+            [
+                "--dry-run",
+                "--debug",
+                "--noprompt",
+                $"--config-override={configPath}"
+            ],
+            startInfo.ArgumentList);
+        Assert.DoesNotContain("--confirm-dl", startInfo.ArgumentList);
+    }
+
+    [Fact]
+    public void TrackedSilentGameReadyStartInfo_IsHiddenAndUnattended()
+    {
+        const string toolPath = @"C:\Tools for Steam\TinyNvidiaUpdateChecker.exe";
+        const string configPath =
+            @"C:\Tools for Steam\data\system\driver\silent-game-ready.config";
+
+        var startInfo =
+            NvidiaDriverUpdateService.CreateTrackedSilentGameReadyStartInfo(
+                toolPath,
+                configPath);
+
+        Assert.False(startInfo.UseShellExecute);
+        Assert.True(startInfo.CreateNoWindow);
+        Assert.Equal(
+            [
+                "--quiet",
+                "--noprompt",
+                "--confirm-dl",
+                $"--config-override={configPath}"
+            ],
+            startInfo.ArgumentList);
+        Assert.DoesNotContain("--force-dl", startInfo.ArgumentList);
+    }
+
+    [Fact]
+    public void ParseGameReadyCheckOutput_ReturnsVersionsAndDownloadMetadata()
+    {
+        const string output = """
+                              downloadURL: https://international.download.nvidia.com/Windows/611.20/driver.exe
+                              downloadFileSize:  934 MiB
+                              OfflineGPUVersion: 610.88
+                              OnlineGPUVersion:  611.20
+                              There is a new GPU driver available to download!
+                              """;
+
+        var result =
+            NvidiaDriverUpdateService.ParseGameReadyCheckOutput(output);
+
+        Assert.Equal("610.88", result.InstalledDriverVersion);
+        Assert.Equal("611.20", result.AvailableDriverVersion);
+        Assert.True(result.UpdateAvailable);
+        Assert.Equal(
+            "https://international.download.nvidia.com/Windows/611.20/driver.exe",
+            result.DownloadUrl);
+        Assert.Equal(934L * 1024 * 1024, result.EstimatedDownloadBytes);
+    }
+
+    [Fact]
+    public void ParseGameReadyCheckOutput_RecognizesCurrentDriver()
+    {
+        const string output = """
+                              OfflineGPUVersion: 610.88
+                              OnlineGPUVersion:  610.88
+                              There is no new GPU driver available, you are up to date.
+                              """;
+
+        var result =
+            NvidiaDriverUpdateService.ParseGameReadyCheckOutput(output);
+
+        Assert.False(result.UpdateAvailable);
+    }
+
+    [Fact]
     public void SilentGameReadyConfig_SelectsGameReadyAndDisablesMinimalInstall()
     {
         var document = XDocument.Parse(

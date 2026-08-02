@@ -14,6 +14,21 @@ namespace SteamLoader.App.Infrastructure.StoreSync;
 /// </summary>
 internal static class UnifySteamLauncher
 {
+    internal enum UbisoftAccountLinkState
+    {
+        LinkRequired,
+        Redeemable,
+        Activated,
+        NotEligible,
+    }
+
+    private enum ExternalPublisherOperation
+    {
+        Install,
+        Launch,
+        Uninstall,
+    }
+
     private const string GogManagedInstallMarkerFileName =
         ".tools-for-steam-omnilibrary-gog";
     private const int GogLaunchFallbackThresholdMilliseconds = 3000;
@@ -109,6 +124,11 @@ internal static class UnifySteamLauncher
                 return 1;
             }
 
+            if (ShouldAbortPendingDownloadWorker(storeId, gameId))
+            {
+                return 0;
+            }
+
             using var sleepBlocker =
                 OmniLibraryDownloadSleepBlocker.AcquireForCurrentThread();
             return storeId switch
@@ -136,6 +156,11 @@ internal static class UnifySteamLauncher
                 ShowError(
                     "The OmniLibrary repair target is invalid. Refresh the GOG library and try again.");
                 return 1;
+            }
+
+            if (ShouldAbortPendingDownloadWorker(storeId, gameId))
+            {
+                return 0;
             }
 
             using var sleepBlocker =
@@ -406,6 +431,7 @@ internal static class UnifySteamLauncher
 
             return storeId switch
             {
+                OmniLibraryRomSystemRegistry.StoreId => RunRom(gameId),
                 "xbox-game-pass" => RunXbox(gameId),
                 "epic-games" => RunEpic(gameId),
                 "gog-galaxy" => RunGog(gameId),
@@ -442,6 +468,114 @@ internal static class UnifySteamLauncher
             ShowError($"The OmniLibrary uninstall action failed: {exception.Message}");
             return 1;
         }
+    }
+
+    private static int RunRom(string gameId)
+    {
+        var configuration = LoadStoreSyncConfiguration();
+        if (!configuration.UnifySteam.Stores.TryGetValue(
+                OmniLibraryRomSystemRegistry.StoreId,
+                out var store) ||
+            store?.Enabled != true)
+        {
+            return Fail("The Emulator library is disabled in OmniLibrary.");
+        }
+
+        var game = store.Cache?.Games?.FirstOrDefault(candidate =>
+            candidate is not null &&
+            candidate.Id.Equals(gameId, StringComparison.OrdinalIgnoreCase));
+        if (game is null)
+        {
+            return Fail("This ROM is no longer in the Emulator library. Scan the ROM folder again.");
+        }
+
+        var romPath = !string.IsNullOrWhiteSpace(game.RomPath)
+            ? game.RomPath
+            : game.ExecutablePath;
+        if (string.IsNullOrWhiteSpace(romPath) || !File.Exists(romPath))
+        {
+            return Fail("The ROM file was moved or removed. OmniLibrary will remove the stale entry during its next delta scan.");
+        }
+
+        OmniLibraryRomSystemDescriptor system;
+        try
+        {
+            system = OmniLibraryRomSystemRegistry.GetRequired(game.PlatformId);
+        }
+        catch (InvalidOperationException)
+        {
+            return Fail($"The {game.PlatformTitle} emulator is not supported by this OmniLibrary build.");
+        }
+
+        store.RomSystems.TryGetValue(system.Id, out var systemSettings);
+        var configuredPath = systemSettings?.EmulatorPath ??
+            (system.Id.Equals("psp", StringComparison.OrdinalIgnoreCase)
+                ? store.ToolPath
+                : string.Empty);
+        var emulatorPath = UnifySteamService.ResolveRomEmulatorExecutable(
+            system.Id,
+            configuredPath);
+        if (string.IsNullOrWhiteSpace(emulatorPath))
+        {
+            return Fail(
+                $"{system.EmulatorTitle} was not found. Install it or select {system.EmulatorExecutableName} in OmniLibrary's {system.Title} settings.");
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = emulatorPath,
+            WorkingDirectory = Path.GetDirectoryName(emulatorPath) ?? string.Empty,
+            UseShellExecute = false,
+        };
+        foreach (var argument in BuildRomLaunchArguments(
+                     system.Id,
+                     romPath,
+                     systemSettings?.Fullscreen ?? true))
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var emulatorProcess = Process.Start(startInfo);
+        if (emulatorProcess is null)
+        {
+            return Fail($"{system.EmulatorTitle} could not be started.");
+        }
+
+        // Keep the Steam shortcut's launcher process alive for the complete
+        // emulation session. Steam can then retain its Running state, overlay
+        // ownership and play-time tracking until PPSSPP exits.
+        emulatorProcess.WaitForExit();
+        return emulatorProcess.ExitCode;
+    }
+
+    internal static IReadOnlyList<string> BuildPpssppLaunchArguments(
+        string romPath) =>
+        BuildRomLaunchArguments("psp", romPath, fullscreen: true);
+
+    internal static IReadOnlyList<string> BuildRomLaunchArguments(
+        string systemId,
+        string romPath,
+        bool fullscreen)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(romPath);
+        var fullRomPath = Path.GetFullPath(romPath);
+        return systemId.Trim().ToLowerInvariant() switch
+        {
+            "psp" => fullscreen
+                ? ["--fullscreen", "--pause-menu-exit", fullRomPath]
+                : ["--pause-menu-exit", fullRomPath],
+            "gamecube" => fullscreen
+                ? ["--batch", "--config=Dolphin.Display.Fullscreen=True", "--exec", fullRomPath]
+                : ["--batch", "--exec", fullRomPath],
+            "game-boy-advance" => fullscreen
+                ? ["-f", fullRomPath]
+                : [fullRomPath],
+            "nintendo-64" => fullscreen
+                ? ["--system", "Nintendo 64", "--no-file-prompt", "--fullscreen", fullRomPath]
+                : ["--system", "Nintendo 64", "--no-file-prompt", fullRomPath],
+            _ => throw new InvalidOperationException(
+                $"Unsupported ROM system '{systemId}'."),
+        };
     }
 
     public static int CancelDownload(string target)
@@ -565,6 +699,196 @@ internal static class UnifySteamLauncher
         return true;
     }
 
+    internal static bool TryPrepareManagedDownloadCancellation(
+        string storeId,
+        string gameId,
+        out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty)
+            .Trim()
+            .ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        if (normalizedStoreId is not ("epic-games" or "gog-galaxy") ||
+            !IsSafeLauncherId(normalizedGameId))
+        {
+            message =
+                "Only downloads managed by Tools for Steam can be canceled and cleaned up directly.";
+            return false;
+        }
+
+        var current = UnifySteamDownloadStatusStore.Get(
+            normalizedStoreId,
+            normalizedGameId);
+        if (!StoreSyncService.CanCancelManagedDownload(
+                managedByToolsForSteam: true,
+                current.Status))
+        {
+            message =
+                "This transfer is no longer in a phase that can be canceled.";
+            return false;
+        }
+
+        if (current.WorkerProcessId > 0 &&
+            !TryStopManagedDownloadWorker(current, out var stopError))
+        {
+            message = stopError;
+            return false;
+        }
+
+        // Publish the cancellation intent before waiting for a just-created
+        // worker. AssignDownloadWorkerIfUnclaimed can still attach that process
+        // to this busy state, allowing us to terminate it without PID guessing.
+        UnifySteamDownloadStatusStore.Update(
+            normalizedStoreId,
+            normalizedGameId,
+            "canceling",
+            current.ProgressPercent,
+            "Stopping the transfer before partial-file cleanup.",
+            workerProcessId: 0,
+            downloadedBytes: current.DownloadedBytes,
+            totalBytes: current.TotalBytes,
+            attempt: current.Attempt,
+            gameTitle: current.GameTitle,
+            steamAppId: current.SteamAppId);
+
+        if (current.WorkerProcessId <= 0)
+        {
+            for (var attempt = 0; attempt < 12; attempt++)
+            {
+                Thread.Sleep(100);
+                var claimed = UnifySteamDownloadStatusStore.Get(
+                    normalizedStoreId,
+                    normalizedGameId);
+                if (claimed.WorkerProcessId <= 0)
+                {
+                    continue;
+                }
+
+                if (!TryStopManagedDownloadWorker(
+                        claimed,
+                        out var claimedStopError))
+                {
+                    message = claimedStopError;
+                    return false;
+                }
+
+                break;
+            }
+        }
+
+        var latest = UnifySteamDownloadStatusStore.Get(
+            normalizedStoreId,
+            normalizedGameId);
+        UnifySteamDownloadStatusStore.Update(
+            normalizedStoreId,
+            normalizedGameId,
+            "canceling",
+            latest.ProgressPercent,
+            "The transfer stopped. Removing its partial files.",
+            workerProcessId: 0,
+            downloadedBytes: latest.DownloadedBytes,
+            totalBytes: latest.TotalBytes,
+            attempt: latest.Attempt,
+            gameTitle: latest.GameTitle,
+            steamAppId: latest.SteamAppId);
+        message =
+            $"{GetStoreDisplayName(normalizedStoreId)} download stopped safely.";
+        return true;
+    }
+
+    internal static bool TryStopTrackingDownload(
+        string storeId,
+        string gameId,
+        out string message)
+    {
+        var normalizedStoreId = (storeId ?? string.Empty)
+            .Trim()
+            .ToLowerInvariant();
+        var normalizedGameId = (gameId ?? string.Empty).Trim();
+        if (!IsSafeLauncherId(normalizedGameId))
+        {
+            message = "The Download Center entry is invalid.";
+            return false;
+        }
+
+        var current = UnifySteamDownloadStatusStore.Get(
+            normalizedStoreId,
+            normalizedGameId);
+        if (UnifySteamDownloadStatusStore.IsBusyOperation(current.Status) &&
+            current.WorkerProcessId > 0 &&
+            !TryStopManagedDownloadWorker(current, out var stopError))
+        {
+            message = stopError;
+            return false;
+        }
+
+        WriteTrackingStoppedStatus(
+            normalizedStoreId,
+            normalizedGameId,
+            current);
+
+        // Cover the narrow gap between Process.Start and worker assignment.
+        // The tombstone prevents a worker that has not entered Install yet;
+        // this loop stops one that was already entering at the same moment.
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            Thread.Sleep(100);
+            var latest = UnifySteamDownloadStatusStore.Get(
+                normalizedStoreId,
+                normalizedGameId);
+            if (latest.Status == "tracking-stopped")
+            {
+                continue;
+            }
+
+            if (latest.WorkerProcessId > 0 &&
+                !TryStopManagedDownloadWorker(
+                    latest,
+                    out var lateStopError))
+            {
+                message = lateStopError;
+                return false;
+            }
+
+            WriteTrackingStoppedStatus(
+                normalizedStoreId,
+                normalizedGameId,
+                latest);
+        }
+
+        message =
+            "Tracking stopped. A download owned by another store may continue in that store's app.";
+        return true;
+    }
+
+    private static void WriteTrackingStoppedStatus(
+        string storeId,
+        string gameId,
+        UnifySteamDownloadStatus previous)
+    {
+        UnifySteamDownloadStatusStore.Update(
+            storeId,
+            gameId,
+            "tracking-stopped",
+            previous.ProgressPercent,
+            "Tracking was stopped by the user.",
+            workerProcessId: 0,
+            downloadedBytes: previous.DownloadedBytes,
+            totalBytes: previous.TotalBytes,
+            attempt: previous.Attempt,
+            gameTitle: previous.GameTitle,
+            steamAppId: previous.SteamAppId);
+    }
+
+    internal static bool ShouldAbortPendingDownloadWorker(
+        string storeId,
+        string gameId)
+    {
+        return UnifySteamDownloadStatusStore
+            .Get(storeId, gameId)
+            .Status is "canceling" or "canceled" or "tracking-stopped";
+    }
+
     public static bool TryOpenExternalDownloadManager(
         string storeId,
         string gameId,
@@ -607,16 +931,25 @@ internal static class UnifySteamLauncher
             var game = GetEpicCachedGame(normalizedGameId);
             if (game?.DeliveryProvider == "ea-app")
             {
-                var eaApp = FindEaAppPath();
+                var availability =
+                    EaAppIntegration.GetAvailability(forceRefresh: true);
+                var eaApp = availability.ExecutablePath;
                 if (!string.IsNullOrWhiteSpace(eaApp))
                 {
                     RunVisibleAndWait(eaApp, [], waitForExit: false);
                     message = "EA app opened for this Epic-owned title.";
                     return true;
                 }
+
+                if (TryOpenShellTarget(EaAppIntegration.OfficialDownloadUrl))
+                {
+                    message =
+                        "The official EA app download page opened. Install the EA app, then retry the game handoff.";
+                    return true;
+                }
             }
             else if (game?.DeliveryProvider == "ubisoft-connect" &&
-                     OpenUbisoftConnect(game, installationRequested: true))
+                     OpenUbisoftConnect(game, openProduct: true))
             {
                 message = "Ubisoft Connect opened for this Epic-owned title.";
                 return true;
@@ -698,7 +1031,7 @@ internal static class UnifySteamLauncher
             process.Kill(entireProcessTree: true);
             if (!process.WaitForExit(10000))
             {
-                error = "The download worker did not stop within 10 seconds.";
+            error = "The operation worker did not stop within 10 seconds.";
                 return false;
             }
 
@@ -710,7 +1043,7 @@ internal static class UnifySteamLauncher
         }
         catch (Exception exception)
         {
-            error = $"The download worker could not be paused: {exception.Message}";
+            error = $"The operation worker could not be stopped: {exception.Message}";
             return false;
         }
     }
@@ -737,6 +1070,29 @@ internal static class UnifySteamLauncher
         if (File.Exists(resumePath))
         {
             File.Delete(resumePath);
+        }
+
+        // Finalizing is cancelable as well. If Legendary already committed its
+        // installed record before the worker was stopped, remove only that
+        // record after our contained cleanup so a later retry starts cleanly.
+        var legendary = ResolveLegendaryTool(installWhenMissing: false);
+        if (!string.IsNullOrWhiteSpace(legendary) &&
+            IsEpicGameInstalled(legendary, appName))
+        {
+            var metadataExitCode = RunHiddenAndWait(
+                legendary,
+                [
+                    "-y",
+                    "uninstall",
+                    appName,
+                    "--keep-files",
+                    "--skip-uninstaller",
+                ]);
+            if (metadataExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Epic partial files were removed, but its local installation record could not be cleared.");
+            }
         }
 
         UpdateEpicUninstalledCache(appName);
@@ -817,7 +1173,7 @@ internal static class UnifySteamLauncher
         Directory.Delete(normalizedTarget, recursive: true);
     }
 
-    private static bool TryParseTarget(string target, out string storeId, out string gameId)
+    internal static bool TryParseTarget(string target, out string storeId, out string gameId)
     {
         storeId = string.Empty;
         gameId = string.Empty;
@@ -829,6 +1185,16 @@ internal static class UnifySteamLauncher
 
         storeId = target[..separatorIndex].Trim().ToLowerInvariant();
         gameId = target[(separatorIndex + 1)..].Trim();
+        if (storeId.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var romIdParts = gameId.Split(':');
+            return romIdParts.Length == 2 &&
+                   IsSafeLauncherId(romIdParts[0]) &&
+                   IsSafeLauncherId(romIdParts[1]);
+        }
+
         return IsSafeLauncherId(gameId);
     }
 
@@ -888,14 +1254,14 @@ internal static class UnifySteamLauncher
                 {
                     return OpenExternalPublisherAction(
                         cachedGame,
-                        installationRequested: true);
+                        ExternalPublisherOperation.Install);
                 }
             }
             else if (cachedGame?.RequiresExternalLauncher == true)
             {
                 return OpenExternalPublisherAction(
                     cachedGame,
-                    installationRequested: true);
+                    ExternalPublisherOperation.Install);
             }
 
             if (cachedGame?.IsPreloaded == true)
@@ -1110,7 +1476,7 @@ internal static class UnifySteamLauncher
                     ? OpenEaAppForUninstall(cachedGame)
                     : OpenExternalPublisherAction(
                         cachedGame,
-                        installationRequested: false);
+                        ExternalPublisherOperation.Uninstall);
             }
 
             if (!IsEpicGameInstalled(legendary, appName))
@@ -2256,11 +2622,10 @@ internal static class UnifySteamLauncher
         }
 
         var epicManagedInstall = IsEpicGameInstalled(legendary, appName);
-        if (cachedGame?.DeliveryProvider == "ubisoft-connect" &&
-            !epicManagedInstall &&
+        if (ShouldEnsureUbisoftAccountLink(cachedGame) &&
             !EnsureUbisoftAccountLink(
                 legendary,
-                cachedGame,
+                cachedGame!,
                 out var accountLinkDetail))
         {
             UnifySteamDownloadStatusStore.Update(
@@ -2272,12 +2637,13 @@ internal static class UnifySteamLauncher
             return 0;
         }
 
-        if (cachedGame?.RequiresExternalLauncher == true &&
-            !cachedGame.HasInstallableAsset)
+        if (cachedGame?.RequiresExternalLauncher == true)
         {
             return OpenExternalPublisherAction(
                 cachedGame,
-                installationRequested: !cachedGame.Installed);
+                cachedGame.Installed
+                    ? ExternalPublisherOperation.Launch
+                    : ExternalPublisherOperation.Install);
         }
 
         if (!epicManagedInstall)
@@ -2460,6 +2826,11 @@ internal static class UnifySteamLauncher
                         appName,
                         StringComparison.OrdinalIgnoreCase))
                 : null;
+            if (game is not null)
+            {
+                UnifySteamService.NormalizeEpicDeliveryCapabilities(game);
+            }
+
             if (game?.RequiresExternalLauncher == true &&
                 !string.IsNullOrWhiteSpace(game.RegistryPath))
             {
@@ -2495,40 +2866,73 @@ internal static class UnifySteamLauncher
         detail = string.Empty;
         try
         {
-            var summary = RunHiddenAndCapture(
-                legendary,
-                "activate",
-                "--uplay",
-                "--summary",
-                "--json");
-            using var document = JsonDocument.Parse(
-                string.IsNullOrWhiteSpace(summary) ? "null" : summary);
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            var state = GetUbisoftAccountLinkState(
+                RunHiddenAndCapture(
+                    legendary,
+                    "activate",
+                    "--uplay",
+                    "--summary",
+                    "--json"),
+                game.Id);
+            if (state == UbisoftAccountLinkState.Activated)
+            {
+                return true;
+            }
+
+            if (state == UbisoftAccountLinkState.NotEligible)
             {
                 detail =
-                    "Link Epic with Ubisoft Connect in the browser that just opened. " +
-                    "Then select Download again; OmniLibrary will continue automatically.";
+                    "Epic is linked with Ubisoft Connect, but Ubisoft did not expose this title for activation. " +
+                    "Open Ubisoft Connect and confirm that the same Ubisoft account is linked to Epic.";
                 return false;
             }
 
+            // With no linked account Legendary opens Epic's official Ubisoft-link page.
+            // With a linked account it redeems the outstanding Ubisoft entitlements.
             var exitCode = RunHiddenAndWait(
                 legendary,
                 ["-y", "activate", "--uplay"]);
             if (exitCode != 0)
             {
                 detail =
-                    "Ubisoft could not confirm this Epic entitlement. Open Ubisoft Connect, " +
-                    "finish account linking, then retry.";
+                    "Epic could not start Ubisoft account linking. Check the Epic sign-in and try again.";
                 return false;
             }
 
-            return true;
-        }
-        catch (JsonException)
-        {
+            if (state == UbisoftAccountLinkState.LinkRequired)
+            {
+                detail =
+                    "Complete the Epic-Ubisoft account link in the browser that just opened. " +
+                    "Then select Link Ubisoft again; OmniLibrary will continue with this title.";
+                return false;
+            }
+
+            // Ubisoft's redemption endpoint can be briefly eventually consistent.
+            // Confirm this exact title instead of trusting Legendary's process exit code.
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                if (attempt > 0)
+                {
+                    Thread.Sleep(750);
+                }
+
+                var refreshedState = GetUbisoftAccountLinkState(
+                    RunHiddenAndCapture(
+                        legendary,
+                        "activate",
+                        "--uplay",
+                        "--summary",
+                        "--json"),
+                    game.Id);
+                if (refreshedState == UbisoftAccountLinkState.Activated)
+                {
+                    return true;
+                }
+            }
+
             detail =
-                "Link Epic with Ubisoft Connect in the browser that just opened. " +
-                "Then select Download again; OmniLibrary will continue automatically.";
+                "Epic is linked with Ubisoft Connect, but Ubisoft is still confirming this title. " +
+                "Wait a moment, then select Link Ubisoft again.";
             return false;
         }
         catch (Exception exception)
@@ -2539,31 +2943,176 @@ internal static class UnifySteamLauncher
         }
     }
 
+    internal static bool ShouldEnsureUbisoftAccountLink(
+        UnifySteamGameCacheEntry? game)
+    {
+        return game?.DeliveryProvider == "ubisoft-connect" &&
+               !game.Installed;
+    }
+
+    internal static UbisoftAccountLinkState GetUbisoftAccountLinkState(
+        string? summary,
+        string appName)
+    {
+        if (string.IsNullOrWhiteSpace(summary))
+        {
+            return UbisoftAccountLinkState.LinkRequired;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(summary);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return UbisoftAccountLinkState.LinkRequired;
+            }
+
+            if (ContainsUbisoftActivationEntry(
+                    document.RootElement,
+                    "activated",
+                    appName))
+            {
+                return UbisoftAccountLinkState.Activated;
+            }
+
+            if (ContainsUbisoftActivationEntry(
+                    document.RootElement,
+                    "redeemable",
+                    appName))
+            {
+                return UbisoftAccountLinkState.Redeemable;
+            }
+
+            return UbisoftAccountLinkState.NotEligible;
+        }
+        catch (JsonException)
+        {
+            return UbisoftAccountLinkState.LinkRequired;
+        }
+    }
+
+    private static bool ContainsUbisoftActivationEntry(
+        JsonElement summary,
+        string propertyName,
+        string appName)
+    {
+        if (!summary.TryGetProperty(propertyName, out var entries) ||
+            entries.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        return entries.EnumerateArray().Any(entry =>
+            entry.ValueKind == JsonValueKind.Object &&
+            entry.TryGetProperty("app_name", out var appNameNode) &&
+            appNameNode.ValueKind == JsonValueKind.String &&
+            string.Equals(
+                appNameNode.GetString(),
+                appName,
+                StringComparison.OrdinalIgnoreCase));
+    }
+
     private static int OpenEaAppAction(
         string legendary,
         UnifySteamGameCacheEntry game,
         bool installationRequested)
     {
         const string storeId = "epic-games";
+        var availability =
+            EaAppIntegration.GetAvailability(forceRefresh: true);
+        if (!availability.IsAvailable)
+        {
+            var openedDownloadPage =
+                TryOpenShellTarget(EaAppIntegration.OfficialDownloadUrl);
+            UnifySteamDownloadStatusStore.Update(
+                storeId,
+                game.Id,
+                openedDownloadPage ? "action-required" : "failed",
+                0,
+                openedDownloadPage
+                    ? "Install the EA app from the official page that just opened. " +
+                      "Sign in, then select Link EA again. Your Epic and EA passwords stay inside their official sign-in windows."
+                    : "The EA app is required, but its official download page could not be opened.",
+                workerProcessId: 0,
+                gameTitle: game.Title,
+                steamAppId: game.SteamAppId);
+            return openedDownloadPage ? 0 : 1;
+        }
+
         UnifySteamDownloadStatusStore.Update(
             storeId,
             game.Id,
             "preparing",
             0,
-            "Requesting the Epic-owned game in the EA app.");
-        var exitCode = RunHiddenAndWait(
-            legendary,
-            ["launch", game.Id, "--origin"]);
-        if (exitCode != 0)
+            "Creating a secure, short-lived Epic handoff for the EA app.",
+            gameTitle: game.Title,
+            steamAppId: game.SteamAppId);
+
+        Uri handoffUri;
+        try
+        {
+            var handoffJson = RunHiddenAndCapture(
+                legendary,
+                "launch",
+                game.Id,
+                "--origin",
+                "--json");
+            if (!EaAppIntegration.TryParseHandoffUri(
+                    handoffJson,
+                    game.Id,
+                    out handoffUri))
+            {
+                UnifySteamDownloadStatusStore.Update(
+                    storeId,
+                    game.Id,
+                    "failed",
+                    0,
+                    "Epic could not create the EA account handoff for this title. " +
+                    "Reconnect Epic in OmniLibrary, verify that the game is still owned, and retry.",
+                    workerProcessId: 0,
+                    gameTitle: game.Title,
+                    steamAppId: game.SteamAppId);
+                return 1;
+            }
+        }
+        catch (Exception exception)
         {
             UnifySteamDownloadStatusStore.Update(
                 storeId,
                 game.Id,
                 "failed",
                 0,
-                "Epic could not hand this title to the EA app. " +
-                "Check both account sign-ins and retry.");
+                "Epic could not create the EA account handoff. " +
+                $"Check the Epic connection and retry. ({exception.Message})",
+                workerProcessId: 0,
+                gameTitle: game.Title,
+                steamAppId: game.SteamAppId);
             return 1;
+        }
+
+        // The URI contains a short-lived Epic exchange code. It is handed
+        // directly to Windows and is deliberately never persisted or logged.
+        if (!TryOpenShellTarget(handoffUri.AbsoluteUri))
+        {
+            if (!string.IsNullOrWhiteSpace(availability.ExecutablePath))
+            {
+                RunVisibleAndWait(
+                    availability.ExecutablePath,
+                    [],
+                    waitForExit: false);
+            }
+
+            UnifySteamDownloadStatusStore.Update(
+                storeId,
+                game.Id,
+                "action-required",
+                0,
+                "The EA app is installed, but Windows did not accept its secure Epic link. " +
+                "Repair or reinstall the EA app, then select Link EA again.",
+                workerProcessId: 0,
+                gameTitle: game.Title,
+                steamAppId: game.SteamAppId);
+            return 0;
         }
 
         if (installationRequested || !game.Installed)
@@ -2573,8 +3122,12 @@ internal static class UnifySteamLauncher
                 game.Id,
                 "action-required",
                 0,
-                "Continue installation and any first-time Epic/EA account link in the EA app. " +
-                "OmniLibrary will detect the installed game from its official registry entry.");
+                $"EA app opened for {game.Title}. Sign in with the EA account you want linked to Epic, " +
+                "approve the first-time link if requested, then start or continue installation. " +
+                "Progress remains visible in the EA app; OmniLibrary detects completion from the official EA registry entry.",
+                workerProcessId: 0,
+                gameTitle: game.Title,
+                steamAppId: game.SteamAppId);
             return 0;
         }
 
@@ -2619,33 +3172,47 @@ internal static class UnifySteamLauncher
 
     private static int OpenExternalPublisherAction(
         UnifySteamGameCacheEntry game,
-        bool installationRequested)
+        ExternalPublisherOperation operation)
     {
         var provider = UnifySteamService.GetEpicProviderDisplayName(
             game.DeliveryProvider);
         var opened = game.DeliveryProvider == "ubisoft-connect"
-            ? OpenUbisoftConnect(game, installationRequested)
+            ? OpenUbisoftConnect(
+                game,
+                openProduct: operation != ExternalPublisherOperation.Uninstall)
             : OpenEpicGamesLauncher(game.Id);
-        var status = installationRequested
-            ? "action-required"
-            : "uninstall-action-required";
         if (!opened)
         {
+            if (operation == ExternalPublisherOperation.Launch)
+            {
+                return Fail($"{provider} could not be opened.");
+            }
+
             UnifySteamDownloadStatusStore.Update(
                 "epic-games",
                 game.Id,
-                installationRequested ? "failed" : "uninstall-failed",
+                operation == ExternalPublisherOperation.Install
+                    ? "failed"
+                    : "uninstall-failed",
                 0,
                 $"{provider} could not be opened.");
             return 1;
         }
 
+        if (operation == ExternalPublisherOperation.Launch)
+        {
+            UnifySteamDownloadStatusStore.Clear("epic-games", game.Id);
+            return 0;
+        }
+
         UnifySteamDownloadStatusStore.Update(
             "epic-games",
             game.Id,
-            status,
+            operation == ExternalPublisherOperation.Install
+                ? "action-required"
+                : "uninstall-action-required",
             0,
-            installationRequested
+            operation == ExternalPublisherOperation.Install
                 ? $"Continue installation in {provider}. OmniLibrary will detect the completed installation automatically."
                 : $"Finish uninstalling this game in {provider}. OmniLibrary will detect its removal automatically.");
         return 0;
@@ -2653,9 +3220,9 @@ internal static class UnifySteamLauncher
 
     private static bool OpenUbisoftConnect(
         UnifySteamGameCacheEntry game,
-        bool installationRequested)
+        bool openProduct)
     {
-        if (!installationRequested &&
+        if (openProduct &&
             !string.IsNullOrWhiteSpace(game.ProviderGameId) &&
             TryOpenShellTarget(
                 $"uplay://launch/{Uri.EscapeDataString(game.ProviderGameId)}/0"))
@@ -5490,57 +6057,7 @@ internal static class UnifySteamLauncher
 
     private static string FindEaAppPath()
     {
-        foreach (var (hive, path) in new[]
-                 {
-                     (Registry.LocalMachine, @"SOFTWARE\Electronic Arts\EA Desktop"),
-                     (Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Electronic Arts\EA Desktop"),
-                     (Registry.CurrentUser, @"SOFTWARE\Electronic Arts\EA Desktop"),
-                 })
-        {
-            try
-            {
-                using var key = hive.OpenSubKey(path);
-                var installLocation = key?.GetValue("InstallLocation") as string;
-                if (!string.IsNullOrWhiteSpace(installLocation))
-                {
-                    foreach (var candidate in new[]
-                             {
-                                 Path.Combine(installLocation, "EADesktop.exe"),
-                                 Path.Combine(installLocation, "EA Desktop", "EADesktop.exe"),
-                             })
-                    {
-                        if (File.Exists(candidate))
-                        {
-                            return candidate;
-                        }
-                    }
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        foreach (var root in new[]
-                 {
-                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                 })
-        {
-            foreach (var candidate in new[]
-                     {
-                         Path.Combine(root, "Electronic Arts", "EA Desktop", "EA Desktop", "EADesktop.exe"),
-                         Path.Combine(root, "Electronic Arts", "EA Desktop", "EADesktop.exe"),
-                     })
-            {
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
-        }
-
-        return FindTool("EADesktop.exe", "EADesktop");
+        return EaAppIntegration.GetAvailability().ExecutablePath;
     }
 
     private static string FindUbisoftConnectPath()

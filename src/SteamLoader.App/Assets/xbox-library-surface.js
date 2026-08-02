@@ -1,7 +1,7 @@
 // Tools for Steam - OmniLibrary label on Steam's native game details action.
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 25;
+  const stateVersion = 26;
   const activeDownloadRefreshIntervalMs = 1000;
   const managedGameRefreshIntervalMs = 15000;
   const idleRefreshIntervalMs = 30000;
@@ -531,6 +531,8 @@
         ? "Epic Games"
         : storeId === "gog-galaxy"
           ? "GOG"
+          : storeId === "rom-library"
+            ? "Emulator"
           : "OmniLibrary";
   }
 
@@ -701,7 +703,11 @@
         return;
       }
 
-      const storeTitle = getStoreTitle(game.storeId);
+      const storeTitle =
+        game.requiresExternalLauncher === true &&
+        String(game.providerDisplayName || "").trim()
+          ? String(game.providerDisplayName).trim()
+          : getStoreTitle(game.storeId);
       const detailText = currentStatus === "failed"
         ? `Retry requested. ${storeTitle} is checking the saved files before resuming.`
         : currentStatus === "paused"
@@ -786,16 +792,35 @@
                 : downloadStatus === "canceling"
                   ? "Canceling"
                 : downloadStatus === "action-required"
-                  ? game.storeId === "xbox-game-pass"
+                  ? game.externalAction === "install-client"
+                    ? "Install EA app"
+                    : game.externalAction === "link-account"
+                      ? "Link EA"
+                      : game.externalAction === "continue-provider"
+                        ? "Open EA app"
+                    : game.requiresAccountLink === true &&
+                      /(?:link|account)/i.test(String(game.download?.detailText || ""))
+                      ? game.deliveryProvider === "ea-app"
+                        ? "Link EA"
+                        : "Link Ubisoft"
+                    : game.storeId === "xbox-game-pass"
                     ? "Open Xbox"
                     : game.storeId === "gog-galaxy"
                       ? "Open GOG"
                       : `Open ${String(game.providerDisplayName || "Store")}`
                   : ["failed", "cancel-failed"].includes(downloadStatus)
-                    ? "Retry Download"
+                    ? game.requiresExternalLauncher === true
+                      ? `Retry ${String(game.providerDisplayName || "Store")}`
+                      : "Retry Download"
                     : game.installed && game.updateAvailable === true
                       ? "Update"
-                      : "Download";
+                      : game.externalAction === "install-client"
+                        ? "Install EA app"
+                        : game.externalAction === "link-account"
+                          ? "Link EA"
+                          : game.externalAction === "continue-provider"
+                            ? "Open EA app"
+                            : "Download";
     const managedLabel = state.managedLabels.get(label);
     if (managedLabel && typeof managedLabel === "object") {
       managedLabel.appliedLabel = nextLabel;

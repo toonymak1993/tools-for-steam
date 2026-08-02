@@ -1,10 +1,56 @@
 using SteamLoader.App.Services;
+using SteamLoader.App.Infrastructure.StoreSync;
 using Xunit;
 
 namespace SteamLoader.App.Tests;
 
 public sealed class ExternalGameQuickAccessObservationTests
 {
+    [Fact]
+    public void MissingManagedGame_UsesForegroundWindowMetadata()
+    {
+        var metadata = ExternalGameQuickAccessService.ResolveSessionMetadata(
+            managedGame: null,
+            windowTitle: "Hollow Knight Silksong",
+            processName: "Hollow Knight Silksong",
+            executablePath:
+                @"C:\Program Files\WindowsApps\TeamCherry.HollowKnightSilksong_1.0.30000.0_x64__y4jvztpgccj42\Hollow Knight Silksong.exe");
+
+        Assert.Equal("Hollow Knight Silksong", metadata.GameTitle);
+        Assert.Equal(string.Empty, metadata.StoreId);
+    }
+
+    [Fact]
+    public void ManagedGame_MetadataRemainsPreferredWhenAvailable()
+    {
+        var metadata = ExternalGameQuickAccessService.ResolveSessionMetadata(
+            new StoreSyncManagedGameMatch(
+                "managed-title",
+                "xbox-game-pass",
+                "Hollow Knight: Silksong",
+                @"C:\XboxGames\Hollow Knight- Silksong\Content\Hollow Knight Silksong.exe"),
+            windowTitle: "Hollow Knight Silksong",
+            processName: "Hollow Knight Silksong",
+            executablePath:
+                @"C:\Program Files\WindowsApps\TeamCherry.HollowKnightSilksong_1.0.30000.0_x64__y4jvztpgccj42\Hollow Knight Silksong.exe");
+
+        Assert.Equal("Hollow Knight: Silksong", metadata.GameTitle);
+        Assert.Equal("xbox-game-pass", metadata.StoreId);
+    }
+
+    [Fact]
+    public void MissingManagedGame_FallsBackToExecutableName()
+    {
+        var metadata = ExternalGameQuickAccessService.ResolveSessionMetadata(
+            managedGame: null,
+            windowTitle: "",
+            processName: "",
+            executablePath: @"C:\Games\Example Game.exe");
+
+        Assert.Equal("Example Game", metadata.GameTitle);
+        Assert.Equal(string.Empty, metadata.StoreId);
+    }
+
     [Fact]
     public void FirstOpen_DoesNotReturnWhileGameStillOwnsForeground()
     {

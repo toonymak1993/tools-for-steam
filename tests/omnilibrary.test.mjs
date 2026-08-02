@@ -4,14 +4,14 @@ import test from "node:test";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("OmniLibrary exposes opt-in Xbox, Epic, and GOG stores through one isolated shortcut sync", () => {
+test("OmniLibrary exposes opt-in stores and one local emulation library through one isolated shortcut sync", () => {
   const service = read("src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamService.cs");
   const settings = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncSettingsStore.cs");
   const storeSync = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
   const registry = read("src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryStoreRegistry.cs");
 
   assert.match(service, /OmniLibraryStoreRegistry\.All/);
-  assert.match(registry, /"xbox-game-pass"[\s\S]*"epic-games"[\s\S]*"gog-galaxy"/);
+  assert.match(registry, /"xbox-game-pass"[\s\S]*"epic-games"[\s\S]*"gog-galaxy"[\s\S]*OmniLibraryRomSystemRegistry\.StoreId/);
   assert.match(settings, /OmniLibraryStoreRegistry\.Ids/);
   assert.match(settings, /Enabled = false/);
   assert.match(storeSync, /omniLibraryOnly: true/);
@@ -36,24 +36,110 @@ test("dynamic native tabs, LB/RB, and D-Pad use exactly the enabled store order"
   assert.match(registry, /new\("tfs-xbox-cloud", "Xbox Cloud", "cloud", RequiresCloudSource: true\)/);
   assert.match(registry, /new\("tfs-epic", "Epic", "all"\)/);
   assert.match(registry, /new\("tfs-gog", "GOG", "all"\)/);
+  assert.match(registry, /BuildLibraryTabSummaries\([\s\S]*romSystems/);
+  assert.match(registry, /\$"platform:\{system\.Id\}"/);
+  assert.match(registry, /BuildLibraryTabId\(system\.Id\)/);
   assert.match(tabs, /synchronizeStoreDefinitions\(stores\)/);
   assert.match(tabs, /tabTopology\.buildCanonicalTabOrder/);
   assert.match(tabs, /navigationCursorTabId/);
   assert.match(tabs, /navigationCursorAt/);
   assert.match(tabs, /commitLibraryNavigationTarget/);
   assert.match(tabs, /window\.localStorage\?\.setItem\(activeStoreTabSessionKey/);
-  assert.match(tabs, /const backingRoutes = \["Installed", "AllGames", "DesktopApps"\]/);
+  assert.match(tabs, /const preferredRoutes = \["Installed", "AllGames", "DesktopApps"\]/);
+  assert.match(tabs, /visibleNativeIds/);
+  assert.match(tabs, /chooseDistinctBackingRoute/);
+  assert.match(tabs, /__steamLoaderNativeDesktopTab: templateTab/);
+  assert.match(tabs, /restoreRememberedNativeTabs/);
   assert.match(tabs, /function navigateLibraryByDirection\(direction\)/);
+  assert.match(
+    tabs,
+    /isManagedStoreTabId\(nextTabId\)[\s\S]*navigation\.onShowTab\(nextTabId\)[\s\S]*visibleDestination\.click/,
+    "virtual tabs must use the translated navigation proxy instead of Steam's native DOM click handler",
+  );
   assert.match(tabs, /state\.navigationRuntime\.activeTab = normalizedTabId/);
   assert.match(tabs, /function installLibraryBumperInput\(\)/);
   assert.match(tabs, /function uninstallLibraryBumperInput\(\)/);
   assert.match(tabs, /function activateFocusedLibraryTab\(\)/);
   assert.match(tabs, /function scheduleFocusedLibraryTabActivation\(\)/);
+  assert.match(tabs, /function mountedLibraryTabLayoutNeedsPatch\(\)/);
+  assert.match(
+    tabs,
+    /touchesLibraryTabs && mountedLibraryTabLayoutNeedsPatch\(\)[\s\S]*scheduleXboxTabPatch\(\)/,
+  );
+  assert.match(
+    tabs,
+    /ensureXboxTileObserver\(\);[\s\S]*installLibraryBumperInput\(\);[\s\S]*scheduleXboxTabPatch\(\);/,
+  );
   assert.match(tabs, /document\.addEventListener\("focusin", state\.libraryTabFocusHandler, true\)/);
   assert.match(tabs, /numericButton === 11 \? -1 : numericButton === 12 \? 1 : 0/);
   assert.match(topology, /function buildCanonicalTabOrder/);
   assert.match(topology, /function getAdjacentTabId/);
   assert.match(topology, /function resolveActiveTabId/);
+  assert.match(tabs, /tabs\.length > 128/);
+  assert.match(tabs, /function buildSourceStoreSnapshot\(stores, sourceStoreId, now\)/);
+  assert.match(tabs, /function scheduleLibraryTabReveal\(tabId\)/);
+  assert.doesNotMatch(tabs, /\bpersist\b/);
+  assert.match(tabs, /function recordLibraryRuntimeError\(scope, error\)/);
+  assert.match(tabs, /Library tab render preparation/);
+  assert.match(tabs, /Library navigation follow-up/);
+  assert.match(
+    tabs,
+    /scrollIntoView\(\{ behavior: "auto", block: "nearest", inline: "center" \}\)/,
+  );
+});
+
+test("ROM systems become native platform tabs only when imported games have Steam app ids", () => {
+  const tabs = read("src/SteamLoader.App/Assets/library-tabs.js");
+  const registry = read("src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryStoreRegistry.cs");
+  const systems = read("src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryRomSystemRegistry.cs");
+  const automation = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncAutomationService.cs");
+  const storeSync = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
+
+  assert.match(registry, /system\.GameCount > 0/);
+  assert.match(registry, /system\.AppIds\.Any\(appId => appId != 0\)/);
+  assert.match(systems, /return \$"tfs-emulation-/);
+  assert.match(tabs, /startsWith\("platform:"\)/);
+  assert.match(tabs, /platform\?\.appIds/);
+  assert.match(tabs, /legacyManagedTabIds\.add\(definition\.tabId\)/);
+  assert.match(automation, /watcher\.Error \+= OnWatcherError/);
+  assert.match(automation, /ScheduleWatcherTrigger\("watch-recovery"\)/);
+  assert.match(storeSync, /OmniLibraryRomSystemRegistry\.Supported\.Any/);
+  assert.doesNotMatch(tabs, /state\.tileBadgeCount = activeBadges\.size;\s*refreshEmulatorSystemSurface\(\)/);
+});
+
+test("emulation settings keep global ROM controls above four per-system emulator sections", () => {
+  const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
+  const registry = read("src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryRomSystemRegistry.cs");
+  const api = read("src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs");
+
+  assert.match(popup, /title: localLibrary \? "ROM Root Folder"/);
+  assert.match(popup, /omnilibrary-rom-system-\$\{systemId\}/);
+  assert.match(popup, /`Open \$\{system\.title\} ROM Folder`/);
+  assert.match(popup, /"Start in Fullscreen"/);
+  assert.match(popup, /api\/unifystore\/rom-system\/settings/);
+  assert.match(popup, /api\/unifystore\/rom-system\/open-folder/);
+  assert.match(registry, /"game-boy-advance"[\s\S]*"mGBA\.exe"/);
+  assert.match(registry, /"gamecube"[\s\S]*"Dolphin\.exe"/);
+  assert.match(registry, /"nintendo-64"[\s\S]*"ares\.exe"/);
+  assert.match(registry, /"psp"[\s\S]*"PPSSPPWindows64\.exe"/);
+  assert.match(api, /SetOmniLibraryRomSystemSettings/);
+  assert.match(api, /OpenOmniLibraryRomSystemFolder/);
+});
+
+test("OmniLibrary opens collapsed with distinct service and store icons", () => {
+  const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
+
+  assert.match(popup, /function collapseAllSectionsForRoute/);
+  assert.match(popup, /enteringOmniLibrary[\s\S]*collapseAllSectionsForRoute\(route\)/);
+  assert.match(popup, /isExpandedSection\(xboxSectionKey, false\)/);
+  assert.match(popup, /isExpandedSection\(segmentKey, false\)/);
+  assert.match(popup, /isExpandedSection\(centerKey, false\)/);
+  assert.match(popup, /function OmniLibraryXboxIcon/);
+  assert.match(popup, /function OmniLibraryEpicIcon/);
+  assert.match(popup, /function OmniLibraryGogIcon/);
+  assert.match(popup, /function OmniLibraryEmulationIcon/);
+  assert.match(popup, /function OmniLibraryMetadataIcon/);
+  assert.match(popup, /function OmniLibraryModeIcon/);
 });
 
 test("managed game pages relabel only Steam's original action with download progress", () => {
@@ -98,6 +184,172 @@ test("managed game pages relabel only Steam's original action with download prog
   assert.doesNotMatch(surface, /createElement\("button"\)/);
 });
 
+test("enhanced OmniLibrary game pages feed Steam native stores without replacing its details UI", () => {
+  const host = read("src/SteamLoader.App/Hosting/SteamLoaderBackgroundHost.cs");
+  const api = read("src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs");
+  const service = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryGamePageMetadataService.cs",
+  );
+  const surface = read(
+    "src/SteamLoader.App/Assets/omnilibrary-metadata-surface.js",
+  );
+
+  assert.match(host, /Assets\/omnilibrary-metadata-surface\.js/);
+  assert.match(api, /api\/unifystore\/metadata\/games\//);
+  assert.match(api, /TryNormalizeMetadataUrl/);
+  assert.match(service, /GameInfoLifetime = TimeSpan\.FromDays\(7\)/);
+  assert.match(service, /ActivityLifetime = TimeSpan\.FromHours\(6\)/);
+  assert.match(service, /AchievementDefinitionLifetime = TimeSpan\.FromDays\(7\)/);
+  assert.match(service, /AchievementProgressLifetime = TimeSpan\.FromHours\(6\)/);
+  assert.match(service, /SourceMatchLifetime = TimeSpan\.FromDays\(30\)/);
+  assert.match(service, /UnmatchedSourceMatchLifetime = TimeSpan\.FromHours\(6\)/);
+  assert.match(service, /forceRefresh \|\|[\s\S]*sourceMatchLifetime/);
+  assert.match(service, /displaycatalog\.mp\.microsoft\.com\/v7\.0\/products/);
+  assert.match(service, /metadataSource = "Xbox"/);
+  assert.match(service, /ConcurrentDictionary<string, Lazy<Task<CacheEntry>>>/);
+  assert.match(service, /ComputeContentHash/);
+  assert.match(service, /existing\.ContentHash\.Equals\(entry\.ContentHash/);
+  assert.match(service, /Cached data is kept/);
+  assert.match(service, /TFS never presents Steam achievements as store unlocks/);
+  assert.match(service, /steamcommunity\.com\/stats\/\{steamAppId\}\/achievements/);
+  assert.match(service, /"definitions-only"/);
+  assert.match(surface, /state\.summary\?\.pluginEnabled === true/);
+  assert.match(surface, /isManagedAppId\(appId\)/);
+  assert.match(surface, /library\\\/details/);
+  assert.match(surface, /customimages\\\/\(\\d\+\)/);
+  assert.match(surface, /native OmniLibrary metadata bridge/);
+  assert.match(surface, /function installNativePatches\(\)/);
+  assert.match(surface, /GetDescriptions/);
+  assert.match(surface, /function ensureNativeDescriptions\(appId, snapshot, appData\)/);
+  assert.match(surface, /function metadataAppIdForRequest\(value\)/);
+  assert.match(
+    surface,
+    /Number\(trackedSnapshot\?\.sourceSteamAppId \|\| 0\) !== requestedAppId/,
+  );
+  assert.match(surface, /strSnippet: description/);
+  assert.match(surface, /GetAssociations/);
+  assert.match(surface, /GetAchievements/);
+  assert.match(surface, /GetAppActivity/);
+  assert.match(surface, /webpackChunksteamui/);
+  assert.match(surface, /findDetailsSectionsPrototype/);
+  assert.match(surface, /"GetSections"/);
+  assert.match(surface, /nativeSections\.add\("activity"\)/);
+  assert.match(surface, /nativeSections\.add\("community"\)/);
+  assert.match(surface, /nativeSections\.add\("achievements"\)/);
+  assert.match(surface, /SetCachedDataForApp/);
+  assert.match(surface, /m_mapAppActivity/);
+  assert.match(surface, /m_achievementProgress/);
+  assert.match(surface, /function buildNativeActivity\(appId, snapshot\)/);
+  assert.match(surface, /function buildNativeAchievements\(snapshot\)/);
+  assert.match(surface, /function findAchievementStore\(\)/);
+  assert.match(surface, /"LoadMyAchievements"/);
+  assert.match(surface, /m_mapInflightMyAchievementsRequests/);
+  assert.match(surface, /restoreAchievementStoreState/);
+  assert.match(surface, /function buildNativeCommunityPayload\(appId, snapshot\)/);
+  assert.match(surface, /function buildNativeActivityFeedPayload\(appId, snapshot\)/);
+  assert.match(surface, /window\.steamAjaxRequest/);
+  assert.match(surface, /library\\\/appcommunityfeed/);
+  assert.match(surface, /type: nativeMetadataMessageType/);
+  assert.match(surface, /state\.channel\?\.postMessage/);
+  assert.match(surface, /waitForNativeSnapshot/);
+  assert.match(surface, /snapshotWaiters/);
+  assert.match(surface, /RegisterForAppLifetimeNotifications/);
+  assert.match(surface, /postPlayMinimumMs = 45000/);
+  assert.match(surface, /postPlayThrottleMs = 10 \* 60 \* 1000/);
+  assert.match(surface, /refreshMetadataForApp\(appId\)/);
+  assert.match(surface, /function restoreOriginalState\(\)/);
+  assert.match(surface, /uninstallNativePatches\(\)/);
+  assert.match(surface, /removeLegacySurface\(\)/);
+  assert.doesNotMatch(surface, /appendChild\(/);
+  assert.doesNotMatch(surface, /insertBefore\(/);
+  assert.doesNotMatch(surface, /data-omni-focusable/);
+  assert.doesNotMatch(surface, /steamtools-omni-virtual-focus/);
+  assert.doesNotMatch(surface, /suppressNativeContent/);
+  assert.doesNotMatch(surface, /display:\s*none\s*!important/);
+  assert.doesNotMatch(surface, /document\.addEventListener\("keydown"/);
+  assert.match(surface, /button\.addEventListener\("keydown"/);
+  assert.match(surface, /state\.refreshPending = true/);
+  assert.match(surface, /currentManagedAppId\(\)/);
+  assert.match(surface, /hasNativeDetailTabs\(\)/);
+  assert.doesNotMatch(surface, /addEventListener\("gamepadbuttondown"/);
+  assert.match(surface, /state\.dispose = \(\) =>/);
+});
+
+test("games without verified store achievements show one native-flow English notice", () => {
+  const surface = read(
+    "src/SteamLoader.App/Assets/omnilibrary-metadata-surface.js",
+  );
+
+  assert.match(surface, /function renderAchievementNotice\(\)/);
+  assert.match(
+    surface,
+    /OmniLibrary cannot access verified achievements for this game\./,
+  );
+  assert.match(surface, /Achievements unavailable/);
+  assert.match(surface, /achievementUnavailableDetail\(snapshot\)/);
+  assert.match(surface, /unsupported-rom/);
+  assert.match(surface, /RetroAchievements does not recognize this exact ROM revision/);
+  assert.match(surface, /Retry/);
+  assert.match(surface, /Open RetroAchievements/);
+  assert.match(surface, /insertAdjacentElement\("afterend", notice\)/);
+  assert.match(surface, /insertAdjacentElement\("beforebegin", notice\)/);
+  assert.match(surface, /uninstallDetailsUiTracking\(\)/);
+  assert.doesNotMatch(
+    surface,
+    /strName:\s*"Achievements unavailable"/,
+  );
+});
+
+test("brand-new metadata requests show a focus-safe Steam-like loading state", () => {
+  const surface = read(
+    "src/SteamLoader.App/Assets/omnilibrary-metadata-surface.js",
+  );
+
+  assert.match(surface, /function createLoadingDots\(\)/);
+  assert.match(surface, /OmniLibrary is preparing this game/);
+  assert.match(
+    surface,
+    /Loading metadata and checking for verified achievements\./,
+  );
+  assert.match(surface, /state\.requestInFlight/);
+  assert.match(surface, /scheduleMetadataUiRender\(0\)/);
+  assert.match(surface, /prefers-reduced-motion: reduce/);
+  assert.match(surface, /iterations: Number\.POSITIVE_INFINITY/);
+  assert.doesNotMatch(surface, /tabIndex\s*=/);
+});
+
+test("game-data provider credentials use live drafts and encrypted generic storage", () => {
+  const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
+  const api = read("src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs");
+  const service = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
+  const settings = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncSettingsStore.cs",
+  );
+  const provider = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryAchievementProvider.cs",
+  );
+
+  assert.match(popup, /function getOmniLibraryGameDataDraft\(provider\)/);
+  assert.match(
+    popup,
+    /draft\.credentialDirty\s*\? draft\.credential\.trim\(\)/,
+  );
+  assert.match(popup, /api\/unifystore\/game-data\/providers/);
+  assert.match(popup, /api\/unifystore\/game-data\/providers\/test/);
+  assert.match(popup, /Test \$\{provider\.title\} Connection/);
+  assert.match(popup, /ConnectionCheckedAtUtc|connectionCheckedAtUtc/);
+  assert.match(popup, /"Achievements & Metadata"/);
+  assert.match(api, /TestOmniLibraryGameDataProviderAsync/);
+  assert.match(service, /API_GetUserProfile\.php/);
+  assert.match(settings, /ConnectionStatus/);
+  assert.match(settings, /ConnectionDetail/);
+  assert.match(settings, /ProtectJsonSecret/);
+  assert.match(settings, /gameData["']?\]?\?\[?["']providers|GameData\.Providers/);
+  assert.match(settings, /OpenXblTitleIds/);
+  assert.match(provider, /\/api\/v2\/player\/titleHistory\//);
+  assert.match(provider, /PersistOpenXblTitleId/);
+});
+
 test("Epic downloads resume safely, expose telemetry, and block system sleep", () => {
   const launcher = read("src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamLauncher.cs");
   const downloads = read("src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamDownloadStatusStore.cs");
@@ -124,6 +376,34 @@ test("Epic downloads resume safely, expose telemetry, and block system sleep", (
   assert.match(host, /RunStatusMonitorAsync/);
 });
 
+test("Epic-owned EA games use a validated short-lived handoff and honest provider states", () => {
+  const integration = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/EaAppIntegration.cs",
+  );
+  const launcher = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamLauncher.cs",
+  );
+  const service = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamService.cs",
+  );
+  const models = read("src/SteamLoader.App/Models/UnifySteamSnapshot.cs");
+  const surface = read("src/SteamLoader.App/Assets/xbox-library-surface.js");
+
+  assert.match(integration, /OfficialDownloadUrl = "https:\/\/www\.ea\.com\/ea-app"/);
+  assert.match(integration, /candidate\.Scheme\.Equals\(\s*"link2ea"/s);
+  assert.match(integration, /candidate\.Host\.Equals\(\s*"launchgame"/s);
+  assert.match(integration, /targetAppName\.Equals\(\s*appName\.Trim\(\)/s);
+  assert.match(launcher, /"launch",\s*game\.Id,\s*"--origin",\s*"--json"/s);
+  assert.match(launcher, /EaAppIntegration\.TryParseHandoffUri/);
+  assert.match(launcher, /deliberately never persisted or logged/);
+  assert.doesNotMatch(launcher, /AUTH_PASSWORD/);
+  assert.match(service, /EaAppIntegration\.GetExternalAction/);
+  assert.match(models, /string ExternalAction/);
+  assert.match(surface, /game\.externalAction === "install-client"[\s\S]*"Install EA app"/);
+  assert.match(surface, /game\.externalAction === "link-account"[\s\S]*"Link EA"/);
+  assert.match(surface, /game\.externalAction === "continue-provider"[\s\S]*"Open EA app"/);
+});
+
 test("all managed stores expose durable phases and only terminal failures become Retry", () => {
   const launcher = read("src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamLauncher.cs");
   const downloads = read("src/SteamLoader.App/Infrastructure/StoreSync/UnifySteamDownloadStatusStore.cs");
@@ -139,6 +419,7 @@ test("all managed stores expose durable phases and only terminal failures become
   assert.match(api, /AssignDownloadWorkerIfUnclaimed/);
   assert.match(surface, /\["failed", "cancel-failed"\]\.includes\(downloadStatus\)[\s\S]*"Retry Download"/);
   assert.match(surface, /downloadStatus === "action-required"[\s\S]*"Open Xbox"[\s\S]*"Open GOG"/);
+  assert.match(surface, /game\.requiresAccountLink === true[\s\S]*"Link Ubisoft"/);
 });
 
 test("Download Center unifies concurrent stores with durable controller actions and safe cleanup", () => {
@@ -154,7 +435,7 @@ test("Download Center unifies concurrent stores with durable controller actions 
 
   assert.match(models, /OmniLibraryDownloadCenterSnapshot/);
   assert.match(models, /OmniLibraryDownloadCenterEntry/);
-  assert.match(models, /bool CanPause[\s\S]*bool CanResume[\s\S]*bool CanCancel[\s\S]*bool CanDismiss/);
+  assert.match(models, /string TransferOwner[\s\S]*bool ManagedByToolsForSteam[\s\S]*bool CanPause[\s\S]*bool CanResume[\s\S]*bool CanCancel[\s\S]*bool CanStopTracking[\s\S]*bool CanDismiss/);
   assert.match(
     downloads,
     /IsDownloadCenterStatus[\s\S]*"uninstalling"[\s\S]*"uninstall-action-required"[\s\S]*"uninstall-failed"/,
@@ -176,20 +457,35 @@ test("Download Center unifies concurrent stores with durable controller actions 
   assert.match(api, /case "pause" when entry\.CanPause/);
   assert.match(api, /case "resume" when entry\.CanResume/);
   assert.match(api, /case "cancel" when entry\.CanCancel/);
+  assert.match(api, /TryPrepareManagedDownloadCancellation/);
+  assert.match(api, /case "stop-tracking" when entry\.CanStopTracking/);
+  assert.match(api, /TryStopTrackingDownload/);
   assert.match(api, /case "dismiss" when entry\.CanDismiss/);
   assert.match(api, /case "manage" when entry\.CanManageExternally/);
   assert.match(api, /case "retry-uninstall" when entry\.CanRetryUninstall/);
   assert.match(launcher, /CancelDownloadArgument = "--unifysteam-cancel-download"/);
   assert.match(program, /UnifySteamLauncher\.CancelDownloadArgument/);
   assert.match(launcher, /process\.Kill\(entireProcessTree: true\)/);
+  assert.match(launcher, /ShouldAbortPendingDownloadWorker/);
+  assert.match(launcher, /"tracking-stopped"/);
+  assert.match(launcher, /"--keep-files"/);
+  assert.match(launcher, /"--skip-uninstaller"/);
   assert.match(launcher, /DeleteContainedDownloadDirectory/);
   assert.match(launcher, /normalizedTarget\.StartsWith\([\s\S]*containedPrefix/s);
   assert.match(launcher, /FileAttributes\.ReparsePoint/);
   assert.match(popup, /buildOmniLibraryDownloadCenterSlots/);
-  assert.match(popup, /topSlots:\s*\[\s*\.\.\.downloadCenterSlots/s);
+  assert.match(popup, /topSlots:\s*\[\s*\.\.\.libraryModeSlots,\s*\.\.\.downloadCenterSlots/s);
+  assert.match(popup, /createOmniLibraryIdleDownloadSlot/);
+  assert.match(popup, /"Waiting for download"/);
+  assert.match(popup, /leadingIcon: OmniLibraryDownloadIcon/);
   assert.match(popup, /"Pause Download"/);
   assert.match(popup, /"Resume Download"/);
   assert.match(popup, /"Cancel & Delete Partial Files"/);
+  assert.match(popup, /"Force Stop & Clean Up"/);
+  assert.match(popup, /"Stop Tracking"/);
+  assert.match(popup, /"Cancel All TFS Downloads"/);
+  assert.match(popup, /Managed by \$\{entry\?\.transferOwner/);
+  assert.match(popup, /`Cancel in \$\{transferOwner\}`/);
   assert.match(popup, /"Remove from Download Center"/);
   assert.match(popup, /"Retry Uninstall"/);
   assert.match(popup, /downloadActionKeys/);
@@ -270,7 +566,7 @@ test("OmniLibrary reconciles install and uninstall lifecycle deltas promptly", (
   );
 });
 
-test("disabling OmniLibrary removes its UI, input hooks, and protected API surface", () => {
+test("disabling OmniLibrary removes its owned UI while the shared Tabhero compositor remains independent", () => {
   const tabs = read("src/SteamLoader.App/Assets/library-tabs.js");
   const surface = read("src/SteamLoader.App/Assets/xbox-library-surface.js");
   const artwork = read("src/SteamLoader.App/Assets/artwork-surface.js");
@@ -288,9 +584,12 @@ test("disabling OmniLibrary removes its UI, input hooks, and protected API surfa
   assert.match(tabs, /function disableXboxTileObserver\(\)/);
   assert.match(tabs, /function disableActiveRuntimeTimers\(\)/);
   assert.match(tabs, /state\.pluginEnabled = snapshot\?\.pluginEnabled === true/);
-  assert.match(tabs, /if \(!state\.pluginEnabled \|\| !direction\)/);
+  assert.match(tabs, /if \(!isLibraryTabRuntimeEnabled\(\) \|\| !direction\)/);
   assert.match(tabs, /if \(!runtimeActive\)\s*\{\s*setVirtualActiveTabId\("", true\)/s);
-  assert.match(tabs, /if \(!state\.pluginEnabled \|\| !enabledDefinitions\.length\)/);
+  assert.match(tabs, /function getEnabledStoreDefinitions\(\)\s*\{\s*if \(!state\.pluginEnabled\)/s);
+  assert.match(tabs, /const omniLibraryRuntimeActive =\s*state\.pluginEnabled && getEnabledStoreDefinitions\(\)\.length > 0/);
+  assert.match(tabs, /if \(omniLibraryRuntimeActive\)[\s\S]*scheduleDownloadStateRefresh\(0\)/);
+  assert.match(tabs, /isLibraryTabRuntimeEnabled\(\)[\s\S]*isTabHeroEnabled\(\)/);
   assert.match(tabs, /state\.activationResolved = true/);
   assert.match(tabs, /getNativeNavigationHandler\(props\.onShowTab\)/);
   assert.match(tabs, /backendUnavailable: true/);
@@ -339,6 +638,20 @@ test("OmniLibrary uninstall provides store-specific feedback without taking cont
   assert.doesNotMatch(launcher, /IApplicationActivationManager/);
   assert.doesNotMatch(launcher, /TryActivateXboxProductPage/);
   assert.match(launcher, /TryOpenXboxProductPage\(productId, out _\)/);
+});
+
+test("OmniLibrary achievement getters stay read-only and snapshots apply by revision", () => {
+  const surface = read(
+    "src/SteamLoader.App/Assets/omnilibrary-metadata-surface.js",
+  );
+  const getterPatch = surface.match(
+    /for \(const methodName of \["GetMyAchievements", "GetGlobalAchievements"\]\)([\s\S]*?)\n {4}\}/,
+  )?.[1] || "";
+
+  assert.doesNotMatch(getterPatch, /primeAchievementStores/);
+  assert.match(surface, /achievementPrimedStores: new WeakMap\(\)/);
+  assert.match(surface, /applied\?\.revision === revision/);
+  assert.match(surface, /currentUser === storePayload\.user/);
 });
 
 test("managed stores use one isolated authorization runtime", () => {
@@ -484,7 +797,42 @@ test("OmniLibrary artwork is asynchronous and Steam-public-first with SteamGridD
   assert.match(artwork, /library_hero\.jpg/);
   assert.match(artwork, /logo_2x\.png/);
   assert.match(artwork, /DownloadArtworkSetAsync\(/);
+  assert.match(artwork, /DownloadRetroAchievementsArtworkSetAsync/);
+  assert.match(artwork, /API_GetGame\.php/);
+  assert.match(artwork, /ImageBoxArt/);
+  assert.match(artwork, /ImageIngame/);
+  assert.match(artwork, /ImageIcon/);
+  assert.match(artwork, /HasCompleteArtworkSet/);
+  assert.match(artwork, /GenerateTitleLogo/);
+  assert.match(artwork, /previous run may already have every real primary image/i);
+  assert.match(artwork, /MaximumArtworkBytes = 32L \* 1024 \* 1024/);
+  assert.match(artwork, /CopyArtworkWithLimitAsync/);
+  assert.match(artwork, /IsUsableArtworkFile/);
+  assert.match(artwork, /File\.Move\(stagingPath, targetPath, overwrite: true\)/);
+  assert.match(artwork, /IsRetroAchievementsHost/);
+  assert.match(artwork, /RetroAchievementsGameId/);
   assert.match(artwork, /Deliberately sequential/);
+});
+
+test("RetroAchievements hashing is deduplicated, bounded, and cancellation-safe", () => {
+  const hasher = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/ManagedRetroAchievementsHasher.cs",
+  );
+  const source = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryRetroAchievementsSource.cs",
+  );
+  const service = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs",
+  );
+
+  assert.match(hasher, /HashCache/);
+  assert.match(hasher, /HashGate/);
+  assert.match(hasher, /MaximumCachedHashes = 2048/);
+  assert.match(hasher, /MaximumArchiveBytes/);
+  assert.match(hasher, /CopyToWithLimitAsync/);
+  assert.match(hasher, /catch \(OperationCanceledException\)[\s\S]*TryKill\(process\)/);
+  assert.match(source, /internal static bool TryResolveCachedHashMapping/);
+  assert.match(service, /ResolveRetroAchievementsArtworkGameId/);
 });
 
 test("differential five-minute checks cover every enabled store with isolated backoff", () => {
@@ -536,7 +884,11 @@ test("Xbox sources are independent and cloud-only games stream without entering 
   assert.match(service, /LoadXboxSiglProductIds/);
   assert.match(service, /LoadXboxPcGamePassProductIds/);
   assert.match(service, /LoadXboxCloudProductIds/);
-  assert.match(service, /XboxCatalogShapeVersion = "xbox-catalog-v2-console-cloud"/);
+  assert.match(
+    service,
+    /XboxCatalogShapeVersion =\s*"xbox-catalog-v3-console-cloud-title-id"/,
+  );
+  assert.match(service, /ResolveXboxTitleId\(product\)/);
   assert.match(service, /IsXboxConsoleCatalogProduct\(product\)/);
   assert.match(service, /GroupBy\(\s*candidate => NormalizeGameTitleKey\(candidate\.Game\.Title\)/s);
   assert.match(service, /ResolveXboxHeroUrl\(localized\)/);
@@ -572,11 +924,11 @@ test("OmniLibrary repairs only missing artwork and keeps store catalog images as
   const settings = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncSettingsStore.cs");
 
   assert.match(storeSync, /BuildIncompleteOmniLibraryArtworkTargets/);
-  assert.match(storeSync, /!SteamGridDbArtworkDownloader\.HasPrimaryArtworkSet\(/);
+  assert.match(storeSync, /!SteamGridDbArtworkDownloader\.HasCompleteArtworkSet\(/);
   assert.match(storeSync, /analysisTargets\s*\.Concat\(cachedRepairTargets\)/s);
   assert.match(storeSync, /Artwork is optional cache data and must never hide Xbox/);
   assert.match(storeSync, /MarkOmniLibraryArtworkRepairPending/);
-  assert.match(storeSync, /GetMissingPrimaryArtworkSlots/);
+  assert.match(storeSync, /GetMissingArtworkSlots/);
   assert.match(storeSync, /optional artwork remains incomplete/);
   assert.match(settings, /OmniLibrarySettingsVersion < 2/);
   assert.match(settings, /wasBlockedOnlyByArtwork/);
@@ -584,4 +936,19 @@ test("OmniLibrary repairs only missing artwork and keeps store catalog images as
   assert.match(artwork, /\[gridId\] = wideFallbackUrl/);
   assert.match(artwork, /\[\$"\{gridId\}p"\] = portraitFallbackUrl/);
   assert.match(artwork, /PromoteStoreFallbackArtwork/);
+});
+
+test("managed OmniLibrary games expose one controller-safe metadata and artwork refresh", () => {
+  const surface = read("src/SteamLoader.App/Assets/artwork-surface.js");
+  const api = read("src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs");
+  const service = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
+
+  assert.match(surface, /Refresh OmniLibrary Data\.\.\./);
+  assert.match(surface, /api\/unifystore\/games\/artwork\/repair/);
+  assert.match(surface, /api\/unifystore\/metadata\/games/);
+  assert.match(surface, /kind: "refresh"/);
+  assert.match(surface, /publishOmniLibraryLifecycleStatus\(appId, "updating"\)/);
+  assert.match(api, /RepairOmniLibraryGameArtwork/);
+  assert.match(service, /OmniLibraryGameArtworkRepairResult/);
+  assert.match(service, /GetMissingArtworkSlots/);
 });

@@ -18,6 +18,7 @@ internal static class ManagedLegendaryHelper
         "ec1ad2d19d44e07b2b0330191c300979f102c509f2a889708099f453c5188f20";
 
     private static readonly object InstallGate = new();
+    internal static readonly SemaphoreSlim CredentialGate = new(1, 1);
     private static readonly HttpClient HttpClient = new()
     {
         Timeout = TimeSpan.FromMinutes(3),
@@ -115,99 +116,115 @@ internal static class ManagedLegendaryHelper
             throw new InvalidOperationException("Epic did not return an authorization code.");
         }
 
-        var toolPath = EnsureInstalled();
-        var startInfo = new ProcessStartInfo
+        CredentialGate.Wait();
+        try
         {
-            FileName = toolPath,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden,
-        };
-        startInfo.ArgumentList.Add("auth");
-        startInfo.ArgumentList.Add("--code");
-        startInfo.ArgumentList.Add(authorizationCode.Trim());
-        ConfigureEnvironment(startInfo);
-
-        using var process = new Process
-        {
-            StartInfo = startInfo,
-        };
-        process.Start();
-        var outputTask = process.StandardOutput.ReadToEndAsync();
-        var errorTask = process.StandardError.ReadToEndAsync();
-        process.WaitForExit(120000);
-        if (!process.HasExited)
-        {
-            try
+            var toolPath = EnsureInstalled();
+            var startInfo = new ProcessStartInfo
             {
-                process.Kill(entireProcessTree: true);
-            }
-            catch
+                FileName = toolPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+            };
+            startInfo.ArgumentList.Add("auth");
+            startInfo.ArgumentList.Add("--code");
+            startInfo.ArgumentList.Add(authorizationCode.Trim());
+            ConfigureEnvironment(startInfo);
+
+            using var process = new Process
             {
+                StartInfo = startInfo,
+            };
+            process.Start();
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            process.WaitForExit(120000);
+            if (!process.HasExited)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                }
+
+                throw new InvalidOperationException("Epic sign-in timed out.");
             }
 
-            throw new InvalidOperationException("Epic sign-in timed out.");
-        }
+            Task.WaitAll(outputTask, errorTask);
+            if (process.ExitCode != 0)
+            {
+                var message = new[] { errorTask.Result, outputTask.Result }
+                    .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
+                    ?.Trim();
+                throw new InvalidOperationException(
+                    string.IsNullOrWhiteSpace(message) ? "Epic sign-in failed." : message);
+            }
 
-        Task.WaitAll(outputTask, errorTask);
-        if (process.ExitCode != 0)
+            return toolPath;
+        }
+        finally
         {
-            var message = new[] { errorTask.Result, outputTask.Result }
-                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
-                ?.Trim();
-            throw new InvalidOperationException(
-                string.IsNullOrWhiteSpace(message) ? "Epic sign-in failed." : message);
+            CredentialGate.Release();
         }
-
-        return toolPath;
     }
 
     public static void ClearAuthentication()
     {
-        var toolPath = ResolveExistingToolPath(null);
-        if (!string.IsNullOrWhiteSpace(toolPath))
-        {
-            try
-            {
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = toolPath,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = false,
-                    RedirectStandardError = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden,
-                };
-                startInfo.ArgumentList.Add("auth");
-                startInfo.ArgumentList.Add("--delete");
-                ConfigureEnvironment(startInfo);
-                using var process = Process.Start(startInfo);
-                if (process is not null && !process.WaitForExit(60000))
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-                // Local credential deletion below is still mandatory even if the
-                // helper cannot revoke the session remotely.
-            }
-        }
-
+        CredentialGate.Wait();
         try
         {
-            if (File.Exists(UserDataPath))
+            var toolPath = ResolveExistingToolPath(null);
+            if (!string.IsNullOrWhiteSpace(toolPath))
             {
-                File.Delete(UserDataPath);
+                try
+                {
+                    var startInfo = new ProcessStartInfo
+                    {
+                        FileName = toolPath,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = false,
+                        RedirectStandardError = false,
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                    };
+                    startInfo.ArgumentList.Add("auth");
+                    startInfo.ArgumentList.Add("--delete");
+                    ConfigureEnvironment(startInfo);
+                    using var process = Process.Start(startInfo);
+                    if (process is not null && !process.WaitForExit(60000))
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                }
+                catch
+                {
+                    // Local credential deletion below is still mandatory even if the
+                    // helper cannot revoke the session remotely.
+                }
+            }
+
+            try
+            {
+                if (File.Exists(UserDataPath))
+                {
+                    File.Delete(UserDataPath);
+                }
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidOperationException(
+                    "Epic credentials are still in use. Close the Epic sign-in window and try again.",
+                    exception);
             }
         }
-        catch (Exception exception)
+        finally
         {
-            throw new InvalidOperationException(
-                "Epic credentials are still in use. Close the Epic sign-in window and try again.",
-                exception);
+            CredentialGate.Release();
         }
     }
 

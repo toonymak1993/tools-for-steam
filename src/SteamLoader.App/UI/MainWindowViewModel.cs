@@ -1,9 +1,11 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using SteamLoader.App;
 using SteamLoader.App.Hosting;
+using SteamLoader.App.Infrastructure.Handheld;
 using SteamLoader.App.Infrastructure.Settings;
 using SteamLoader.App.Infrastructure.Steam;
 using SteamLoader.App.Models;
@@ -14,10 +16,9 @@ namespace SteamLoader.App.UI;
 
 public sealed class MainWindowViewModel : BindableBase
 {
-    private const int BigPictureVisibleWindowsShellHandOffDelaySeconds = 3;
-    private const int RequiredStableShellHandOffPollsWithSteamSignal = 2;
-    private const int RequiredStableShellHandOffPollsWithoutSteamSignal = 4;
     private const int ShowWindowRestore = 9;
+    private static readonly TimeSpan StartupFallbackObservationInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan StartupActionControllerPollInterval = TimeSpan.FromMilliseconds(150);
 
     private readonly SteamLoaderProcessManager _processManager;
     private readonly WindowsAutostartService _autostartService;
@@ -30,6 +31,10 @@ public sealed class MainWindowViewModel : BindableBase
     private readonly bool _shellBootstrapMode;
     private readonly bool _consoleStartupMode;
     private readonly bool _runStartupSyncOnInitialize;
+    private readonly SteamStartupEnvironmentProbe _steamEnvironmentProbe;
+    private readonly SteamStartupTimingPolicy _startupTimingPolicy;
+    private readonly SteamSplashStartupCoordinator? _splashStartupCoordinator;
+    private readonly DateTimeOffset _startupTimelineStartedAt = DateTimeOffset.UtcNow;
     private bool _isBusy;
     private bool _isRunning;
     private bool _autostartEnabled;
@@ -38,14 +43,13 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _showStartupSplash;
     private bool _showFirstRunSetup;
     private bool _windowsShellStarted;
-    // Fixed head start before the console-mode splash is taken down and the
-    // session is handed back to Windows (Steam keeps loading behind it).
-    private static readonly TimeSpan SplashHandOffDelay = TimeSpan.FromSeconds(10);
-
     private Task? _shellBootstrapMonitorTask;
     private SteamLoaderHostStatus? _lastKnownStatus;
-    private int _stableBigPictureVisiblePollCount;
-    private int _stableSteamSignalPollCount;
+    private string _lastStartupTimelineState = string.Empty;
+    private ushort _previousSplashControllerButtons;
+    private bool _manualSplashRecoveryUsed;
+    private bool _showSplashRecoveryActions;
+    private bool _canRestartSteamFromSplash;
     private string _serviceStateText = "Checking background host...";
     private string _serviceDetailText = "Tools for Steam is reading the current runtime status.";
     private string _steamStateText = "Waiting for status...";
@@ -90,6 +94,13 @@ public sealed class MainWindowViewModel : BindableBase
         _shellBootstrapMode = shellBootstrapMode;
         _consoleStartupMode = consoleStartupMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
+        _steamEnvironmentProbe = new SteamStartupEnvironmentProbe(
+            steamInstallationService.ResolveSteamRootPath());
+        var isHandheld = HandheldDeviceCatalog.IsSupported(HandheldDeviceCatalog.Detect());
+        _startupTimingPolicy = new SteamStartupHistoryStore().GetTimingPolicy(isHandheld);
+        _splashStartupCoordinator = consoleStartupMode
+            ? new SteamSplashStartupCoordinator(_startupTimingPolicy, DateTimeOffset.UtcNow)
+            : null;
         ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
         _showStartupSplash = consoleStartupMode;
         if (consoleStartupMode)
@@ -113,6 +124,11 @@ public sealed class MainWindowViewModel : BindableBase
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, () => !IsBusy);
         InstallUpdateCommand = new AsyncRelayCommand(InstallUpdateAsync, () => !IsBusy && _updateSnapshot?.CanInstall == true);
         ExportSupportBundleCommand = new AsyncRelayCommand(ExportSupportBundleAsync, () => !IsBusy);
+        ContinueWaitingFromSplashCommand = new RelayCommand(ContinueWaitingFromSplash);
+        RestartSteamFromSplashCommand = new AsyncRelayCommand(
+            RestartSteamFromSplashAsync,
+            () => CanRestartSteamFromSplash && !_manualSplashRecoveryUsed);
+        OpenDesktopFromSplashCommand = new RelayCommand(OpenDesktopFromSplash);
     }
 
     public string InstallPath => _processManager.WorkingDirectory.TrimEnd(Path.DirectorySeparatorChar);
@@ -291,6 +307,38 @@ public sealed class MainWindowViewModel : BindableBase
         private set => SetProperty(ref _splashDebugText, value);
     }
 
+    public bool ShowSplashRecoveryActions
+    {
+        get => _showSplashRecoveryActions;
+        private set => SetProperty(ref _showSplashRecoveryActions, value);
+    }
+
+    public bool CanRestartSteamFromSplash
+    {
+        get => _canRestartSteamFromSplash;
+        private set
+        {
+            if (SetProperty(ref _canRestartSteamFromSplash, value))
+            {
+                RestartSteamFromSplashCommand?.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string SplashHeadlineText => IsGermanUi
+        ? "Steam wird vorbereitet"
+        : "Preparing Steam";
+
+    public string SplashContinueLabel => IsGermanUi ? "A  Weiter warten" : "A  Keep waiting";
+
+    public string SplashRestartLabel => IsGermanUi ? "X  Steam neu starten" : "X  Restart Steam";
+
+    public string SplashDesktopLabel => IsGermanUi ? "Y  Desktop öffnen" : "Y  Open desktop";
+
+    public string SplashRecoveryHeadline => IsGermanUi
+        ? "Steam braucht länger als gewöhnlich"
+        : "Steam is taking longer than usual";
+
     public int WindowsShellStartDelaySeconds
     {
         get => _windowsShellStartDelaySeconds;
@@ -338,6 +386,12 @@ public sealed class MainWindowViewModel : BindableBase
     public AsyncRelayCommand InstallUpdateCommand { get; }
 
     public AsyncRelayCommand ExportSupportBundleCommand { get; }
+
+    public RelayCommand ContinueWaitingFromSplashCommand { get; }
+
+    public AsyncRelayCommand RestartSteamFromSplashCommand { get; }
+
+    public RelayCommand OpenDesktopFromSplashCommand { get; }
 
     public async Task InitializeAsync()
     {
@@ -723,6 +777,7 @@ public sealed class MainWindowViewModel : BindableBase
         CheckForUpdatesCommand.RaiseCanExecuteChanged();
         InstallUpdateCommand.RaiseCanExecuteChanged();
         ExportSupportBundleCommand.RaiseCanExecuteChanged();
+        RestartSteamFromSplashCommand.RaiseCanExecuteChanged();
     }
 
     private static string BuildSetupChecklistText(SteamLoaderHostStatus? status)
@@ -782,112 +837,312 @@ public sealed class MainWindowViewModel : BindableBase
 
     private async Task MonitorShellBootstrapAsync()
     {
-        // Simple, predictable hand-off: give Steam a fixed head start, then take
-        // the splash down and hand the session back to Windows. No Big Picture
-        // window/title detection - Steam keeps loading behind the scenes either
-        // way, and the old detection was locale-fragile and could hang the splash.
-        await Task.Delay(SplashHandOffDelay);
-
-        // Clear the splash WITHOUT the fade: fading it out briefly reveals the
-        // manager UI underneath it. Clearing the flag directly triggers the
-        // window's hide-to-tray, so the manager UI never appears in console mode -
-        // Tools for Steam just runs in the background.
-        ShowStartupSplash = false;
-        ShowFirstRunSetup = false;
-
-        TryFocusSteamWindow();
-        CompleteShellBootstrap();
-    }
-
-    private ShellHandOffReadiness CaptureShellHandOffReadiness()
-    {
-        var bigPictureVisible = IsSteamBigPictureWindowVisible();
-        var quickAccessAttached = _lastKnownStatus?.QuickAccessAttached == true;
-        var sharedContextAttached = _lastKnownStatus?.SharedContextAttached == true;
-        var steamSignalReady = quickAccessAttached || sharedContextAttached;
-
-        if (!bigPictureVisible)
-        {
-            _stableBigPictureVisiblePollCount = 0;
-            _stableSteamSignalPollCount = 0;
-            return new ShellHandOffReadiness(
-                BigPictureVisible: false,
-                SteamSignalReady: false,
-                WindowsShellHandOffReady: false);
-        }
-
-        _stableBigPictureVisiblePollCount += 1;
-        _stableSteamSignalPollCount = steamSignalReady
-            ? _stableSteamSignalPollCount + 1
-            : 0;
-
-        var windowsShellHandOffReady =
-            _stableSteamSignalPollCount >= RequiredStableShellHandOffPollsWithSteamSignal ||
-            _stableBigPictureVisiblePollCount >= RequiredStableShellHandOffPollsWithoutSteamSignal;
-
-        return new ShellHandOffReadiness(
-            BigPictureVisible: true,
-            SteamSignalReady: steamSignalReady,
-            WindowsShellHandOffReady: windowsShellHandOffReady);
-    }
-
-    private static bool IsBigPictureWindowTitle(string? title)
-    {
-        if (string.IsNullOrWhiteSpace(title))
-        {
-            return false;
-        }
-
-        // Steam titles the Gamepad UI window "Big-Picture" (with a hyphen), and
-        // localized builds add suffixes (e.g. German "Big-Picture-Modus"). The
-        // old space-only check ("Big Picture") never matched those, which left
-        // startup stuck at "waiting for the Big Picture window" even though Big
-        // Picture was already up. Normalise the separators so all variants match.
-        return title.Replace('-', ' ').Contains("Big Picture", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsSteamBigPictureWindowVisible()
-    {
-        var processes = Process.GetProcessesByName("steamwebhelper");
         try
         {
-            foreach (var process in processes)
+            await MonitorShellBootstrapCoreAsync();
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write(
+                $"startup splash monitor failed safely: {exception.GetType().Name}: {exception.Message}");
+            ErrorText = exception.Message;
+            ServiceStateText = IsGermanUi
+                ? "Steam-Start konnte nicht weiter geprüft werden"
+                : "Steam startup could not be monitored further";
+            ServiceDetailText = IsGermanUi
+                ? "Der Windows-Desktop wird sicher gestartet. Steam wird nicht automatisch beendet."
+                : "The Windows desktop will open safely. Steam will not be terminated automatically.";
+            CompleteStartupSplashHandOff(steamReady: false);
+        }
+    }
+
+    private async Task MonitorShellBootstrapCoreAsync()
+    {
+        if (_splashStartupCoordinator is null)
+        {
+            CompleteShellBootstrap();
+            return;
+        }
+
+        using var signalWatcher = new SteamStartupSignalWatcher();
+        while (!_windowsShellStarted)
+        {
+            var status = await _processManager.GetStatusAsync();
+            var runtime = _steamEnvironmentProbe.Capture();
+            _lastKnownStatus = status;
+            ApplyShellBootstrapStatus(status, runtime);
+
+            var stage = status?.SteamStartupStage ?? SteamClientStartupStage.Starting;
+            var uiState = status?.SteamUiState ?? SteamUiState.Starting;
+            var decision = _splashStartupCoordinator.Observe(
+                DateTimeOffset.UtcNow,
+                runtime,
+                stage,
+                uiState,
+                hostAvailable: status is not null,
+                hostSteamSignalReady: status?.QuickAccessAttached == true ||
+                    status?.SharedContextAttached == true);
+            ApplySplashDecision(decision, status, runtime, uiState);
+
+            switch (decision.Action)
             {
-                try
-                {
-                    if (!process.HasExited &&
-                        process.MainWindowHandle != IntPtr.Zero &&
-                        IsBigPictureWindowTitle(process.MainWindowTitle))
+                case SteamSplashNextAction.FocusSteam:
+                    TryFocusSteamWindow(runtime.Windows.PreferredWindowHandle);
+                    break;
+
+                case SteamSplashNextAction.CompleteWithSteam:
+                    SteamStartupDiagnostics.Write("splash hand-off confirmed from stable Steam UI and foreground signals");
+                    if (!await WaitBeforeWindowsShellHandoffAsync())
                     {
-                        return true;
+                        break;
                     }
-                }
-                catch
-                {
-                }
+
+                    CompleteStartupSplashHandOff(steamReady: true);
+                    return;
+
+                case SteamSplashNextAction.CompleteWithDesktop:
+                    SteamStartupDiagnostics.Write($"splash hand-off selected safe desktop fallback: {decision.Detail}");
+                    CompleteStartupSplashHandOff(steamReady: false);
+                    return;
             }
 
-            return false;
+            await WaitForStartupSignalOrControllerAsync(signalWatcher);
         }
-        finally
+    }
+
+    private void ApplySplashDecision(
+        SteamSplashDecision decision,
+        SteamLoaderHostStatus? status,
+        SteamRuntimeObservation runtime,
+        SteamUiState uiState)
+    {
+        ShowSplashRecoveryActions = decision.ShowRecoveryActions;
+        CanRestartSteamFromSplash = decision.CanRestartSteam && !_manualSplashRecoveryUsed;
+
+        ServiceStateText = status?.SteamStartupStage switch
         {
-            foreach (var process in processes)
+            SteamClientStartupStage.Updating => IsGermanUi ? "Steam wird aktualisiert" : "Steam is updating",
+            SteamClientStartupStage.Protected => IsGermanUi ? "Steam-Aktivität geschützt" : "Steam activity protected",
+            SteamClientStartupStage.Recovering => IsGermanUi ? "Steam wird einmal neu gestartet" : "Restarting Steam once",
+            SteamClientStartupStage.Failed => IsGermanUi ? "Steam benötigt Aufmerksamkeit" : "Steam needs attention",
+            SteamClientStartupStage.Ready => IsGermanUi ? "Steam ist bereit" : "Steam is ready",
+            _ => IsGermanUi ? "Steam wird gestartet" : "Starting Steam"
+        };
+        ServiceDetailText = decision.ShowRecoveryActions
+            ? decision.Detail
+            : status?.ServiceMessage ?? decision.Detail;
+        SteamStateText = BuildSplashRuntimeState(runtime, uiState, decision.Detail);
+
+        var transitionState = string.Join(
+            ':',
+            status?.SteamStartupStage ?? SteamClientStartupStage.Starting,
+            uiState,
+            runtime.SteamRunning,
+            runtime.WebHelperRunning,
+            runtime.Windows.HasVisibleSteamWindow,
+            runtime.Windows.IsSteamForeground,
+            decision.Action);
+        if (!string.Equals(transitionState, _lastStartupTimelineState, StringComparison.Ordinal))
+        {
+            _lastStartupTimelineState = transitionState;
+            var elapsed = DateTimeOffset.UtcNow - _startupTimelineStartedAt;
+            SteamStartupDiagnostics.Write(
+                $"timeline +{elapsed.TotalSeconds:F1}s state={transitionState} detail={decision.Detail}");
+        }
+    }
+
+    private static string BuildSplashRuntimeState(
+        SteamRuntimeObservation runtime,
+        SteamUiState uiState,
+        string fallback)
+    {
+        if (uiState == SteamUiState.Login)
+        {
+            return IsGermanUi
+                ? "Steam wartet auf eine Anmeldung. Öffne bei Bedarf den Desktop."
+                : "Steam is waiting for sign-in. Open the desktop if needed.";
+        }
+
+        if (uiState == SteamUiState.Offline)
+        {
+            return IsGermanUi
+                ? "Steam zeigt einen Offline- oder Netzwerkdialog."
+                : "Steam is showing an offline or network dialog.";
+        }
+
+        if (uiState == SteamUiState.Error || runtime.ErrorReporterRunning)
+        {
+            return IsGermanUi
+                ? "Steam hat einen Fehler gemeldet; automatische Neustarts bleiben begrenzt."
+                : "Steam reported an error; automatic restarts remain limited.";
+        }
+
+        if (runtime.UpdateInProgress || uiState == SteamUiState.Updating)
+        {
+            return IsGermanUi
+                ? "Ein Steam-Update läuft; ein automatischer Neustart ist gesperrt."
+                : "A Steam update is active; automatic restart is blocked.";
+        }
+
+        if (runtime.GameOrOverlayRunning)
+        {
+            return IsGermanUi
+                ? "Ein laufendes Spiel wird nicht durch die Start-Recovery beendet."
+                : "A running game is protected from startup recovery.";
+        }
+
+        if (!runtime.SteamRunning)
+        {
+            return IsGermanUi ? "Warte auf steam.exe." : "Waiting for steam.exe.";
+        }
+
+        if (!runtime.WebHelperRunning)
+        {
+            return IsGermanUi ? "Steam läuft; die Web-Oberfläche startet." : "Steam is running; its web UI is starting.";
+        }
+
+        if (!runtime.Windows.HasVisibleSteamWindow)
+        {
+            return IsGermanUi ? "Steam-Oberfläche wird aufgebaut." : "Steam UI is being created.";
+        }
+
+        if (!runtime.Windows.IsSteamForeground)
+        {
+            return IsGermanUi ? "Steam wurde erkannt und wird fokussiert." : "Steam was detected and is being focused.";
+        }
+
+        return fallback;
+    }
+
+    private async Task WaitForStartupSignalOrControllerAsync(SteamStartupSignalWatcher signalWatcher)
+    {
+        if (!ShowSplashRecoveryActions)
+        {
+            await signalWatcher.WaitForSignalAsync(
+                StartupFallbackObservationInterval,
+                CancellationToken.None);
+            return;
+        }
+
+        var fallbackAt = DateTimeOffset.UtcNow + StartupFallbackObservationInterval;
+        while (!_windowsShellStarted && DateTimeOffset.UtcNow < fallbackAt)
+        {
+            if (await HandleSplashControllerInputAsync())
             {
-                process.Dispose();
+                return;
+            }
+
+            if (await signalWatcher.WaitForSignalAsync(
+                    StartupActionControllerPollInterval,
+                    CancellationToken.None))
+            {
+                return;
             }
         }
     }
 
-    private static void TryFocusSteamWindow()
+    private async Task<bool> HandleSplashControllerInputAsync()
     {
-        var handle = FindSteamWindowHandle();
-        if (handle == IntPtr.Zero)
+        var mask = ControllerShortcutService.ReadConnectedControllerButtonMasks()
+            .Aggregate((ushort)0, (combined, current) => (ushort)(combined | current));
+        var newlyPressed = (ushort)(mask & ~_previousSplashControllerButtons);
+        _previousSplashControllerButtons = mask;
+        if (!ShowSplashRecoveryActions || newlyPressed == 0)
+        {
+            return false;
+        }
+
+        if ((newlyPressed & 0x8000) != 0)
+        {
+            OpenDesktopFromSplash();
+            return true;
+        }
+        else if ((newlyPressed & 0x4000) != 0 && CanRestartSteamFromSplash)
+        {
+            await RestartSteamFromSplashAsync();
+            return true;
+        }
+        else if ((newlyPressed & 0x1000) != 0)
+        {
+            ContinueWaitingFromSplash();
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ContinueWaitingFromSplash()
+    {
+        _splashStartupCoordinator?.ExtendWait(DateTimeOffset.UtcNow);
+        ShowSplashRecoveryActions = false;
+        ServiceDetailText = IsGermanUi
+            ? "Die Wartezeit wurde um fünf Minuten verlängert."
+            : "Waiting was extended by five minutes.";
+        SteamStartupDiagnostics.Write("user extended Steam splash wait by five minutes");
+    }
+
+    private async Task RestartSteamFromSplashAsync()
+    {
+        if (_manualSplashRecoveryUsed || !CanRestartSteamFromSplash)
         {
             return;
         }
 
+        _manualSplashRecoveryUsed = true;
+        CanRestartSteamFromSplash = false;
+        _splashStartupCoordinator?.ExtendWait(DateTimeOffset.UtcNow);
+        ServiceStateText = IsGermanUi ? "Steam-Reparatur wird gestartet" : "Starting Steam repair";
+        ServiceDetailText = IsGermanUi
+            ? "Steam wird höchstens einmal kontrolliert neu gestartet."
+            : "Steam will be restarted at most once in a controlled repair.";
+        SteamStartupDiagnostics.Write("user requested the one splash Steam repair");
+
+        var repaired = await _processManager.RequestSteamStartupRepairAsync();
+        if (!repaired)
+        {
+            ShowSplashRecoveryActions = true;
+            ServiceStateText = IsGermanUi ? "Steam-Reparatur wurde nicht ausgeführt" : "Steam repair was not performed";
+            ServiceDetailText = IsGermanUi
+                ? "Ein Update, Download oder Spiel kann den Neustart geschützt haben."
+                : "An update, download, or running game may have protected Steam from restart.";
+        }
+    }
+
+    private void OpenDesktopFromSplash()
+    {
+        SteamStartupDiagnostics.Write("user opened the Windows desktop from the startup splash");
+        CompleteStartupSplashHandOff(steamReady: false);
+    }
+
+    private static bool TryFocusSteamWindow(IntPtr preferredHandle = default)
+    {
+        var handle = preferredHandle != IntPtr.Zero
+            ? preferredHandle
+            : SteamBigPictureForegroundDetector.Capture().PreferredWindowHandle;
+        if (handle == IntPtr.Zero)
+        {
+            handle = FindSteamWindowHandle();
+        }
+
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        _ = GetWindowThreadProcessId(handle, out var steamProcessId);
+        if (steamProcessId != 0)
+        {
+            AllowSetForegroundWindow(steamProcessId);
+        }
+
         ShowWindow(handle, ShowWindowRestore);
-        SetForegroundWindow(handle);
+        return SetForegroundWindow(handle);
+    }
+
+    private static bool IsSteamBigPictureWindowVisible()
+    {
+        var snapshot = SteamBigPictureForegroundDetector.Capture();
+        return snapshot.HasVisibleSteamWindow && snapshot.HasLikelyGamepadWindow;
     }
 
     private static IntPtr FindSteamWindowHandle()
@@ -975,22 +1230,68 @@ public sealed class MainWindowViewModel : BindableBase
         SplashOverlayOpacity = 1.0;
     }
 
-    private async Task WaitBeforeWindowsShellHandoffAsync()
+    private async Task<bool> WaitBeforeWindowsShellHandoffAsync()
     {
         ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
-        var holdSeconds = BigPictureVisibleWindowsShellHandOffDelaySeconds + WindowsShellStartDelaySeconds;
+        var holdSeconds = WindowsShellStartDelaySeconds;
 
         if (holdSeconds <= 0)
         {
-            return;
+            return true;
         }
 
-        ServiceStateText = "Steam is ready";
-        ServiceDetailText = $"Big Picture is visible. Starting the Windows desktop in {holdSeconds}s.";
+        ServiceStateText = IsGermanUi ? "Steam ist bereit" : "Steam is ready";
+        ServiceDetailText = IsGermanUi
+            ? $"Steam ist im Vordergrund bestätigt. Der Windows-Desktop startet in {holdSeconds} s."
+            : $"Steam is confirmed in the foreground. Starting the Windows desktop in {holdSeconds}s.";
         await Task.Delay(TimeSpan.FromSeconds(holdSeconds));
+
+        // The configurable hold can be several seconds long. Steam may close,
+        // switch to a login/error page, or lose foreground during that time.
+        // Revalidate once before uncovering the desktop instead of trusting the
+        // earlier observation indefinitely.
+        var status = await _processManager.GetStatusAsync();
+        var runtime = _steamEnvironmentProbe.Capture();
+        _lastKnownStatus = status;
+        var uiState = status?.SteamUiState ?? SteamUiState.Unknown;
+        var stillReady = runtime.SteamRunning &&
+            runtime.Windows.IsSteamForeground &&
+            !runtime.ErrorReporterRunning &&
+            uiState is not (SteamUiState.Login or SteamUiState.Offline or SteamUiState.Error) &&
+            (runtime.Windows.HasLikelyGamepadWindow ||
+             (runtime.Windows.HasVisibleSteamWindow && uiState == SteamUiState.Gamepad));
+
+        if (stillReady)
+        {
+            return true;
+        }
+
+        SteamStartupDiagnostics.Write(
+            $"Steam readiness changed during shell hand-off hold; continuing monitor " +
+            $"(running={runtime.SteamRunning}, foreground={runtime.Windows.IsSteamForeground}, ui={uiState})");
+        ApplyShellBootstrapStatus(status, runtime);
+        return false;
     }
 
-    private void ApplyShellBootstrapStatus(SteamLoaderHostStatus? status)
+    private void CompleteStartupSplashHandOff(bool steamReady)
+    {
+        // Clear the splash without a fade so the manager UI cannot flash between
+        // the overlay and Steam/the desktop. PropertyChanged hides this window.
+        ShowStartupSplash = false;
+        ShowFirstRunSetup = false;
+        ShowSplashRecoveryActions = false;
+
+        if (steamReady)
+        {
+            TryFocusSteamWindow();
+        }
+
+        CompleteShellBootstrap();
+    }
+
+    private void ApplyShellBootstrapStatus(
+        SteamLoaderHostStatus? status,
+        SteamRuntimeObservation? runtime = null)
     {
         ErrorText = string.Empty;
         ApiStateText = _processManager.ApiBaseUri.ToString();
@@ -1004,7 +1305,9 @@ public sealed class MainWindowViewModel : BindableBase
         }
 
         ApiStateText = $"{_processManager.ApiBaseUri} ({FormatElapsed(status.StartedAtUtc)})";
-        var bigPictureVisible = IsSteamBigPictureWindowVisible();
+        var bigPictureVisible = runtime?.Windows.HasLikelyGamepadWindow ??
+            SteamBigPictureForegroundDetector.Capture(
+                _steamInstallationService.ResolveSteamRootPath()).HasLikelyGamepadWindow;
 
         if (bigPictureVisible)
         {
@@ -1084,14 +1387,20 @@ public sealed class MainWindowViewModel : BindableBase
         WindowsShellStartDelaySeconds = settings.WindowsShellStartDelaySeconds;
     }
 
-    private sealed record ShellHandOffReadiness(
-        bool BigPictureVisible,
-        bool SteamSignalReady,
-        bool WindowsShellHandOffReady);
+    private static bool IsGermanUi =>
+        CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals(
+            "de",
+            StringComparison.OrdinalIgnoreCase);
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }

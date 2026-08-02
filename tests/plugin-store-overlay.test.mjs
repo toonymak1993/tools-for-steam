@@ -41,6 +41,15 @@ test("store snapshot refresh preserves the active controller focus zone", async 
   );
 });
 
+test("plugin Store does not inherit Wishlist navigation sounds", async () => {
+  const source = await readFile(
+    new URL("../src/SteamLoader.App/Assets/plugin-store-overlay.js", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(source, /deck_ui_navigation/);
+});
+
 test("store activation ignores a stale closed overlay announcement", async () => {
   const source = await readFile(
     new URL("../src/SteamLoader.App/Assets/quickaccess-popup.js", import.meta.url),

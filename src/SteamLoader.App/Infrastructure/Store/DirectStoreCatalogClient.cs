@@ -923,7 +923,7 @@ internal sealed partial class DirectStoreCatalogClient
         var requested = NormalizeTitle(requestedTitle);
         return products
             .Select(product => new { Product = product, Score = ScoreTitle(NormalizeTitle(product.Title), requested) })
-            .Where(item => item.Score < int.MaxValue)
+            .Where(item => item.Score == 0)
             .OrderBy(item => item.Score)
             .ThenByDescending(item => item.Product.Popularity)
             .Select(item => item.Product)

@@ -1,0 +1,11 @@
+OmniLibrary game-data provider architecture
+
+Portions of the provider discovery model and the GOG, EA, Battle.net,
+PlayStation, FFXIV and RetroAchievements achievement flows were adapted from
+PlayniteAchievements:
+https://github.com/justin-delano/PlayniteAchievements
+
+Copyright (c) 2025 Justin Delano and PlayniteAchievements contributors
+Licensed under the MIT License.
+
+The full upstream license is included in LICENSE.txt next to this notice.

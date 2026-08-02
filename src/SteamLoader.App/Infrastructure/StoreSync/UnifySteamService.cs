@@ -25,7 +25,8 @@ internal sealed class UnifySteamService
     private const string XboxPcGamePassCatalogId = "fdd9e2a7-0fee-49f6-ad69-4354098401ff";
     private const string XboxCloudGamingCatalogId = "af206485-e87d-4624-9007-cb7f6d0cc42e";
     private const string XboxCloudCatalogMarker = "__Cloud:XGPUWEB";
-    private const string XboxCatalogShapeVersion = "xbox-catalog-v2-console-cloud";
+    private const string XboxCatalogShapeVersion =
+        "xbox-catalog-v3-console-cloud-title-id";
     private const string GogCatalogShapeVersion = "gog-catalog-v1";
 
     private static readonly HttpClient HttpClient = new()
@@ -129,7 +130,12 @@ internal sealed class UnifySteamService
             statusText,
             detailText,
             lastRefreshedAtUtc,
-            stores);
+            stores)
+        {
+            GameData = OmniLibraryGameDataProviderRegistry.BuildState(
+                configuration,
+                stores),
+        };
     }
 
     public UnifySteamRefreshBatchResult RefreshLibraries(
@@ -182,6 +188,15 @@ internal sealed class UnifySteamService
 
     private static bool IsStoreConfigured(OmniLibraryStoreDescriptor definition, UnifySteamStoreConfiguration storeConfiguration)
     {
+        if (definition.Id.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // A local ROM library has no account dependency. Enabling it is the
+            // configuration step; Refresh creates the deterministic folders.
+            return storeConfiguration.Enabled;
+        }
+
         if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
         {
             var epicAuthPath = ResolveReadableEpicAuthPath(storeConfiguration.AuthPath);
@@ -381,22 +396,34 @@ internal sealed class UnifySteamService
         var availableCount = games.Length;
         var xboxAppInstalled = definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) && IsXboxAppInstalled();
         var xboxSignedIn = xboxAppInstalled && IsXboxAppSignedIn();
-        var toolDetected = definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
+        var isRomLibrary = definition.Id.Equals(
+            OmniLibraryRomSystemRegistry.StoreId,
+            StringComparison.OrdinalIgnoreCase);
+        var romSystemStates = isRomLibrary
+            ? BuildRomSystemStates(games, storeConfiguration)
+            : [];
+        var toolDetected = isRomLibrary
+            ? romSystemStates.Any(system => system.EmulatorDetected)
+            : definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
             ? !string.IsNullOrWhiteSpace(effectiveToolPath) || !string.IsNullOrWhiteSpace(effectiveEpicLauncherPath)
             : definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
                 ? xboxAppInstalled || !string.IsNullOrWhiteSpace(effectiveToolPath)
                 : !string.IsNullOrWhiteSpace(effectiveToolPath);
-        var authConfigured = definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
+        var authConfigured = isRomLibrary
+            ? true
+            : definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase)
             ? !string.IsNullOrWhiteSpace(effectiveAuthPath)
             : definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
                 ? !string.IsNullOrWhiteSpace(effectiveAuthPath) || toolDetected
                 : definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
                     ? xboxSignedIn
                     : toolDetected;
-        var authReady = definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
+        var authReady = isRomLibrary
+            ? true
+            : definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
             ? xboxSignedIn
             : !string.IsNullOrWhiteSpace(cache.AccountName);
-        var canRefresh = storeConfiguration.Enabled && authReady;
+        var canRefresh = storeConfiguration.Enabled && (isRomLibrary || authReady);
         var steamSessionStartedAtUtc = GetSteamSessionStartedAtUtc();
         var readiness = OmniLibraryLifecycle.Evaluate(
             storeConfiguration,
@@ -425,12 +452,18 @@ internal sealed class UnifySteamService
                             : "Setup required"
                         : !authReady && definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase)
                             ? xboxAppInstalled ? "Sign-in required" : "Xbox app required"
+                        : isRomLibrary && availableCount == 0
+                            ? "Waiting for ROMs"
                         : availableCount > 0
                             ? "Ready"
                             : "Not loaded";
 
         var detailText = !string.IsNullOrWhiteSpace(cacheLastError)
             ? cacheLastError
+            : isRomLibrary
+                ? !string.IsNullOrWhiteSpace(cache.DetailText)
+                    ? cache.DetailText
+                    : $"Add ROMs to the matching system folders in {OmniLibraryRomSystemRegistry.ResolveRootPath(storeConfiguration.InstallPath)}."
             : !authReady && definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
                 ? authConfigured
                     ? !string.IsNullOrWhiteSpace(cache.DetailText)
@@ -498,7 +531,9 @@ internal sealed class UnifySteamService
             statusText,
             detailText,
             cache.AccountName,
-            storeConfiguration.InstallPath,
+            isRomLibrary
+                ? OmniLibraryRomSystemRegistry.ResolveRootPath(storeConfiguration.InstallPath)
+                : storeConfiguration.InstallPath,
             cache.RefreshedAtUtc,
             installedCount,
             availableCount,
@@ -506,7 +541,9 @@ internal sealed class UnifySteamService
         {
             Lifecycle = readiness.Lifecycle,
             Capabilities = OmniLibraryStoreRegistry.GetCapabilityIds(definition),
-            LibraryTabs = OmniLibraryStoreRegistry.BuildLibraryTabSummaries(definition),
+            LibraryTabs = OmniLibraryStoreRegistry.BuildLibraryTabSummaries(
+                definition,
+                isRomLibrary ? romSystemStates : null),
             DownloadWorkers = Math.Clamp(storeConfiguration.DownloadWorkers, 1, 32),
             DownloadTimeoutSeconds = Math.Clamp(
                 storeConfiguration.DownloadTimeoutSeconds,
@@ -518,7 +555,152 @@ internal sealed class UnifySteamService
             GogGalaxyLaunchEnabled =
                 definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) &&
                 storeConfiguration.PreferGogGalaxyForLaunch,
+            AchievementsEnabled = ResolveGameDataProvider(configuration, definition.Id)?.Enabled == true,
+            AchievementProviderConfigured = IsGameDataProviderConfigured(
+                configuration,
+                definition.Id,
+                authReady),
+            AchievementProviderName = ResolveGameDataProviderDescriptor(definition.Id)?.Title ??
+                                      string.Empty,
+            AchievementProviderDetail = BuildGameDataProviderDetail(
+                configuration,
+                definition.Id,
+                authReady),
+            AchievementCredentialPreview = PreviewSecret(
+                ResolveGameDataProvider(configuration, definition.Id)?.Credential ??
+                string.Empty),
+            RomSystems = isRomLibrary
+                ? romSystemStates
+                : [],
+            ToolPath = isRomLibrary
+                ? romSystemStates.FirstOrDefault(system => system.Id.Equals(
+                    "psp",
+                    StringComparison.OrdinalIgnoreCase))?.EmulatorPath ?? string.Empty
+                : effectiveToolPath,
         };
+    }
+
+    private static IReadOnlyList<OmniLibraryRomSystemState> BuildRomSystemStates(
+        IReadOnlyList<UnifySteamGameState> games,
+        UnifySteamStoreConfiguration storeConfiguration)
+    {
+        var root = OmniLibraryRomSystemRegistry.ResolveRootPath(storeConfiguration.InstallPath);
+        return OmniLibraryRomSystemRegistry.Supported
+            .Select(system =>
+            {
+                storeConfiguration.RomSystems.TryGetValue(system.Id, out var settings);
+                var configuredPath = settings?.EmulatorPath ??
+                    (system.Id.Equals("psp", StringComparison.OrdinalIgnoreCase)
+                        ? storeConfiguration.ToolPath
+                        : string.Empty);
+                var resolvedPath = ResolveRomEmulatorExecutable(system.Id, configuredPath);
+                return new OmniLibraryRomSystemState(
+                    system.Id,
+                    system.Title,
+                    system.EmulatorTitle,
+                    games.Count(game => game.PlatformId.Equals(
+                        system.Id,
+                        StringComparison.OrdinalIgnoreCase)),
+                    system.Id,
+                    games.Where(game =>
+                            game.PlatformId.Equals(
+                                system.Id,
+                                StringComparison.OrdinalIgnoreCase) &&
+                            game.SteamAppId != 0)
+                        .Select(game => game.SteamAppId)
+                        .Distinct()
+                        .OrderBy(appId => appId)
+                        .ToArray())
+                {
+                    EmulatorPath = resolvedPath.Length > 0 ? resolvedPath : configuredPath,
+                    ExecutableName = system.EmulatorExecutableName,
+                    FolderPath = Path.Combine(root, system.FolderName),
+                    EmulatorDetected = resolvedPath.Length > 0,
+                    Fullscreen = settings?.Fullscreen ?? true,
+                };
+            })
+            .ToArray();
+    }
+
+    private static OmniLibraryGameDataProviderDescriptor?
+        ResolveGameDataProviderDescriptor(string storeId) =>
+        OmniLibraryGameDataProviderRegistry.ResolveForStore(storeId);
+
+    private static OmniLibraryGameDataProviderConfiguration?
+        ResolveGameDataProvider(
+            StoreSyncConfiguration configuration,
+            string storeId)
+    {
+        var descriptor = ResolveGameDataProviderDescriptor(storeId);
+        return descriptor is not null &&
+               configuration.UnifySteam.GameData.Providers.TryGetValue(
+                   descriptor.Id,
+                   out var provider)
+            ? provider
+            : null;
+    }
+
+    private static bool IsGameDataProviderConfigured(
+        StoreSyncConfiguration configuration,
+        string storeId,
+        bool storeAuthReady)
+    {
+        var descriptor = ResolveGameDataProviderDescriptor(storeId);
+        var provider = ResolveGameDataProvider(configuration, storeId);
+        if (descriptor is null || provider?.Enabled != true)
+        {
+            return false;
+        }
+
+        return descriptor.SetupKind switch
+        {
+            "openxbl" => !string.IsNullOrWhiteSpace(provider.Credential),
+            "store-account" => storeAuthReady,
+            "local-path" => !string.IsNullOrWhiteSpace(provider.DataPath),
+            "username-api-key" =>
+                !string.IsNullOrWhiteSpace(provider.AccountName) &&
+                !string.IsNullOrWhiteSpace(provider.Credential),
+            _ =>
+                (descriptor.Supports(OmniLibraryGameDataCapabilities.StoreAccount) &&
+                 storeAuthReady) ||
+                !string.IsNullOrWhiteSpace(provider.Credential) ||
+                !string.IsNullOrWhiteSpace(provider.SecondaryCredential) ||
+                !string.IsNullOrWhiteSpace(provider.AccountId) ||
+                !string.IsNullOrWhiteSpace(provider.AccountName) ||
+                !string.IsNullOrWhiteSpace(provider.DataPath),
+        };
+    }
+
+    private static string BuildGameDataProviderDetail(
+        StoreSyncConfiguration configuration,
+        string storeId,
+        bool storeAuthReady)
+    {
+        var descriptor = ResolveGameDataProviderDescriptor(storeId);
+        var provider = ResolveGameDataProvider(configuration, storeId);
+        if (descriptor is null || provider is null)
+        {
+            return "No game-data provider is registered for this store.";
+        }
+
+        if (!configuration.UnifySteam.GameData.Enabled || !provider.Enabled)
+        {
+            return "Achievements and enhanced metadata are disabled for this provider.";
+        }
+
+        if (descriptor.Supports(OmniLibraryGameDataCapabilities.StoreAccount))
+        {
+            return storeAuthReady
+                ? $"Uses the connected {descriptor.Title} account and refreshes only opened or recently played titles."
+                : $"Connect {descriptor.Title} to show verified achievement progress.";
+        }
+
+        return !string.IsNullOrWhiteSpace(provider.Credential) ||
+               !string.IsNullOrWhiteSpace(provider.AccountId) ||
+               !string.IsNullOrWhiteSpace(provider.AccountName) ||
+               !string.IsNullOrWhiteSpace(provider.DataPath)
+            ? $"{descriptor.Title} is configured and loaded on demand."
+            : $"Configure {descriptor.Title} in Achievements & Metadata.";
     }
 
     internal static string ComputePreparedCatalogSignature(UnifySteamStoreConfiguration storeConfiguration)
@@ -563,6 +745,9 @@ internal sealed class UnifySteamService
                 game.PartnerLinkType.Trim(),
                 game.PartnerLinkId.Trim(),
                 game.ProviderGameId.Trim(),
+                game.PlatformId.Trim(),
+                game.PlatformTitle.Trim(),
+                game.RomPath.Trim(),
                 game.RegistryPath.Trim(),
                 game.RegistryValueName.Trim(),
                 game.ProcessNames.Trim(),
@@ -655,7 +840,7 @@ internal sealed class UnifySteamService
         return earliestStart;
     }
 
-    private static UnifySteamGameCacheEntry MergeXboxInstallState(
+    internal static UnifySteamGameCacheEntry MergeXboxInstallState(
         UnifySteamGameCacheEntry game,
         IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installedGames,
         UnifySteamDownloadStatus downloadStatus)
@@ -698,6 +883,10 @@ internal sealed class UnifySteamService
             ProviderGameId = installationReady
                 ? installed?.Id ?? game.ProviderGameId
                 : game.ProviderGameId,
+            StoreTitleId = FirstNonEmpty(
+                game.StoreTitleId,
+                installed?.StoreTitleId),
+            StoreNamespace = game.StoreNamespace,
             RegistryPath = game.RegistryPath,
             RegistryValueName = game.RegistryValueName,
             ProcessNames = game.ProcessNames,
@@ -976,6 +1165,11 @@ internal sealed class UnifySteamService
         IReadOnlyList<StoreSyncDetectedTitleState> detectedTitles,
         IReadOnlyDictionary<string, UnifySteamDownloadStatus> downloadStatuses)
     {
+        if (definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase))
+        {
+            NormalizeEpicDeliveryCapabilities(game);
+        }
+
         var matchedDetectedTitle = detectedTitles.FirstOrDefault(title =>
         {
             if (!string.IsNullOrWhiteSpace(game.ExecutablePath) &&
@@ -1033,24 +1227,41 @@ internal sealed class UnifySteamService
                 game.LatestVersion,
                 game.Version,
                 StringComparison.OrdinalIgnoreCase);
-        var providerDisplayName = GetEpicProviderDisplayName(game.DeliveryProvider);
+        var providerDisplayName =
+            definition.Id.Equals("epic-games", StringComparison.OrdinalIgnoreCase)
+                ? GetEpicProviderDisplayName(game.DeliveryProvider)
+                : definition.Title;
+        var eaAppAvailable =
+            game.DeliveryProvider.Equals(
+                "ea-app",
+                StringComparison.OrdinalIgnoreCase) &&
+            EaAppIntegration.GetAvailability().IsAvailable;
+        var eaAppRequired =
+            game.DeliveryProvider.Equals(
+                "ea-app",
+                StringComparison.OrdinalIgnoreCase) &&
+            !eaAppAvailable;
         var statusText = game.IsPreloaded
             ? "Preloaded"
             : updateAvailable
                 ? "Update available"
             : !installed
-            ? game.RequiresExternalLauncher
-                ? $"Available via {providerDisplayName}"
-                : "Available"
+            ? eaAppRequired
+                ? "EA app required"
+                : game.RequiresExternalLauncher
+                    ? $"Available via {providerDisplayName}"
+                    : "Available"
             : syncedToSteam
                 ? "Installed + Synced"
                 : "Installed";
         var detailText = game.IsPreloaded
             ? "Game files are preloaded. Play becomes available after the store release unlock."
             : !installed
-            ? game.RequiresExternalLauncher
-                ? $"Owned on Epic. Installation and account linking continue in {providerDisplayName}."
-                : "In your account library."
+            ? eaAppRequired
+                ? "Owned on Epic. Install the official EA app before linking the accounts and installing this title."
+                : game.RequiresExternalLauncher
+                    ? $"Owned on Epic. Installation and account linking continue in {providerDisplayName}."
+                    : "In your account library."
             : !string.IsNullOrWhiteSpace(installPath)
                 ? installPath
                 : "Installed locally.";
@@ -1081,6 +1292,14 @@ internal sealed class UnifySteamService
                 0,
                 0);
         }
+        var externalAction = game.DeliveryProvider.Equals(
+                "ea-app",
+                StringComparison.OrdinalIgnoreCase)
+            ? EaAppIntegration.GetExternalAction(
+                installed,
+                eaAppAvailable,
+                downloadState.Status)
+            : string.Empty;
 
         return new UnifySteamGameState(
             game.Id,
@@ -1101,13 +1320,90 @@ internal sealed class UnifySteamService
             ProviderDisplayName = providerDisplayName,
             RequiresAccountLink = game.RequiresAccountLink,
             RequiresExternalLauncher = game.RequiresExternalLauncher,
-            CanInstallDirectly =
-                string.IsNullOrWhiteSpace(game.DeliveryProvider) ||
-                game.HasInstallableAsset,
+            CanInstallDirectly = CanInstallDirectly(
+                definition.Id,
+                game.CloudPlayable,
+                game.DeliveryProvider,
+                game.HasInstallableAsset),
+            ExternalAction = externalAction,
             SupportsCloudSaves = game.SupportsCloudSaves,
             IsPreloaded = game.IsPreloaded,
             UpdateAvailable = updateAvailable,
+            StoreTitleId = game.StoreTitleId,
+            StoreNamespace = game.StoreNamespace,
+            PlatformId = game.PlatformId,
+            PlatformTitle = game.PlatformTitle,
+            RomPath = game.RomPath,
         };
+    }
+
+    internal static string ResolvePpssppExecutable(string? configuredPath) =>
+        ResolveRomEmulatorExecutable("psp", configuredPath);
+
+    internal static string ResolveRomEmulatorExecutable(
+        string systemId,
+        string? configuredPath)
+    {
+        var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            candidates.Add(configuredPath.Trim());
+        }
+
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        candidates.Add(Path.Combine(
+            localAppData,
+            "Programs",
+            system.EmulatorTitle,
+            system.EmulatorExecutableName));
+        candidates.Add(Path.Combine(localAppData, system.EmulatorTitle, system.EmulatorExecutableName));
+        candidates.Add(Path.Combine(programFiles, system.EmulatorTitle, system.EmulatorExecutableName));
+        candidates.Add(Path.Combine(
+            AppContext.BaseDirectory,
+            "tools",
+            system.Id,
+            system.EmulatorExecutableName));
+
+        if (system.Id.Equals("gamecube", StringComparison.OrdinalIgnoreCase))
+        {
+            candidates.Add(Path.Combine(programFiles, "Dolphin Emulator", system.EmulatorExecutableName));
+        }
+
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var fullPath = Path.GetFullPath(candidate);
+                if (File.Exists(fullPath))
+                {
+                    return fullPath;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        try
+        {
+            var pathDirectories = (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
+                .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var directory in pathDirectories)
+            {
+                var candidate = Path.Combine(directory.Trim('"'), system.EmulatorExecutableName);
+                if (File.Exists(candidate))
+                {
+                    return Path.GetFullPath(candidate);
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return string.Empty;
     }
 
     private static UnifySteamDownloadState ToDownloadState(
@@ -1139,6 +1435,9 @@ internal sealed class UnifySteamService
         {
             switch (definition.Id)
             {
+                case OmniLibraryRomSystemRegistry.StoreId:
+                    OmniLibraryRomLibrary.Refresh(storeConfiguration);
+                    break;
                 case "epic-games":
                     RefreshEpicStore(definition, storeConfiguration, quiet);
                     break;
@@ -1156,7 +1455,12 @@ internal sealed class UnifySteamService
             OmniLibraryLifecycle.SetStage(
                 storeConfiguration,
                 "authentication",
-                string.IsNullOrWhiteSpace(cache.AccountName) ? "required" : "ready");
+                definition.Id.Equals(
+                    OmniLibraryRomSystemRegistry.StoreId,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.IsNullOrWhiteSpace(cache.AccountName)
+                    ? "ready"
+                    : "required");
             OmniLibraryLifecycle.SetStage(
                 storeConfiguration,
                 "catalog",
@@ -1953,6 +2257,9 @@ internal sealed class UnifySteamService
                     ExecutablePath = installedGame?.ExecutablePath ?? string.Empty,
                     Version = installedGame?.Version ?? string.Empty,
                     ProviderGameId = installedGame?.Id ?? string.Empty,
+                    StoreTitleId = FirstNonEmpty(
+                        ResolveXboxTitleId(product),
+                        installedGame?.StoreTitleId),
                     ImageUrl = localized.ValueKind == JsonValueKind.Object
                         ? ResolveXboxPortraitUrl(localized)
                         : string.Empty,
@@ -2434,6 +2741,13 @@ internal sealed class UnifySteamService
                             element.Name.LocalName.Equals("Identity", StringComparison.OrdinalIgnoreCase));
                         var identityName = identity?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
                         var identityVersion = identity?.Attribute("Version")?.Value?.Trim() ?? string.Empty;
+                        var manifestTitleId = root?.Elements().FirstOrDefault(element =>
+                            element.Name.LocalName.Equals(
+                                "TitleId",
+                                StringComparison.OrdinalIgnoreCase))?.Value;
+                        TryNormalizeXboxManifestTitleId(
+                            manifestTitleId,
+                            out var storeTitleId);
                         var executableName = executable?.Attribute("Name")?.Value?.Trim() ?? string.Empty;
                         var executablePath = string.IsNullOrWhiteSpace(executableName)
                             ? string.Empty
@@ -2456,6 +2770,7 @@ internal sealed class UnifySteamService
                             InstallPath = contentDirectory,
                             ExecutablePath = executableReady ? executablePath : string.Empty,
                             Version = identityVersion,
+                            StoreTitleId = storeTitleId,
                         };
                         if (!games.TryGetValue(storeId, out var existing) ||
                             (!existing.Installed && candidate.Installed) ||
@@ -2775,6 +3090,25 @@ internal sealed class UnifySteamService
                 InstallPath = pair.Value.InstallPath,
                 ExecutablePath = pair.Value.ExecutablePath,
                 Version = pair.Value.Version,
+                DeliveryProvider = pair.Value.DeliveryProvider,
+                ThirdPartyManagedApp = pair.Value.ThirdPartyManagedApp,
+                PartnerLinkType = pair.Value.PartnerLinkType,
+                PartnerLinkId = pair.Value.PartnerLinkId,
+                ProviderGameId = pair.Value.ProviderGameId,
+                StoreTitleId = pair.Value.StoreTitleId,
+                StoreNamespace = pair.Value.StoreNamespace,
+                RegistryPath = pair.Value.RegistryPath,
+                RegistryValueName = pair.Value.RegistryValueName,
+                ProcessNames = pair.Value.ProcessNames,
+                HasInstallableAsset = pair.Value.HasInstallableAsset,
+                RequiresAccountLink = pair.Value.RequiresAccountLink,
+                RequiresExternalLauncher = pair.Value.RequiresExternalLauncher,
+                RequiresEpicLauncherBridge =
+                    pair.Value.RequiresEpicLauncherBridge,
+                SupportsCloudSaves = pair.Value.SupportsCloudSaves,
+                IsPreloaded = pair.Value.IsPreloaded,
+                LatestVersion = pair.Value.LatestVersion,
+                PreparationSignature = pair.Value.PreparationSignature,
                 ImageUrl = pair.Value.ImageUrl,
                 HeroImageUrl = pair.Value.HeroImageUrl,
                 SteamAppId = pair.Value.SteamAppId,
@@ -2995,6 +3329,9 @@ internal sealed class UnifySteamService
                 InstallPath = installed?.InstallPath ?? string.Empty,
                 ExecutablePath = installed?.ExecutablePath ?? string.Empty,
                 Version = installed?.Version ?? string.Empty,
+                StoreNamespace = FirstNonEmpty(
+                    GetJsonString(record, "namespace"),
+                    GetJsonString(record, "sandboxId")),
                 // Artwork is resolved later by the asynchronous Steam-first worker.
                 ImageUrl = string.Empty,
             });
@@ -3127,6 +3464,10 @@ internal sealed class UnifySteamService
                 PartnerLinkType = partnerLinkType,
                 PartnerLinkId = GetEpicCustomAttribute(metadata, "partnerLinkId"),
                 ProviderGameId = GetEpicCustomAttribute(metadata, "GameID"),
+                StoreTitleId = GetJsonString(metadata, "id"),
+                StoreNamespace = FirstNonEmpty(
+                    GetJsonString(metadata, "namespace"),
+                    GetJsonString(metadata, "sandboxId")),
                 RegistryPath = GetEpicCustomAttribute(metadata, "RegistryPath"),
                 RegistryValueName = FirstNonEmpty(
                     GetEpicCustomAttribute(metadata, "RegistryKey"),
@@ -3137,9 +3478,9 @@ internal sealed class UnifySteamService
                 HasInstallableAsset = hasInstallableAsset,
                 RequiresAccountLink =
                     deliveryProvider is "ea-app" or "ubisoft-connect",
-                RequiresExternalLauncher =
-                    deliveryProvider == "ea-app" ||
-                    (!hasInstallableAsset && deliveryProvider != "epic"),
+                RequiresExternalLauncher = RequiresEpicExternalLauncher(
+                    deliveryProvider,
+                    hasInstallableAsset),
                 RequiresEpicLauncherBridge =
                     EpicCompatibilityCatalog.Get(appName).FakeEpicLauncher,
                 SupportsCloudSaves =
@@ -3227,6 +3568,66 @@ internal sealed class UnifySteamService
             "external" => "the publisher launcher",
             _ => "Epic Games",
         };
+    }
+
+    internal static bool RequiresEpicExternalLauncher(
+        string? deliveryProvider,
+        bool hasInstallableAsset)
+    {
+        var normalizedProvider = deliveryProvider?.Trim().ToLowerInvariant() ?? string.Empty;
+        return normalizedProvider == "ea-app" ||
+               (!hasInstallableAsset && normalizedProvider != "epic");
+    }
+
+    internal static bool CanInstallEpicDirectly(
+        string? deliveryProvider,
+        bool hasInstallableAsset)
+    {
+        return !RequiresEpicExternalLauncher(
+                   deliveryProvider,
+                   hasInstallableAsset) &&
+               (string.IsNullOrWhiteSpace(deliveryProvider) ||
+                hasInstallableAsset);
+    }
+
+    internal static bool CanInstallDirectly(
+        string? storeId,
+        bool cloudPlayable,
+        string? deliveryProvider,
+        bool hasInstallableAsset)
+    {
+        if (string.Equals(
+                storeId,
+                "epic-games",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return CanInstallEpicDirectly(
+                deliveryProvider,
+                hasInstallableAsset);
+        }
+
+        if (string.Equals(
+                storeId,
+                "xbox-game-pass",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return !cloudPlayable;
+        }
+
+        return true;
+    }
+
+    internal static void NormalizeEpicDeliveryCapabilities(
+        UnifySteamGameCacheEntry game)
+    {
+        ArgumentNullException.ThrowIfNull(game);
+        var normalizedProvider =
+            game.DeliveryProvider?.Trim().ToLowerInvariant() ?? string.Empty;
+        game.RequiresAccountLink =
+            normalizedProvider is "ea-app" or "ubisoft-connect";
+        game.RequiresExternalLauncher = RequiresEpicExternalLauncher(
+            normalizedProvider,
+            game.HasInstallableAsset);
     }
 
     private static void MergeEpicExternalInstallState(
@@ -3454,22 +3855,30 @@ internal sealed class UnifySteamService
 
     private EpicCredential EnsureEpicCredentials(string authPath)
     {
-        var current = LoadEpicCredential(authPath)
-            ?? throw new InvalidOperationException("Epic auth data could not be read.");
-
-        if (DateTimeOffset.UtcNow < current.ExpiresAtUtc.AddMinutes(-2))
+        ManagedLegendaryHelper.CredentialGate.Wait();
+        try
         {
-            return current;
-        }
+            var current = LoadEpicCredential(authPath)
+                ?? throw new InvalidOperationException("Epic auth data could not be read.");
 
-        if (string.IsNullOrWhiteSpace(current.RefreshToken))
+            if (DateTimeOffset.UtcNow < current.ExpiresAtUtc.AddMinutes(-2))
+            {
+                return current;
+            }
+
+            if (string.IsNullOrWhiteSpace(current.RefreshToken))
+            {
+                throw new InvalidOperationException("The saved Epic login has expired. Sign in again to refresh the library.");
+            }
+
+            var token = ExchangeEpicRefreshToken(current.RefreshToken);
+            SaveEpicCredentials(authPath, token);
+            return token;
+        }
+        finally
         {
-            throw new InvalidOperationException("The saved Epic login has expired. Sign in again to refresh the library.");
+            ManagedLegendaryHelper.CredentialGate.Release();
         }
-
-        var token = ExchangeEpicRefreshToken(current.RefreshToken);
-        SaveEpicCredentials(authPath, token);
-        return token;
     }
 
     private GogLibraryResponse LoadGogLibrary(
@@ -4290,7 +4699,37 @@ internal sealed class UnifySteamService
             }
         };
 
-        File.WriteAllText(authPath, JsonSerializer.Serialize(payload, JsonOptions));
+        var temporaryPath = Path.Combine(
+            directory ?? AppContext.BaseDirectory,
+            $".{Path.GetFileName(authPath)}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.WriteAllText(
+                temporaryPath,
+                JsonSerializer.Serialize(payload, JsonOptions),
+                new UTF8Encoding(false));
+            if (File.Exists(authPath))
+            {
+                File.Replace(temporaryPath, authPath, authPath + ".bak", true);
+            }
+            else
+            {
+                File.Move(temporaryPath, authPath);
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static CommandResult RunTool(string toolPath, params string[] arguments)
@@ -4794,6 +5233,71 @@ internal sealed class UnifySteamService
             JsonValueKind.False => "false",
             _ => string.Empty,
         };
+    }
+
+    private static string ResolveXboxTitleId(JsonElement product)
+    {
+        if (product.ValueKind != JsonValueKind.Object ||
+            !product.TryGetProperty("AlternateIds", out var alternateIds) ||
+            alternateIds.ValueKind != JsonValueKind.Array)
+        {
+            return string.Empty;
+        }
+
+        foreach (var alternateId in alternateIds.EnumerateArray())
+        {
+            if (!GetJsonString(alternateId, "IdType")
+                    .Equals("XboxTitleId", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var value = GetJsonString(alternateId, "Value");
+            if (ulong.TryParse(value, out _))
+            {
+                return value;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    internal static bool TryNormalizeXboxManifestTitleId(
+        string? value,
+        out string titleId)
+    {
+        titleId = string.Empty;
+        var hexadecimal = value?.Trim() ?? string.Empty;
+        if (hexadecimal.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            hexadecimal = hexadecimal[2..];
+        }
+        if (hexadecimal.Length != 8 ||
+            !uint.TryParse(
+                hexadecimal,
+                NumberStyles.AllowHexSpecifier,
+                CultureInfo.InvariantCulture,
+                out var numericTitleId) ||
+            numericTitleId is 0 or uint.MaxValue)
+        {
+            return false;
+        }
+
+        titleId = numericTitleId.ToString(CultureInfo.InvariantCulture);
+        return true;
+    }
+
+    private static string PreviewSecret(string value)
+    {
+        var secret = value?.Trim() ?? string.Empty;
+        if (secret.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        return secret.Length <= 8
+            ? new string('•', secret.Length)
+            : $"{secret[..4]}…{secret[^4..]}";
     }
 
     private static string GetGogLinkHref(JsonElement links, string propertyName)

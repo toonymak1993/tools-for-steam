@@ -81,6 +81,10 @@ public sealed class SteamLoaderBackgroundHost
             steamInstallationService,
             devToolsClient,
             storeSyncJournal);
+        using var omniLibraryMetadataService = new OmniLibraryGamePageMetadataService(
+            storeSyncService.GetUnifySteamGame,
+            Path.Combine(dataDirectory, "cache", "omnilibrary-game-pages.json"),
+            settingsStore: storeSyncSettingsStore);
         var storeService = new StoreService(
             httpClient,
             new StoreSettingsStore(Path.Combine(dataDirectory, "store.json")),
@@ -191,15 +195,18 @@ public sealed class SteamLoaderBackgroundHost
         var popupScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
+            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"),
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-tab-topology.js"),
             EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
             EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/omnilibrary-metadata-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
             EmbeddedAssetReader.ReadText("Assets/store-overlay.js"));
@@ -260,6 +267,7 @@ public sealed class SteamLoaderBackgroundHost
             hltbService,
             storeService,
             storeSyncService,
+            omniLibraryMetadataService,
             themesService,
             performanceService,
             handheldPerformanceService,

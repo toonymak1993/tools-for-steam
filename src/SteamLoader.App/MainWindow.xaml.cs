@@ -1,8 +1,11 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Threading;
 using System.Windows.Media;
 using SteamLoader.App.UI;
+using InputKey = System.Windows.Input.Key;
+using InputKeyEventArgs = System.Windows.Input.KeyEventArgs;
 
 namespace SteamLoader.App;
 
@@ -80,6 +83,7 @@ public partial class MainWindow : Window
                 HideToTray();
             }
         };
+        PreviewKeyDown += OnSplashRecoveryKeyDown;
         Closing += OnClosingToTray;
     }
 
@@ -147,7 +151,10 @@ public partial class MainWindow : Window
             await viewModel.InitializeAsync();
         }
 
-        if (IsVisible)
+        // The startup monitor already performs an adaptive, signal-driven status
+        // check. Do not run the manager's periodic refresh alongside it.
+        if (IsVisible &&
+            !(DataContext is MainWindowViewModel activeViewModel && activeViewModel.ShowStartupSplash))
         {
             _refreshTimer.Start();
         }
@@ -172,11 +179,23 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (viewModel.ShowStartupSplash)
+        {
+            _refreshTimer.Stop();
+            return;
+        }
+
         if (StartHiddenInTray && !viewModel.ShowStartupSplash)
         {
             // Call directly (no dispatcher delay) so the window hides before
             // WPF renders the now-uncovered manager UI — eliminates the flicker.
             HideToTray();
+            return;
+        }
+
+        if (IsVisible)
+        {
+            _refreshTimer.Start();
         }
     }
 
@@ -189,6 +208,31 @@ public partial class MainWindow : Window
 
         eventArgs.Cancel = true;
         HideToTray();
+    }
+
+    private void OnSplashRecoveryKeyDown(object sender, InputKeyEventArgs eventArgs)
+    {
+        if (DataContext is not MainWindowViewModel viewModel ||
+            !viewModel.ShowStartupSplash ||
+            !viewModel.ShowSplashRecoveryActions)
+        {
+            return;
+        }
+
+        ICommand? command = eventArgs.Key switch
+        {
+            InputKey.A => viewModel.ContinueWaitingFromSplashCommand,
+            InputKey.X => viewModel.RestartSteamFromSplashCommand,
+            InputKey.Y => viewModel.OpenDesktopFromSplashCommand,
+            _ => null
+        };
+        if (command?.CanExecute(null) != true)
+        {
+            return;
+        }
+
+        command.Execute(null);
+        eventArgs.Handled = true;
     }
 
     private void ApplyStartupSplashChrome()

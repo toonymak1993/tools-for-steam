@@ -70,6 +70,7 @@ The plugin stays hidden on unverified devices instead of applying unknown hardwa
 | **App Start** | Curate and launch installed Windows apps with a controller |
 | **Store Sync** | Discover launcher libraries, create Steam shortcuts and collections, and refresh artwork |
 | **OmniLibrary** | Prepare Xbox, Xbox Cloud, Epic, and GOG as native Steam tabs, with one controller-native Download Center for progress and transfer actions |
+| **Tabhero** | Rename, hide, reorder, and add filtered Steam Library tabs while preserving tabs owned by OmniLibrary and other plugins |
 | **SteamGridDB** | Search and apply game artwork from Steam context menus or settings |
 | **Audio** | Switch playback devices, control volume, and manage mixer state |
 | **Display** | Switch displays, resolutions, and refresh rates |
@@ -87,6 +88,10 @@ Most tools can be hidden from TFS Settings. Safety and recovery actions remain a
 OmniLibrary is an alternative to Store Sync: only one can run at a time. Each enabled and connected provider is prepared in the background, then appears as its own **Xbox**, optional **Xbox Cloud**, **Epic**, or **GOG** tab after Steam has reloaded the prepared state. Selecting a title uses Steam's normal game page. Only managed OmniLibrary entries have their native Play label changed to Download while absent; installed games keep Steam's original Play action. The Download Center at the top of OmniLibrary combines simultaneous provider transfers with progress, pause, resume, safe two-step cancellation, recent history, and controller navigation. Xbox keeps native transfer control in the official app; Epic and GOG use their resumable managed helpers.
 
 Xbox uses the official Xbox app session, PC Game Pass catalog data, and local `XboxGames` manifests. Direct installation is best effort because Microsoft's broker uses a private capability; the safe fallback opens the exact Xbox product page and never automates a confirmation. Xbox uninstall also opens the exact product page for the user to finish. Epic and GOG sign-ins use isolated sessions. Their downloads and managed uninstalls run through pinned, SHA-256-verified Legendary and heroic-gogdl helpers obtained from the official upstream releases. See [OmniLibrary architecture](docs/omnilibrary.md) and the bundled third-party notices.
+
+### Tabhero
+
+Tabhero manages Steam's editable Library tabs and adds filter-backed custom tabs with profiles. It shares one dynamic compositor with OmniLibrary: OmniLibrary/OmniConsole and all other Tools for Steam-owned tabs are protected from renaming, hiding, deletion, and reordering. See the [Tabhero guide](docs/tabhero.md) for filter syntax and ownership rules.
 
 The Performance tool reuses existing RTSS binaries and settings without reinstalling them. Setup only grants the installing user write access to RTSS' data-only `Profiles` folder so per-game frame limits can be saved without an elevated TFS service. Only when RTSS is missing does Setup install the tested 7.3.7 WinGet package; Tools for Steam then uses the RTSS shared-memory and profile APIs. It owns one isolated OSD slot, writes only per-game profiles, leaves other RTSS clients untouched, and does not uninstall RTSS because another application may still use it. RTSS is third-party freeware by Unwinder/Guru3D and is downloaded separately rather than bundled into Tools for Steam.
 

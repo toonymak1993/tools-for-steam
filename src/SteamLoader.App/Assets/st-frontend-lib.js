@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 45) {
+  if (existing?.version >= 47) {
     return;
   }
 
@@ -3345,7 +3345,7 @@
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 45,
+        libraryVersion: window.STFrontendLib?.version || 47,
         sdkVersion: "1.0.0",
         pluginId,
       }),
@@ -3357,7 +3357,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 45,
+      version: 47,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3425,7 +3425,7 @@
   }
 
   window.STFrontendLib = {
-    version: 45,
+    version: 47,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

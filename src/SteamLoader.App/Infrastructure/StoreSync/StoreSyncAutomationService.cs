@@ -16,6 +16,7 @@ public sealed class StoreSyncAutomationService
     private DateTimeOffset _nextWatcherRefreshAtUtc = DateTimeOffset.UtcNow;
     private DateTimeOffset? _lastWatcherEventAtUtc;
     private string _pendingWatcherTriggerSource = string.Empty;
+    private string _pendingWatcherPath = string.Empty;
 
     public StoreSyncAutomationService(
         StoreSyncService storeSyncService,
@@ -90,6 +91,7 @@ public sealed class StoreSyncAutomationService
         lock (_gate)
         {
             _pendingWatcherTriggerSource = string.Empty;
+            _pendingWatcherPath = string.Empty;
             _lastWatcherEventAtUtc = null;
         }
     }
@@ -116,6 +118,7 @@ public sealed class StoreSyncAutomationService
         string triggerSource;
         DateTimeOffset? lastEventAtUtc;
 
+        string changedPath;
         lock (_gate)
         {
             triggerSource = _pendingWatcherTriggerSource;
@@ -139,11 +142,16 @@ public sealed class StoreSyncAutomationService
             }
 
             triggerSource = _pendingWatcherTriggerSource;
+            changedPath = _pendingWatcherPath;
             _pendingWatcherTriggerSource = string.Empty;
+            _pendingWatcherPath = string.Empty;
             _lastWatcherEventAtUtc = null;
         }
 
-        TryRunAutomaticSync(triggerSource);
+        if (!_storeSyncService.TryQueueLocalLibraryDelta(changedPath))
+        {
+            TryRunAutomaticSync(triggerSource);
+        }
     }
 
     private void RefreshWatchers()
@@ -185,12 +193,14 @@ public sealed class StoreSyncAutomationService
                     {
                         IncludeSubdirectories = target.IncludeSubdirectories,
                         NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                        InternalBufferSize = 16 * 1024,
                         EnableRaisingEvents = true,
                     };
                     watcher.Created += OnWatcherChanged;
                     watcher.Deleted += OnWatcherChanged;
                     watcher.Changed += OnWatcherChanged;
                     watcher.Renamed += OnWatcherRenamed;
+                    watcher.Error += OnWatcherError;
                     _watchers[key] = watcher;
                 }
                 catch
@@ -222,7 +232,7 @@ public sealed class StoreSyncAutomationService
             return;
         }
 
-        ScheduleWatcherTrigger("watch");
+        ScheduleWatcherTrigger("watch", eventArgs.FullPath);
     }
 
     private void OnWatcherRenamed(object sender, RenamedEventArgs eventArgs)
@@ -233,15 +243,27 @@ public sealed class StoreSyncAutomationService
             return;
         }
 
-        ScheduleWatcherTrigger("watch");
+        ScheduleWatcherTrigger("watch", eventArgs.FullPath);
     }
 
-    private void ScheduleWatcherTrigger(string triggerSource)
+    private void OnWatcherError(object sender, ErrorEventArgs eventArgs)
+    {
+        // FileSystemWatcher can lose individual events when a large ROM batch is
+        // copied at once. Queue one debounced full reconciliation so the cache,
+        // shortcuts, and dynamic platform tabs still converge correctly.
+        ScheduleWatcherTrigger("watch-recovery");
+    }
+
+    private void ScheduleWatcherTrigger(string triggerSource, string? changedPath = null)
     {
         lock (_gate)
         {
             _storeSyncService.InvalidateAutomaticSyncState();
             _pendingWatcherTriggerSource = string.IsNullOrWhiteSpace(triggerSource) ? "watch" : triggerSource;
+            if (!string.IsNullOrWhiteSpace(changedPath))
+            {
+                _pendingWatcherPath = changedPath;
+            }
             _lastWatcherEventAtUtc = DateTimeOffset.UtcNow;
         }
     }

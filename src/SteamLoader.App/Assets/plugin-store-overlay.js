@@ -1,6 +1,6 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 19;
+  const stateVersion = 21;
   const closedPollMs = 700;
   const openPollMs = 2200;
   const overlayOpenInputGraceMs = 360;

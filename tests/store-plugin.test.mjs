@@ -27,6 +27,7 @@ test("Wishlist is a permanent core header action with a dedicated full-screen op
   assert.doesNotMatch(apiServer, /\["\/api\/store"\]\s*=\s*"store"/);
   assert.match(popup, /async function openStoreOverlay\(\)/);
   assert.match(popup, /api\/store\/overlay\/open/);
+  assert.match(apiServer, /api\/store\/wishlist\/bulk/);
 });
 
 test("Store overlay includes async price loading, controller navigation, alerts, and currency settings", async () => {
@@ -107,9 +108,33 @@ test("Store overlay includes async price loading, controller navigation, alerts,
   assert.match(source, /steamloader-store-artwork-frame is-loading/);
   assert.match(source, /steamloader-store-artwork-loader-dot/);
   assert.match(source, /@keyframes steamloader-store-artwork-dot/);
+  assert.match(source, /function playNavigationSound\(\)/);
+  assert.match(source, /\/sounds\/deck_ui_navigation\.wav/);
+  assert.match(source, /direction && previousIndex !== state\.focusIndex/);
   assert.match(source, /maxConcurrentArtworkLoads = 3/);
   assert.match(source, /function scheduleArtworkLoad/);
   assert.match(source, /new window\.IntersectionObserver/);
+  assert.match(source, /function renderWishlistToolbar\(allGames\)/);
+  assert.match(source, /function getVisibleWishlist\(\)/);
+  assert.match(source, /function renderWishlistManageBar\(allGames\)/);
+  assert.match(source, /function renderWishlistActivityBanner\(\)/);
+  assert.match(source, /function renderGameTracking\(game\)/);
+  assert.match(source, /function renderWishlistGameTools\(game\)/);
+  assert.match(source, /state\.alertDraft\.mode = "new-low"/);
+  assert.match(source, /state\.alertDraft\.mode = "release"/);
+  assert.match(source, /wishlistViewStorageKey/);
+  assert.match(source, /function persistWishlistViewPreferences/);
+  assert.match(source, /function restoreRecentlyRemovedGames/);
+  assert.match(source, /Undo remove/);
+  assert.match(source, /api\/store\/wishlist\/bulk/);
+  assert.match(source, /function renderStatusToast/);
+  assert.match(source, /function syncRefreshingSnapshot/);
+  assert.match(source, /previousMainScrollTop/);
+  assert.match(source, /Price notifications/);
+  assert.match(source, /Resume now/);
+  assert.match(source, /api\/store\/backup\/import/);
+  assert.match(source, /api\/store\/settings\/cache/);
+  assert.match(source, /api\/store\/wishlist\/metadata/);
   assert.match(source, /rootMargin: "90px 120px"/);
   assert.match(source, /activeArtworkLoads < maxConcurrentArtworkLoads/);
   assert.match(source, /scheduleArtworkLoad\(frame/);

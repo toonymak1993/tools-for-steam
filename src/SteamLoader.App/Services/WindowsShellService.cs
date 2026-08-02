@@ -116,8 +116,11 @@ public sealed class WindowsShellService
 
     private static void StartExplorerIfNeeded()
     {
-        var explorerRunning = Process.GetProcessesByName("explorer")
-            .Any(process =>
+        var explorerProcesses = Process.GetProcessesByName("explorer");
+        var explorerRunning = false;
+        try
+        {
+            explorerRunning = explorerProcesses.Any(process =>
             {
                 try
                 {
@@ -128,6 +131,14 @@ public sealed class WindowsShellService
                     return false;
                 }
             });
+        }
+        finally
+        {
+            foreach (var process in explorerProcesses)
+            {
+                process.Dispose();
+            }
+        }
 
         if (explorerRunning)
         {

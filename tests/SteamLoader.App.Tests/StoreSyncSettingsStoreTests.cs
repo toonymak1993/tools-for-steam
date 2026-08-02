@@ -217,7 +217,7 @@ public sealed class StoreSyncSettingsStoreTests
             var configuration = store.Load();
             var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
 
-            Assert.Equal(4, configuration.OmniLibrarySettingsVersion);
+            Assert.Equal(5, configuration.OmniLibrarySettingsVersion);
             Assert.True(xbox.IncludeXboxPcGamePass);
             Assert.False(xbox.IncludeXboxCloudGaming);
 
@@ -293,7 +293,7 @@ public sealed class StoreSyncSettingsStoreTests
 
             var configuration = new StoreSyncSettingsStore(settingsPath).Load();
 
-            Assert.Equal(4, configuration.OmniLibrarySettingsVersion);
+            Assert.Equal(5, configuration.OmniLibrarySettingsVersion);
             foreach (var storeId in new[] { "xbox-game-pass", "epic-games" })
             {
                 var store = configuration.UnifySteam.Stores[storeId];
@@ -457,6 +457,83 @@ public sealed class StoreSyncSettingsStoreTests
 
             Assert.False(gog.Enabled);
             Assert.Equal(["123", "ABC"], gog.RemoteCatalogItemIds);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Save_ProtectsOpenXblKeyForCurrentWindowsUser()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            const string apiKey = "personal-openxbl-key-that-must-not-be-plaintext";
+            var store = new StoreSyncSettingsStore(settingsPath);
+
+            store.Update(configuration =>
+                configuration.UnifySteam.Stores["xbox-game-pass"].OpenXblApiKey =
+                    apiKey);
+
+            var storedJson = File.ReadAllText(settingsPath);
+            Assert.DoesNotContain(apiKey, storedJson, StringComparison.Ordinal);
+            Assert.Contains("dpapi:v1:", storedJson, StringComparison.Ordinal);
+            Assert.Equal(
+                apiKey,
+                store.Load().UnifySteam.Stores["xbox-game-pass"].OpenXblApiKey);
+        }
+        finally
+        {
+            DeleteTempSettingsPath(settingsPath);
+        }
+    }
+
+    [Fact]
+    public void Save_MigratesLegacyPlaintextOpenXblKeyWithoutPlaintextBackup()
+    {
+        var settingsPath = CreateTempSettingsPath();
+        try
+        {
+            const string legacyKey = "legacy-plaintext-openxbl-key";
+            File.WriteAllText(
+                settingsPath,
+                $$"""
+                  {
+                    "unifySteam": {
+                      "stores": {
+                        "xbox-game-pass": {
+                          "openXblApiKey": "{{legacyKey}}"
+                        }
+                      }
+                    }
+                  }
+                  """);
+            var store = new StoreSyncSettingsStore(settingsPath);
+            var configuration = store.Load();
+
+            Assert.Equal(
+                legacyKey,
+                configuration.UnifySteam.Stores["xbox-game-pass"].OpenXblApiKey);
+
+            store.Save(configuration);
+
+            Assert.DoesNotContain(
+                legacyKey,
+                File.ReadAllText(settingsPath),
+                StringComparison.Ordinal);
+            var backupPath = settingsPath + ".bak";
+            if (File.Exists(backupPath))
+            {
+                Assert.DoesNotContain(
+                    legacyKey,
+                    File.ReadAllText(backupPath),
+                    StringComparison.Ordinal);
+            }
+            Assert.Equal(
+                legacyKey,
+                store.Load().UnifySteam.Stores["xbox-game-pass"].OpenXblApiKey);
         }
         finally
         {

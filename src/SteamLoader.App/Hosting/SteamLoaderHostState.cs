@@ -1,3 +1,5 @@
+using SteamLoader.App.Services;
+
 namespace SteamLoader.App.Hosting;
 
 public sealed class SteamLoaderHostState
@@ -8,6 +10,8 @@ public sealed class SteamLoaderHostState
     private bool _quickAccessAttached;
     private string _serviceMessage = "Starting background host...";
     private string? _lastError;
+    private SteamClientStartupStage _steamStartupStage = SteamClientStartupStage.Starting;
+    private SteamUiState _steamUiState = SteamUiState.Starting;
 
     public SteamLoaderHostState()
     {
@@ -52,6 +56,28 @@ public sealed class SteamLoaderHostState
         }
     }
 
+    public void UpdateSteamStartup(SteamClientStartupStage stage, string message)
+    {
+        lock (_gate)
+        {
+            _steamStartupStage = stage;
+            _serviceMessage = message;
+
+            if (stage == SteamClientStartupStage.Ready)
+            {
+                _lastError = null;
+            }
+        }
+    }
+
+    public void UpdateSteamUiState(SteamUiState state)
+    {
+        lock (_gate)
+        {
+            _steamUiState = state;
+        }
+    }
+
     public void UpdateError(string message)
     {
         lock (_gate)
@@ -70,7 +96,9 @@ public sealed class SteamLoaderHostState
                 _sharedContextAttached,
                 _quickAccessAttached,
                 _serviceMessage,
-                _lastError);
+                _lastError,
+                _steamStartupStage,
+                _steamUiState);
         }
     }
 }
@@ -80,4 +108,6 @@ public sealed record SteamLoaderHostStatus(
     bool SharedContextAttached,
     bool QuickAccessAttached,
     string ServiceMessage,
-    string? LastError);
+    string? LastError,
+    SteamClientStartupStage SteamStartupStage = SteamClientStartupStage.Starting,
+    SteamUiState SteamUiState = SteamUiState.Starting);
