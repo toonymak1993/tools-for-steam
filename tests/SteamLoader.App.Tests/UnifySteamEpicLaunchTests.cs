@@ -12,6 +12,7 @@ public sealed class UnifySteamEpicLaunchTests
     [InlineData("gog-galaxy", false, "", false, true)]
     [InlineData("epic-games", false, "epic", true, true)]
     [InlineData("epic-games", false, "ea-app", false, false)]
+    [InlineData("epic-games", false, "ubisoft-connect", true, false)]
     public void CanInstallDirectly_UsesStoreSpecificCapabilities(
         string storeId,
         bool cloudPlayable,
@@ -114,6 +115,9 @@ public sealed class UnifySteamEpicLaunchTests
     [InlineData("The EA App", "", "", "ea-app")]
     [InlineData("", "UbisoftConnect", "", "ubisoft-connect")]
     [InlineData("", "", "ubisoft", "ubisoft-connect")]
+    [InlineData("Rockstar Games Launcher", "", "", "rockstar-games-launcher")]
+    [InlineData("", "GOG Galaxy", "", "gog-galaxy")]
+    [InlineData("", "Blizzard", "", "battle-net")]
     [InlineData("", "", "", "epic")]
     [InlineData("Another Publisher", "", "", "external")]
     public void ResolveEpicDeliveryProvider_SeparatesOwnershipFromDelivery(
@@ -131,9 +135,14 @@ public sealed class UnifySteamEpicLaunchTests
     }
 
     [Theory]
-    [InlineData("ubisoft-connect", true, false, true)]
+    [InlineData("ubisoft-connect", true, true, false)]
     [InlineData("ubisoft-connect", false, true, false)]
     [InlineData("ea-app", true, true, false)]
+    [InlineData("rockstar-games-launcher", true, true, false)]
+    [InlineData("rockstar-games-launcher", false, true, false)]
+    [InlineData("gog-galaxy", true, true, false)]
+    [InlineData("battle-net", true, true, false)]
+    [InlineData("external", true, true, false)]
     [InlineData("epic", true, false, true)]
     [InlineData("epic", false, false, false)]
     public void EpicDeliveryCapabilities_KeepPublisherLaunchersExternal(
@@ -201,7 +210,7 @@ public sealed class UnifySteamEpicLaunchTests
     }
 
     [Fact]
-    public void NormalizeEpicDeliveryCapabilities_PreservesInstallableUbisoftEpicAsset()
+    public void NormalizeEpicDeliveryCapabilities_AlwaysHandsUbisoftInstallToPublisher()
     {
         var game = new UnifySteamGameCacheEntry
         {
@@ -214,8 +223,8 @@ public sealed class UnifySteamEpicLaunchTests
         UnifySteamService.NormalizeEpicDeliveryCapabilities(game);
 
         Assert.True(game.RequiresAccountLink);
-        Assert.False(game.RequiresExternalLauncher);
-        Assert.True(UnifySteamService.CanInstallEpicDirectly(
+        Assert.True(game.RequiresExternalLauncher);
+        Assert.False(UnifySteamService.CanInstallEpicDirectly(
             game.DeliveryProvider,
             game.HasInstallableAsset));
     }

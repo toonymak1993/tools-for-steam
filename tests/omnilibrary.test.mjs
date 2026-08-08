@@ -51,10 +51,25 @@ test("dynamic native tabs, LB/RB, and D-Pad use exactly the enabled store order"
   assert.match(tabs, /__steamLoaderNativeDesktopTab: templateTab/);
   assert.match(tabs, /restoreRememberedNativeTabs/);
   assert.match(tabs, /function navigateLibraryByDirection\(direction\)/);
+  assert.match(tabs, /function isNavigableLibraryTabElement\(element\)/);
+  assert.match(tabs, /document\.querySelectorAll\('\[role="tablist"\]'\)/);
+  assert.match(tabs, /for \(let depth = 0; current && depth < 24; depth \+= 1\)/);
+  assert.match(tabs, /function filterMountedNavigationTabs\(tabs, visibleTabs\)/);
+  assert.match(tabs, /const tabs = filterMountedNavigationTabs\(plannedTabs, visibleTabs\)/);
   assert.match(
     tabs,
     /isManagedStoreTabId\(nextTabId\)[\s\S]*navigation\.onShowTab\(nextTabId\)[\s\S]*visibleDestination\.click/,
     "virtual tabs must use the translated navigation proxy instead of Steam's native DOM click handler",
+  );
+  assert.match(
+    tabs,
+    /if \(!visibleDestination\) \{[\s\S]*state\.forceRenderRequested = true;[\s\S]*scheduleXboxTabPatch\(\);[\s\S]*return true;[\s\S]*commitLibraryNavigationTarget\(nextTabId\)/,
+    "a tab removed during navigation must trigger a repair instead of becoming an invisible destination",
+  );
+  assert.doesNotMatch(
+    tabs,
+    /else if \(typeof navigation\.onShowTab === "function"\) \{\s*navigation\.onShowTab\(nextTabId\)/,
+    "unmounted tabs must never be selected through the stale React navigation callback",
   );
   assert.match(tabs, /state\.navigationRuntime\.activeTab = normalizedTabId/);
   assert.match(tabs, /function installLibraryBumperInput\(\)/);
@@ -78,6 +93,35 @@ test("dynamic native tabs, LB/RB, and D-Pad use exactly the enabled store order"
   assert.match(tabs, /tabs\.length > 128/);
   assert.match(tabs, /function buildSourceStoreSnapshot\(stores, sourceStoreId, now\)/);
   assert.match(tabs, /function scheduleLibraryTabReveal\(tabId\)/);
+  assert.match(tabs, /function scheduleLibraryLayoutVerification\(resetAttempts = false\)/);
+  assert.match(tabs, /function scheduleInitialLibraryPatchRetry\(\)/);
+  assert.match(tabs, /maximumInitialPatchAttempts/);
+  assert.match(tabs, /function pulseMountedNativeTabRoute\(\)/);
+  assert.match(
+    tabs,
+    /runBatchedLibraryUpdate\(\(\) => \{[\s\S]*pulseTab\.click\?\.\(\);[\s\S]*selectedTab\.click\?\.\(\);/,
+    "the initial compositor render must finish on the already-selected native tab",
+  );
+  assert.match(tabs, /layoutRenderPulseUsed/);
+  assert.match(tabs, /bumperHeldFallbackMs = 700/);
+  assert.match(tabs, /function holdLibraryBumper\(direction\)/);
+  assert.match(tabs, /state\.heldBumperDirections\.has\(direction\)/);
+  assert.match(tabs, /"vgp_onbuttonup",\s*state\.libraryBumperReleaseEventHandler/);
+  assert.match(
+    tabs,
+    /if \(!getLiveLibraryNavigation\(\)\) \{[\s\S]*scheduleXboxTabPatch\(\);[\s\S]*\} else \{\s*navigateLibraryByDirection\(direction\);/,
+    "the Library handler must repair a stale row instead of delegating bumper input to its invisible tab array",
+  );
+  assert.doesNotMatch(
+    tabs,
+    /mountedLibraryTabLayoutNeedsPatch\(\)[\s\S]{0,1200}selectedTab\.click\?\.\(\);\s*if \(preservedVirtualTabId\)/,
+    "a selected-tab-only click does not wake Steam's function-component tab row",
+  );
+  assert.doesNotMatch(
+    tabs,
+    /function scheduleXboxTabPatch\(\)\s*\{\s*state\.forceRenderRequested = true/,
+    "ordinary tab navigation must not turn every coalesced patch into a forced Library render",
+  );
   assert.doesNotMatch(tabs, /\bpersist\b/);
   assert.match(tabs, /function recordLibraryRuntimeError\(scope, error\)/);
   assert.match(tabs, /Library tab render preparation/);
@@ -102,7 +146,7 @@ test("ROM systems become native platform tabs only when imported games have Stea
   assert.match(tabs, /platform\?\.appIds/);
   assert.match(tabs, /legacyManagedTabIds\.add\(definition\.tabId\)/);
   assert.match(automation, /watcher\.Error \+= OnWatcherError/);
-  assert.match(automation, /ScheduleWatcherTrigger\("watch-recovery"\)/);
+  assert.match(automation, /ScheduleWatcherTrigger\("watch-recovery"/);
   assert.match(storeSync, /OmniLibraryRomSystemRegistry\.Supported\.Any/);
   assert.doesNotMatch(tabs, /state\.tileBadgeCount = activeBadges\.size;\s*refreshEmulatorSystemSurface\(\)/);
 });
@@ -540,6 +584,15 @@ test("OmniLibrary hot paths use cached lightweight state and batched download st
 test("OmniLibrary reconciles install and uninstall lifecycle deltas promptly", () => {
   const tabs = read("src/SteamLoader.App/Assets/library-tabs.js");
   const artwork = read("src/SteamLoader.App/Assets/artwork-surface.js");
+  const providerTracker = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/ProviderInstallStateTracker.cs",
+  );
+  const automation = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncAutomationService.cs",
+  );
+  const storeSync = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs",
+  );
 
   assert.match(tabs, /function isPendingLifecycleStatus\(status\)/);
   assert.match(
@@ -564,9 +617,19 @@ test("OmniLibrary reconciles install and uninstall lifecycle deltas promptly", (
     tabs,
     /entry\?\.installed !== true[\s\S]*state\.pendingLifecycleAppIds\.has\(appId\)/,
   );
+  assert.match(
+    providerTracker,
+    /return includeIdle \|\| IsOperationRelevant\(status\)/,
+  );
+  assert.match(providerTracker, /game\.ProviderGameId = installedGame\.Id/);
+  assert.match(
+    automation,
+    /\["gog-galaxy"\] = \["gog-galaxy", "epic-games"\]/,
+  );
+  assert.match(storeSync, /storeConfiguration\.Enabled && !omniLibraryStoreEnabled/);
 });
 
-test("disabling OmniLibrary removes its owned UI while the shared Tabhero compositor remains independent", () => {
+test("disabling OmniLibrary removes its owned UI and standalone tab runtime", () => {
   const tabs = read("src/SteamLoader.App/Assets/library-tabs.js");
   const surface = read("src/SteamLoader.App/Assets/xbox-library-surface.js");
   const artwork = read("src/SteamLoader.App/Assets/artwork-surface.js");
@@ -589,7 +652,10 @@ test("disabling OmniLibrary removes its owned UI while the shared Tabhero compos
   assert.match(tabs, /function getEnabledStoreDefinitions\(\)\s*\{\s*if \(!state\.pluginEnabled\)/s);
   assert.match(tabs, /const omniLibraryRuntimeActive =\s*state\.pluginEnabled && getEnabledStoreDefinitions\(\)\.length > 0/);
   assert.match(tabs, /if \(omniLibraryRuntimeActive\)[\s\S]*scheduleDownloadStateRefresh\(0\)/);
-  assert.match(tabs, /isLibraryTabRuntimeEnabled\(\)[\s\S]*isTabHeroEnabled\(\)/);
+  assert.match(
+    tabs,
+    /function isLibraryTabRuntimeEnabled\(\) \{\s*return getEnabledVirtualDefinitions\(\)\.length > 0;\s*\}/,
+  );
   assert.match(tabs, /state\.activationResolved = true/);
   assert.match(tabs, /getNativeNavigationHandler\(props\.onShowTab\)/);
   assert.match(tabs, /backendUnavailable: true/);
@@ -599,7 +665,7 @@ test("disabling OmniLibrary removes its owned UI while the shared Tabhero compos
   assert.match(storeSync, /CancelOmniLibraryBackgroundWork\(storeId\)/);
   assert.match(storeSync, /activeSyncCancellation\?\.Cancel\(\)/);
   assert.match(storeSync, /cancellation\.Cancel\(\)/);
-  assert.match(storeSync, /DownloadSteamFirstAsync\([\s\S]*cancellationToken/s);
+  assert.match(storeSync, /DownloadLocalFirstAsync\([\s\S]*cancellationToken/s);
   assert.match(storeSync, /catch \(OperationCanceledException\) when \(cancellationToken\.IsCancellationRequested\)/);
   assert.doesNotMatch(
     tabs,
@@ -609,6 +675,22 @@ test("disabling OmniLibrary removes its owned UI while the shared Tabhero compos
   assert.match(surface, /state\.summary\?\.pluginEnabled === true/);
   assert.match(artwork, /snapshot\?\.pluginEnabled !== true/);
   assert.match(artwork, /removeOmniLibraryUninstallContextRows\(\)/);
+});
+
+test("retired Library tab customization plugin has no active registration or runtime dependency", () => {
+  const retiredPluginId = ["tab", "hero"].join("");
+  const sources = [
+    read("README.md"),
+    read("src/SteamLoader.App/Hosting/SteamLoaderBackgroundHost.cs"),
+    read("src/SteamLoader.App/Infrastructure/Settings/SteamLoaderPluginCatalog.cs"),
+    read("src/SteamLoader.App/Assets/quickaccess-popup.js"),
+    read("src/SteamLoader.App/Assets/library-tabs.js"),
+  ];
+
+  assert.equal(
+    sources.some((source) => source.toLowerCase().includes(retiredPluginId)),
+    false,
+  );
 });
 
 test("OmniLibrary uninstall provides store-specific feedback without taking controller focus", () => {
@@ -780,16 +862,19 @@ test("GOG reuses the managed provider contracts and processes only catalog delta
   assert.doesNotMatch(launcher, /heroic_gogdl/);
 });
 
-test("OmniLibrary artwork is asynchronous and Steam-public-first with SteamGridDB fallback", () => {
+test("OmniLibrary artwork is local-first and keeps SteamGridDB as the final fallback", () => {
   const storeSync = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
   const artwork = read("src/SteamLoader.App/Infrastructure/StoreSync/SteamGridDbArtworkDownloader.cs");
+  const localArtwork = read(
+    "src/SteamLoader.App/Infrastructure/StoreSync/OmniLibraryLocalArtworkResolver.cs",
+  );
 
   assert.match(storeSync, /QueueOmniLibraryArtworkSync/);
   assert.match(storeSync, /_activeOmniArtworkTask/);
   assert.match(storeSync, /_pendingOmniArtworkTargets/);
   assert.match(storeSync, /_activeOmniArtworkTargetIds/);
   assert.match(storeSync, /ProcessQueuedOmniLibraryArtworkAsync/);
-  assert.match(storeSync, /DownloadSteamFirstAsync/);
+  assert.match(storeSync, /DownloadLocalFirstAsync/);
   assert.match(storeSync, /must not[\s\S]*move the public preparation state backwards/);
   assert.match(artwork, /store\.steampowered\.com\/api\/storesearch/);
   assert.match(artwork, /cdn\.cloudflare\.steamstatic\.com/);
@@ -804,7 +889,19 @@ test("OmniLibrary artwork is asynchronous and Steam-public-first with SteamGridD
   assert.match(artwork, /ImageIcon/);
   assert.match(artwork, /HasCompleteArtworkSet/);
   assert.match(artwork, /GenerateTitleLogo/);
-  assert.match(artwork, /previous run may already have every real primary image/i);
+  assert.match(artwork, /ImportLocalArtworkSetAsync/);
+  assert.match(artwork, /DownloadRemoteStoreArtworkSetAsync/);
+  assert.match(localArtwork, /appcache[\s\S]*librarycache/);
+  assert.match(localArtwork, /appmanifest_\*\.acf/);
+  assert.match(localArtwork, /AddInstallArtwork/);
+  assert.match(localArtwork, /AddRomSidecarArtwork/);
+  const localStage = artwork.indexOf("// Stage 1:");
+  const providerStage = artwork.indexOf("// Stage 2:");
+  const steamStage = artwork.indexOf("// Stage 3:");
+  const steamGridDbStage = artwork.indexOf("// Stage 4:");
+  assert.ok(localStage >= 0 && localStage < providerStage);
+  assert.ok(providerStage < steamStage);
+  assert.ok(steamStage < steamGridDbStage);
   assert.match(artwork, /MaximumArtworkBytes = 32L \* 1024 \* 1024/);
   assert.match(artwork, /CopyArtworkWithLimitAsync/);
   assert.match(artwork, /IsUsableArtworkFile/);
@@ -918,10 +1015,11 @@ test("Xbox sources are independent and cloud-only games stream without entering 
   assert.match(popup, /api\/unifystore\/restart-steam/);
 });
 
-test("OmniLibrary repairs only missing artwork and keeps store catalog images as the final fallback", () => {
+test("OmniLibrary repairs only missing artwork and keeps provider images ahead of SteamGridDB", () => {
   const storeSync = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
   const artwork = read("src/SteamLoader.App/Infrastructure/StoreSync/SteamGridDbArtworkDownloader.cs");
   const settings = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncSettingsStore.cs");
+  const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
 
   assert.match(storeSync, /BuildIncompleteOmniLibraryArtworkTargets/);
   assert.match(storeSync, /!SteamGridDbArtworkDownloader\.HasCompleteArtworkSet\(/);
@@ -932,10 +1030,12 @@ test("OmniLibrary repairs only missing artwork and keeps store catalog images as
   assert.match(storeSync, /optional artwork remains incomplete/);
   assert.match(settings, /OmniLibrarySettingsVersion < 2/);
   assert.match(settings, /wasBlockedOnlyByArtwork/);
-  assert.match(artwork, /DownloadStoreFallbackArtworkSetAsync/);
-  assert.match(artwork, /\[gridId\] = wideFallbackUrl/);
-  assert.match(artwork, /\[\$"\{gridId\}p"\] = portraitFallbackUrl/);
+  assert.match(artwork, /DownloadRemoteStoreArtworkSetAsync/);
+  assert.match(artwork, /SteamGridDB is intentionally last/);
+  assert.match(artwork, /\[gridId\] = \[heroUrl, portraitUrl\]/);
+  assert.match(artwork, /\[\$"\{gridId\}p"\] = \[portraitUrl, heroUrl\]/);
   assert.match(artwork, /PromoteStoreFallbackArtwork/);
+  assert.doesNotMatch(popup, /artwork repair pending/);
 });
 
 test("managed OmniLibrary games expose one controller-safe metadata and artwork refresh", () => {
@@ -951,4 +1051,20 @@ test("managed OmniLibrary games expose one controller-safe metadata and artwork 
   assert.match(api, /RepairOmniLibraryGameArtwork/);
   assert.match(service, /OmniLibraryGameArtworkRepairResult/);
   assert.match(service, /GetMissingArtworkSlots/);
+});
+
+test("OmniLibrary exposes a confirmed safe reload for every managed artwork set", () => {
+  const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
+  const api = read("src/SteamLoader.App/Hosting/SteamLoaderApiServer.cs");
+  const service = read("src/SteamLoader.App/Infrastructure/StoreSync/StoreSyncService.cs");
+  const downloader = read("src/SteamLoader.App/Infrastructure/StoreSync/SteamGridDbArtworkDownloader.cs");
+
+  assert.match(popup, /Reload All Artwork/);
+  assert.match(popup, /Confirm Reload All Artwork/);
+  assert.match(popup, /api\/unifystore\/artwork\/reload-all/);
+  assert.match(api, /ReloadAllOmniLibraryArtwork/);
+  assert.match(service, /includeComplete: true/);
+  assert.match(service, /forceReload: true/);
+  assert.match(downloader, /\.tfs-artwork-reload-/);
+  assert.match(downloader, /PromoteReloadedArtworkSet/);
 });

@@ -13,7 +13,6 @@ public static class SteamLoaderPluginCatalog
         new("app-start", "Apps", "One-click launcher for installed Windows apps.", true),
         new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true, false),
         new("omnilibrary", "OmniLibrary", "Bring Xbox and Epic libraries into dedicated Steam tabs with download, play, and safe uninstall actions.", true, false),
-        new("tabhero", "Tabhero", "Rename, hide, reorder, and add filtered Steam Library tabs without changing tabs owned by other plugins.", true),
         new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),

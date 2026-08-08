@@ -100,6 +100,25 @@ public static class Program
                 args[gogPreparationIndex + 4]);
         }
 
+        var lockScreenWallpaperIndex = Array.FindIndex(args, argument =>
+            string.Equals(
+                argument,
+                Infrastructure.Themes.LockScreenWallpaperElevatedWorker.ElevatedArgument,
+                StringComparison.OrdinalIgnoreCase));
+        if (lockScreenWallpaperIndex >= 0)
+        {
+            if (lockScreenWallpaperIndex + 3 >= args.Length)
+            {
+                Console.Error.WriteLine("The elevated lock screen wallpaper request is incomplete.");
+                return 1;
+            }
+
+            return Infrastructure.Themes.LockScreenWallpaperElevatedWorker.RunElevated(
+                args[lockScreenWallpaperIndex + 1],
+                args[lockScreenWallpaperIndex + 2],
+                args[lockScreenWallpaperIndex + 3]);
+        }
+
         var unifyInstallIndex = Array.FindIndex(args, argument =>
             string.Equals(argument, Infrastructure.StoreSync.UnifySteamLauncher.InstallArgument, StringComparison.OrdinalIgnoreCase));
         if (unifyInstallIndex >= 0)

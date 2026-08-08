@@ -707,7 +707,9 @@ public sealed class StoreSyncService
             ResolveRetroAchievementsArtworkGameId(
                 configuration,
                 cachedGame?.Id ?? game.Id,
-                cachedGame?.RomPath ?? game.RomPath));
+                cachedGame?.RomPath ?? game.RomPath),
+            cachedGame?.InstallPath ?? game.InstallPath,
+            cachedGame?.ExecutablePath ?? game.ExecutablePath);
         var steamGridDbApiKey = _artworkDownloader.GetEffectiveApiKey(
             configuration.SteamGridDbApiKey);
         lock (_gate)
@@ -737,6 +739,79 @@ public sealed class StoreSyncService
             true,
             missing,
             $"Repairing {string.Join(", ", missing)} in the background.");
+    }
+
+    public OmniLibraryArtworkReloadResult ReloadAllOmniLibraryArtwork()
+    {
+        var profile = ResolveSteamProfile() ??
+            throw new InvalidOperationException("Steam profile could not be resolved.");
+        var configuration = _settingsStore.Load();
+        var enabledStoreIds = configuration.UnifySteam.Stores
+            .Where(pair => pair.Value?.Enabled == true)
+            .Select(pair => pair.Key)
+            .ToArray();
+        var gridDirectory = BuildGridDirectory(profile);
+        var targets = BuildOmniLibraryArtworkTargets(
+                configuration,
+                gridDirectory,
+                enabledStoreIds,
+                includeComplete: true,
+                forceReload: true)
+            .GroupBy(target => target.AppId)
+            .Select(group => group.Aggregate(SelectPreferredArtworkTarget))
+            .ToArray();
+        if (targets.Length == 0)
+        {
+            return new OmniLibraryArtworkReloadResult(
+                false,
+                0,
+                0,
+                "No enabled OmniLibrary games with a managed Steam shortcut were found.");
+        }
+
+        var steamGridDbApiKey = _artworkDownloader.GetEffectiveApiKey(
+            configuration.SteamGridDbApiKey);
+        lock (_gate)
+        {
+            _pendingOmniArtworkGridDirectory = gridDirectory;
+            _pendingOmniArtworkApiKey = steamGridDbApiKey;
+            foreach (var target in targets)
+            {
+                if (!_pendingOmniArtworkTargets.TryGetValue(
+                        target.StoreId,
+                        out var storeTargets))
+                {
+                    storeTargets = new Dictionary<uint, StoreSyncArtworkTarget>();
+                    _pendingOmniArtworkTargets[target.StoreId] = storeTargets;
+                }
+
+                storeTargets[target.AppId] = storeTargets.TryGetValue(
+                        target.AppId,
+                        out var existingTarget)
+                    ? SelectPreferredArtworkTarget(existingTarget, target)
+                    : target;
+                _omniArtworkRetryAtUtc.Remove(target.StoreId);
+            }
+
+            if (_activeOmniArtworkTask is not { IsCompleted: false })
+            {
+                _activeOmniArtworkTask = Task.Run(ProcessQueuedOmniLibraryArtworkAsync);
+            }
+        }
+
+        var storeCount = targets
+            .Select(target => target.StoreId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        _journal.Append(
+            "info",
+            "omnilibrary",
+            $"Queued a safe full artwork reload for {targets.Length} title(s) across {storeCount} store(s).");
+        return new OmniLibraryArtworkReloadResult(
+            true,
+            targets.Length,
+            storeCount,
+            $"Reloading artwork for {targets.Length} OmniLibrary title(s) in the background. Existing artwork stays in place until each five-slot replacement is complete.");
     }
 
     public OmniLibraryDownloadCenterSnapshot GetOmniLibraryDownloadCenter()
@@ -3842,7 +3917,7 @@ public sealed class StoreSyncService
         var targets = new Dictionary<string, StoreSyncWatchTarget>(StringComparer.OrdinalIgnoreCase);
         var profile = ResolveSteamProfile();
 
-        void addDirectoryTarget(string? path, string filter = "*")
+        void addDirectoryTarget(string? path, string filter = "*", string storeId = "")
         {
             var normalizedPath = NormalizePath(path);
             if (string.IsNullOrWhiteSpace(normalizedPath) || !Directory.Exists(normalizedPath))
@@ -3851,10 +3926,10 @@ public sealed class StoreSyncService
             }
 
             var key = $"{normalizedPath}|{filter}";
-            targets[key] = new StoreSyncWatchTarget(normalizedPath, filter, IncludeSubdirectories: true);
+            targets[key] = new StoreSyncWatchTarget(normalizedPath, filter, IncludeSubdirectories: true, StoreId: storeId);
         }
 
-        void addFileTarget(string? path)
+        void addFileTarget(string? path, string storeId = "")
         {
             var normalizedPath = NormalizePath(path);
             if (string.IsNullOrWhiteSpace(normalizedPath))
@@ -3872,7 +3947,7 @@ public sealed class StoreSyncService
             }
 
             var key = $"{parentDirectory}|{fileName}";
-            targets[key] = new StoreSyncWatchTarget(parentDirectory, fileName, IncludeSubdirectories: false);
+            targets[key] = new StoreSyncWatchTarget(parentDirectory, fileName, IncludeSubdirectories: false, StoreId: storeId);
         }
 
         addFileTarget(profile?.ShortcutsPath);
@@ -3890,7 +3965,20 @@ public sealed class StoreSyncService
         foreach (var definition in StoreDefinitions)
         {
             var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
-            if (!storeConfiguration.Enabled)
+            var omniLibraryWatchStoreId = definition.Id switch
+            {
+                "epic-games" or "ea-app" or "ubisoft-connect" or "battle-net" => "epic-games",
+                "gog-galaxy" => "gog-galaxy",
+                "xbox-game-pass" => "xbox-game-pass",
+                _ => string.Empty,
+            };
+            var omniLibraryStoreEnabled =
+                !string.IsNullOrWhiteSpace(omniLibraryWatchStoreId) &&
+                configuration.UnifySteam.Stores.TryGetValue(
+                    omniLibraryWatchStoreId,
+                    out var omniLibraryStore) &&
+                omniLibraryStore?.Enabled == true;
+            if (!storeConfiguration.Enabled && !omniLibraryStoreEnabled)
             {
                 continue;
             }
@@ -3910,11 +3998,11 @@ public sealed class StoreSyncService
                         "EpicGamesLauncher",
                         "Data",
                         "Manifests");
-                    addFileTarget(launcherInstalledPath);
-                    addDirectoryTarget(manifestDirectory, "*.item");
+                    addFileTarget(launcherInstalledPath, definition.Id);
+                    addDirectoryTarget(manifestDirectory, "*.item", definition.Id);
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -3923,7 +4011,7 @@ public sealed class StoreSyncService
                 {
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -3932,12 +4020,12 @@ public sealed class StoreSyncService
                 {
                     foreach (var root in GetXboxCandidateRoots().Distinct(StringComparer.OrdinalIgnoreCase))
                     {
-                        addDirectoryTarget(root);
+                        addDirectoryTarget(root, storeId: definition.Id);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -3948,15 +4036,15 @@ public sealed class StoreSyncService
                         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                         "Ubisoft Game Launcher",
                         "settings.yaml");
-                    addFileTarget(settingsPath);
+                    addFileTarget(settingsPath, definition.Id);
                     foreach (var root in GetUbisoftConnectCandidateRoots())
                     {
-                        addDirectoryTarget(root);
+                        addDirectoryTarget(root, storeId: definition.Id);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -3965,12 +4053,12 @@ public sealed class StoreSyncService
                 {
                     foreach (var root in GetEaAppCandidateRoots())
                     {
-                        addDirectoryTarget(root);
+                        addDirectoryTarget(root, storeId: definition.Id);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -3981,10 +4069,10 @@ public sealed class StoreSyncService
                         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                         "Battle.net",
                         "Battle.net.config");
-                    addFileTarget(configPath);
+                    addFileTarget(configPath, definition.Id);
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot);
+                        addDirectoryTarget(extraRoot, storeId: definition.Id);
                     }
 
                     break;
@@ -4312,7 +4400,7 @@ public sealed class StoreSyncService
                 DebugLines: debugLines));
         }
 
-        var cleanupPlan = configuration.CleanupMissingTitles || forceCleanupMissingTitles
+        var missingTitleCleanupPlan = configuration.CleanupMissingTitles || forceCleanupMissingTitles
             ? BuildCleanupCandidates(
                 configuration,
                 existingShortcuts,
@@ -4321,12 +4409,23 @@ public sealed class StoreSyncService
                 cleanupAuthorityByStoreId,
                 cleanupOmniGameIds)
             : new StoreSyncCleanupPlan([], 0);
+        var duplicateCleanupCandidates = BuildDuplicateOmniLibraryCleanupCandidates(
+            existingShortcuts,
+            items,
+            matchedManagedShortcutIndices);
+        var cleanupCandidates = missingTitleCleanupPlan.Candidates
+            .Concat(duplicateCleanupCandidates)
+            .GroupBy(candidate => candidate.ExistingShortcut.Index)
+            .Select(group => group.First())
+            .OrderBy(candidate => candidate.StoreTitle, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         return new StoreSyncAnalysis(
             items,
-            cleanupPlan.Candidates,
-            cleanupPlan.DeferredCount,
-            BuildPreviewState(items, cleanupPlan.Candidates, cleanupPlan.DeferredCount));
+            cleanupCandidates,
+            missingTitleCleanupPlan.DeferredCount,
+            BuildPreviewState(items, cleanupCandidates, missingTitleCleanupPlan.DeferredCount));
     }
 
     private static StoreSyncAnalysis FilterOmniLibraryAnalysis(
@@ -4344,13 +4443,10 @@ public sealed class StoreSyncService
             .ToArray();
         var cleanupCandidates = analysis.CleanupCandidates
             .Where(candidate =>
-                candidate.ManifestEntry is not null &&
-                TryResolveOmniLibraryGameIdentity(
-                    candidate.ManifestEntry.StoreItemId,
-                    out var storeId,
-                    out var gameId) &&
+                TryResolveCleanupOmniLibraryGameIdentity(candidate, out var storeId, out var gameId) &&
                 storeId.Equals(delta.StoreId, StringComparison.OrdinalIgnoreCase) &&
-                delta.RemovedGameIds.Contains(gameId))
+                (delta.RemovedGameIds.Contains(gameId) ||
+                 candidate.ManifestEntry is null))
             .ToArray();
 
         return new StoreSyncAnalysis(
@@ -4358,6 +4454,83 @@ public sealed class StoreSyncService
             cleanupCandidates,
             DeferredCleanupCount: 0,
             BuildPreviewState(items, cleanupCandidates, deferredCleanupCount: 0));
+    }
+
+    private static IReadOnlyList<StoreSyncCleanupCandidate> BuildDuplicateOmniLibraryCleanupCandidates(
+        IReadOnlyList<ExistingShortcutEntry> existingShortcuts,
+        IReadOnlyList<StoreSyncAnalysisItem> items,
+        IReadOnlySet<int> matchedManagedShortcutIndices)
+    {
+        var itemByIdentity = items
+            .Where(item => string.Equals(item.Game.StoreId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
+            .Select(item => new
+            {
+                Item = item,
+                Identity = NormalizeOmniLibraryLaunchIdentity(ResolveShortcutLaunchOptions(item.Game)),
+            })
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate.Identity))
+            .GroupBy(candidate => candidate.Identity, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First().Item, StringComparer.OrdinalIgnoreCase);
+
+        var result = new List<StoreSyncCleanupCandidate>();
+        foreach (var group in existingShortcuts
+                     .Select(entry => new
+                     {
+                         Entry = entry,
+                         Identity = NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions),
+                     })
+                     .Where(candidate => !string.IsNullOrWhiteSpace(candidate.Identity))
+                     .GroupBy(candidate => candidate.Identity, StringComparer.OrdinalIgnoreCase)
+                     .Where(group => group.Count() > 1))
+        {
+            itemByIdentity.TryGetValue(group.Key, out var item);
+            var desiredExecutablePath = item is null
+                ? string.Empty
+                : NormalizePath(ResolveShortcutExecutablePath(item.Game));
+            var canonical = group
+                .OrderBy(candidate => matchedManagedShortcutIndices.Contains(candidate.Entry.Index) ? 0 : 1)
+                .ThenBy(candidate => !string.IsNullOrWhiteSpace(desiredExecutablePath) &&
+                                     string.Equals(candidate.Entry.ExecutablePath, desiredExecutablePath, StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : 1)
+                .ThenByDescending(candidate => candidate.Entry.IsManaged)
+                .ThenBy(candidate => candidate.Entry.Index)
+                .First();
+
+            foreach (var duplicate in group.Where(candidate => candidate.Entry.Index != canonical.Entry.Index))
+            {
+                var title = !string.IsNullOrWhiteSpace(canonical.Entry.AppName)
+                    ? canonical.Entry.AppName
+                    : item?.EffectiveTitle ?? group.Key;
+                result.Add(new StoreSyncCleanupCandidate(
+                    $"omnilibrary-duplicate-{duplicate.Entry.AppId:x8}-{duplicate.Entry.Index}",
+                    title,
+                    "OmniLibrary",
+                    duplicate.Entry,
+                    null,
+                    [
+                        $"Duplicate OmniLibrary shortcut identity {group.Key} was detected.",
+                        $"Shortcut {duplicate.Entry.AppId:x8} will be removed; {canonical.Entry.AppId:x8} remains canonical.",
+                    ]));
+            }
+        }
+
+        return result;
+    }
+
+    private static bool TryResolveCleanupOmniLibraryGameIdentity(
+        StoreSyncCleanupCandidate candidate,
+        out string storeId,
+        out string gameId)
+    {
+        if (candidate.ManifestEntry is not null &&
+            TryResolveOmniLibraryGameIdentity(candidate.ManifestEntry.StoreItemId, out storeId, out gameId))
+        {
+            return true;
+        }
+
+        var identity = NormalizeOmniLibraryLaunchIdentity(candidate.ExistingShortcut.LaunchOptions);
+        return TryResolveOmniLibraryGameIdentity(identity, out storeId, out gameId);
     }
 
     private static StoreSyncCleanupPlan BuildCleanupCandidates(
@@ -4421,6 +4594,7 @@ public sealed class StoreSyncService
         foreach (var existingShortcut in existingShortcuts
                      .Where(entry => entry.IsManaged &&
                                      !matchedManagedShortcutIndices.Contains(entry.Index) &&
+                                     ShouldCleanupUnmatchedManagedShortcut(entry, cleanupOmniGameIds) &&
                                      claimedIndices.Add(entry.Index)))
         {
             cleanupCandidates.Add(new StoreSyncCleanupCandidate(
@@ -4441,6 +4615,25 @@ public sealed class StoreSyncService
             .ToArray() is var orderedCandidates
             ? new StoreSyncCleanupPlan(orderedCandidates, deferredCleanupCount)
             : new StoreSyncCleanupPlan([], deferredCleanupCount);
+    }
+
+    private static bool ShouldCleanupUnmatchedManagedShortcut(
+        ExistingShortcutEntry existingShortcut,
+        IReadOnlySet<string>? cleanupOmniGameIds)
+    {
+        // A full Store Sync scan may remove every unmatched managed shortcut.
+        // An OmniLibrary delta scan contains only changed games, however, so
+        // every unchanged shortcut is intentionally absent from `items`. In
+        // that mode only shortcuts whose game IDs were explicitly reported as
+        // removed may be cleaned up.
+        if (cleanupOmniGameIds is null)
+        {
+            return true;
+        }
+
+        var identity = NormalizeOmniLibraryLaunchIdentity(existingShortcut.LaunchOptions);
+        return TryResolveOmniLibraryGameIdentity(identity, out _, out var gameId) &&
+               cleanupOmniGameIds.Contains(gameId);
     }
 
     private static ExistingShortcutEntry? TryFindCleanupShortcutForManifest(
@@ -7463,7 +7656,9 @@ public sealed class StoreSyncService
                         ResolveRetroAchievementsArtworkGameId(
                             configuration,
                             cachedGame?.Id,
-                            cachedGame?.RomPath));
+                            cachedGame?.RomPath),
+                        cachedGame?.InstallPath ?? string.Empty,
+                        cachedGame?.ExecutablePath ?? string.Empty);
             })
             .Where(target => target is not null)
             .Cast<StoreSyncArtworkTarget>()
@@ -7591,7 +7786,7 @@ public sealed class StoreSyncService
                 {
                     await concurrencyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
                     gateEntered = true;
-                    var summary = await _artworkDownloader.DownloadSteamFirstAsync(
+                    var summary = await _artworkDownloader.DownloadLocalFirstAsync(
                         gridDirectory,
                         group.Value,
                         apiKey,
@@ -7703,6 +7898,7 @@ public sealed class StoreSyncService
         static int Score(StoreSyncArtworkTarget target)
         {
             var score = 0;
+            score += target.ForceReload ? 100 : 0;
             score += string.IsNullOrWhiteSpace(target.FallbackPortraitUrl) ? 0 : 4;
             score += string.IsNullOrWhiteSpace(target.FallbackHeroUrl) ? 0 : 4;
             score += string.IsNullOrWhiteSpace(target.RomPath) ? 0 : 3;
@@ -7722,6 +7918,21 @@ public sealed class StoreSyncService
         string gridDirectory,
         IReadOnlyList<string> storeIds)
     {
+        return BuildOmniLibraryArtworkTargets(
+            configuration,
+            gridDirectory,
+            storeIds,
+            includeComplete: false,
+            forceReload: false);
+    }
+
+    private static IReadOnlyList<StoreSyncArtworkTarget> BuildOmniLibraryArtworkTargets(
+        StoreSyncConfiguration configuration,
+        string gridDirectory,
+        IReadOnlyList<string> storeIds,
+        bool includeComplete,
+        bool forceReload)
+    {
         var targets = new List<StoreSyncArtworkTarget>();
         foreach (var storeId in storeIds.Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -7736,17 +7947,22 @@ public sealed class StoreSyncService
                          game.SteamAppId != 0 &&
                          !string.IsNullOrWhiteSpace(game.Id) &&
                          !string.IsNullOrWhiteSpace(game.Title) &&
-                         !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
-                             gridDirectory,
-                             game.SteamAppId)))
+                         (includeComplete ||
+                          !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
+                              gridDirectory,
+                              game.SteamAppId))))
             {
+                var titleId = $"{storeId}:{game.Id}";
+                configuration.ArtworkMatchCache.TryGetValue(
+                    titleId,
+                    out var artworkCache);
                 targets.Add(new StoreSyncArtworkTarget(
-                    $"{storeId}:{game.Id}",
+                    titleId,
                     game.Title,
                     game.SteamAppId,
                     [game.Title],
-                    null,
-                    string.Empty,
+                    artworkCache?.GameId,
+                    artworkCache?.MatchName ?? string.Empty,
                     storeId,
                     game.ImageUrl,
                     game.HeroImageUrl,
@@ -7762,7 +7978,10 @@ public sealed class StoreSyncService
                     ResolveRetroAchievementsArtworkGameId(
                         configuration,
                         game.Id,
-                        game.RomPath)));
+                        game.RomPath),
+                    game.InstallPath,
+                    game.ExecutablePath,
+                    forceReload));
             }
         }
 
@@ -7950,7 +8169,10 @@ public sealed class StoreSyncService
     {
         lock (_gate)
         {
-            _omniArtworkRetryAtUtc[storeId] = DateTimeOffset.UtcNow.AddMinutes(30);
+            // Every configured source has already been attempted. Do not turn
+            // an optional missing image into an endless store-wide repair job.
+            // A later catalog delta or the per-game Refresh action can try again.
+            _omniArtworkRetryAtUtc.Remove(storeId);
         }
         _settingsStore.Update(configuration =>
         {
@@ -7962,18 +8184,17 @@ public sealed class StoreSyncService
 
             store.PreparationStatus = store.PreparedAtUtc.HasValue
                 ? "prepared"
-                : "artwork-pending";
+                : store.PreparationStatus;
             OmniLibraryLifecycle.SetStage(
                 store,
                 "artwork",
-                "degraded",
-                detail);
+                "ready");
             store.PreparationCompletedCount = Math.Max(0, total);
             store.PreparationTotalCount = Math.Max(0, total);
             store.PreparationDetail =
-                $"Library ready. Optional artwork is still incomplete for " +
-                $"{Math.Max(0, incompleteTitleCount)} title(s) and will retry in the background." +
-                (string.IsNullOrWhiteSpace(detail) ? string.Empty : $" {detail}");
+                $"Library ready. Artwork was unavailable for " +
+                $"{Math.Max(0, incompleteTitleCount)} optional title(s). " +
+                "Use Refresh OmniLibrary Data on a game to try again.";
         });
     }
 
@@ -9917,6 +10138,18 @@ public sealed class StoreSyncService
         return Regex.Replace(value.Trim(), "\\s+", " ");
     }
 
+    private static string NormalizeOmniLibraryLaunchIdentity(string? launchOptions)
+    {
+        var normalized = NormalizeLaunchOptions(launchOptions);
+        var match = Regex.Match(
+            normalized,
+            "^--unifysteam-launch\\s+[\\\"]?(?<identity>[^\\\"\\s]+)[\\\"]?(?:\\s|$)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return match.Success
+            ? match.Groups["identity"].Value.Trim().ToLowerInvariant()
+            : string.Empty;
+    }
+
     private static string CreateDetectedTitleId(StoreGameEntry game)
     {
         var key = ResolveStoreGameIdentityKey(game);
@@ -10084,9 +10317,10 @@ public sealed class StoreSyncService
 
         var manifestTitleId = manifestEntry?.TitleId ?? string.Empty;
         existingShortcut = existingEntries
-            .Where(entry => string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase))
             .Select(entry =>
             {
+                var executablePathMatches =
+                    string.Equals(entry.ExecutablePath, normalizedExecutablePath, StringComparison.OrdinalIgnoreCase);
                 var launchOptionsMatch =
                     !string.IsNullOrWhiteSpace(normalizedLaunchOptions) &&
                     string.Equals(NormalizeLaunchOptions(entry.LaunchOptions), normalizedLaunchOptions, StringComparison.OrdinalIgnoreCase);
@@ -10101,13 +10335,18 @@ public sealed class StoreSyncService
                     !string.IsNullOrWhiteSpace(manifestTitleId) &&
                     string.Equals(entry.ManagedTitleId, manifestTitleId, StringComparison.OrdinalIgnoreCase);
 
+                // Launch options (--unifysteam-launch {storeId}:{gameId}) are the
+                // durable identity of a managed shortcut. They must keep matching
+                // even when the TFS executable path changes (reinstall, move, or
+                // a dev rebuild to a different output folder) so a path change
+                // alone never creates a duplicate shortcut for the same game.
                 var score = managedTitleMatch
                     ? 0
                     : launchOptionsMatch && titleMatches
                         ? 1
                         : launchOptionsMatch
                             ? 2
-                            : titleMatches && startDirectoryMatch && (entry.AppId == expectedAppId || (manifestAppId != 0 && entry.AppId == manifestAppId))
+                            : executablePathMatches && titleMatches && startDirectoryMatch && (entry.AppId == expectedAppId || (manifestAppId != 0 && entry.AppId == manifestAppId))
                                 ? 3
                                 : int.MaxValue;
 
@@ -10748,7 +10987,8 @@ public sealed class StoreSyncService
     internal sealed record StoreSyncWatchTarget(
         string DirectoryPath,
         string Filter,
-        bool IncludeSubdirectories);
+        bool IncludeSubdirectories,
+        string StoreId = "");
 
     private sealed record StoreSnapshot(
         StoreDefinition Definition,

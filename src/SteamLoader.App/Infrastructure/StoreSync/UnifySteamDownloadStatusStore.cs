@@ -192,7 +192,10 @@ internal static class UnifySteamDownloadStatusStore
         var age = DateTimeOffset.UtcNow - status.UpdatedAtUtc;
         var storeOwnsTransferLifecycle = key.StartsWith(
             "xbox-game-pass:",
-            StringComparison.OrdinalIgnoreCase);
+            StringComparison.OrdinalIgnoreCase) &&
+            !status.DetailText.StartsWith(
+                "Waiting for the current Xbox operation",
+                StringComparison.OrdinalIgnoreCase);
         var activeWorkerMissing =
                                   IsBusyOperation(status.Status) &&
                                   status.WorkerProcessId > 0 &&

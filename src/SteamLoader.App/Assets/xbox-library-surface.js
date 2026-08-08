@@ -818,9 +818,11 @@
                         ? "Install EA app"
                         : game.externalAction === "link-account"
                           ? "Link EA"
-                          : game.externalAction === "continue-provider"
+                      : game.externalAction === "continue-provider"
                             ? "Open EA app"
-                            : "Download";
+                            : game.requiresExternalLauncher === true
+                              ? `Open ${String(game.providerDisplayName || "Store")}`
+                              : "Download";
     const managedLabel = state.managedLabels.get(label);
     if (managedLabel && typeof managedLabel === "object") {
       managedLabel.appliedLabel = nextLabel;

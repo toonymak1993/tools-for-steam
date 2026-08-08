@@ -2685,7 +2685,7 @@
         --store-success: #5ee6a8;
         --store-success-strong: #13d889;
         --store-success-ink: #032016;
-        position: fixed;
+        position: absolute;
         inset: 0;
         z-index: 2147483635;
         display: none;
@@ -2699,13 +2699,13 @@
       .steamloader-store-root, .steamloader-store-root * { box-sizing: border-box; }
       .steamloader-store-root.is-open { display: block; }
       .steamloader-store-shell { height: 100%; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; overflow: hidden; }
-      .steamloader-store-header { display: flex; justify-content: space-between; align-items: center; gap: 28px; padding: 30px 48px 18px; }
+      .steamloader-store-header { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 16px 40px 10px; }
       .steamloader-store-brand { min-width: 0; }
-      .steamloader-store-kicker { color: var(--store-accent); font-size: 11px; font-weight: 900; letter-spacing: .2em; }
-      .steamloader-store-title { margin: 2px 0 0; font-size: clamp(30px, 3.2vw, 52px); line-height: 1; letter-spacing: -.04em; }
-      .steamloader-store-subtitle { margin: 8px 0 0; color: var(--store-muted); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .steamloader-store-kicker { color: var(--store-accent); font-size: 10px; font-weight: 900; letter-spacing: .18em; }
+      .steamloader-store-title { margin: 1px 0 0; font-size: clamp(20px, 2.2vw, 30px); line-height: 1; letter-spacing: -.03em; }
+      .steamloader-store-subtitle { display: none; }
       .steamloader-store-header-actions { display: flex; align-items: center; gap: 10px; flex: none; }
-      .steamloader-store-updated { margin-right: 4px; color: var(--store-dim); font-size: 12px; font-weight: 750; }
+      .steamloader-store-updated { margin-right: 4px; color: var(--store-dim); font-size: 11px; font-weight: 750; }
       .steamloader-store-button, .steamloader-store-mini-button, .steamloader-store-tab, .steamloader-store-card, .steamloader-store-currency-card, .steamloader-store-modal-close, .steamloader-store-region-trigger, .steamloader-store-region-option {
         border: 1px solid rgba(255,255,255,.09); color: var(--store-text); font: inherit; cursor: pointer; outline: none;
       }
@@ -2725,17 +2725,16 @@
         border-color: var(--store-accent); box-shadow: 0 0 0 3px rgba(102,192,244,.2), 0 18px 48px rgba(0,0,0,.38); transform: translateY(-2px);
       }
       .steamloader-store-card.is-controller-focus, .steamloader-store-currency-card.is-controller-focus, .steamloader-store-region-option.is-controller-focus { transform: none; }
-      .steamloader-store-tabs { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 58px; padding: 0 48px 12px; border-bottom: 1px solid rgba(255,255,255,.06); }
+      .steamloader-store-tabs { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 42px; padding: 0 40px 8px; border-bottom: 1px solid rgba(255,255,255,.06); }
       .steamloader-store-bumper { padding: 5px 9px; border-radius: 7px; color: #101820; background: rgba(255,255,255,.8); font-size: 10px; font-weight: 950; }
-      .steamloader-store-tab { position: relative; min-width: 132px; padding: 13px 20px; border-color: transparent; border-radius: 13px; color: var(--store-muted); background: transparent; font-weight: 800; }
+      .steamloader-store-tab { position: relative; min-width: 108px; padding: 9px 16px; border-color: transparent; border-radius: 13px; color: var(--store-muted); background: transparent; font-weight: 800; font-size: 13px; }
       .steamloader-store-tab.is-active { color: #fff; background: rgba(255,255,255,.065); }
       .steamloader-store-tab.is-active::after { content: ""; position: absolute; left: 30%; right: 30%; bottom: -7px; height: 4px; border-radius: 9px; background: var(--store-accent-strong); box-shadow: 0 0 18px rgba(26,159,255,.6); }
-      .steamloader-store-main { overflow: auto; padding: 26px 48px 50px; scroll-padding: 28px 28px 96px; scrollbar-width: thin; scrollbar-color: rgba(102,192,244,.38) transparent; }
-      .steamloader-store-main::-webkit-scrollbar { width: 8px; height: 8px; }
-      .steamloader-store-main::-webkit-scrollbar-thumb { background: rgba(102,192,244,.34); border-radius: 999px; }
+      .steamloader-store-main { overflow: auto; padding: 14px 40px 40px; scroll-padding: 20px 20px 80px; scrollbar-width: none; }
+      .steamloader-store-main::-webkit-scrollbar { display: none; }
       .steamloader-store-notice, .steamloader-store-empty { padding: 24px; border: 1px solid rgba(255,255,255,.08); border-radius: 18px; color: var(--store-muted); background: rgba(255,255,255,.035); }
       .steamloader-store-notice.is-error { margin-bottom: 18px; color: #ffc0c5; border-color: rgba(255,91,106,.28); background: rgba(255,91,106,.08); }
-      .steamloader-store-status-toast { position: fixed; left: 50%; bottom: 70px; z-index: 2147483646; max-width: min(720px, calc(100vw - 80px)); padding: 12px 18px; border: 1px solid rgba(102,192,244,.42); border-radius: 14px; color: var(--store-text); background: rgba(12,28,39,.96); box-shadow: 0 18px 55px rgba(0,0,0,.48); font-size: 12px; font-weight: 800; transform: translateX(-50%); pointer-events: none; animation: steamloader-store-toast-in .18s ease-out; }
+      .steamloader-store-status-toast { position: absolute; left: 50%; bottom: 70px; z-index: 2147483646; max-width: min(720px, calc(100vw - 80px)); padding: 12px 18px; border: 1px solid rgba(102,192,244,.42); border-radius: 14px; color: var(--store-text); background: rgba(12,28,39,.96); box-shadow: 0 18px 55px rgba(0,0,0,.48); font-size: 12px; font-weight: 800; transform: translateX(-50%); pointer-events: none; animation: steamloader-store-toast-in .18s ease-out; }
       @keyframes steamloader-store-toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
       .steamloader-store-empty.is-actionable { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-top: 18px; }
       .steamloader-store-empty.is-actionable > strong { color: var(--store-text); font-size: 16px; }
@@ -2757,10 +2756,11 @@
       .steamloader-store-section-head { margin-bottom: 14px; }
       .steamloader-store-section-head h2, .steamloader-store-page-head h2 { margin: 0; font-size: 24px; letter-spacing: -.025em; }
       .steamloader-store-section-head p, .steamloader-store-page-head p { margin: 5px 0 0; color: var(--store-muted); font-size: 13px; font-weight: 650; }
-      .steamloader-store-rail { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(190px, 15.5vw); gap: 16px; overflow-x: auto; overflow-y: hidden; padding: 5px 5px 18px; margin: -5px; scroll-snap-type: x proximity; }
-      .steamloader-store-rail.is-landscape { grid-auto-columns: minmax(280px, 23vw); }
-      .steamloader-store-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 18px; margin-top: 24px; }
-      .steamloader-store-card { position: relative; min-width: 0; padding: 0; overflow: hidden; border-radius: 20px; text-align: left; background: var(--store-panel-solid); box-shadow: 0 14px 38px rgba(0,0,0,.24); transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease; scroll-snap-align: start; }
+      .steamloader-store-rail { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(150px, 190px); gap: 14px; overflow-x: auto; overflow-y: hidden; padding: 5px 5px 18px; margin: -5px; scroll-snap-type: x proximity; scrollbar-width: none; }
+      .steamloader-store-rail::-webkit-scrollbar { display: none; }
+      .steamloader-store-rail.is-landscape { grid-auto-columns: minmax(210px, 260px); }
+      .steamloader-store-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 190px)); justify-content: start; gap: 16px; margin-top: 20px; }
+      .steamloader-store-card { position: relative; min-width: 0; max-width: 100%; padding: 0; overflow: hidden; border-radius: 20px; text-align: left; background: var(--store-panel-solid); box-shadow: 0 14px 38px rgba(0,0,0,.24); transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease; scroll-snap-align: start; }
       .steamloader-store-card-art { position: relative; aspect-ratio: 2 / 3; overflow: hidden; background: linear-gradient(135deg, #173140, #112029); }
       .steamloader-store-card.is-landscape .steamloader-store-card-art { aspect-ratio: 16 / 10; }
       .steamloader-store-artwork-frame { position: relative; width: 100%; height: 100%; overflow: hidden; }
@@ -2796,7 +2796,7 @@
       .steamloader-store-search-input::placeholder { color: var(--store-dim); }
       .steamloader-store-search-input:focus, .steamloader-store-search-input.is-controller-focus { border-color: var(--store-accent); box-shadow: 0 0 0 3px rgba(102,192,244,.18); }
       .steamloader-store-search-note { margin: 12px 4px 0; color: var(--store-muted); font-size: 11px; line-height: 1.5; }
-      .steamloader-store-keyboard-backdrop { position: fixed; inset: 0; z-index: 9; display: flex; align-items: flex-end; justify-content: center; padding: 36px; background: rgba(0,5,9,.7); backdrop-filter: blur(12px); }
+      .steamloader-store-keyboard-backdrop { position: absolute; inset: 0; z-index: 9; display: flex; align-items: flex-end; justify-content: center; padding: 36px; background: rgba(0,5,9,.7); backdrop-filter: blur(12px); }
       .steamloader-store-search-keyboard { width: min(1260px, calc(100vw - 72px)); padding: 22px; border: 1px solid rgba(255,255,255,.13); border-radius: 28px; background: rgba(17,24,32,.985); box-shadow: 0 32px 110px rgba(0,0,0,.68); }
       .steamloader-store-search-keyboard-header { display: grid; grid-template-columns: auto minmax(280px,1fr); align-items: center; gap: 18px; margin-bottom: 16px; }
       .steamloader-store-search-keyboard-title { color: var(--store-accent); font-size: 17px; font-weight: 950; }
@@ -2843,7 +2843,8 @@
       .steamloader-store-region-trigger { min-height: 64px; padding: 0 20px; border-radius: 16px; text-align: left; background: rgba(255,255,255,.07); font-size: 16px; font-weight: 850; }
       .steamloader-store-region-trigger::after { content: "⌄"; float: right; color: var(--store-accent); }
       .steamloader-store-region-trigger.is-open::after { content: "⌃"; }
-      .steamloader-store-region-menu { position: absolute; z-index: 12; top: calc(100% - 8px); right: 22px; width: min(420px, calc(100% - 44px)); max-height: min(62vh, 620px); overflow-y: auto; padding: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 22px; background: rgba(18,22,26,.98); box-shadow: 0 28px 90px rgba(0,0,0,.6); backdrop-filter: blur(24px); scroll-padding: 12px; scrollbar-width: thin; }
+      .steamloader-store-region-menu { position: absolute; z-index: 12; top: calc(100% - 8px); right: 22px; width: min(420px, calc(100% - 44px)); max-height: min(62vh, 620px); overflow-y: auto; padding: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 22px; background: rgba(18,22,26,.98); box-shadow: 0 28px 90px rgba(0,0,0,.6); backdrop-filter: blur(24px); scroll-padding: 12px; scrollbar-width: none; }
+      .steamloader-store-region-menu::-webkit-scrollbar { display: none; }
       .steamloader-store-region-option { width: 100%; min-height: 58px; display: grid; grid-template-columns: 6px minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 8px 14px; border-color: transparent; border-radius: 14px; text-align: left; background: transparent; }
       .steamloader-store-region-option > span:last-child { color: var(--store-muted); }
       .steamloader-store-region-marker { width: 5px; height: 28px; border-radius: 999px; background: transparent; }
@@ -2859,7 +2860,7 @@
       .steamloader-store-currency-copy { margin-top: 8px; color: var(--store-muted); font-size: 12px; line-height: 1.45; }
       .steamloader-store-data-note { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; padding: 18px; border-radius: 16px; color: var(--store-muted); background: rgba(0,0,0,.18); font-size: 12px; line-height: 1.45; }
       .steamloader-store-data-note strong { color: var(--store-accent); font-size: 13px; }
-      .steamloader-store-modal-backdrop { position: fixed; inset: 0; z-index: 5; display: grid; place-items: center; padding: 42px; background: rgba(0,5,9,.7); backdrop-filter: blur(12px); }
+      .steamloader-store-modal-backdrop { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; padding: 42px; background: rgba(0,5,9,.7); backdrop-filter: blur(12px); }
       .steamloader-store-modal { width: min(1500px, 94vw); height: min(850px, 90vh); display: grid; grid-template-rows: minmax(220px, 34%) minmax(0, 1fr); overflow: hidden; border: 1px solid rgba(255,255,255,.13); border-radius: 30px; background: #111820; box-shadow: 0 35px 120px rgba(0,0,0,.65); }
       .steamloader-store-modal-banner { position: relative; isolation: isolate; display: flex; align-items: flex-end; padding: 38px 44px; overflow: hidden; }
       .steamloader-store-modal-banner::before { content: ""; position: absolute; inset: 0; z-index: -2; background-image: var(--store-detail-image); background-size: cover; background-position: center 25%; }
@@ -2867,10 +2868,8 @@
       .steamloader-store-modal-title { margin: 0; font-size: clamp(34px, 4.2vw, 70px); line-height: .96; letter-spacing: -.045em; text-shadow: 0 6px 25px #000; }
       .steamloader-store-modal-close { position: absolute; top: 22px; right: 24px; width: 54px; height: 54px; border-radius: 17px; color: #fff; background: rgba(5,8,12,.62); font-size: 30px; }
       .steamloader-store-modal-body { overflow: auto; padding: 0 32px 32px; }
-      .steamloader-store-modal-body { scrollbar-width: thin; scrollbar-color: rgba(102,192,244,.4) transparent; }
-      .steamloader-store-modal-body::-webkit-scrollbar { width: 8px; }
-      .steamloader-store-modal-body::-webkit-scrollbar-track { background: transparent; }
-      .steamloader-store-modal-body::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(102,192,244,.36); }
+      .steamloader-store-modal-body { scrollbar-width: none; }
+      .steamloader-store-modal-body::-webkit-scrollbar { display: none; }
       .steamloader-store-summary { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px 22px; border: 1px solid rgba(102,192,244,.3); border-radius: 20px; background: linear-gradient(100deg, rgba(26,159,255,.14), rgba(255,255,255,.03)); }
       .steamloader-store-summary-price { display: flex; align-items: baseline; gap: 10px; margin-top: 6px; }
       .steamloader-store-summary-price strong { font-size: 27px; }
@@ -2954,7 +2953,8 @@
         .steamloader-store-subtitle, .steamloader-store-updated { display: none; }
         .steamloader-store-tabs { padding-left: 24px; padding-right: 24px; overflow-x: auto; justify-content: flex-start; }
         .steamloader-store-main { padding-left: 24px; padding-right: 24px; }
-        .steamloader-store-rail { grid-auto-columns: 210px; }
+        .steamloader-store-rail { grid-auto-columns: minmax(130px, 165px); }
+        .steamloader-store-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 165px)); }
         .steamloader-store-hero-content { width: 78%; padding: 32px; }
         .steamloader-store-currency-grid { grid-template-columns: 1fr; }
         .steamloader-store-region-setting { grid-template-columns: 1fr; }
