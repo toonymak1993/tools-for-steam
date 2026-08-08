@@ -50,6 +50,29 @@ The first section in OmniLibrary is a controller-native Download Center shared b
 - A failed recovery or cleanup remains isolated to that game; it cannot prevent another store's transfer from resuming.
 - The first preparation may require substantial artwork work; later syncs reuse cached assets.
 
+### Artwork source order
+
+Artwork is filled progressively without replacing a usable Steam slot. The source
+order is fixed so SteamGridDB is never a single point of failure:
+
+1. Existing Steam grid files, Steam's local `appcache\librarycache`, explicit
+   `file://` images, ROM sidecars, bounded artwork folders inside an installed
+   game, and the installed executable's icon.
+2. Exact provider-owned images and free provider APIs, including Xbox/Epic/GOG
+   catalog assets and RetroAchievements for content-hashed ROMs.
+3. The public Steam Store search and CDN, which require no API key.
+4. SteamGridDB only for slots still missing after every preceding source.
+
+When real primary artwork exists locally, missing shapes, the small icon, and a
+readable title logo are generated locally before any network request is attempted.
+
+**Reload All Artwork** in OmniLibrary performs the same source chain again for
+every enabled, managed title. It requires a second confirmation and builds all
+five replacement slots in an isolated staging directory first. Existing artwork
+is replaced only after that title has a complete valid set, so an unavailable
+provider or fallback cannot turn a populated library into blank tiles. Native
+Steam games and unrelated non-Steam shortcuts are never included.
+
 ## Xbox behavior
 
 The Xbox library combines the public PC Game Pass PC catalog, optional cloud catalog data, and locally detected `XboxGames` manifests. A configured library path is scanned in addition to standard fixed-drive roots.

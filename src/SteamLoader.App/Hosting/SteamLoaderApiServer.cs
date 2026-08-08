@@ -2311,6 +2311,90 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/theme/wallpaper")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetWallpaperEnabled(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/theme/animations")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetAnimationsEnabled(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/theme/accent-color")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.Value))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "An accent color is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetAccentColor(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/splash/artwork-mode")
             {
                 var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
@@ -3570,6 +3654,35 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 await WriteJsonAsync(
                     response,
                     HttpStatusCode.Accepted,
+                    result,
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/artwork/reload-all")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<ConfirmedRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload?.Confirmed != true)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new
+                        {
+                            message = "Reloading every managed artwork set requires explicit confirmation.",
+                        },
+                        cancellationToken);
+                    return;
+                }
+
+                var result = _storeSyncService.ReloadAllOmniLibraryArtwork();
+                await WriteJsonAsync(
+                    response,
+                    result.Queued ? HttpStatusCode.Accepted : HttpStatusCode.OK,
                     result,
                     cancellationToken);
                 return;
@@ -6903,13 +7016,19 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/artwork"] = "artwork",
             ["/api/hltb"] = "hltb",
             ["/api/smart-home"] = "smart-home",
+            // OmniLibrary shares the /api/store-sync/* path prefix with the
+            // classic Store Sync plugin but is a separate, independently
+            // toggleable plugin ("OmniLibrary is an alternative to Store
+            // Sync"). This more specific prefix must win so disabling classic
+            // Store Sync never blocks OmniLibrary's own sync/refresh calls.
+            ["/api/store-sync/unifysteam"] = "omnilibrary",
             ["/api/store-sync"] = "store-sync",
             ["/api/unifystore"] = "omnilibrary",
             ["/api/themes"] = "themes",
             ["/api/power"] = "power"
         };
 
-        foreach (var (prefix, id) in pluginPrefixes)
+        foreach (var (prefix, id) in pluginPrefixes.OrderByDescending(pair => pair.Key.Length))
         {
             if (normalizedPath.Equals(prefix, StringComparison.OrdinalIgnoreCase) ||
                 normalizedPath.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase))
@@ -7870,6 +7989,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record TestGameDataProviderRequest(string ProviderId);
 
     private sealed record SetSteamAppIdRequest(uint SteamAppId);
+
+    private sealed record ConfirmedRequest(bool Confirmed);
 
     private sealed record SetGogOptionsRequest(
         bool IncludeDlc,

@@ -185,11 +185,11 @@ internal sealed class SteamGridDbArtworkDownloader
     }
 
     /// <summary>
-    /// Fills every Steam library artwork slot progressively. Public Steam CDN
-    /// assets are preferred; SteamGridDB supplies only the slots Steam does not
-    /// expose for a title.
+    /// Fills every Steam library artwork slot progressively. Sources are strictly
+    /// ordered: assets already present on this PC, provider-owned/free sources,
+    /// the public Steam catalog, and SteamGridDB only as the final remote fallback.
     /// </summary>
-    public async Task<StoreSyncArtworkSummary> DownloadSteamFirstAsync(
+    public async Task<StoreSyncArtworkSummary> DownloadLocalFirstAsync(
         string gridDirectory,
         IReadOnlyList<StoreSyncArtworkTarget> targets,
         string apiKey,
@@ -222,12 +222,15 @@ internal sealed class SteamGridDbArtworkDownloader
 
         var steamSearchCache = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
         var steamGridDbSearchCache = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
+        var localArtworkResolver = new OmniLibraryLocalArtworkResolver();
         var updatedTitleIds = new List<string>();
         var updatedFileCount = 0;
 
         var uniqueTargets = targets
             .GroupBy(target => target.AppId)
-            .Select(group => group.First())
+            .Select(group => group
+                .OrderByDescending(target => target.ForceReload)
+                .First())
             .ToArray();
         var completedTargetCount = 0;
 
@@ -238,9 +241,42 @@ internal sealed class SteamGridDbArtworkDownloader
             cancellationToken.ThrowIfCancellationRequested();
             var updatedForTitle = 0;
             var gridId = SteamShortcutIds.BuildGridId(target.AppId);
+            var workingGridDirectory = gridDirectory;
+            string? reloadStagingDirectory = null;
             try
             {
-                if (target.StoreId.Equals(
+                if (target.ForceReload)
+                {
+                    reloadStagingDirectory = Path.Combine(
+                        gridDirectory,
+                        $".tfs-artwork-reload-{gridId}-{Guid.NewGuid():N}");
+                    Directory.CreateDirectory(reloadStagingDirectory);
+                    workingGridDirectory = reloadStagingDirectory;
+                }
+
+                // Stage 1: never use the network while a usable asset is already
+                // present in Steam's cache, the provider install, a ROM sidecar,
+                // or an explicit file:// catalog reference.
+                updatedForTitle += await ImportLocalArtworkSetAsync(
+                    workingGridDirectory,
+                    gridId,
+                    target,
+                    localArtworkResolver,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (HasAnyPrimaryArtwork(workingGridDirectory, gridId))
+                {
+                    updatedForTitle += EnsureCompleteArtworkSetFromExistingAssets(
+                        workingGridDirectory,
+                        gridId,
+                        target.Title);
+                }
+
+                // Stage 2: exact provider/free sources. RetroAchievements is an
+                // exact content-hash source for ROMs; Xbox/Epic/GOG catalog URLs
+                // are provider-owned and therefore precede title-based matching.
+                if (!HasCompleteArtworkSet(workingGridDirectory, target.AppId) &&
+                    target.StoreId.Equals(
                         OmniLibraryRomSystemRegistry.StoreId,
                         StringComparison.OrdinalIgnoreCase) &&
                     !string.IsNullOrWhiteSpace(target.RomPath) &&
@@ -251,7 +287,7 @@ internal sealed class SteamGridDbArtworkDownloader
                     {
                         updatedForTitle += await DownloadRetroAchievementsArtworkSetAsync(
                             steamClient,
-                            gridDirectory,
+                            workingGridDirectory,
                             gridId,
                             target,
                             cancellationToken).ConfigureAwait(false);
@@ -267,44 +303,20 @@ internal sealed class SteamGridDbArtworkDownloader
                     }
                 }
 
-                if (target.StoreId.Equals(
-                        OmniLibraryRomSystemRegistry.StoreId,
-                        StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrWhiteSpace(target.FallbackPortraitUrl))
+                if (!HasCompleteArtworkSet(workingGridDirectory, target.AppId))
                 {
-                    try
-                    {
-                        updatedForTitle += await DownloadPreferredPortraitAsync(
-                            steamClient,
-                            gridDirectory,
-                            gridId,
-                            target,
-                            cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch
-                    {
-                        // A filename may not match Libretro exactly. Public
-                        // Steam and SteamGridDB remain independent fallbacks.
-                    }
-                }
-
-                // A previous run may already have every real primary image and
-                // only be missing Steam's small icon/logo slots. Complete those
-                // locally before doing any title search so an upgrade does not
-                // re-query Steam or SteamGridDB for an otherwise complete library.
-                if (HasPrimaryArtworkSet(gridDirectory, target.AppId))
-                {
-                    updatedForTitle += EnsureCompleteArtworkSetFromExistingAssets(
-                        gridDirectory,
+                    updatedForTitle += await DownloadRemoteStoreArtworkSetAsync(
+                        steamClient,
+                        workingGridDirectory,
                         gridId,
-                        target.Title);
+                        target,
+                        cancellationToken).ConfigureAwait(false);
                 }
 
-                if (!HasCompleteArtworkSet(gridDirectory, target.AppId))
+                // Stage 3: the public Steam Store API/CDN is free and needs no
+                // user key. It is title-matched, so exact provider sources above
+                // remain preferable.
+                if (!HasCompleteArtworkSet(workingGridDirectory, target.AppId))
                 {
                     var steamAppId = await ResolvePublicSteamAppIdAsync(
                         steamClient,
@@ -316,15 +328,30 @@ internal sealed class SteamGridDbArtworkDownloader
                     {
                         updatedForTitle += await DownloadPublicSteamArtworkSetAsync(
                             steamClient,
-                            gridDirectory,
+                            workingGridDirectory,
                             gridId,
                             steamAppId.Value,
                             target.StoreId,
                             cancellationToken).ConfigureAwait(false);
                     }
 
-                    if (!HasCompleteArtworkSet(gridDirectory, target.AppId) &&
-                        !string.IsNullOrWhiteSpace(apiKey))
+                }
+
+                if (HasAnyPrimaryArtwork(workingGridDirectory, gridId))
+                {
+                    updatedForTitle += EnsureCompleteArtworkSetFromExistingAssets(
+                        workingGridDirectory,
+                        gridId,
+                        target.Title);
+                }
+
+                // Stage 4: SteamGridDB is intentionally last. A missing key,
+                // outage, or rate limit can no longer prevent local, provider,
+                // RetroAchievements, or public Steam artwork from being used.
+                if (!HasCompleteArtworkSet(workingGridDirectory, target.AppId) &&
+                    !string.IsNullOrWhiteSpace(apiKey))
+                {
+                    try
                     {
                         var match = target.CachedGameId.HasValue && target.CachedGameId.Value > 0
                             ? new StoreSyncArtworkMatch(target.CachedGameId.Value, target.CachedMatchName)
@@ -338,24 +365,21 @@ internal sealed class SteamGridDbArtworkDownloader
                         {
                             updatedForTitle += await DownloadArtworkSetAsync(
                                 steamGridDbClient,
-                                gridDirectory,
+                                workingGridDirectory,
                                 gridId,
                                 match.GameId,
                                 target.StoreId,
                                 cancellationToken).ConfigureAwait(false);
                         }
                     }
-
-                    if (!HasCompleteArtworkSet(gridDirectory, target.AppId))
+                    catch (OperationCanceledException)
                     {
-                        // Store-owned catalog images are the final safety net only.
-                        // Public Steam remains first and SteamGridDB remains second.
-                        updatedForTitle += await DownloadStoreFallbackArtworkSetAsync(
-                            steamClient,
-                            gridDirectory,
-                            gridId,
-                            target,
-                            cancellationToken).ConfigureAwait(false);
+                        throw;
+                    }
+                    catch
+                    {
+                        // SteamGridDB is optional and must never block completion
+                        // from assets already obtained earlier in the pipeline.
                     }
                 }
 
@@ -364,9 +388,21 @@ internal sealed class SteamGridDbArtworkDownloader
                 // Steam slots from an already downloaded real asset so the
                 // title never remains permanently half-populated.
                 updatedForTitle += EnsureCompleteArtworkSetFromExistingAssets(
-                    gridDirectory,
+                    workingGridDirectory,
                     gridId,
                     target.Title);
+
+                if (target.ForceReload)
+                {
+                    updatedForTitle = HasCompleteArtworkSet(
+                            workingGridDirectory,
+                            target.AppId)
+                        ? PromoteReloadedArtworkSet(
+                            workingGridDirectory,
+                            gridDirectory,
+                            gridId)
+                        : 0;
+                }
             }
             catch (OperationCanceledException)
             {
@@ -375,6 +411,10 @@ internal sealed class SteamGridDbArtworkDownloader
             catch
             {
                 // One missing/broken source must not stop the progressive queue.
+            }
+            finally
+            {
+                DeleteArtworkReloadStagingDirectory(reloadStagingDirectory);
             }
 
             if (updatedForTitle > 0)
@@ -391,6 +431,130 @@ internal sealed class SteamGridDbArtworkDownloader
             updatedTitleIds.Count,
             updatedFileCount,
             updatedTitleIds);
+    }
+
+    private static async Task<int> ImportLocalArtworkSetAsync(
+        string gridDirectory,
+        string gridId,
+        StoreSyncArtworkTarget target,
+        OmniLibraryLocalArtworkResolver resolver,
+        CancellationToken cancellationToken)
+    {
+        var localArtwork = resolver.Resolve(target);
+        var updated = 0;
+        foreach (var slot in ArtworkSlots)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fileStem = slot.FileStemBuilder(gridId);
+            if (HasArtworkVariant(gridDirectory, fileStem) ||
+                !TryGetLocalSlotKind(slot, out var slotKind) ||
+                !localArtwork.TryGetValue(slotKind, out var sourcePath) ||
+                !OmniLibraryLocalArtworkResolver.TryResolveLocalReference(
+                    sourcePath,
+                    out var resolvedSourcePath))
+            {
+                continue;
+            }
+
+            var extension = Path.GetExtension(resolvedSourcePath).ToLowerInvariant();
+            if (extension is not (".png" or ".jpg" or ".jpeg" or ".webp" or ".ico"))
+            {
+                continue;
+            }
+
+            if (PromoteStoreFallbackArtwork(
+                    gridDirectory,
+                    fileStem,
+                    new DownloadedArtworkFile(resolvedSourcePath, extension),
+                    slot))
+            {
+                updated++;
+                await TryApplyStoreBadgeAsync(
+                    gridDirectory,
+                    gridId,
+                    slot,
+                    target.StoreId,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        var iconStem = $"{gridId}-icon";
+        if (!HasArtworkVariant(gridDirectory, iconStem) &&
+            TryExtractExecutableIcon(target.LocalExecutablePath, out var iconPath))
+        {
+            try
+            {
+                var iconSlot = ArtworkSlots.First(slot => slot.SlotName == "icon");
+                if (PromoteStoreFallbackArtwork(
+                        gridDirectory,
+                        iconStem,
+                        new DownloadedArtworkFile(iconPath, ".png"),
+                        iconSlot))
+                {
+                    updated++;
+                }
+            }
+            finally
+            {
+                DeleteFileIfExists(iconPath);
+            }
+        }
+
+        return updated;
+    }
+
+    private static bool TryGetLocalSlotKind(
+        ArtworkSlot slot,
+        out OmniLibraryArtworkSlotKind slotKind)
+    {
+        slotKind = slot.SlotName switch
+        {
+            "library capsule" => OmniLibraryArtworkSlotKind.LibraryCapsule,
+            "portrait" => OmniLibraryArtworkSlotKind.Portrait,
+            "hero" => OmniLibraryArtworkSlotKind.Hero,
+            "logo" => OmniLibraryArtworkSlotKind.Logo,
+            "icon" => OmniLibraryArtworkSlotKind.Icon,
+            _ => (OmniLibraryArtworkSlotKind)(-1),
+        };
+        return Enum.IsDefined(slotKind);
+    }
+
+    private static bool HasAnyPrimaryArtwork(string gridDirectory, string gridId) =>
+        HasArtworkVariant(gridDirectory, gridId) ||
+        HasArtworkVariant(gridDirectory, $"{gridId}p") ||
+        HasArtworkVariant(gridDirectory, $"{gridId}_hero");
+
+    private static bool TryExtractExecutableIcon(
+        string? executablePath,
+        out string iconPath)
+    {
+        iconPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var icon = Icon.ExtractAssociatedIcon(executablePath);
+            if (icon is null)
+            {
+                return false;
+            }
+
+            iconPath = Path.Combine(
+                Path.GetTempPath(),
+                $"steamloader-local-icon-{Guid.NewGuid():N}.png");
+            using var bitmap = icon.ToBitmap();
+            bitmap.Save(iconPath, ImageFormat.Png);
+            return IsUsableArtworkFile(iconPath);
+        }
+        catch
+        {
+            DeleteFileIfExists(iconPath);
+            iconPath = string.Empty;
+            return false;
+        }
     }
 
     private static async Task<int> DownloadRetroAchievementsArtworkSetAsync(
@@ -562,49 +726,6 @@ internal sealed class SteamGridDbArtworkDownloader
     private static bool IsRetroAchievementsHost(string host) =>
         host.Equals("retroachievements.org", StringComparison.OrdinalIgnoreCase) ||
         host.EndsWith(".retroachievements.org", StringComparison.OrdinalIgnoreCase);
-
-    private static async Task<int> DownloadPreferredPortraitAsync(
-        HttpClient httpClient,
-        string gridDirectory,
-        string gridId,
-        StoreSyncArtworkTarget target,
-        CancellationToken cancellationToken)
-    {
-        var fileStem = $"{gridId}p";
-        if (HasArtworkVariant(gridDirectory, fileStem))
-        {
-            return 0;
-        }
-
-        var slot = ArtworkSlots.First(candidate =>
-            candidate.FileStemBuilder(gridId).Equals(
-                fileStem,
-                StringComparison.Ordinal));
-        var downloaded = await DownloadAssetToTemporaryFileAsync(
-            httpClient,
-            target.FallbackPortraitUrl,
-            cancellationToken).ConfigureAwait(false);
-        if (downloaded is null)
-        {
-            return 0;
-        }
-
-        try
-        {
-            return new FileInfo(downloaded.TempPath).Length >= 1024 &&
-                   PromoteStoreFallbackArtwork(
-                       gridDirectory,
-                       fileStem,
-                       downloaded,
-                       slot)
-                ? 1
-                : 0;
-        }
-        finally
-        {
-            DeleteFileIfExists(downloaded.TempPath);
-        }
-    }
 
     private static async Task<int?> ResolvePublicSteamAppIdAsync(
         HttpClient httpClient,
@@ -958,7 +1079,7 @@ internal sealed class SteamGridDbArtworkDownloader
         return null;
     }
 
-    private static async Task<int> DownloadStoreFallbackArtworkSetAsync(
+    private static async Task<int> DownloadRemoteStoreArtworkSetAsync(
         HttpClient httpClient,
         string gridDirectory,
         string gridId,
@@ -967,17 +1088,11 @@ internal sealed class SteamGridDbArtworkDownloader
     {
         var portraitUrl = target.FallbackPortraitUrl?.Trim() ?? string.Empty;
         var heroUrl = target.FallbackHeroUrl?.Trim() ?? string.Empty;
-        var wideFallbackUrl = !string.IsNullOrWhiteSpace(heroUrl)
-            ? heroUrl
-            : portraitUrl;
-        var portraitFallbackUrl = !string.IsNullOrWhiteSpace(portraitUrl)
-            ? portraitUrl
-            : heroUrl;
-        var candidates = new Dictionary<string, string>(StringComparer.Ordinal)
+        var candidates = new Dictionary<string, string[]>(StringComparer.Ordinal)
         {
-            [gridId] = wideFallbackUrl,
-            [$"{gridId}p"] = portraitFallbackUrl,
-            [$"{gridId}_hero"] = wideFallbackUrl,
+            [gridId] = [heroUrl, portraitUrl],
+            [$"{gridId}p"] = [portraitUrl, heroUrl],
+            [$"{gridId}_hero"] = [heroUrl, portraitUrl],
         };
 
         var updated = 0;
@@ -985,56 +1100,67 @@ internal sealed class SteamGridDbArtworkDownloader
                      candidates.ContainsKey(slot.FileStemBuilder(gridId))))
         {
             var fileStem = slot.FileStemBuilder(gridId);
-            var url = candidates[fileStem];
-            if (string.IsNullOrWhiteSpace(url) ||
-                HasArtworkVariant(gridDirectory, fileStem))
+            if (HasArtworkVariant(gridDirectory, fileStem))
             {
                 continue;
             }
 
-            try
+            foreach (var url in candidates[fileStem]
+                         .Where(url => !string.IsNullOrWhiteSpace(url))
+                         .Distinct(StringComparer.OrdinalIgnoreCase))
             {
-                var downloaded = await DownloadAssetToTemporaryFileAsync(
-                    httpClient,
-                    url,
-                    cancellationToken).ConfigureAwait(false);
-                if (downloaded is null)
+                // file:// and rooted references were consumed by the local stage.
+                // This stage performs network requests only.
+                if (OmniLibraryLocalArtworkResolver.TryResolveLocalReference(url, out _))
                 {
                     continue;
                 }
 
                 try
                 {
-                    var length = new FileInfo(downloaded.TempPath).Length;
-                    if (length < 1024 ||
-                        !PromoteStoreFallbackArtwork(
-                            gridDirectory,
-                            fileStem,
-                            downloaded,
-                            slot))
+                    var downloaded = await DownloadAssetToTemporaryFileAsync(
+                        httpClient,
+                        url,
+                        cancellationToken).ConfigureAwait(false);
+                    if (downloaded is null)
                     {
                         continue;
                     }
 
-                    updated++;
-                    await TryApplyStoreBadgeAsync(
-                        gridDirectory,
-                        gridId,
-                        slot,
-                        target.StoreId,
-                        cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        var length = new FileInfo(downloaded.TempPath).Length;
+                        if (length < 1024 ||
+                            !PromoteStoreFallbackArtwork(
+                                gridDirectory,
+                                fileStem,
+                                downloaded,
+                                slot))
+                        {
+                            continue;
+                        }
+
+                        updated++;
+                        await TryApplyStoreBadgeAsync(
+                            gridDirectory,
+                            gridId,
+                            slot,
+                            target.StoreId,
+                            cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+                    finally
+                    {
+                        DeleteFileIfExists(downloaded.TempPath);
+                    }
                 }
-                finally
+                catch (OperationCanceledException)
                 {
-                    DeleteFileIfExists(downloaded.TempPath);
+                    throw;
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
+                catch
+                {
+                }
             }
         }
 
@@ -1442,11 +1568,14 @@ internal sealed class SteamGridDbArtworkDownloader
                     FileMode.Open,
                     FileAccess.Read,
                     FileShare.Read);
-                await using var localOutput = File.Create(localTempPath);
-                await CopyArtworkWithLimitAsync(
-                    localInput,
-                    localOutput,
-                    cancellationToken).ConfigureAwait(false);
+                await using (var localOutput = File.Create(localTempPath))
+                {
+                    await CopyArtworkWithLimitAsync(
+                        localInput,
+                        localOutput,
+                        cancellationToken).ConfigureAwait(false);
+                    await localOutput.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
                 if (!IsUsableArtworkFile(localTempPath))
                 {
                     DeleteFileIfExists(localTempPath);
@@ -1481,8 +1610,11 @@ internal sealed class SteamGridDbArtworkDownloader
         try
         {
             await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
-            await using var output = File.Create(tempPath);
-            await CopyArtworkWithLimitAsync(input, output, cancellationToken).ConfigureAwait(false);
+            await using (var output = File.Create(tempPath))
+            {
+                await CopyArtworkWithLimitAsync(input, output, cancellationToken).ConfigureAwait(false);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
             if (!IsUsableArtworkFile(tempPath))
             {
                 DeleteFileIfExists(tempPath);
@@ -1962,6 +2094,65 @@ internal sealed class SteamGridDbArtworkDownloader
         }
     }
 
+    private static int PromoteReloadedArtworkSet(
+        string stagingDirectory,
+        string gridDirectory,
+        string gridId)
+    {
+        var updated = 0;
+        foreach (var fileStem in GetArtworkFileStems(gridId))
+        {
+            var sourcePath = FindArtworkFile(stagingDirectory, fileStem);
+            if (sourcePath is null)
+            {
+                return 0;
+            }
+
+            var extension = Path.GetExtension(sourcePath);
+            if (PromoteDownloadedArtwork(
+                    gridDirectory,
+                    fileStem,
+                    new DownloadedArtworkFile(sourcePath, extension)))
+            {
+                updated++;
+            }
+        }
+
+        return updated;
+    }
+
+    private static IReadOnlyList<string> GetArtworkFileStems(string gridId) =>
+    [
+        gridId,
+        $"{gridId}p",
+        $"{gridId}_hero",
+        $"{gridId}_logo",
+        $"{gridId}-icon",
+    ];
+
+    private static void DeleteArtworkReloadStagingDirectory(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            var directory = new DirectoryInfo(path);
+            if (directory.Name.StartsWith(
+                    ".tfs-artwork-reload-",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                directory.Delete(recursive: true);
+            }
+        }
+        catch
+        {
+            // A later stale-staging cleanup can remove a briefly locked file.
+        }
+    }
+
     private static bool FilesAreEqual(string leftPath, string rightPath)
     {
         var leftInfo = new FileInfo(leftPath);
@@ -2171,6 +2362,24 @@ internal sealed class SteamGridDbArtworkDownloader
                 {
                 }
             }
+
+            foreach (var directory in Directory.EnumerateDirectories(
+                         gridDirectory,
+                         ".tfs-artwork-reload-*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(directory) <
+                        now.Subtract(TimeSpan.FromHours(1)))
+                    {
+                        Directory.Delete(directory, recursive: true);
+                    }
+                }
+                catch
+                {
+                }
+            }
         }
         catch
         {
@@ -2225,7 +2434,10 @@ internal sealed record StoreSyncArtworkTarget(
     string RomPath = "",
     string RomSystemId = "",
     string RetroAchievementsApiKey = "",
-    uint? RetroAchievementsGameId = null);
+    uint? RetroAchievementsGameId = null,
+    string LocalInstallPath = "",
+    string LocalExecutablePath = "",
+    bool ForceReload = false);
 
 internal sealed record StoreSyncArtworkSummary(
     int UpdatedTitleCount,

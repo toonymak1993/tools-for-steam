@@ -1062,6 +1062,71 @@ public sealed class StoreSyncLiveSyncHardeningTests
         Assert.True(result);
     }
 
+    [Fact]
+    public void ShouldCleanupUnmatchedManagedShortcut_DeltaKeepsUnchangedOmniLibraryGame()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod(
+            "ShouldCleanupUnmatchedManagedShortcut",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var shortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            0,
+            4040u,
+            "Forza Horizon",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch xbox-game-pass:9NUNCHANGED",
+            true,
+            "unifysteam",
+            "unifysteam-forza",
+            new Dictionary<string, object?>());
+        var removedGameIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var result = (bool?)method!.Invoke(null, [shortcut, removedGameIds]);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void ShouldCleanupUnmatchedManagedShortcut_DeltaRemovesExplicitlyDeletedOmniLibraryGame()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod(
+            "ShouldCleanupUnmatchedManagedShortcut",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var shortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            0,
+            4040u,
+            "Forza Horizon",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch xbox-game-pass:9NREMOVED",
+            true,
+            "unifysteam",
+            "unifysteam-forza",
+            new Dictionary<string, object?>());
+        var removedGameIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "9NREMOVED",
+        };
+
+        var result = (bool?)method!.Invoke(null, [shortcut, removedGameIds]);
+
+        Assert.True(result);
+    }
+
     private static object CreateNonPublicInstance(Type type, params object?[] arguments)
     {
         var constructor = type.GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)

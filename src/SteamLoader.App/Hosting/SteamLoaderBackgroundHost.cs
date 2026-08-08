@@ -195,14 +195,12 @@ public sealed class SteamLoaderBackgroundHost
         var popupScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
-            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"),
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-tab-topology.js"),
             EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
             EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
@@ -346,6 +344,20 @@ public sealed class SteamLoaderBackgroundHost
             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var gogInstallStateTask =
             GogInstallStateTracker.RunAsync(gogInstallStateCts.Token);
+        using var xboxInstallStateCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var xboxInstallStateTask =
+            ProviderInstallStateTracker.RunAsync(
+                "xbox-game-pass",
+                UnifySteamService.LoadXboxInstalledGamesForReconciliation,
+                xboxInstallStateCts.Token);
+        using var epicInstallStateCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var epicInstallStateTask =
+            ProviderInstallStateTracker.RunAsync(
+                "epic-games",
+                UnifySteamService.LoadEpicInstalledGamesForReconciliation,
+                epicInstallStateCts.Token);
 
         try
         {
@@ -357,6 +369,24 @@ public sealed class SteamLoaderBackgroundHost
             try
             {
                 await gogInstallStateTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await xboxInstallStateCts.CancelAsync();
+            try
+            {
+                await xboxInstallStateTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await epicInstallStateCts.CancelAsync();
+            try
+            {
+                await epicInstallStateTask;
             }
             catch (OperationCanceledException)
             {

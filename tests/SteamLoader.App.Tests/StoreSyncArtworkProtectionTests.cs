@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Drawing;
+using System.Drawing.Imaging;
 using SteamLoader.App.Infrastructure.StoreSync;
 using Xunit;
 
@@ -6,6 +8,236 @@ namespace SteamLoader.App.Tests;
 
 public sealed class StoreSyncArtworkProtectionTests
 {
+    [Fact]
+    public void LocalArtworkResolver_UsesSteamLibraryCacheBeforeRemoteSources()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var steamApps = Path.Combine(root, "steamapps");
+            var cache = Path.Combine(root, "appcache", "librarycache", "424242");
+            Directory.CreateDirectory(steamApps);
+            Directory.CreateDirectory(cache);
+            File.WriteAllText(
+                Path.Combine(steamApps, "appmanifest_424242.acf"),
+                "\"AppState\"\n{\n\t\"appid\"\t\"424242\"\n\t\"name\"\t\"Local Cache Test Game\"\n}");
+            WriteTestImage(Path.Combine(cache, "header.jpg"), 920, 430, ImageFormat.Jpeg);
+            WriteTestImage(Path.Combine(cache, "library_600x900.jpg"), 600, 900, ImageFormat.Jpeg);
+            WriteTestImage(Path.Combine(cache, "library_hero.jpg"), 1920, 620, ImageFormat.Jpeg);
+            WriteTestImage(Path.Combine(cache, "logo.png"), 800, 240, ImageFormat.Png);
+
+            var resolver = new OmniLibraryLocalArtworkResolver(root);
+            var target = new StoreSyncArtworkTarget(
+                "epic-games:local-cache-test",
+                "Local Cache Test Game",
+                3000000001,
+                ["Local Cache Test Game"],
+                null,
+                string.Empty,
+                "epic-games");
+
+            var resolved = resolver.Resolve(target);
+
+            Assert.Equal(
+                Path.Combine(cache, "header.jpg"),
+                resolved[OmniLibraryArtworkSlotKind.LibraryCapsule]);
+            Assert.Equal(
+                Path.Combine(cache, "library_600x900.jpg"),
+                resolved[OmniLibraryArtworkSlotKind.Portrait]);
+            Assert.Equal(
+                Path.Combine(cache, "library_hero.jpg"),
+                resolved[OmniLibraryArtworkSlotKind.Hero]);
+            Assert.Equal(
+                Path.Combine(cache, "logo.png"),
+                resolved[OmniLibraryArtworkSlotKind.Logo]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public void LocalArtworkResolver_UsesBoundedInstallArtworkAndExplicitFiles()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var installPath = Path.Combine(root, "game");
+            var artworkPath = Path.Combine(installPath, "artwork");
+            Directory.CreateDirectory(artworkPath);
+            var explicitPortrait = Path.Combine(root, "exact-cover.png");
+            var discoveredPortrait = Path.Combine(artworkPath, "boxart.png");
+            var discoveredHero = Path.Combine(artworkPath, "library-hero.jpg");
+            var discoveredLogo = Path.Combine(artworkPath, "clearlogo.png");
+            WriteTestImage(explicitPortrait, 600, 900, ImageFormat.Png);
+            WriteTestImage(discoveredPortrait, 600, 900, ImageFormat.Png);
+            WriteTestImage(discoveredHero, 1920, 620, ImageFormat.Jpeg);
+            WriteTestImage(discoveredLogo, 800, 240, ImageFormat.Png);
+
+            var resolver = new OmniLibraryLocalArtworkResolver(
+                Path.Combine(root, "missing-steam"));
+            var target = new StoreSyncArtworkTarget(
+                "gog:test",
+                "Install Artwork Test",
+                3000000002,
+                ["Install Artwork Test"],
+                null,
+                string.Empty,
+                "gog-galaxy",
+                new Uri(explicitPortrait).AbsoluteUri,
+                string.Empty,
+                LocalInstallPath: installPath);
+
+            var resolved = resolver.Resolve(target);
+
+            Assert.Equal(
+                explicitPortrait,
+                resolved[OmniLibraryArtworkSlotKind.Portrait]);
+            Assert.Equal(
+                discoveredHero,
+                resolved[OmniLibraryArtworkSlotKind.Hero]);
+            Assert.Equal(
+                discoveredLogo,
+                resolved[OmniLibraryArtworkSlotKind.Logo]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadLocalFirst_CompletesEverySlotWithoutSteamGridDb()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            const uint appId = 3000000003;
+            var gridDirectory = Path.Combine(root, "grid");
+            var portraitPath = Path.Combine(root, "portrait.png");
+            var heroPath = Path.Combine(root, "hero.jpg");
+            WriteTestImage(portraitPath, 600, 900, ImageFormat.Png);
+            WriteTestImage(heroPath, 1920, 620, ImageFormat.Jpeg);
+            var target = new StoreSyncArtworkTarget(
+                "xbox-game-pass:local-only",
+                "A Local Only Artwork Test That Does Not Exist",
+                appId,
+                ["A Local Only Artwork Test That Does Not Exist"],
+                null,
+                string.Empty,
+                string.Empty,
+                new Uri(portraitPath).AbsoluteUri,
+                new Uri(heroPath).AbsoluteUri);
+
+            var summary = await new SteamGridDbArtworkDownloader().DownloadLocalFirstAsync(
+                gridDirectory,
+                [target],
+                string.Empty,
+                CancellationToken.None);
+
+            Assert.Equal(1, summary.UpdatedTitleCount);
+            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task ForceReload_StagesCompleteSetBeforeReplacingManagedArtwork()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            const uint appId = 3000000004;
+            const uint unrelatedAppId = 3000000005;
+            var gridDirectory = Path.Combine(root, "grid");
+            Directory.CreateDirectory(gridDirectory);
+            var gridId = SteamShortcutIds.BuildGridId(appId);
+            foreach (var stem in new[]
+                     {
+                         gridId,
+                         $"{gridId}p",
+                         $"{gridId}_hero",
+                         $"{gridId}_logo",
+                         $"{gridId}-icon",
+                     })
+            {
+                WriteTestImage(
+                    Path.Combine(gridDirectory, $"{stem}.png"),
+                    320,
+                    180,
+                    ImageFormat.Png,
+                    Color.DarkRed);
+            }
+
+            var unrelatedPath = Path.Combine(
+                gridDirectory,
+                $"{SteamShortcutIds.BuildGridId(unrelatedAppId)}.png");
+            WriteTestImage(
+                unrelatedPath,
+                320,
+                180,
+                ImageFormat.Png,
+                Color.DarkOrange);
+            var unrelatedBefore = File.ReadAllBytes(unrelatedPath);
+            var portraitPath = Path.Combine(root, "replacement-portrait.png");
+            var heroPath = Path.Combine(root, "replacement-hero.jpg");
+            WriteTestImage(
+                portraitPath,
+                600,
+                900,
+                ImageFormat.Png,
+                Color.DarkGreen);
+            WriteTestImage(
+                heroPath,
+                1920,
+                620,
+                ImageFormat.Jpeg,
+                Color.DarkGreen);
+            var portraitBefore = File.ReadAllBytes(
+                Path.Combine(gridDirectory, $"{gridId}p.png"));
+            var target = new StoreSyncArtworkTarget(
+                "xbox-game-pass:reload-test",
+                "Artwork Reload Test",
+                appId,
+                ["Artwork Reload Test"],
+                null,
+                string.Empty,
+                "xbox-game-pass",
+                new Uri(portraitPath).AbsoluteUri,
+                new Uri(heroPath).AbsoluteUri,
+                ForceReload: true);
+
+            var summary = await new SteamGridDbArtworkDownloader().DownloadLocalFirstAsync(
+                gridDirectory,
+                [target],
+                string.Empty,
+                CancellationToken.None);
+
+            Assert.Equal(1, summary.UpdatedTitleCount);
+            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.NotEqual(
+                portraitBefore,
+                File.ReadAllBytes(Path.Combine(gridDirectory, $"{gridId}p.png")));
+            Assert.Equal(unrelatedBefore, File.ReadAllBytes(unrelatedPath));
+            Assert.Empty(Directory.EnumerateDirectories(
+                gridDirectory,
+                ".tfs-artwork-reload-*",
+                SearchOption.TopDirectoryOnly));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
     [Fact]
     public void CompleteArtworkSet_RequiresEverySteamLibrarySlot()
     {
@@ -72,6 +304,44 @@ public sealed class StoreSyncArtworkProtectionTests
         }
         finally
         {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadAssetToTemporaryFile_FlushesBeforeValidatingLocalArtwork()
+    {
+        var root = CreateTempRoot();
+        string? downloadedPath = null;
+
+        try
+        {
+            var sourcePath = Path.Combine(root, "source.png");
+            File.WriteAllBytes(sourcePath, ValidPngBytes());
+            using var httpClient = new HttpClient();
+            var method = typeof(SteamGridDbArtworkDownloader).GetMethod(
+                "DownloadAssetToTemporaryFileAsync",
+                BindingFlags.NonPublic | BindingFlags.Static);
+
+            Assert.NotNull(method);
+            var task = (Task)method!.Invoke(
+                null,
+                [httpClient, new Uri(sourcePath).AbsoluteUri, CancellationToken.None])!;
+            await task;
+
+            var result = task.GetType().GetProperty("Result")!.GetValue(task);
+            Assert.NotNull(result);
+            downloadedPath = (string)result!.GetType().GetProperty("TempPath")!.GetValue(result)!;
+            Assert.True(File.Exists(downloadedPath));
+            Assert.Equal(ValidPngBytes().Length, new FileInfo(downloadedPath).Length);
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(downloadedPath) && File.Exists(downloadedPath))
+            {
+                File.Delete(downloadedPath);
+            }
+
             DeleteTempRoot(root);
         }
     }
@@ -272,6 +542,20 @@ public sealed class StoreSyncArtworkProtectionTests
         byte[] signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         signature.CopyTo(bytes, 0);
         return bytes;
+    }
+
+    private static void WriteTestImage(
+        string path,
+        int width,
+        int height,
+        ImageFormat format,
+        Color? color = null)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using var bitmap = new Bitmap(width, height);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(color ?? Color.DarkSlateBlue);
+        bitmap.Save(path, format);
     }
 
     private static void DeleteTempRoot(string root)

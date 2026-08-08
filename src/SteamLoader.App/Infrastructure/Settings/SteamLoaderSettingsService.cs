@@ -1,5 +1,6 @@
 using SteamLoader.App;
 using SteamLoader.App.Infrastructure.Handheld;
+using SteamLoader.App.Infrastructure.Themes;
 using SteamLoader.App.Models;
 using SteamLoader.App.Services;
 using System.Reflection;
@@ -279,6 +280,50 @@ public sealed class SteamLoaderSettingsService
         };
 
         SaveSettings(settings);
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetWallpaperEnabled(bool enabled)
+    {
+        var settings = LoadSettings();
+        var theme = settings.Theme ?? new SteamLoaderThemeSettingsData();
+
+        if (enabled)
+        {
+            var previousWallpaperPath = WallpaperService.ApplyTfsWallpaper();
+            theme = theme with
+            {
+                WallpaperEnabled = true,
+                PreviousWallpaperPath = theme.PreviousWallpaperPath ?? previousWallpaperPath
+            };
+        }
+        else
+        {
+            WallpaperService.RestoreWallpaper(theme.PreviousWallpaperPath);
+            theme = theme with
+            {
+                WallpaperEnabled = false,
+                PreviousWallpaperPath = null
+            };
+        }
+
+        SaveSettings(settings with { Theme = theme });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetAnimationsEnabled(bool enabled)
+    {
+        var settings = LoadSettings();
+        var theme = settings.Theme ?? new SteamLoaderThemeSettingsData();
+        SaveSettings(settings with { Theme = theme with { AnimationsEnabled = enabled } });
+        return GetSnapshot();
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetAccentColor(string color)
+    {
+        var settings = LoadSettings();
+        var theme = settings.Theme ?? new SteamLoaderThemeSettingsData();
+        SaveSettings(settings with { Theme = theme with { AccentColor = NormalizeAccentColor(color) } });
         return GetSnapshot();
     }
 
@@ -657,6 +702,36 @@ public sealed class SteamLoaderSettingsService
             .ToArray();
     }
 
+    private static readonly IReadOnlyList<string> AccentColorPalette =
+    [
+        "#66c0f4",
+        "#5ee6a8",
+        "#c084fc",
+        "#ff9f43",
+        "#ff6b6b",
+        "#4dd0e1",
+    ];
+    private const string NoneAccentColor = "none";
+
+    private static string NormalizeAccentColor(string? color)
+    {
+        if (string.Equals(color, NoneAccentColor, StringComparison.OrdinalIgnoreCase))
+        {
+            return NoneAccentColor;
+        }
+
+        return AccentColorPalette.FirstOrDefault(candidate =>
+            string.Equals(candidate, color, StringComparison.OrdinalIgnoreCase)) ?? NoneAccentColor;
+    }
+
+    private static SteamLoaderThemeSettingsSnapshot BuildThemeSettings(SteamLoaderSettingsData settings)
+    {
+        return new SteamLoaderThemeSettingsSnapshot(
+            settings.Theme?.WallpaperEnabled == true,
+            settings.Theme?.AnimationsEnabled != false,
+            NormalizeAccentColor(settings.Theme?.AccentColor));
+    }
+
     private static SteamLoaderSplashScreenSettingsSnapshot BuildSplashScreenSettings(SteamLoaderSettingsData settings)
     {
         var splashScreen = NormalizeSplashScreenSettings(settings.SplashScreen);
@@ -748,6 +823,7 @@ public sealed class SteamLoaderSettingsService
             FirstRunCompleted: settings.FirstRunCompleted == true,
             ConsoleModeDefaultApplied: settings.ConsoleModeDefaultApplied == true,
             SplashScreen: BuildSplashScreenSettings(settings),
+            Theme: BuildThemeSettings(settings),
             ControllerShortcuts: BuildControllerShortcutSettings(settings),
             WindowsShellStartDelaySeconds: GetWindowsShellStartDelaySeconds(settings),
             ProductVersion: GetProductVersion(),
@@ -923,7 +999,21 @@ public sealed class SteamLoaderSettingsService
 
         public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
 
+        public SteamLoaderThemeSettingsData? Theme { get; init; }
+
         public SteamLoaderControllerShortcutSettingsData? ControllerShortcuts { get; init; }
+    }
+
+    private sealed record SteamLoaderThemeSettingsData
+    {
+        public bool? WallpaperEnabled { get; init; }
+
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? PreviousWallpaperPath { get; init; }
+
+        public bool? AnimationsEnabled { get; init; }
+
+        public string? AccentColor { get; init; }
     }
 
     private sealed record SteamLoaderControllerShortcutSettingsData
