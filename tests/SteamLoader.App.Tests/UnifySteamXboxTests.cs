@@ -43,6 +43,248 @@ public sealed class UnifySteamXboxTests
     }
 
     [Fact]
+    public void MergeXboxInstalledGames_KeepsInstalledTitleNotInCurrentCatalog()
+    {
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        var installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["9NPURCHASEDOUTRIGHT"] = new UnifySteamGameCacheEntry
+            {
+                Id = "9NPURCHASEDOUTRIGHT",
+                Title = "Purchased Outright Game",
+                Installed = true,
+                InstallPath = @"C:\XboxGames\Purchased Outright Game\Content",
+                ExecutablePath = @"C:\XboxGames\Purchased Outright Game\Content\game.exe",
+            },
+        };
+
+        UnifySteamService.MergeXboxInstalledGames(
+            games,
+            installed,
+            pcProductIdSet: [],
+            cloudProductIdSet: [],
+            previousSteamAppIds: new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase));
+
+        var survivor = Assert.Single(games.Values);
+        Assert.Equal("Purchased Outright Game", survivor.Title);
+        Assert.True(survivor.Installed);
+    }
+
+    [Fact]
+    public void MergeXboxInstalledGames_PreservesExistingSteamAppIdForOffCatalogTitle()
+    {
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        var installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["9NROTATEDOUTOFGAMEPASS"] = new UnifySteamGameCacheEntry
+            {
+                Id = "9NROTATEDOUTOFGAMEPASS",
+                Title = "Rotated Out Game",
+                Installed = true,
+            },
+        };
+        var previousSteamAppIds = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["9NROTATEDOUTOFGAMEPASS"] = 123456789u,
+        };
+
+        UnifySteamService.MergeXboxInstalledGames(
+            games,
+            installed,
+            pcProductIdSet: [],
+            cloudProductIdSet: [],
+            previousSteamAppIds);
+
+        var survivor = Assert.Single(games.Values);
+        Assert.Equal(123456789u, survivor.SteamAppId);
+    }
+
+    [Fact]
+    public void TryParseXboxAppxManifest_RecognizesLegacyXboxUwpGame()
+    {
+        var packageRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"tfs-xbox-appx-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(packageRoot);
+        try
+        {
+            File.WriteAllText(
+                Path.Combine(packageRoot, "AppxManifest.xml"),
+                """
+                <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+                  <Identity Name="Microsoft.OriandtheBlindForestDefinitiveEdition" Version="1.1.29.0" />
+                  <Properties><DisplayName>Ori and the Blind Forest: Definitive Edition</DisplayName></Properties>
+                  <Applications><Application Id="App" Executable="Ori.exe" /></Applications>
+                  <Extensions><Extension Category="Microsoft.Xbox.Services" /></Extensions>
+                </Package>
+                """);
+
+            var parsed = UnifySteamService.TryParseXboxAppxManifest(
+                "Microsoft.OriandtheBlindForestDefinitiveEdition_1.1.29.0_x64__8wekyb3d8bbwe",
+                packageRoot,
+                "Ori and the Blind Forest: Definitive Edition",
+                out var game);
+
+            Assert.True(parsed);
+            Assert.True(game.Installed);
+            Assert.Equal("Ori and the Blind Forest: Definitive Edition", game.Title);
+            Assert.Equal("xbox-appx", game.StoreNamespace);
+            Assert.Equal(
+                "shell:AppsFolder\\Microsoft.OriandtheBlindForestDefinitiveEdition_8wekyb3d8bbwe!App",
+                game.ExecutablePath);
+        }
+        finally
+        {
+            Directory.Delete(packageRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void MergeXboxInstalledGames_MapsLegacyAppxPackageByUniqueCatalogTitle()
+    {
+        var catalog = new UnifySteamGameCacheEntry
+        {
+            Id = "9NBLGGH1Z6FB",
+            Title = "Ori and the Blind Forest: Definitive Edition",
+        };
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+        {
+            [catalog.Id] = catalog,
+        };
+        var appx = new UnifySteamGameCacheEntry
+        {
+            Id = "Microsoft.OriandtheBlindForestDefinitiveEdition",
+            Title = catalog.Title,
+            Installed = true,
+            InstallPath = @"C:\Program Files\WindowsApps\Ori",
+            ExecutablePath =
+                "shell:AppsFolder\\Microsoft.OriandtheBlindForestDefinitiveEdition_8wekyb3d8bbwe!App",
+            StoreNamespace = "xbox-appx",
+        };
+
+        UnifySteamService.MergeXboxInstalledGames(
+            games,
+            new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+            {
+                [appx.Id] = appx,
+            },
+            [catalog.Id],
+            [],
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase));
+
+        Assert.Single(games);
+        Assert.True(catalog.Installed);
+        Assert.Equal(appx.ExecutablePath, catalog.ExecutablePath);
+    }
+
+    [Fact]
+    public void MergeXboxInstalledGames_DoesNotImportUnmatchedXboxRelatedAppAsGame()
+    {
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        var xboxApp = new UnifySteamGameCacheEntry
+        {
+            Id = "Microsoft.GamingApp",
+            Title = "Xbox",
+            Installed = true,
+            InstallPath = @"C:\Program Files\WindowsApps\Microsoft.GamingApp",
+            ExecutablePath = "shell:AppsFolder\\Microsoft.GamingApp_8wekyb3d8bbwe!App",
+            StoreNamespace = "xbox-appx",
+        };
+
+        UnifySteamService.MergeXboxInstalledGames(
+            games,
+            new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+            {
+                [xboxApp.Id] = xboxApp,
+            },
+            [],
+            [],
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase));
+
+        Assert.Empty(games);
+    }
+
+    [Fact]
+    public void CollapseRelatedXboxProductEntries_KeepsCatalogEditionAndRemovesPackageAlias()
+    {
+        const string catalogId = "9N6J4RNFPKKL";
+        const string packageId = "9N683TDT5M7R";
+        var catalog = new UnifySteamGameCacheEntry
+        {
+            Id = catalogId,
+            Title = "Halo: Campaign Evolved – Standard Edition",
+            SteamAppId = 111u,
+        };
+        var package = new UnifySteamGameCacheEntry
+        {
+            Id = packageId,
+            Title = "Halo: Campaign Evolved",
+            Installed = true,
+            InstallPath = @"C:\XboxGames\Halo\Content",
+            ExecutablePath = @"C:\XboxGames\Halo\Content\Halo.exe",
+            SteamAppId = 222u,
+        };
+        var games = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase)
+        {
+            [catalog.Id] = catalog,
+            [package.Id] = package,
+        };
+
+        var removed = UnifySteamService.CollapseRelatedXboxProductEntries(
+            games,
+            id => id == catalogId
+                ? new HashSet<string>([catalogId, packageId], StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>([id], StringComparer.OrdinalIgnoreCase));
+
+        Assert.Equal(packageId, Assert.Single(removed));
+        var survivor = Assert.Single(games.Values);
+        Assert.Equal(catalogId, survivor.Id);
+        Assert.Equal(111u, survivor.SteamAppId);
+        Assert.True(survivor.Installed);
+        Assert.Equal(package.ExecutablePath, survivor.ExecutablePath);
+        Assert.Equal(packageId, survivor.ProviderGameId);
+    }
+
+    [Fact]
+    public void DedupeLibraryGames_CollapsesSameTitleAcrossPcAndCloudProductIds()
+    {
+        var pcEntry = new UnifySteamGameCacheEntry
+        {
+            Id = "9NPCPRODUCTID",
+            Title = "Forza Horizon 5",
+            CloudPlayable = false,
+        };
+        var cloudEntry = new UnifySteamGameCacheEntry
+        {
+            Id = "9NCLOUDPRODUCTID",
+            Title = "Forza Horizon 5",
+            CloudPlayable = true,
+        };
+
+        var deduped = UnifySteamService.DedupeLibraryGames([cloudEntry, pcEntry]);
+
+        var survivor = Assert.Single(deduped);
+        Assert.Equal("9NPCPRODUCTID", survivor.Id);
+        Assert.False(survivor.CloudPlayable);
+    }
+
+    [Fact]
+    public void DedupeLibraryGames_KeepsCloudOnlyEntryWhenNoPcCounterpartExists()
+    {
+        var cloudOnlyEntry = new UnifySteamGameCacheEntry
+        {
+            Id = "9NCLOUDONLYPRODUCT",
+            Title = "Cloud Exclusive Game",
+            CloudPlayable = true,
+        };
+
+        var deduped = UnifySteamService.DedupeLibraryGames([cloudOnlyEntry]);
+
+        var survivor = Assert.Single(deduped);
+        Assert.Equal("9NCLOUDONLYPRODUCT", survivor.Id);
+    }
+
+    [Fact]
     public void TryResolveXboxInstalledGame_MatchesUniqueStandardEditionPackage()
     {
         var catalogGame = new UnifySteamGameCacheEntry

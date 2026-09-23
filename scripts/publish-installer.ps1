@@ -4,7 +4,11 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "XboxHostPayloadSnapshot.ps1")
 $projectPath = Join-Path $projectRoot "src\SteamLoader.App\SteamLoader.App.csproj"
 $innoCandidates = @(
+    "C:\Program Files\Inno Setup 7\ISCC.exe"
+    "C:\Program Files (x86)\Inno Setup 7\ISCC.exe"
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 7\ISCC.exe")
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    "C:\Program Files\Inno Setup 6\ISCC.exe"
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
 )
 $innoPath = $innoCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -23,7 +27,7 @@ $packageTimeSlot = [int][Math]::Floor($packageBuildTime.TimeOfDay.TotalSeconds /
 $xboxHostPackageVersion = "$packageMajor.$packageMinor.$packageDay.$packageTimeSlot"
 
 if (-not $innoPath) {
-    throw "Inno Setup 6 compiler was not found."
+    throw "Inno Setup 7 or 6 compiler was not found."
 }
 
 if (-not (Test-Path $issPath)) {

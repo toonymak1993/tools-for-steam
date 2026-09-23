@@ -347,7 +347,7 @@
 
     style.textContent = `
       .steamloader-plugin-store-root {
-        position: fixed;
+        position: absolute;
         inset: 0;
         z-index: 2147483640;
         display: none;

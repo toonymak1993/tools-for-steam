@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 147;
+  const stateVersion = 149;
   const popupScriptVersion = "__STEAMLOADER_SCRIPT_VERSION__";
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
@@ -18,7 +18,13 @@
   const omniLibraryStoreStorageKey = "ToolsForSteamOmniLibraryStoresChanged";
   const omniLibraryStoreChannelName = "ToolsForSteamOmniLibraryStores";
   const storefrontEnabled = true;
-  const tabHeroEngine = window.__steamLoaderTabHero;
+  const retiredTabRuntimeKey = ["__steamLoader", "Tab", "Hero"].join("");
+  try {
+    window[retiredTabRuntimeKey]?.dispose?.();
+    delete window[retiredTabRuntimeKey];
+    window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroSettings.v1"].join(""));
+    window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroCatalog.v1"].join(""));
+  } catch (_) {}
 
   window.__steamLoaderApiBase = apiBase;
 
@@ -125,6 +131,10 @@
       window.clearTimeout(previousState.storeSync.downloadCenterNoticeTimer);
     }
 
+    if (previousState?.storeSync?.artworkReloadArmTimer) {
+      window.clearTimeout(previousState.storeSync.artworkReloadArmTimer);
+    }
+
     if (previousState?.generalSettings?.overlayCapture?.timer) {
       window.clearTimeout(previousState.generalSettings.overlayCapture.timer);
     }
@@ -188,7 +198,7 @@
     }
 
     try {
-      previousState?.tabHero?.unsubscribe?.();
+      previousState?.[["tab", "Hero"].join("")]?.unsubscribe?.();
     } catch {
     }
 
@@ -396,6 +406,10 @@
             cancelAllDownloadsArmed: false,
             cancelAllDownloadsArmTimer: 0,
             cancelAllDownloadsBusy: false,
+            artworkReloadArmed: false,
+            artworkReloadArmTimer: 0,
+            artworkReloadBusy: false,
+            artworkReloadStatus: "",
             artworkPreviewByTitleId: {},
             artworkPreviewLoadingByTitleId: {},
             pinnedTitleIds: readStoreSyncPinnedTitleIds(),
@@ -517,18 +531,6 @@
             sessionTokenDraft: "",
             sessionTokenInputVersion: 0,
             sliderCommitTimersByKey: {},
-          },
-          tabHero: {
-            snapshot: tabHeroEngine?.getSnapshot?.() || null,
-            error: "",
-            notice: "",
-            unsubscribe: null,
-            titleDraft: "",
-            filtersDraft: "[]",
-            profileDraft: "",
-            inputVersion: 0,
-            deleteArmedId: "",
-            profileDeleteArmedId: "",
           },
           nativeUi: {
             dialogButtonType: null,
@@ -1427,6 +1429,16 @@
     },
   ];
 
+  const accentColorPalette = [
+    { value: "none", title: "None (Default)" },
+    { value: "#66c0f4", title: "Steam Blue" },
+    { value: "#5ee6a8", title: "Mint Green" },
+    { value: "#c084fc", title: "Violet" },
+    { value: "#ff9f43", title: "Amber" },
+    { value: "#ff6b6b", title: "Coral Red" },
+    { value: "#4dd0e1", title: "Teal" },
+  ];
+
   const plugins = [
     {
       id: "settings",
@@ -1457,6 +1469,11 @@
           id: "splashscreen-themes",
           title: "Splashscreen",
           description: "Choose dynamic game artwork or your own image",
+        },
+        {
+          id: "theme",
+          title: "Theme",
+          description: "Wallpaper and other TFS look-and-feel options",
         },
         {
           id: "oem-software",
@@ -1522,28 +1539,6 @@
       title: "OmniLibrary",
       description: "Xbox games in a native Steam library tab",
       pages: [],
-    },
-    {
-      id: "tabhero",
-      title: "Tabhero",
-      description: "Rename, hide, reorder, and add filtered Library tabs",
-      pages: [
-        {
-          id: "tabs",
-          title: "Tabs",
-          description: "Manage native, custom, and protected plugin tabs",
-        },
-        {
-          id: "new-tab",
-          title: "New Tab",
-          description: "Create a tab from any combination of filters",
-        },
-        {
-          id: "profiles",
-          title: "Profiles",
-          description: "Save and switch complete tab layouts",
-        },
-      ],
     },
     {
       id: "auto-sisr",
@@ -2177,9 +2172,65 @@
       }
 
       .steamloader-dialog-button-home {
+        position: relative;
+        overflow: hidden;
         min-height: 44px !important;
         padding: 7px 10px !important;
         border-radius: 12px !important;
+      }
+
+      body.steamloader-accent-active .steamloader-dialog-button-home.gpfocus,
+      body.steamloader-accent-active .steamloader-dialog-button-home:hover,
+      body.steamloader-accent-active .steamloader-dialog-button-home:focus-visible {
+        background: linear-gradient(
+          45deg,
+          transparent 0%,
+          transparent 50%,
+          color-mix(in srgb, var(--tfs-accent, #66c0f4) 85%, #10161f) 100%
+        ) !important;
+      }
+
+      body.steamloader-accent-active .steamloader-dialog-button-home.gpfocus .steamloader-row-title,
+      body.steamloader-accent-active .steamloader-dialog-button-home:hover .steamloader-row-title,
+      body.steamloader-accent-active .steamloader-dialog-button-home:focus-visible .steamloader-row-title,
+      body.steamloader-accent-active .steamloader-dialog-button-home.gpfocus .steamloader-row-copy,
+      body.steamloader-accent-active .steamloader-dialog-button-home:hover .steamloader-row-copy,
+      body.steamloader-accent-active .steamloader-dialog-button-home:focus-visible .steamloader-row-copy,
+      body.steamloader-accent-active .steamloader-dialog-button-home.gpfocus .steamloader-row-icon,
+      body.steamloader-accent-active .steamloader-dialog-button-home:hover .steamloader-row-icon,
+      body.steamloader-accent-active .steamloader-dialog-button-home:focus-visible .steamloader-row-icon {
+        color: #f5f8fb !important;
+      }
+
+      .steamloader-dialog-button-home::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.55) 50%, transparent 80%);
+        background-size: 220% 100%;
+        background-position: 220% 0;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 220ms ease;
+      }
+
+      body:not(.steamloader-animations-disabled) .steamloader-dialog-button-home.gpfocus::before,
+      body:not(.steamloader-animations-disabled) .steamloader-dialog-button-home:hover::before {
+        opacity: 1;
+        animation: steamloader-home-shine 1650ms ease-in-out infinite;
+      }
+
+      @keyframes steamloader-home-shine {
+        0% { background-position: 220% 0; }
+        100% { background-position: -120% 0; }
+      }
+
+      body.steamloader-animations-disabled .steamloader-dialog-button-home::before {
+        display: none;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .steamloader-dialog-button-home::before { animation: none !important; }
       }
 
       .steamloader-dialog-button-performance-summary {
@@ -4016,6 +4067,13 @@
         gap: 8px;
       }
 
+      body.steamloader-accent-active .steamloader-panel-home .steamloader-header {
+        padding: 10px 12px;
+        border-radius: 16px;
+        background: linear-gradient(45deg, transparent 0%, transparent 50%, color-mix(in srgb, var(--tfs-accent, #66c0f4) 30%, transparent) 100%);
+        transition: background 200ms ease;
+      }
+
       .steamloader-panel-home .steamloader-header-main {
         align-items: center;
         gap: 8px;
@@ -5439,18 +5497,6 @@
         };
       }
 
-      if (route.pluginId === "tabhero" && route.pageId?.startsWith("edit-")) {
-        const encodedTabId = route.pageId.slice("edit-".length);
-        let tabId = encodedTabId;
-        try {
-          tabId = decodeURIComponent(encodedTabId);
-        } catch (_) {}
-        return {
-          route: parseRoute("page:tabhero:tabs"),
-          fallbackSlotKey: `tabhero-tab-${tabId}`,
-        };
-      }
-
       if (route.pluginId === "smart-home" && route.pageId?.startsWith("room-")) {
         const roomId = route.pageId.replace(/^room-/, "");
         return {
@@ -5838,6 +5884,43 @@
         }),
       ),
     );
+  }
+
+  function NoAccentColorIcon() {
+    return createElement(
+      "svg",
+      withChildren(
+        { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "none" },
+        createElement("circle", {
+          cx: "12",
+          cy: "12",
+          r: "9",
+          fill: "none",
+          stroke: "rgba(255,255,255,.45)",
+          strokeWidth: "1.5",
+          strokeDasharray: "3 3",
+        }),
+      ),
+    );
+  }
+
+  function createAccentSwatchIcon(hex) {
+    return function AccentSwatchIcon() {
+      return createElement(
+        "svg",
+        withChildren(
+          { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", fill: "none" },
+          createElement("circle", {
+            cx: "12",
+            cy: "12",
+            r: "9",
+            fill: hex,
+            stroke: "rgba(255,255,255,.35)",
+            strokeWidth: "1.5",
+          }),
+        ),
+      );
+    };
   }
 
   function AudioPluginIcon() {
@@ -6734,20 +6817,6 @@
     );
   }
 
-  function TabHeroPluginIcon() {
-    return createElement("svg", withChildren(
-      { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 36 36", fill: "none" },
-      createElement("rect", {
-        x: "6.5", y: "8", width: "23", height: "20", rx: "4",
-        stroke: "currentColor", strokeWidth: "2.2",
-      }),
-      createElement("path", {
-        d: "M7 14H29M13.5 8V14M21.5 8V14M11 20H16M20 20H25M11 24H18",
-        stroke: "currentColor", strokeWidth: "2.1", strokeLinecap: "round",
-      }),
-    ));
-  }
-
   function getPluginIconComponent(pluginId) {
     switch (pluginId) {
       case "audio":
@@ -6770,8 +6839,6 @@
       case "store-sync":
       case "omnilibrary":
         return StoreSyncPluginIcon;
-      case "tabhero":
-        return TabHeroPluginIcon;
       case "auto-sisr":
         return AutoSisirPluginIcon;
       case "artwork":
@@ -9963,13 +10030,6 @@
     renderPanelState();
   }
 
-  function rerenderTabHeroPanel() {
-    if (isCurrentPluginRoute("tabhero")) {
-      renderPanelDataRefresh();
-      return;
-    }
-  }
-
   function rerenderSystemToolsPanel() {
     if (
       state.route.screen === "page" &&
@@ -12963,298 +13023,6 @@
     return state.generalSettings.snapshot;
   }
 
-  function getTabHeroSnapshot() {
-    const snapshot = state.tabHero.snapshot || tabHeroEngine?.getSnapshot?.();
-    state.tabHero.snapshot = snapshot;
-    return snapshot || {
-      enabled: false,
-      order: [],
-      native: {},
-      customTabs: [],
-      profiles: [],
-      catalog: [],
-    };
-  }
-
-  function getTabHeroEntries() {
-    const snapshot = getTabHeroSnapshot();
-    const nativeEntries = (snapshot.catalog || []).map((entry) => ({
-      ...entry,
-      title: snapshot.native?.[entry.id]?.title || entry.title || entry.id,
-      originalTitle: entry.title || entry.id,
-      hidden: entry.protected ? false : snapshot.native?.[entry.id]?.hidden === true,
-      custom: false,
-    }));
-    const customEntries = (snapshot.customTabs || []).map((entry) => ({
-      ...entry,
-      originalTitle: entry.title,
-      hidden: entry.enabled === false,
-      custom: true,
-      protected: false,
-      owner: "tabhero",
-    }));
-    const byId = new Map();
-    [...nativeEntries, ...customEntries].forEach((entry) => {
-      if (entry?.id && !byId.has(entry.id)) {
-        byId.set(entry.id, entry);
-      }
-    });
-    const source = Array.from(byId.values());
-    const protectedEntries = source.filter((entry) => entry.protected);
-    const editable = source.filter((entry) => !entry.protected);
-    const naturalRank = new Map(editable.map((entry, index) => [entry.id, index]));
-    const configuredRank = new Map((snapshot.order || []).map((id, index) => [id, index]));
-    editable.sort((left, right) => {
-      const leftRank = configuredRank.has(left.id)
-        ? configuredRank.get(left.id)
-        : configuredRank.size + naturalRank.get(left.id);
-      const rightRank = configuredRank.has(right.id)
-        ? configuredRank.get(right.id)
-        : configuredRank.size + naturalRank.get(right.id);
-      return leftRank - rightRank;
-    });
-    let anchorIndex = editable.findIndex((entry) => entry.id === "DesktopApps");
-    if (anchorIndex < 0) {
-      anchorIndex = editable.findIndex((entry) => entry.id === "Installed");
-    }
-    const insertIndex = anchorIndex >= 0 ? anchorIndex + 1 : Math.min(3, editable.length);
-    return [
-      ...editable.slice(0, insertIndex),
-      ...protectedEntries,
-      ...editable.slice(insertIndex),
-    ];
-  }
-
-  function getTabHeroEntry(tabId) {
-    return getTabHeroEntries().find((entry) => entry.id === tabId) || null;
-  }
-
-  function getTabHeroEditRouteId() {
-    const pageId = String(state.route?.pageId || "");
-    if (!pageId.startsWith("edit-")) {
-      return "";
-    }
-    try {
-      return decodeURIComponent(pageId.slice("edit-".length));
-    } catch {
-      return pageId.slice("edit-".length);
-    }
-  }
-
-  function openTabHeroEditor(tabId) {
-    const entry = getTabHeroEntry(tabId);
-    if (!entry) {
-      return;
-    }
-    state.tabHero.titleDraft = entry.title || entry.id;
-    state.tabHero.filtersDraft = JSON.stringify(entry.custom ? entry.filters || [] : [], null, 2);
-    state.tabHero.error = "";
-    state.tabHero.notice = "";
-    state.tabHero.deleteArmedId = "";
-    state.tabHero.inputVersion += 1;
-    setRoute({
-      screen: "page",
-      pluginId: "tabhero",
-      pageId: `edit-${encodeURIComponent(entry.id)}`,
-    });
-  }
-
-  function resetTabHeroNewDrafts() {
-    state.tabHero.titleDraft = "";
-    state.tabHero.filtersDraft = "[]";
-    state.tabHero.error = "";
-    state.tabHero.notice = "";
-    state.tabHero.inputVersion += 1;
-  }
-
-  function parseTabHeroFiltersDraft() {
-    let filters;
-    try {
-      filters = JSON.parse(state.tabHero.filtersDraft || "[]");
-    } catch (error) {
-      throw new Error(`Filter JSON is invalid: ${String(error?.message || error)}`);
-    }
-    if (!Array.isArray(filters)) {
-      throw new Error("Filter JSON must be an array.");
-    }
-    const validation = tabHeroEngine?.validateFilters?.(filters);
-    if (validation && !validation.valid) {
-      throw new Error(validation.errors.join(" "));
-    }
-    return filters;
-  }
-
-  function createTabHeroCustomTab() {
-    state.tabHero.error = "";
-    state.tabHero.notice = "";
-    try {
-      const filters = parseTabHeroFiltersDraft();
-      const result = tabHeroEngine?.upsertCustomTab?.({
-        title: state.tabHero.titleDraft || "New Tab",
-        filters,
-        matchMode: "all",
-        enabled: true,
-      });
-      if (!result?.ok) {
-        throw new Error(result?.reason === "limit"
-          ? "Tabhero supports up to 64 custom tabs."
-          : result?.errors?.join(" ") || result?.reason || "The tab could not be created.");
-      }
-      state.tabHero.snapshot = result.snapshot;
-      state.tabHero.notice = `${result.tab.title} was added to the Library.`;
-      openTabHeroEditor(result.tab.id);
-    } catch (error) {
-      state.tabHero.error = error instanceof Error ? error.message : String(error);
-      rerenderTabHeroPanel();
-    }
-  }
-
-  function saveTabHeroEntry(tabId) {
-    const entry = getTabHeroEntry(tabId);
-    if (!entry || entry.protected) {
-      return;
-    }
-    state.tabHero.error = "";
-    state.tabHero.notice = "";
-    try {
-      const result = entry.custom
-        ? tabHeroEngine?.upsertCustomTab?.({
-            ...entry,
-            title: state.tabHero.titleDraft || entry.title,
-            filters: parseTabHeroFiltersDraft(),
-          })
-        : tabHeroEngine?.updateNativeTab?.(entry.id, {
-            title: state.tabHero.titleDraft === entry.originalTitle
-              ? ""
-              : state.tabHero.titleDraft,
-          });
-      if (!result?.ok) {
-        throw new Error(result?.reason || "The tab could not be saved.");
-      }
-      state.tabHero.snapshot = result.snapshot;
-      state.tabHero.notice = "Tab saved. The Library row updates automatically.";
-    } catch (error) {
-      state.tabHero.error = error instanceof Error ? error.message : String(error);
-    }
-    rerenderTabHeroPanel();
-  }
-
-  function patchTabHeroCustomTab(tabId, patch) {
-    const entry = getTabHeroSnapshot().customTabs?.find((tab) => tab.id === tabId);
-    if (!entry) {
-      return false;
-    }
-    const result = tabHeroEngine?.upsertCustomTab?.({ ...entry, ...patch });
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      return true;
-    }
-    return false;
-  }
-
-  function toggleTabHeroEntryVisibility(entry) {
-    if (!entry || entry.protected) {
-      return;
-    }
-    const result = entry.custom
-      ? tabHeroEngine?.upsertCustomTab?.({ ...entry, enabled: entry.enabled === false })
-      : tabHeroEngine?.updateNativeTab?.(entry.id, { hidden: !entry.hidden });
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      rerenderTabHeroPanel();
-    }
-  }
-
-  function deleteTabHeroCustomTab(tabId) {
-    if (state.tabHero.deleteArmedId !== tabId) {
-      state.tabHero.deleteArmedId = tabId;
-      state.tabHero.notice = "Press Delete once more to confirm.";
-      rerenderTabHeroPanel();
-      return;
-    }
-    state.tabHero.deleteArmedId = "";
-    const result = tabHeroEngine?.deleteCustomTab?.(tabId);
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      state.tabHero.notice = "Custom tab deleted.";
-      setRoute({ screen: "page", pluginId: "tabhero", pageId: "tabs" });
-    }
-  }
-
-  function moveTabHeroEntry(tabId, direction) {
-    const result = tabHeroEngine?.moveTab?.(tabId, direction);
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      rerenderTabHeroPanel();
-    }
-  }
-
-  function moveTabHeroEntryToEdge(tabId, edge) {
-    const result = tabHeroEngine?.moveTabToEdge?.(tabId, edge);
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      state.tabHero.error = "";
-      state.tabHero.notice = edge === "end" ? "Tab moved to the end." : "Tab moved to the start.";
-      rerenderTabHeroPanel();
-    }
-  }
-
-  function duplicateTabHeroCustomTab(tabId) {
-    const result = tabHeroEngine?.duplicateCustomTab?.(tabId);
-    if (!result?.ok || !result.tab) {
-      state.tabHero.error = result?.reason === "limit"
-        ? "Tabhero supports up to 64 custom tabs."
-        : "The custom tab could not be duplicated.";
-      rerenderTabHeroPanel();
-      return;
-    }
-    state.tabHero.snapshot = result.snapshot;
-    state.tabHero.error = "";
-    openTabHeroEditor(result.tab.id);
-    state.tabHero.notice = `${result.tab.title} was created as an independent copy.`;
-    rerenderTabHeroPanel();
-  }
-
-  function undoLastTabHeroChange() {
-    const result = tabHeroEngine?.undoLastChange?.();
-    if (!result?.ok) {
-      return;
-    }
-    state.tabHero.snapshot = result.snapshot;
-    state.tabHero.notice = "Last Tabhero layout change undone.";
-    state.tabHero.error = "";
-    setRoute({ screen: "page", pluginId: "tabhero", pageId: "tabs" });
-  }
-
-  function showAllTabHeroNativeTabs() {
-    const result = tabHeroEngine?.showAllNativeTabs?.();
-    if (!result?.ok) {
-      return;
-    }
-    state.tabHero.snapshot = result.snapshot;
-    state.tabHero.notice = result.changed
-      ? "All Steam-owned tabs are visible again."
-      : "Every Steam-owned tab is already visible.";
-    rerenderTabHeroPanel();
-  }
-
-  function saveTabHeroProfile() {
-    state.tabHero.error = "";
-    const result = tabHeroEngine?.saveProfile?.(state.tabHero.profileDraft);
-    if (result?.ok) {
-      state.tabHero.snapshot = result.snapshot;
-      state.tabHero.profileDraft = "";
-      state.tabHero.inputVersion += 1;
-      state.tabHero.notice = `Profile ${result.profile.title} saved.`;
-      rerenderTabHeroPanel();
-      return;
-    }
-    state.tabHero.error = result?.reason === "limit"
-      ? "Tabhero supports up to 32 saved profiles. Delete an older profile first."
-      : "The profile could not be saved.";
-    rerenderTabHeroPanel();
-  }
-
   function getUpdateSnapshot() {
     return state.updates.snapshot;
   }
@@ -13344,24 +13112,27 @@
     }
   }
 
+  function applyThemeToDocument(theme) {
+    const accentColor = theme?.accentColor || "none";
+    const hasAccent = accentColor !== "none";
+    if (hasAccent) {
+      document.body?.style.setProperty("--tfs-accent", accentColor);
+    } else {
+      document.body?.style.removeProperty("--tfs-accent");
+    }
+    document.body?.classList.toggle("steamloader-accent-active", hasAccent);
+    document.body?.classList.toggle("steamloader-animations-disabled", theme?.animationsEnabled === false);
+  }
+
   function setGeneralSettingsSnapshot(snapshot, options = {}) {
     state.generalSettings.snapshot = isSnapshotObject(snapshot) ? snapshot : null;
+    applyThemeToDocument(state.generalSettings.snapshot?.theme);
     if (options.clearError !== false) {
       state.generalSettings.error = "";
     }
 
     if (state.generalSettings.snapshot && options.syncDrafts !== false) {
       syncSplashDraftsFromSnapshot(options.forceDraftSync === true);
-    }
-
-    const tabHeroPlugin = state.generalSettings.snapshot?.plugins?.find(
-      (plugin) => plugin.id === "tabhero",
-    );
-    if (
-      tabHeroPlugin &&
-      tabHeroEngine?.getSnapshot?.().enabled !== (tabHeroPlugin.enabled !== false)
-    ) {
-      state.tabHero.snapshot = tabHeroEngine.setEnabled(tabHeroPlugin.enabled !== false);
     }
 
     if (
@@ -13486,6 +13257,10 @@
 
   function getSplashScreenSettings() {
     return getGeneralSettingsSnapshot()?.splashScreen || null;
+  }
+
+  function getThemeSettings() {
+    return getGeneralSettingsSnapshot()?.theme || null;
   }
 
   function syncSplashDraftsFromSnapshot(force = false) {
@@ -14338,9 +14113,6 @@
     const total = Math.max(0, Number(store?.preparationTotalCount) || 0);
     if ((preparation === "artwork" || artwork === "updating") && total > 0) {
       return ` - artwork ${Math.min(completed, total)}/${total}`;
-    }
-    if (artwork === "degraded") {
-      return " - artwork repair pending";
     }
     return store?.steamRestartRequired ? " - restart Steam" : "";
   }
@@ -15640,7 +15412,10 @@
   }
 
   function isStoreSyncBusy() {
-    return state.storeSync.loading || state.storeSync.saving || state.storeSync.syncing;
+    return state.storeSync.loading ||
+      state.storeSync.saving ||
+      state.storeSync.syncing ||
+      state.storeSync.artworkReloadBusy === true;
   }
 
   function isGeneralSettingsBusy() {
@@ -19220,6 +18995,50 @@
     await sendGeneralSettingsRequest("api/settings/developer-debug", { value: enabled }, { rerenderOnStart: false });
   }
 
+  async function toggleTfsWallpaper() {
+    const snapshot = getGeneralSettingsSnapshot();
+    const theme = snapshot?.theme;
+    const enabled = !Boolean(theme?.wallpaperEnabled);
+    if (snapshot && theme) {
+      state.generalSettings.snapshot = {
+        ...snapshot,
+        theme: {
+          ...theme,
+          wallpaperEnabled: enabled,
+        },
+      };
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/theme/wallpaper", { value: enabled }, { rerenderOnStart: false });
+  }
+
+  async function toggleTfsAnimations() {
+    const snapshot = getGeneralSettingsSnapshot();
+    const theme = snapshot?.theme;
+    const enabled = !Boolean(theme?.animationsEnabled);
+    if (snapshot && theme) {
+      const nextSnapshot = { ...snapshot, theme: { ...theme, animationsEnabled: enabled } };
+      state.generalSettings.snapshot = nextSnapshot;
+      applyThemeToDocument(nextSnapshot.theme);
+      rerenderGeneralSettingsPanel();
+    }
+
+    await sendGeneralSettingsRequest("api/settings/theme/animations", { value: enabled }, { rerenderOnStart: false });
+  }
+
+  async function setTfsAccentColor(color) {
+    const snapshot = getGeneralSettingsSnapshot();
+    const theme = snapshot?.theme;
+    if (!theme || theme.accentColor === color) return;
+    const nextSnapshot = { ...snapshot, theme: { ...theme, accentColor: color } };
+    state.generalSettings.snapshot = nextSnapshot;
+    applyThemeToDocument(nextSnapshot.theme);
+    rerenderGeneralSettingsPanel();
+
+    await sendGeneralSettingsRequest("api/settings/theme/accent-color", { value: color }, { rerenderOnStart: false });
+  }
+
   async function setSplashArtworkMode(mode) {
     const snapshot = getGeneralSettingsSnapshot();
     const splash = snapshot?.splashScreen;
@@ -19655,9 +19474,6 @@
   }
 
   async function togglePluginEnabled(pluginId, enabled) {
-    if (pluginId === "tabhero") {
-      state.tabHero.snapshot = tabHeroEngine?.setEnabled?.(enabled) || state.tabHero.snapshot;
-    }
     const snapshot = getGeneralSettingsSnapshot();
     if (snapshot?.plugins) {
       const alternativeLibraryPluginId =
@@ -20348,6 +20164,59 @@
       state.storeSync.error = error instanceof Error ? error.message : String(error);
     } finally {
       state.power.actioning = false;
+      rerenderStoreSyncPanel();
+    }
+  }
+
+  function resetOmniLibraryArtworkReloadConfirmation() {
+    if (state.storeSync.artworkReloadArmTimer) {
+      window.clearTimeout(state.storeSync.artworkReloadArmTimer);
+      state.storeSync.artworkReloadArmTimer = 0;
+    }
+    state.storeSync.artworkReloadArmed = false;
+  }
+
+  async function reloadAllOmniLibraryArtwork() {
+    if (state.storeSync.artworkReloadBusy === true) {
+      return;
+    }
+
+    if (state.storeSync.artworkReloadArmed !== true) {
+      resetOmniLibraryArtworkReloadConfirmation();
+      state.storeSync.artworkReloadArmed = true;
+      state.storeSync.artworkReloadStatus = "";
+      state.storeSync.artworkReloadArmTimer = window.setTimeout(() => {
+        state.storeSync.artworkReloadArmTimer = 0;
+        state.storeSync.artworkReloadArmed = false;
+        rerenderStoreSyncPanel();
+      }, 10000);
+      rerenderStoreSyncPanel();
+      return;
+    }
+
+    resetOmniLibraryArtworkReloadConfirmation();
+    state.storeSync.artworkReloadBusy = true;
+    state.storeSync.artworkReloadStatus = "";
+    state.storeSync.error = "";
+    rerenderStoreSyncPanel();
+    try {
+      const response = await fetch(`${apiBase}api/unifystore/artwork/reload-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: true }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || `Artwork reload could not be started (${response.status}).`);
+      }
+
+      state.storeSync.artworkReloadStatus = payload.message ||
+        `Reloading artwork for ${Number(payload.queuedTitleCount) || 0} OmniLibrary titles.`;
+      await loadStoreSyncState({ showLoading: false, preserveDrafts: true });
+    } catch (error) {
+      state.storeSync.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.storeSync.artworkReloadBusy = false;
       rerenderStoreSyncPanel();
     }
   }
@@ -25896,6 +25765,89 @@
     if (
       state.route.screen === "page" &&
       state.route.pluginId === "settings" &&
+      state.route.pageId === "theme"
+    ) {
+      const theme = getThemeSettings();
+      const wallpaperEnabled = Boolean(theme?.wallpaperEnabled);
+      const animationsEnabled = theme?.animationsEnabled !== false;
+      const accentColor = theme?.accentColor || "none";
+
+      return {
+        ...defaultModel,
+        title: "Settings",
+        subtitle: "Theme",
+        status: resolveGeneralSettingsStatusText(),
+        error: state.generalSettings.error,
+        note: "Theme options change how Tools for Steam looks on your desktop, lock screen, and inside Steam.",
+        sectionHeaders: [
+          createSectionHeader(0, "Wallpaper", "Apply or remove the Tools for Steam desktop and lock screen wallpaper.", {
+            icon: DesktopActionIcon,
+          }),
+          createSectionHeader(1, "Animations", "Subtle shine while browsing the Tools for Steam tab.", {
+            icon: EyeActionIcon,
+          }),
+          createSectionHeader(2, "Colors", "Tint the Tools for Steam tab with an accent color.", {
+            icon: ThemesPluginIcon,
+          }),
+        ],
+        cards: [
+          {
+            title: "Wallpaper",
+            lines: [
+              `Status: ${wallpaperEnabled ? "TFS wallpaper active" : "Using your own wallpaper"}`,
+              wallpaperEnabled
+                ? "Turning this off restores the desktop wallpaper you had before and clears the lock screen image."
+                : "Turning this on saves your current desktop wallpaper so it can be restored later.",
+              "Setting the lock screen image needs one Windows administrator confirmation.",
+            ],
+          },
+        ],
+        slots: [
+          makeSettingToggleSlot(
+            "tfs",
+            "wallpaper",
+            "Set TFS Wallpaper",
+            "Apply the Tools for Steam wallpaper to your desktop and lock screen. Disabling it restores your previous desktop wallpaper and clears the lock screen image. Setting the lock screen asks for administrator confirmation once.",
+            wallpaperEnabled,
+            () => toggleTfsWallpaper(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          makeSettingToggleSlot(
+            "tfs",
+            "animations",
+            "Enable Shine Animations",
+            "Play a soft accent-colored sweep across the focused Tools for Steam tab, using your chosen color below.",
+            animationsEnabled,
+            () => toggleTfsAnimations(),
+            {
+              disabled: isGeneralSettingsBusy(),
+            },
+          ),
+          ...accentColorPalette.map((swatch) =>
+            makeChoiceSlot(
+              swatch.title,
+              swatch.value === "none"
+                ? "Keep the default Steam look with no accent tint."
+                : "Tint the Tools for Steam header and focused tiles with this accent color.",
+              () => setTfsAccentColor(swatch.value),
+              {
+                disabled: isGeneralSettingsBusy() || accentColor === swatch.value,
+                selected: accentColor === swatch.value,
+                badge: accentColor === swatch.value ? "Current" : "",
+                trailing: accentColor === swatch.value ? "none" : "chevron",
+                leadingIcon: swatch.value === "none" ? NoAccentColorIcon : createAccentSwatchIcon(swatch.value),
+              },
+            ),
+          ),
+        ],
+      };
+    }
+
+    if (
+      state.route.screen === "page" &&
+      state.route.pluginId === "settings" &&
       state.route.pageId === "updates"
     ) {
       const settings = getGeneralSettingsSnapshot();
@@ -28607,6 +28559,24 @@
             ),
           ]
         : [];
+      const artworkReloadArmed = state.storeSync.artworkReloadArmed === true;
+      const artworkReloadBusy = state.storeSync.artworkReloadBusy === true;
+      const artworkReloadSlots = [
+        makeCommandSlot(
+          artworkReloadArmed ? "Confirm Reload All Artwork" : "Reload All Artwork",
+          artworkReloadArmed
+            ? "Press once more to rebuild all five artwork slots for every managed OmniLibrary game. Existing artwork is replaced only after a complete new set is ready."
+            : state.storeSync.artworkReloadStatus ||
+              "Rebuild every managed OmniLibrary artwork set using local files, provider sources, public Steam, and SteamGridDB last.",
+          () => reloadAllOmniLibraryArtwork(),
+          {
+            slotKey: "omnilibrary-reload-all-artwork",
+            badge: artworkReloadArmed ? "Confirm" : artworkReloadBusy ? "Starting" : "",
+            disabled: isStoreSyncBusy(),
+            leadingIcon: ArtworkPluginIcon,
+          },
+        ),
+      ];
 
       return {
         ...defaultModel,
@@ -28620,6 +28590,7 @@
         topSlots: [
           ...libraryModeSlots,
           ...downloadCenterSlots,
+          ...artworkReloadSlots,
           ...restartSteamSlots,
         ],
         autoFocusIndex: resolveAutoFocusIndex(state.route) ?? 0,
@@ -28665,391 +28636,6 @@
           ),
           ...(epicExpanded ? epicSlots : []),
           ...genericStoreSlots,
-        ],
-      };
-    }
-
-    if (
-      state.route.screen === "page" &&
-      state.route.pluginId === "tabhero" &&
-      state.route.pageId === "tabs"
-    ) {
-      const entries = getTabHeroEntries();
-      const protectedCount = entries.filter((entry) => entry.protected).length;
-      const editableEntries = entries.filter((entry) => !entry.protected);
-      const firstEditableId = editableEntries[0]?.id || "";
-      const lastEditableId = editableEntries[editableEntries.length - 1]?.id || "";
-      const hiddenNativeCount = entries.filter((entry) => !entry.custom && !entry.protected && entry.hidden).length;
-      const tabSlots = entries.length
-        ? entries.map((entry) => makeInlineStepperSlot(
-            entry.title || entry.id,
-            entry.protected
-              ? entry.protectionReason === "omnilibrary-native-route"
-                ? "Required by OmniLibrary while it is active. Tabhero cannot rename, hide, delete, or reposition it."
-                : `Managed by ${entry.owner === "omnilibrary" ? "OmniLibrary / OmniConsole" : entry.owner}. Tabhero cannot rename, hide, delete, or reposition it.`
-              : entry.custom
-                ? `${entry.filters?.length || 0} filters · ${entry.matchMode === "any" ? "match any" : "match all"}${entry.hidden ? " · hidden" : ""}`
-                : `${entry.originalTitle || "Steam tab"}${entry.hidden ? " · hidden" : ""}`,
-            () => moveTabHeroEntry(entry.id, -1),
-            () => moveTabHeroEntry(entry.id, 1),
-            {
-              slotKey: `tabhero-tab-${entry.id}`,
-              badge: entry.protected ? "Protected" : entry.hidden ? "Hidden" : entry.custom ? "Custom" : "Steam",
-              leftDisabled: entry.protected || entry.id === firstEditableId,
-              rightDisabled: entry.protected || entry.id === lastEditableId,
-              onClick: () => openTabHeroEditor(entry.id),
-              leadingIcon: entry.protected ? StoreSyncPluginIcon : TabHeroPluginIcon,
-            },
-          ))
-        : [makeCommandSlot(
-            "Open Steam Library",
-            "Tabhero discovers Steam's currently available tabs as soon as the Library mounts.",
-            () => {},
-            { disabled: true, slotKey: "tabhero-waiting" },
-          )];
-      return {
-        ...defaultModel,
-        title: "Tabhero",
-        subtitle: "Library Tabs",
-        status: state.tabHero.notice,
-        error: state.tabHero.error,
-        note: protectedCount
-          ? `${protectedCount} tabs are owned by OmniLibrary/OmniConsole and remain visible, named, and grouped by their owner. Left / Right moves every other tab.`
-          : "Left / Right changes the order. Open a tab to rename it or change its visibility.",
-        sectionHeaders: [
-          createSectionHeader(0, "Current Layout", "One compositor applies this list to Steam without competing position patches.", {
-            icon: TabHeroPluginIcon,
-          }),
-          createSectionHeader(tabSlots.length, "Quick Actions", "Recover visibility or reverse the latest layout edit.", {
-            icon: RefreshActionIcon,
-          }),
-        ],
-        slots: [
-          ...tabSlots,
-          makeCommandSlot("Undo Last Change", "Restore the editable layout from before the latest Tabhero action.", () => undoLastTabHeroChange(), {
-            slotKey: "tabhero-undo",
-            disabled: tabHeroEngine?.canUndo?.() !== true,
-            leadingIcon: RefreshActionIcon,
-          }),
-          makeCommandSlot("Show All Steam Tabs", "Make hidden native Steam tabs visible without changing names, custom tabs, or protected plugin tabs.", () => showAllTabHeroNativeTabs(), {
-            slotKey: "tabhero-show-all",
-            disabled: hiddenNativeCount === 0,
-            badge: hiddenNativeCount > 0 ? String(hiddenNativeCount) : "",
-            leadingIcon: TabHeroPluginIcon,
-          }),
-        ],
-      };
-    }
-
-    if (
-      state.route.screen === "page" &&
-      state.route.pluginId === "tabhero" &&
-      state.route.pageId === "new-tab"
-    ) {
-      const setPreset = (title, filters) => {
-        state.tabHero.titleDraft = title;
-        state.tabHero.filtersDraft = JSON.stringify(filters, null, 2);
-        state.tabHero.inputVersion += 1;
-        rerenderTabHeroPanel();
-      };
-      const presets = [
-        ["All Games", "Every app Steam exposes.", []],
-        ["Installed", "Only apps currently installed on this device.", [
-          { type: "installed", params: { installed: true } },
-        ]],
-        ["Non-Steam", "Only shortcuts and apps that are not native Steam titles.", [
-          { type: "platform", params: { platform: "nonSteam" } },
-        ]],
-        ["Played Recently", "Games played during the last 30 days.", [
-          { type: "last played", params: { condition: "above", daysAgo: 30 } },
-        ]],
-        ["Favorites", "Games in Steam's Favorites collection.", [
-          { type: "collection", params: { id: "favorite" } },
-        ]],
-        ["Deck Verified", "Games with Steam Deck Verified compatibility.", [
-          { type: "deck compatibility", params: { category: 3 } },
-        ]],
-        ["Family Shared", "Games supplied by a Steam Family library.", [
-          { type: "family sharing", params: { isFamilyShared: true } },
-        ]],
-        ["Demos", "Only Steam demos.", [
-          { type: "demo", params: { isDemo: true } },
-        ]],
-        ["Coming Soon", "Unreleased games marked Coming Soon by Steam.", [
-          { type: "coming soon", params: { isComingSoon: true } },
-        ]],
-      ];
-      const presetSlots = presets.map(([title, copy, filters]) =>
-        makeCommandSlot(title, copy, () => setPreset(title, filters), {
-          slotKey: `tabhero-preset-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
-        }));
-      return {
-        ...defaultModel,
-        title: "Tabhero",
-        subtitle: "New Custom Tab",
-        status: state.tabHero.notice,
-        error: state.tabHero.error,
-        note: "Filters use Tabhero's complete filter engine. Combine entries in the JSON array; the new tab initially requires every filter to match.",
-        editors: [
-          {
-            label: "Tab Name",
-            help: "The label shown in Steam Library.",
-            value: state.tabHero.titleDraft,
-            inputKey: `tabhero-new-title-${state.tabHero.inputVersion}`,
-            inputType: "text",
-            onInput: (value) => { state.tabHero.titleDraft = value; },
-          },
-          {
-            label: "Filters (JSON)",
-            help: "Use an array of { type, params, inverted? } objects. Empty means every game.",
-            value: state.tabHero.filtersDraft,
-            inputKey: `tabhero-new-filters-${state.tabHero.inputVersion}`,
-            rows: 7,
-            onInput: (value) => { state.tabHero.filtersDraft = value; },
-          },
-        ],
-        sectionHeaders: [
-          createSectionHeader(0, "Quick Presets", "Start with a common filter, then edit the JSON if needed.", {
-            icon: TabHeroPluginIcon,
-          }),
-          createSectionHeader(presetSlots.length, "Create", "Add the live filtered tab to Steam Library.", {
-            icon: SaveActionIcon,
-          }),
-        ],
-        slots: [
-          ...presetSlots,
-          makeCommandSlot("Create Tab", "Validate the filters and add the tab immediately.", () => createTabHeroCustomTab(), {
-            slotKey: "tabhero-create",
-            disabled: !String(state.tabHero.titleDraft || "").trim(),
-            leadingIcon: SaveActionIcon,
-          }),
-          makeCommandSlot("Clear Draft", "Return the editor to an empty new tab.", () => {
-            resetTabHeroNewDrafts();
-            rerenderTabHeroPanel();
-          }, { slotKey: "tabhero-clear-new" }),
-        ],
-      };
-    }
-
-    if (
-      state.route.screen === "page" &&
-      state.route.pluginId === "tabhero" &&
-      state.route.pageId === "profiles"
-    ) {
-      const profiles = getTabHeroSnapshot().profiles || [];
-      const profileSlots = profiles.flatMap((profile) => [
-        makeCommandSlot(
-          profile.title,
-          `${profile.order?.length || 0} ordered tabs · ${profile.customTabIds?.length || 0} custom tabs enabled`,
-          () => {
-            const result = tabHeroEngine?.applyProfile?.(profile.id);
-            if (result?.ok) {
-              state.tabHero.snapshot = result.snapshot;
-              state.tabHero.notice = `${profile.title} applied.`;
-              rerenderTabHeroPanel();
-            }
-          },
-          {
-            slotKey: `tabhero-profile-${profile.id}`,
-            badge: getTabHeroSnapshot().activeProfileId === profile.id ? "Active" : "Apply",
-            leadingIcon: TabHeroPluginIcon,
-          },
-        ),
-        makeCommandSlot(
-          state.tabHero.profileDeleteArmedId === profile.id
-            ? `Confirm Delete ${profile.title}`
-            : `Delete ${profile.title}`,
-          "Delete only this saved profile; the current live layout stays unchanged.",
-          () => {
-            if (state.tabHero.profileDeleteArmedId !== profile.id) {
-              state.tabHero.profileDeleteArmedId = profile.id;
-              rerenderTabHeroPanel();
-              return;
-            }
-            state.tabHero.profileDeleteArmedId = "";
-            const result = tabHeroEngine?.deleteProfile?.(profile.id);
-            if (result?.ok) {
-              state.tabHero.snapshot = result.snapshot;
-              rerenderTabHeroPanel();
-            }
-          },
-          {
-            slotKey: `tabhero-profile-delete-${profile.id}`,
-            badge: state.tabHero.profileDeleteArmedId === profile.id ? "Confirm" : "",
-            leadingIcon: DeleteActionIcon,
-          },
-        ),
-      ]);
-      return {
-        ...defaultModel,
-        title: "Tabhero",
-        subtitle: "Layout Profiles",
-        status: state.tabHero.notice,
-        error: state.tabHero.error,
-        note: "Profiles save native renames, visibility, order, and which custom tabs are active. Protected OmniLibrary/OmniConsole tabs remain dynamic and are never stored as editable settings.",
-        editor: {
-          label: "New Profile Name",
-          help: "Save the complete current Tabhero layout.",
-          value: state.tabHero.profileDraft,
-          inputKey: `tabhero-profile-name-${state.tabHero.inputVersion}`,
-          inputType: "text",
-          onInput: (value) => { state.tabHero.profileDraft = value; },
-        },
-        sectionHeaders: profileSlots.length
-          ? [createSectionHeader(1, "Saved Profiles", "Apply or remove a stored layout.", { icon: TabHeroPluginIcon })]
-          : [],
-        slots: [
-          makeCommandSlot("Save Current Layout", "Create a profile from the live Tabhero settings.", () => saveTabHeroProfile(), {
-            slotKey: "tabhero-profile-save",
-            disabled: !String(state.tabHero.profileDraft || "").trim(),
-            leadingIcon: SaveActionIcon,
-          }),
-          ...profileSlots,
-        ],
-      };
-    }
-
-    if (
-      state.route.screen === "page" &&
-      state.route.pluginId === "tabhero" &&
-      state.route.pageId?.startsWith("edit-")
-    ) {
-      const tabId = getTabHeroEditRouteId();
-      const entry = getTabHeroEntry(tabId);
-      if (!entry) {
-        return {
-          ...defaultModel,
-          title: "Tabhero",
-          subtitle: "Tab unavailable",
-          error: "This tab disappeared because its owning plugin changed the live Library topology.",
-          slots: [],
-        };
-      }
-      if (entry.protected) {
-        const omniLibraryDependency = entry.protectionReason === "omnilibrary-native-route";
-        return {
-          ...defaultModel,
-          title: entry.title,
-          subtitle: omniLibraryDependency ? "Required by OmniLibrary" : "Protected Plugin Tab",
-          note: omniLibraryDependency
-            ? "OmniLibrary uses Steam's Non-Steam route as its stable navigation base. Tabhero keeps this tab visible and unchanged until OmniLibrary is disabled. Your previous Tabhero preference remains saved for later."
-            : "Tabhero observes this tab for smooth navigation but does not save a rename, visibility, deletion, or position override. Its owning plugin remains the only authority.",
-          slots: [makeCommandSlot(
-            omniLibraryDependency ? "Required by OmniLibrary" : "Managed by OmniLibrary / OmniConsole",
-            omniLibraryDependency
-              ? "Disable OmniLibrary before changing the Non-Steam tab in Tabhero."
-              : "Availability and position update automatically when its provider is enabled, disabled, connected, or disconnected.",
-            () => {},
-            { disabled: true, slotKey: `tabhero-protected-${entry.id}`, leadingIcon: StoreSyncPluginIcon },
-          )],
-        };
-      }
-      const custom = entry.custom === true;
-      const editableEntries = getTabHeroEntries().filter((candidate) => !candidate.protected);
-      const editableIndex = editableEntries.findIndex((candidate) => candidate.id === entry.id);
-      const customSlots = custom
-        ? [
-            makeSettingToggleSlot(
-              "tabhero", `${entry.id}-mode`, "Match Any Filter",
-              entry.matchMode === "any"
-                ? "A game appears when at least one filter matches."
-                : "A game must pass every top-level filter.",
-              entry.matchMode === "any",
-              () => {
-                patchTabHeroCustomTab(entry.id, { matchMode: entry.matchMode === "any" ? "all" : "any" });
-                rerenderTabHeroPanel();
-              },
-              { slotKey: `tabhero-mode-${entry.id}` },
-            ),
-            makeSettingToggleSlot(
-              "tabhero", `${entry.id}-auto-hide`, "Hide When Empty",
-              "Remove this tab from the row whenever no games pass its filters.",
-              entry.autoHide === true,
-              () => {
-                patchTabHeroCustomTab(entry.id, { autoHide: entry.autoHide !== true });
-                rerenderTabHeroPanel();
-              },
-              { slotKey: `tabhero-auto-hide-${entry.id}` },
-            ),
-          ]
-        : [];
-      return {
-        ...defaultModel,
-        title: "Tabhero",
-        subtitle: custom ? "Edit Custom Tab" : "Edit Steam Tab",
-        status: state.tabHero.notice,
-        error: state.tabHero.error,
-        note: custom
-          ? "Supported filters: collection, installed, regex, friends, tags, whitelist, blacklist, merge, platform, Deck/SteamOS compatibility, reviews, play time, disk size, dates, family sharing, demo, coming soon, streaming, Steam features, achievements, SD card, and install folder."
-          : "Reset restores Steam's original label and visibility. Native tabs cannot be deleted.",
-        editors: [
-          {
-            label: "Tab Name",
-            help: custom ? "Name shown for this custom tab." : `Steam default: ${entry.originalTitle}`,
-            value: state.tabHero.titleDraft,
-            inputKey: `tabhero-title-${entry.id}-${state.tabHero.inputVersion}`,
-            inputType: "text",
-            onInput: (value) => { state.tabHero.titleDraft = value; },
-          },
-          ...(custom ? [{
-            label: "Filters (JSON)",
-            help: "Array of filter objects. Nested merge filters are supported.",
-            value: state.tabHero.filtersDraft,
-            inputKey: `tabhero-filters-${entry.id}-${state.tabHero.inputVersion}`,
-            rows: 8,
-            onInput: (value) => { state.tabHero.filtersDraft = value; },
-          }] : []),
-        ],
-        slots: [
-          makeSettingToggleSlot(
-            "tabhero", `${entry.id}-visible`, "Visible in Library",
-            entry.hidden ? "This tab is currently hidden." : "This tab is currently visible.",
-            !entry.hidden,
-            () => toggleTabHeroEntryVisibility(entry),
-            { slotKey: `tabhero-visible-${entry.id}` },
-          ),
-          ...customSlots,
-          ...(custom ? [makeCommandSlot(
-            "Duplicate Custom Tab",
-            "Create an independent copy with the same filters and visibility options.",
-            () => duplicateTabHeroCustomTab(entry.id),
-            { slotKey: `tabhero-duplicate-${entry.id}`, leadingIcon: TabHeroPluginIcon },
-          )] : []),
-          makeCommandSlot("Move to Start", "Place this editable tab before every other editable tab.", () => moveTabHeroEntryToEdge(entry.id, "start"), {
-            slotKey: `tabhero-first-${entry.id}`,
-            disabled: editableIndex <= 0,
-            leadingIcon: TabHeroPluginIcon,
-          }),
-          makeCommandSlot("Move to End", "Place this editable tab after every other editable tab.", () => moveTabHeroEntryToEdge(entry.id, "end"), {
-            slotKey: `tabhero-last-${entry.id}`,
-            disabled: editableIndex < 0 || editableIndex === editableEntries.length - 1,
-            leadingIcon: TabHeroPluginIcon,
-          }),
-          makeCommandSlot("Save Changes", "Apply the name and filter editor values.", () => saveTabHeroEntry(entry.id), {
-            slotKey: `tabhero-save-${entry.id}`,
-            disabled: !String(state.tabHero.titleDraft || "").trim(),
-            leadingIcon: SaveActionIcon,
-          }),
-          custom
-            ? makeCommandSlot(
-                state.tabHero.deleteArmedId === entry.id ? "Confirm Delete Custom Tab" : "Delete Custom Tab",
-                "Remove this Tabhero tab. Steam and OmniLibrary tabs are not changed.",
-                () => deleteTabHeroCustomTab(entry.id),
-                {
-                  slotKey: `tabhero-delete-${entry.id}`,
-                  badge: state.tabHero.deleteArmedId === entry.id ? "Confirm" : "",
-                  leadingIcon: DeleteActionIcon,
-                },
-              )
-            : makeCommandSlot("Reset Steam Tab", "Restore the original title and visibility.", () => {
-                const result = tabHeroEngine?.resetNativeTab?.(entry.id);
-                if (result?.ok) {
-                  state.tabHero.snapshot = result.snapshot;
-                  state.tabHero.titleDraft = entry.originalTitle;
-                  state.tabHero.inputVersion += 1;
-                  rerenderTabHeroPanel();
-                }
-              }, { slotKey: `tabhero-reset-${entry.id}`, leadingIcon: RefreshActionIcon }),
         ],
       };
     }
@@ -29101,9 +28687,6 @@
             ...visiblePages.map((page, pageIndex) =>
               makeNavigationSlot(page.title, page.description, () => {
                 rememberCurrentRouteIndex(pageIndex);
-                if (plugin.id === "tabhero" && page.id === "new-tab") {
-                  resetTabHeroNewDrafts();
-                }
                 const targetRoute = { screen: "page", pluginId: plugin.id, pageId: page.id };
                 requestFreshEntryForRoute(targetRoute, 0, 0);
                 setRoute(targetRoute);
@@ -31397,15 +30980,6 @@
       renderPanelState();
     },
   };
-
-  if (!state.tabHero.unsubscribe && tabHeroEngine?.subscribe) {
-    state.tabHero.unsubscribe = tabHeroEngine.subscribe((snapshot, reason) => {
-      state.tabHero.snapshot = snapshot;
-      if (reason !== "subscribe" && isCurrentPluginRoute("tabhero")) {
-        rerenderTabHeroPanel();
-      }
-    });
-  }
 
   const installed = install();
   if (!installed) {

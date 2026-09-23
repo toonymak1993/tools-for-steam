@@ -217,7 +217,7 @@ public sealed class StoreSyncSettingsStoreTests
             var configuration = store.Load();
             var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
 
-            Assert.Equal(5, configuration.OmniLibrarySettingsVersion);
+            Assert.Equal(6, configuration.OmniLibrarySettingsVersion);
             Assert.True(xbox.IncludeXboxPcGamePass);
             Assert.False(xbox.IncludeXboxCloudGaming);
 
@@ -293,7 +293,7 @@ public sealed class StoreSyncSettingsStoreTests
 
             var configuration = new StoreSyncSettingsStore(settingsPath).Load();
 
-            Assert.Equal(5, configuration.OmniLibrarySettingsVersion);
+            Assert.Equal(6, configuration.OmniLibrarySettingsVersion);
             foreach (var storeId in new[] { "xbox-game-pass", "epic-games" })
             {
                 var store = configuration.UnifySteam.Stores[storeId];
@@ -301,7 +301,7 @@ public sealed class StoreSyncSettingsStoreTests
                 Assert.NotNull(store.PreparedAtUtc);
                 Assert.NotEmpty(store.PreparedCatalogSignature);
                 Assert.StartsWith("Library ready.", store.PreparationDetail);
-                Assert.Equal("degraded", store.Lifecycle.Artwork);
+                Assert.Equal("ready", store.Lifecycle.Artwork);
                 Assert.NotEqual("failed", store.Lifecycle.Shortcuts);
             }
         }

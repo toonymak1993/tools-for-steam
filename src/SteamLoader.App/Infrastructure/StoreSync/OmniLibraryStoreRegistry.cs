@@ -76,7 +76,8 @@ internal static class OmniLibraryStoreRegistry
             OmniLibraryStoreCapabilities.ManualCodeSignIn |
             OmniLibraryStoreCapabilities.InstallPath |
             OmniLibraryStoreCapabilities.ManagedInstall |
-            OmniLibraryStoreCapabilities.ManagedUninstall,
+            OmniLibraryStoreCapabilities.ManagedUninstall |
+            OmniLibraryStoreCapabilities.ProductPageInstallFallback,
             [
                 new("tfs-epic", "Epic", "all"),
             ]),

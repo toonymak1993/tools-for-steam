@@ -95,6 +95,12 @@ public sealed record OmniLibraryGameArtworkRepairResult(
     IReadOnlyList<string> MissingArtworkSlots,
     string Message);
 
+public sealed record OmniLibraryArtworkReloadResult(
+    bool Queued,
+    int QueuedTitleCount,
+    int StoreCount,
+    string Message);
+
 public sealed record OmniLibraryDownloadCenterSnapshot(
     long Revision,
     DateTimeOffset GeneratedAtUtc,

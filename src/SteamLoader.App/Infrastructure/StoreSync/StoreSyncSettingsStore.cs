@@ -665,6 +665,33 @@ public sealed class StoreSyncSettingsStore
             configuration.OmniLibrarySettingsVersion = 5;
         }
 
+        if (configuration.OmniLibrarySettingsVersion < 6)
+        {
+            // Artwork is best-effort cache data. Older builds persisted a
+            // store-wide degraded state when even one optional image could not
+            // be found, causing an endless "repair pending" loop.
+            foreach (var store in configuration.UnifySteam.Stores.Values.Where(store =>
+                         store is not null &&
+                         store.PreparedAtUtc.HasValue &&
+                         (store.PreparationStatus.Equals(
+                              "artwork-pending",
+                              StringComparison.OrdinalIgnoreCase) ||
+                          store.Lifecycle?.Artwork.Equals(
+                              "degraded",
+                              StringComparison.OrdinalIgnoreCase) == true)))
+            {
+                store.PreparationStatus = "prepared";
+                OmniLibraryLifecycle.SetStage(store, "artwork", "ready");
+                store.PreparationCompletedCount = Math.Max(
+                    store.PreparationCompletedCount,
+                    store.PreparationTotalCount);
+                store.PreparationDetail =
+                    "Library ready. Optional artwork can be refreshed per game.";
+            }
+
+            configuration.OmniLibrarySettingsVersion = 6;
+        }
+
         // Downgrade/older-client compatibility: legacy callers still writing
         // the former per-store fields must remain effective. New setters write
         // both representations, so this merge cannot undo current UI choices.

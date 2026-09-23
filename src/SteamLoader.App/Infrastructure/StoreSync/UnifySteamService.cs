@@ -1052,6 +1052,15 @@ internal sealed class UnifySteamService
             return true;
         }
 
+        if (IsXboxAppxShellTarget(game.ExecutablePath))
+        {
+            // The package repository removes the protected WindowsApps root
+            // when a legacy UWP game is uninstalled. Its shell target is the
+            // launch contract; there is intentionally no MicrosoftGame.config.
+            installed = true;
+            return true;
+        }
+
         var configPath = new[]
             {
                 Path.Combine(contentDirectory, "MicrosoftGame.Config"),
@@ -2175,14 +2184,32 @@ internal sealed class UnifySteamService
                 StringComparison.OrdinalIgnoreCase))
         {
             // The two public membership lists are sufficient for the frequent probe.
-            // Avoid hundreds of product-detail records when neither source changed.
+            // Avoid hundreds of product-detail records when neither source changed,
+            // but still re-scan local install state so a game installed outside
+            // OmniLibrary (e.g. directly in the Xbox app) is reflected without
+            // waiting for the next full refresh.
             storeConfiguration.RemoteCatalogSignature = remoteCatalogSignature;
+            var lightweightInstalled = LoadXboxInstalledGames(storeConfiguration.InstallPath, forceRefresh: true);
+            var lightweightGames = (cache.Games ?? [])
+                .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+                .ToDictionary(game => game.Id, StringComparer.OrdinalIgnoreCase);
+            MergeXboxInstalledGames(
+                lightweightGames,
+                lightweightInstalled,
+                pcProductIdSet,
+                cloudProductIdSet,
+                previousSteamAppIds);
+            CollapseRelatedXboxProductEntries(lightweightGames);
+            cache.Games = DedupeLibraryGames(lightweightGames.Values)
+                .OrderByDescending(game => game.Installed)
+                .ThenBy(game => game.Title, StringComparer.OrdinalIgnoreCase)
+                .ToList();
             cache.LastError = string.Empty;
             cache.StatusText = "Ready";
-            if (string.IsNullOrWhiteSpace(cache.DetailText))
-            {
-                cache.DetailText = $"Loaded {cache.Games.Count} Xbox title{(cache.Games.Count == 1 ? string.Empty : "s")}.";
-            }
+            cache.DetailText =
+                $"Loaded {cache.Games.Count} Xbox title{(cache.Games.Count == 1 ? string.Empty : "s")}; " +
+                $"{cache.Games.Count(game => game.Installed)} installed locally.";
+            cache.RefreshedAtUtc = DateTimeOffset.UtcNow;
             return;
         }
 
@@ -2297,33 +2324,23 @@ internal sealed class UnifySteamService
             games[candidate.Game.Id] = candidate.Game;
         }
 
-        var selectedProductIds = games.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var (productId, installedGame) in installed)
-        {
-            if (!installedGame.Installed ||
-                !selectedProductIds.Contains(productId))
-            {
-                continue;
-            }
+        // The PC and Cloud SIGL catalogs can list the exact same game under two
+        // different product IDs (the pass above only dedupes regional variants
+        // within the Cloud bucket). Collapse any remaining same-title survivor
+        // across both buckets so the same game never shows twice, matching the
+        // safety net Epic and GOG already apply to their own catalogs.
+        games = DedupeLibraryGames(games.Values)
+            .ToDictionary(game => game.Id, StringComparer.OrdinalIgnoreCase);
 
-            if (!games.TryGetValue(productId, out var catalogGame))
-            {
-                installedGame.CloudPlayable =
-                    cloudProductIdSet.Contains(productId) &&
-                    !pcProductIdSet.Contains(productId);
-                games[productId] = installedGame;
-                continue;
-            }
-
-            catalogGame.Installed = true;
-            catalogGame.InstallPath = installedGame.InstallPath;
-            catalogGame.ExecutablePath = installedGame.ExecutablePath;
-            catalogGame.Version = installedGame.Version;
-            if (catalogGame.SteamAppId == 0 && previousSteamAppIds.TryGetValue(productId, out var steamAppId))
-            {
-                catalogGame.SteamAppId = steamAppId;
-            }
-        }
+        MergeXboxInstalledGames(
+            games,
+            installed,
+            pcProductIdSet,
+            cloudProductIdSet,
+            previousSteamAppIds);
+        CollapseRelatedXboxProductEntries(games);
+        games = DedupeLibraryGames(games.Values)
+            .ToDictionary(game => game.Id, StringComparer.OrdinalIgnoreCase);
 
         cache.AccountName = "Xbox account";
         cache.Games = games.Values
@@ -2343,6 +2360,155 @@ internal sealed class UnifySteamService
         {
             _journal.Append("info", "omnilibrary", "Refreshed Xbox library.", cache.DetailText);
         }
+    }
+
+    // Merges local install state into the catalog-sourced game list. A game
+    // that is installed but no longer (or never was) part of the fetched
+    // Game Pass/Cloud catalogs is kept as its own entry instead of being
+    // dropped, so a purchased-outright title or one that rotated out of
+    // Game Pass after install still shows up as installed.
+    internal static void MergeXboxInstalledGames(
+        Dictionary<string, UnifySteamGameCacheEntry> games,
+        IReadOnlyDictionary<string, UnifySteamGameCacheEntry> installed,
+        HashSet<string> pcProductIdSet,
+        HashSet<string> cloudProductIdSet,
+        IReadOnlyDictionary<string, uint> previousSteamAppIds)
+    {
+        var matchedInstalledIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var catalogGame in games.Values.ToArray())
+        {
+            if (!TryResolveXboxInstalledGame(catalogGame, installed, out var resolvedInstalledGame))
+            {
+                continue;
+            }
+
+            ApplyXboxInstalledState(catalogGame, resolvedInstalledGame, previousSteamAppIds);
+            matchedInstalledIds.Add(resolvedInstalledGame.Id);
+        }
+
+        foreach (var (productId, installedGame) in installed)
+        {
+            if (!installedGame.Installed || matchedInstalledIds.Contains(productId))
+            {
+                continue;
+            }
+
+            if (!games.TryGetValue(productId, out var catalogGame))
+            {
+                // Legacy AppX packages use package identity names rather than
+                // Microsoft Store product IDs. They are imported only after a
+                // unique catalog-title match; otherwise ordinary Xbox-related
+                // Windows apps could appear as games.
+                if (installedGame.StoreNamespace.Equals(
+                        "xbox-appx",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                installedGame.CloudPlayable =
+                    cloudProductIdSet.Contains(productId) &&
+                    !pcProductIdSet.Contains(productId);
+                // This title has no catalog entry (purchased outright, or
+                // rotated out of Game Pass after install) but may already
+                // have an existing Steam shortcut from an earlier refresh.
+                // Keep that link so it's updated in place instead of quietly
+                // losing its AppId and getting a duplicate shortcut.
+                if (previousSteamAppIds.TryGetValue(productId, out var previousSteamAppId))
+                {
+                    installedGame.SteamAppId = previousSteamAppId;
+                }
+
+                games[productId] = installedGame;
+                continue;
+            }
+
+            ApplyXboxInstalledState(catalogGame, installedGame, previousSteamAppIds);
+        }
+    }
+
+    private static void ApplyXboxInstalledState(
+        UnifySteamGameCacheEntry catalogGame,
+        UnifySteamGameCacheEntry installedGame,
+        IReadOnlyDictionary<string, uint> previousSteamAppIds)
+    {
+        catalogGame.Installed = true;
+        catalogGame.InstallPath = installedGame.InstallPath;
+        catalogGame.ExecutablePath = installedGame.ExecutablePath;
+        catalogGame.Version = installedGame.Version;
+        catalogGame.ProviderGameId = installedGame.ProviderGameId;
+        if (string.IsNullOrWhiteSpace(catalogGame.ImageUrl) &&
+            !string.IsNullOrWhiteSpace(installedGame.ImageUrl))
+        {
+            // The Microsoft catalog fetch can come back without an image for
+            // a product (batch failure, missing localization). The locally
+            // bundled tile is a free fallback that beats no artwork at all.
+            catalogGame.ImageUrl = installedGame.ImageUrl;
+        }
+
+        if (catalogGame.SteamAppId == 0 &&
+            previousSteamAppIds.TryGetValue(catalogGame.Id, out var steamAppId))
+        {
+            catalogGame.SteamAppId = steamAppId;
+        }
+    }
+
+    internal static IReadOnlyList<string> CollapseRelatedXboxProductEntries(
+        Dictionary<string, UnifySteamGameCacheEntry> games,
+        Func<string, IReadOnlySet<string>>? relationResolver = null)
+    {
+        relationResolver ??= XboxProductRelationStore.GetRelatedProductIds;
+        var removedIds = new List<string>();
+        foreach (var canonicalGame in games.Values.ToArray())
+        {
+            var relatedIds = relationResolver(canonicalGame.Id)
+                .Where(id => !id.Equals(
+                    canonicalGame.Id,
+                    StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            foreach (var relatedId in relatedIds)
+            {
+                if (!games.TryGetValue(relatedId, out var aliasGame))
+                {
+                    continue;
+                }
+
+                if (aliasGame.Installed)
+                {
+                    canonicalGame.Installed = true;
+                    if (string.IsNullOrWhiteSpace(canonicalGame.InstallPath))
+                    {
+                        canonicalGame.InstallPath = aliasGame.InstallPath;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(canonicalGame.ExecutablePath))
+                    {
+                        canonicalGame.ExecutablePath = aliasGame.ExecutablePath;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(canonicalGame.Version))
+                    {
+                        canonicalGame.Version = aliasGame.Version;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(canonicalGame.ImageUrl))
+                {
+                    canonicalGame.ImageUrl = aliasGame.ImageUrl;
+                }
+
+                if (string.IsNullOrWhiteSpace(canonicalGame.HeroImageUrl))
+                {
+                    canonicalGame.HeroImageUrl = aliasGame.HeroImageUrl;
+                }
+
+                canonicalGame.ProviderGameId = relatedId;
+                games.Remove(relatedId);
+                removedIds.Add(relatedId);
+            }
+        }
+
+        return removedIds;
     }
 
     private static string[] LoadXboxPcGamePassProductIds(string language, string market)
@@ -2762,11 +2928,13 @@ internal sealed class UnifySteamService
                             shellVisuals?.Attribute("DefaultDisplayName")?.Value,
                             Path.GetFileName(gameDirectory),
                             storeId);
+                        var localImageUrl = ResolveXboxLocalTileImageUrl(shellVisuals, contentDirectory);
                         var candidate = new UnifySteamGameCacheEntry
                         {
                             Id = storeId,
                             Title = title,
                             Installed = executableReady,
+                            ImageUrl = localImageUrl,
                             InstallPath = contentDirectory,
                             ExecutablePath = executableReady ? executablePath : string.Empty,
                             Version = identityVersion,
@@ -2794,6 +2962,8 @@ internal sealed class UnifySteamService
             }
         }
 
+        MergeRegisteredXboxAppxGames(games);
+
         lock (XboxInstalledCacheGate)
         {
             XboxInstalledCache[cacheKey] = new XboxInstalledCacheState(
@@ -2802,6 +2972,187 @@ internal sealed class UnifySteamService
         }
 
         return games;
+    }
+
+    internal static Dictionary<string, UnifySteamGameCacheEntry>
+        LoadXboxInstalledGamesForReconciliation()
+    {
+        var installed = LoadXboxInstalledGames(forceRefresh: true);
+        try
+        {
+            var configuration = new StoreSyncSettingsStore(
+                Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json")).Load();
+            if (!configuration.UnifySteam.Stores.TryGetValue("xbox-game-pass", out var store) ||
+                store?.Cache?.Games is null)
+            {
+                return installed;
+            }
+
+            foreach (var catalogGame in store.Cache.Games.Where(game =>
+                         game is not null && !string.IsNullOrWhiteSpace(game.Id)))
+            {
+                if (TryResolveXboxInstalledGame(catalogGame, installed, out var installedGame))
+                {
+                    installed[catalogGame.Id] = installedGame;
+                }
+            }
+        }
+        catch
+        {
+            // The regular catalog refresh remains the fallback.
+        }
+
+        return installed;
+    }
+
+    internal static bool IsXboxAppxShellTarget(string? value)
+    {
+        return !string.IsNullOrWhiteSpace(value) &&
+               value.StartsWith(
+                   "shell:AppsFolder\\",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void MergeRegisteredXboxAppxGames(
+        Dictionary<string, UnifySteamGameCacheEntry> games)
+    {
+        const string packagesKeyPath =
+            @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+        try
+        {
+            using var packagesKey = Registry.CurrentUser.OpenSubKey(packagesKeyPath);
+            if (packagesKey is null)
+            {
+                return;
+            }
+
+            foreach (var packageFullName in packagesKey.GetSubKeyNames())
+            {
+                try
+                {
+                    using var packageKey = packagesKey.OpenSubKey(packageFullName);
+                    var packageRoot = packageKey?.GetValue("PackageRootFolder") as string;
+                    var registryDisplayName = packageKey?.GetValue("DisplayName") as string;
+                    if (string.IsNullOrWhiteSpace(packageRoot) ||
+                        !Directory.Exists(packageRoot) ||
+                        !TryParseXboxAppxManifest(
+                            packageFullName,
+                            packageRoot,
+                            registryDisplayName,
+                            out var candidate))
+                    {
+                        continue;
+                    }
+
+                    if (!games.TryGetValue(candidate.Id, out var existing) ||
+                        CompareXboxVersions(candidate.Version, existing.Version) > 0)
+                    {
+                        games[candidate.Id] = candidate;
+                    }
+                }
+                catch
+                {
+                    // One protected or malformed package must not hide other
+                    // registered legacy Xbox games.
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    internal static bool TryParseXboxAppxManifest(
+        string packageFullName,
+        string packageRoot,
+        string? registryDisplayName,
+        out UnifySteamGameCacheEntry game)
+    {
+        game = default!;
+        var manifestPath = Path.Combine(packageRoot, "AppxManifest.xml");
+        if (string.IsNullOrWhiteSpace(packageFullName) || !File.Exists(manifestPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var document = XDocument.Load(manifestPath, LoadOptions.None);
+            var root = document.Root;
+            var identity = root?.Descendants().FirstOrDefault(element =>
+                element.Name.LocalName.Equals("Identity", StringComparison.OrdinalIgnoreCase));
+            var application = root?.Descendants().FirstOrDefault(element =>
+                element.Name.LocalName.Equals("Application", StringComparison.OrdinalIgnoreCase));
+            if (identity is null || application is null)
+            {
+                return false;
+            }
+
+            // Legacy Xbox/UWP games predate MicrosoftGame.config. Xbox Live
+            // service declarations distinguish them from ordinary Store apps,
+            // which must never be imported as games.
+            var manifestText = document.ToString(SaveOptions.DisableFormatting);
+            if (!manifestText.Contains("Microsoft.Xbox", StringComparison.OrdinalIgnoreCase) &&
+                !manifestText.Contains("XboxLive", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var identityName = identity.Attribute("Name")?.Value?.Trim() ?? string.Empty;
+            var identityVersion = identity.Attribute("Version")?.Value?.Trim() ?? string.Empty;
+            var applicationId = application.Attribute("Id")?.Value?.Trim() ?? string.Empty;
+            var publisherIdSeparator = packageFullName.LastIndexOf("__", StringComparison.Ordinal);
+            var publisherId = publisherIdSeparator >= 0
+                ? packageFullName[(publisherIdSeparator + 2)..].Trim()
+                : string.Empty;
+            if (string.IsNullOrWhiteSpace(identityName) ||
+                string.IsNullOrWhiteSpace(applicationId) ||
+                string.IsNullOrWhiteSpace(publisherId))
+            {
+                return false;
+            }
+
+            var propertiesDisplayName = root?.Descendants().FirstOrDefault(element =>
+                element.Name.LocalName.Equals("Properties", StringComparison.OrdinalIgnoreCase))?
+                .Elements().FirstOrDefault(element =>
+                    element.Name.LocalName.Equals("DisplayName", StringComparison.OrdinalIgnoreCase))?
+                .Value;
+            var visualDisplayName = application.Descendants().FirstOrDefault(element =>
+                element.Name.LocalName.Equals("VisualElements", StringComparison.OrdinalIgnoreCase))?
+                .Attribute("DisplayName")?.Value;
+            var title = new[]
+                {
+                    registryDisplayName,
+                    propertiesDisplayName,
+                    visualDisplayName,
+                    identityName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase)
+                        ? identityName["Microsoft.".Length..]
+                        : identityName,
+                }
+                .Select(value => value?.Trim() ?? string.Empty)
+                .FirstOrDefault(value =>
+                    !string.IsNullOrWhiteSpace(value) &&
+                    !value.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)) ??
+                identityName;
+            var packageFamilyName = $"{identityName}_{publisherId}";
+
+            game = new UnifySteamGameCacheEntry
+            {
+                Id = identityName,
+                Title = title,
+                Installed = true,
+                InstallPath = packageRoot,
+                ExecutablePath = $"shell:AppsFolder\\{packageFamilyName}!{applicationId}",
+                Version = identityVersion,
+                ProviderGameId = packageFamilyName,
+                StoreNamespace = "xbox-appx",
+            };
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     internal static bool TryResolveXboxInstalledGame(
@@ -2872,6 +3223,51 @@ internal sealed class UnifySteamService
         installedGame = titleMatches[0];
         XboxProductRelationStore.Register(catalogGame.Id, installedGame.Id);
         return true;
+    }
+
+    // The artwork pipeline (SteamGridDbArtworkDownloader) already reads a
+    // file:// URL straight off disk with no network call, so a tile image
+    // bundled with the install is a free, always-correct source. It only
+    // fills the ImageUrl gap for locally-scanned entries: catalog-fetched
+    // games already carry a curated Microsoft Store image and are left
+    // untouched, and Public Steam/SteamGridDB still run before this local
+    // image is ever used as a last-resort fallback.
+    private static string ResolveXboxLocalTileImageUrl(XElement? shellVisuals, string contentDirectory)
+    {
+        if (shellVisuals is null)
+        {
+            return string.Empty;
+        }
+
+        foreach (var attributeName in new[]
+                 {
+                     "Square480x800Logo",
+                     "Square1200x600Logo",
+                     "WideLogo",
+                     "Square150x150Logo",
+                     "StoreLogo",
+                 })
+        {
+            var relativePath = shellVisuals.Attribute(attributeName)?.Value?.Trim();
+            if (string.IsNullOrWhiteSpace(relativePath))
+            {
+                continue;
+            }
+
+            try
+            {
+                var fullPath = Path.GetFullPath(Path.Combine(contentDirectory, relativePath));
+                if (File.Exists(fullPath))
+                {
+                    return new Uri(fullPath).AbsoluteUri;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return string.Empty;
     }
 
     internal static string ResolveXboxManifestDisplayName(
@@ -3174,7 +3570,7 @@ internal sealed class UnifySteamService
                value.All(char.IsLetterOrDigit);
     }
 
-    private static Dictionary<string, UnifySteamGameCacheEntry> LoadEpicLauncherInstalledGames()
+    internal static Dictionary<string, UnifySteamGameCacheEntry> LoadEpicLauncherInstalledGames()
     {
         var installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
         var manifestPath = GetEpicLauncherInstalledManifestPath();
@@ -3554,6 +3950,23 @@ internal sealed class UnifySteamService
             return "ubisoft-connect";
         }
 
+        if (combined.Contains("rockstar", StringComparison.OrdinalIgnoreCase))
+        {
+            return "rockstar-games-launcher";
+        }
+
+        if (combined.Contains("gog", StringComparison.OrdinalIgnoreCase) ||
+            combined.Contains("galaxy", StringComparison.OrdinalIgnoreCase))
+        {
+            return "gog-galaxy";
+        }
+
+        if (combined.Contains("battle.net", StringComparison.OrdinalIgnoreCase) ||
+            combined.Contains("blizzard", StringComparison.OrdinalIgnoreCase))
+        {
+            return "battle-net";
+        }
+
         return string.IsNullOrWhiteSpace(combined)
             ? "epic"
             : "external";
@@ -3565,6 +3978,9 @@ internal sealed class UnifySteamService
         {
             "ea-app" => "EA app",
             "ubisoft-connect" => "Ubisoft Connect",
+            "rockstar-games-launcher" => "Rockstar Games Launcher",
+            "gog-galaxy" => "GOG Galaxy",
+            "battle-net" => "Battle.net",
             "external" => "the publisher launcher",
             _ => "Epic Games",
         };
@@ -3575,8 +3991,19 @@ internal sealed class UnifySteamService
         bool hasInstallableAsset)
     {
         var normalizedProvider = deliveryProvider?.Trim().ToLowerInvariant() ?? string.Empty;
-        return normalizedProvider == "ea-app" ||
-               (!hasInstallableAsset && normalizedProvider != "epic");
+        if (normalizedProvider == "epic")
+        {
+            return false;
+        }
+
+        // Any explicitly named third-party fulfillment provider owns the
+        // installation handoff, even when Epic also publishes a downloadable
+        // asset. Treating Rockstar/GOG/Battle.net as a managed Legendary
+        // download can leave files present without the publisher registration
+        // needed to launch them. An unknown provider with no Windows asset is
+        // external for the same reason.
+        return !string.IsNullOrWhiteSpace(normalizedProvider) ||
+               !hasInstallableAsset;
     }
 
     internal static bool CanInstallEpicDirectly(
@@ -3648,6 +4075,56 @@ internal sealed class UnifySteamService
         game.ExecutablePath = FindEpicExternalExecutable(
             installPath,
             game.ProcessNames);
+    }
+
+    internal static Dictionary<string, UnifySteamGameCacheEntry>
+        LoadEpicInstalledGamesForReconciliation()
+    {
+        var installed = LoadEpicLauncherInstalledGames();
+        try
+        {
+            var configuration = new StoreSyncSettingsStore(
+                Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json")).Load();
+            if (!configuration.UnifySteam.Stores.TryGetValue("epic-games", out var store) ||
+                store?.Cache?.Games is null)
+            {
+                return installed;
+            }
+
+            foreach (var game in store.Cache.Games.Where(game =>
+                         game is not null &&
+                         game.RequiresExternalLauncher &&
+                         !string.IsNullOrWhiteSpace(game.Id) &&
+                         !string.IsNullOrWhiteSpace(game.RegistryPath)))
+            {
+                if (!TryReadEpicExternalInstallPath(
+                        game.RegistryPath,
+                        game.RegistryValueName,
+                        out var installPath))
+                {
+                    continue;
+                }
+
+                installed[game.Id] = new UnifySteamGameCacheEntry
+                {
+                    Id = game.Id,
+                    Title = game.Title,
+                    Installed = true,
+                    InstallPath = installPath,
+                    ExecutablePath = FindEpicExternalExecutable(
+                        installPath,
+                        game.ProcessNames),
+                    Version = game.Version,
+                };
+            }
+        }
+        catch
+        {
+            // The five-minute catalog refresh remains the fallback. This
+            // local reconciliation path must never make the host unstable.
+        }
+
+        return installed;
     }
 
     internal static bool TryReadEpicExternalInstallPath(
@@ -4423,7 +4900,7 @@ internal sealed class UnifySteamService
         }
     }
 
-    private static List<UnifySteamGameCacheEntry> DedupeLibraryGames(IEnumerable<UnifySteamGameCacheEntry> games)
+    internal static List<UnifySteamGameCacheEntry> DedupeLibraryGames(IEnumerable<UnifySteamGameCacheEntry> games)
     {
         return games
             .Where(game => game is not null &&
@@ -4431,6 +4908,11 @@ internal sealed class UnifySteamService
             .GroupBy(game => NormalizeGameTitleKey(FirstNonEmpty(game.Title, game.Id)), StringComparer.OrdinalIgnoreCase)
             .Select(group => group
                 .OrderByDescending(game => game.Installed)
+                // Prefer a directly PC-installable entry over a Cloud-only one
+                // for the same title (Xbox PC vs. Xbox Cloud can list the same
+                // game under different product IDs). No-op for Epic/GOG, which
+                // never set CloudPlayable.
+                .ThenByDescending(game => !game.CloudPlayable)
                 .ThenByDescending(game => !string.IsNullOrWhiteSpace(game.ExecutablePath))
                 .ThenByDescending(game => !string.IsNullOrWhiteSpace(game.InstallPath))
                 .ThenByDescending(game => !string.IsNullOrWhiteSpace(game.ImageUrl))
