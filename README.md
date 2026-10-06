@@ -6,12 +6,12 @@
 
 [![Release](https://img.shields.io/badge/release-0.4.1--beta.1-2ea44f?style=for-the-badge)](https://github.com/toonymak1993/tools-for-steam/releases)
 [![Windows](https://img.shields.io/badge/platform-Windows_10%2F11-0078d4?style=for-the-badge&logo=windows)](#requirements)
-[![SDK](https://img.shields.io/badge/plugin_SDK-1.0.0-2ea44f?style=for-the-badge)](sdk/QUICKSTART.md)
+[![Plugins](https://img.shields.io/badge/plugins-included_only-2ea44f?style=for-the-badge)](#built-in-tools)
 [![Xbox Mode](https://img.shields.io/badge/Xbox_Mode-controller_first-107c10?style=for-the-badge&logo=xbox)](#three-startup-modes)
 
 Tools for Steam (TFS) brings a SteamOS-style experience to Windows gaming PCs and handhelds. It integrates directly into Steam's Quick Access panel, starts cleanly into Big Picture, and keeps the important Windows and gaming controls reachable without leaving the controller.
 
-[Download a release](https://github.com/toonymak1993/tools-for-steam/releases) · [Build a plugin](sdk/QUICKSTART.md) · [Developer guide](sdk/DEVELOPER_GUIDE.md) · [Plugin database](https://github.com/toonymak1993/tfs-plugin-database)
+[Download a release](https://github.com/toonymak1993/tools-for-steam/releases)
 
 </div>
 
@@ -30,18 +30,14 @@ Windows is a powerful gaming platform, but it was not designed to feel like a co
 | Console startup | Shell Mode or the signed Xbox Mode Gaming Home package starts the gaming session without exposing the normal desktop first |
 | One gaming hub | Launcher discovery, non-Steam shortcuts, collections, and SteamGridDB artwork |
 | System controls | Audio, displays, windows, performance, themes, apps, power, and recovery from Big Picture |
-| Extensible platform | A Community Store and public SDK 1.0 with normal, native, and Decky-style full-trust plugins |
+| Curated tools | Included plugins selected and shipped by the Tools for Steam author |
 
 TFS is part of **GCM — Gaming Console Mode**. The goal is simple: on a living-room PC or handheld, Steam should be the first-class home experience while Windows remains recoverable underneath.
 
 ## Highlights in the first official beta
 
-- Responsive, controller-native TFS Store with Discover, Built-In, Community, Installed, and Updates sections.
-- Public Plugin SDK `1.0.0` with TypeScript definitions, schemas, templates, packaging, validation, and one-command sideloading.
-- Sandboxed storage, protected secrets, network allowlists, private files, notifications, logs, lifecycle helpers, and change-only events.
-- Reviewed native bridges for audio, processes, displays, CSSLoader, artwork, App Start, Store Sync, automation, performance, and power.
-- `native.full-trust` escape hatch for executable, PowerShell, Python, or Node backends, JSON-RPC, arbitrary files, UAC, processes, and selected Steam CEF surfaces.
-- Community package checks for SDK compatibility, permission parity, safe ZIP extraction, update permission changes, and SHA-256 integrity.
+- Controller-native Plugin Activator with artwork, descriptions, and direct on/off controls for included plugins.
+- No public marketplace, community catalog, third-party installation, or community runtime in the product.
 - Signed Xbox Mode host package with installer recovery, rollback snapshots, and diagnostic collection.
 - Controller focus and Store card layout fixes across 720p, 1080p, and larger displays.
 
@@ -70,7 +66,8 @@ The plugin stays hidden on unverified devices instead of applying unknown hardwa
 | **App Start** | Curate and launch installed Windows apps with a controller |
 | **Store Sync** | Discover launcher libraries, create Steam shortcuts and collections, and refresh artwork |
 | **OmniLibrary** | Prepare Xbox, Xbox Cloud, Epic, and GOG as native Steam tabs, with one controller-native Download Center for progress and transfer actions |
-| **SteamGridDB** | Search and apply game artwork from Steam context menus or settings |
+| **TFS Artworks** | Search SteamGridDB, compare resolution quality, and apply game artwork from Steam context menus |
+| **TFS Curtain** | Hide desktop and launcher transitions behind each game's artwork until a stable game window is ready; toggle it per game |
 | **Audio** | Switch playback devices, control volume, and manage mixer state |
 | **Display** | Switch displays, resolutions, and refresh rates |
 | **CSSLoader** | Control local themes, profiles, presets, and backend tools |
@@ -92,7 +89,7 @@ The Performance tool reuses existing RTSS binaries and settings without reinstal
 
 ### Discord setup
 
-1. Enable the built-in **Discord** plugin in the TFS Store or Settings.
+1. Enable the built-in **Discord** plugin in the Plugin Activator or Settings.
 2. Open **Discord > Friends** in Quick Access and select **Connect Discord**.
 3. Sign in in Discord's browser window and approve the friends/presence permission.
 4. Return to Tools for Steam to see currently online friends and browse your Discord servers.
@@ -103,45 +100,11 @@ The primary integration uses the official Discord Social SDK and requests `openi
 
 The former [public server widget](https://docs.discord.com/developers/resources/guild#get-guild-widget) remains available as an optional fallback. It still requires the server owner to enable **Server Settings > Engagement > Server Widget**, and it can show only data that Discord exposes publicly.
 
-For development and Store publishing, create and approve a Discord application, enable **Public Client**, accept the Social SDK terms, and build with `-p:DiscordClientId=<application-id>` or set `TOOLS_FOR_STEAM_DISCORD_CLIENT_ID`. The Windows x64 Social SDK runtime and Discord license notices are copied into published builds automatically.
+For internal development and release publishing, create and approve a Discord application, enable **Public Client**, accept the Social SDK terms, and build with `-p:DiscordClientId=<application-id>` or set `TOOLS_FOR_STEAM_DISCORD_CLIENT_ID`. The Windows x64 Social SDK runtime and Discord license notices are copied into published builds automatically.
 
-## Community Store
+## Plugin Activator
 
-The Store is designed to work entirely with a controller and keeps plugin trust visible before installation:
-
-- built-in and community discovery;
-- install, update, uninstall, enable, disable, and hide flows;
-- preview cards with responsive fallback artwork;
-- SDK version, publisher, permissions, network hosts, and full-trust warnings;
-- checksum verification and strict package/manifest/catalog parity;
-- local developer catalogs for sideloading without changing TFS Core.
-
-The official catalog lives in [`tfs-plugin-database`](https://github.com/toonymak1993/tfs-plugin-database). The first official community example is **Home Assistant 0.2.0**, built entirely with SDK 1.0 storage, secrets, network, and controller UI capabilities.
-
-## Plugin SDK 1.0
-
-SDK 1.0 is built for trusted gaming plugins in the same spirit as Decky Loader. A normal plugin can stay capability-based; a full-trust plugin can bundle its own backend when the Core does not expose enough.
-
-```powershell
-# Create a plugin
-.\scripts\tfs-plugin.ps1 new .\plugins\my-plugin -Id my-plugin -Name "My Plugin"
-
-# Validate and sideload it into the local TFS Store
-.\scripts\tfs-plugin.ps1 validate .\plugins\my-plugin
-.\scripts\tfs-plugin.ps1 sideload .\plugins\my-plugin
-```
-
-Developer resources:
-
-- [Ten-minute quickstart](sdk/QUICKSTART.md)
-- [Complete API and Xbox Mode guide](sdk/DEVELOPER_GUIDE.md)
-- [SDK contract and permission reference](sdk/README.md)
-- [Store submission guide](sdk/SUBMITTING.md)
-- [TypeScript declarations](sdk/tfs-plugin-sdk.d.ts)
-- [Standalone starter repository](https://github.com/toonymak1993/tfs-plugin-template)
-- [Full-trust backend template](sdk/full-trust-plugin-template/)
-
-SDK v1 evolves additively. Breaking runtime changes require a future SDK major version so existing plugins can remain loadable.
+The Plugin Activator is a controller-friendly list of the plugins included in the current Tools for Steam build. Each row contains its artwork, a short description, current state, and a direct Activate or Deactivate control. Safety-critical plugins remain active. It does not discover, download, install, update, or execute third-party plugins.
 
 ## Three startup modes
 
@@ -225,18 +188,18 @@ The Xbox Host build requires the configured TFS signing certificate. If `TFS_XBO
 
 | Path | Purpose |
 |---|---|
-| `src/SteamLoader.App/Hosting` | Local API, Store routes, Steam injection, and live state |
+| `src/SteamLoader.App/Hosting` | Local API, Plugin Activator routes, Steam injection, and live state |
 | `src/SteamLoader.App/Infrastructure` | Audio, displays, handhelds, Store Sync, Steam, themes, artwork, and native services |
-| `src/SteamLoader.App/Assets` | Quick Access, Store, game-page, controller, and Steam UI assets |
+| `src/SteamLoader.App/Assets` | Quick Access, Plugin Activator, game-page, controller, and Steam UI assets |
 | `src/ToolsForSteam.XboxHost` | Signed Gaming Home / Xbox Mode package |
-| `sdk` | Public SDK, schemas, documentation, and official examples |
-| `scripts` | Build, package, sideload, installer, and release helpers |
+| `sdk` | Owner-only plugin development material retained for first-party work |
+| `scripts` | Build, installer, release, and owner development helpers |
 | `installer` | Inno Setup definition and Xbox Mode recovery tools |
-| `tests` | Runtime, SDK, Store, Xbox Mode, launcher, and update regression tests |
+| `tests` | Runtime, Plugin Activator, Xbox Mode, launcher, and update regression tests |
 
 ## Beta status
 
-This is the first official beta of the complete TFS platform: console startup, Xbox Mode, built-in tools, Community Store, SDK 1.0, Home Assistant example, and the first MSI Claw A8 TDP integration.
+This is the first official beta of the complete TFS platform: console startup, Xbox Mode, curated built-in tools, the Plugin Activator, and the first MSI Claw A8 TDP integration.
 
 Feedback is especially useful for:
 
@@ -244,6 +207,6 @@ Feedback is especially useful for:
 - controller focus at 720p, 1080p, ultrawide, and 4K;
 - fresh installs and upgrades while Xbox Mode is active;
 - MSI Claw A8 power limits and automatic game profiles;
-- third-party SDK plugins and full-trust backends.
+- activation and deactivation of included plugins.
 
-Some internal namespaces still use the original `SteamLoader` codename; the user-facing product and public SDK are **Tools for Steam / TFS**.
+Some internal namespaces still use the original `SteamLoader` codename; the user-facing product is **Tools for Steam / TFS**.

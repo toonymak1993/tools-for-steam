@@ -9,6 +9,63 @@ namespace SteamLoader.App.Tests;
 public sealed class OmniLibraryAchievementProviderTests
 {
     [Fact]
+    public async Task XboxLive_LoginToken_UsesFirstPartyAchievementApi()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var settings = new StoreSyncSettingsStore(
+                Path.Combine(root, "store-sync.json"));
+            settings.Update(configuration =>
+            {
+                var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
+                xbox.Enabled = true;
+                xbox.AchievementsEnabled = true;
+                var provider = configuration.UnifySteam.GameData.Providers["xbox-live"];
+                provider.Enabled = true;
+                provider.SecondaryCredential = "microsoft-refresh-token";
+            });
+            var handler = new AchievementHttpHandler();
+            using var client = new HttpClient(handler);
+            var provider = new OmniLibraryAchievementProvider(
+                settings,
+                client,
+                Path.Combine(root, "epic-user.json"));
+
+            var result = await provider.RefreshAsync(
+                CreateGame(
+                    "xbox-game-pass",
+                    storeTitleId: "1777860928"),
+                EmptyAchievements("Xbox Network"),
+                string.Empty,
+                refreshDefinitions: true,
+                refreshProgress: true,
+                CancellationToken.None);
+
+            Assert.Equal("ready", result.Metadata?.Status);
+            Assert.Equal("Xbox Network", result.Metadata?.Provider);
+            Assert.Equal("TestPlayer", settings.Load()
+                .UnifySteam.GameData.Providers["xbox-live"].AccountName);
+            Assert.Contains(
+                handler.Requests,
+                request => request.RequestUri!.Host.Equals(
+                    "achievements.xboxlive.com",
+                    StringComparison.OrdinalIgnoreCase) &&
+                    request.Headers.TryGetValues("Authorization", out var values) &&
+                    values.Single().StartsWith("XBL3.0 x=", StringComparison.Ordinal));
+            Assert.DoesNotContain(
+                handler.Requests,
+                request => request.RequestUri!.Host.Equals(
+                    "xbl.io",
+                    StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Xbox_UsesCatalogTitleId_WithoutRequiringAccountLookup()
     {
         var root = CreateTemporaryDirectory();
@@ -481,6 +538,68 @@ public sealed class OmniLibraryAchievementProviderTests
             Requests.Add(clone);
 
             var path = request.RequestUri!.AbsolutePath;
+            if (request.RequestUri.Host.Equals(
+                    "login.microsoftonline.com",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return Json(
+                    """
+                    {
+                      "access_token": "microsoft-access-token",
+                      "refresh_token": "rotated-microsoft-refresh-token"
+                    }
+                    """);
+            }
+            if (request.RequestUri.Host.Equals(
+                    "user.auth.xboxlive.com",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return Json("""{ "Token": "xbox-user-token" }""");
+            }
+            if (request.RequestUri.Host.Equals(
+                    "xsts.auth.xboxlive.com",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return Json(
+                    """
+                    {
+                      "Token": "xsts-token",
+                      "NotAfter": "2026-10-04T18:00:00Z",
+                      "DisplayClaims": {
+                        "xui": [
+                          { "uhs": "user-hash", "xid": "281463901", "gtg": "TestPlayer" }
+                        ]
+                      }
+                    }
+                    """);
+            }
+            if (request.RequestUri.Host.Equals(
+                    "achievements.xboxlive.com",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return Json(
+                    """
+                    {
+                      "achievements": [
+                        {
+                          "id": "xbox-live-achievement-1",
+                          "name": "First Win",
+                          "description": "Win once.",
+                          "progressState": "Achieved",
+                          "progression": {
+                            "timeUnlocked": "2026-07-31T10:00:00Z",
+                            "requirements": [
+                              { "current": "10", "target": "10" }
+                            ]
+                          },
+                          "mediaAssets": [
+                            { "type": "Icon", "url": "https://images-eds-ssl.xboxlive.com/test.png" }
+                          ]
+                        }
+                      ]
+                    }
+                    """);
+            }
             if (path.Equals("/api/v2/account", StringComparison.Ordinal))
             {
                 return Json(

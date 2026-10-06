@@ -1,6 +1,6 @@
 (() => {
   const existing = window.STFrontendLib;
-  if (existing?.version >= 47) {
+  if (existing?.version >= 48) {
     return;
   }
 
@@ -1417,6 +1417,30 @@
     return props;
   }
 
+  function consumeCrossAxisNavigation(event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
+    return true;
+  }
+
+  function getSlotDirectionalButtonProps(slot) {
+    const buttonProps = { ...(slot?.buttonProps || {}) };
+    if (typeof buttonProps.onMoveLeft !== "function") {
+      buttonProps.onMoveLeft = consumeCrossAxisNavigation;
+    }
+    if (typeof buttonProps.onMoveRight !== "function") {
+      buttonProps.onMoveRight = consumeCrossAxisNavigation;
+    }
+    if (typeof buttonProps.onMoveUp !== "function") {
+      buttonProps.onMoveUp = consumeCrossAxisNavigation;
+    }
+    if (typeof buttonProps.onMoveDown !== "function") {
+      buttonProps.onMoveDown = consumeCrossAxisNavigation;
+    }
+    return buttonProps;
+  }
+
   function invokeSlotAction(state, slot, index, helpers) {
     if (slot.disabled) {
       return;
@@ -1440,6 +1464,7 @@
       ? helpers.getBackNavigation()
       : null;
     const roleProps = createRoleProps(slot);
+    const directionalButtonProps = getSlotDirectionalButtonProps(slot);
     const nativeComponentId = slot.nativeComponentId || nativeComponentByRole[slot.role || "action"] || "dialogButton";
     const nativeAvailable =
       isNativeComponentAvailable(state, nativeComponentId) ||
@@ -1464,9 +1489,10 @@
         className: slot.buttonClassName || "steamloader-dialog-button",
         extraProps: {
           ...roleProps,
-          ...(slot.buttonProps || {}),
+          ...directionalButtonProps,
           "data-slot-button": String(index),
           "data-slot-key": helpers.resolveSlotFocusKey?.(slot, index) || slot.slotKey || undefined,
+          "data-slot-layout": slot.layout || undefined,
           "data-native-component": nativeComponentId,
           "data-native-component-ready": nativeAvailable ? "true" : "false",
           "data-setting-scope": slot.settingScope || undefined,
@@ -2342,8 +2368,11 @@
     helpers.consumeResolvedFocus?.(state.route, model.autoFocusIndex);
 
     const topSlotChildren = topSlots.flatMap((slot, index) => {
+      const navigableSlot = helpers.getSlotDirectionalButtonProps
+        ? { ...slot, buttonProps: helpers.getSlotDirectionalButtonProps(slot, index) }
+        : slot;
       const children = [
-        createButtonSlot(state, createElement, withChildren, slot, index, model.autoFocusIndex, helpers),
+        createButtonSlot(state, createElement, withChildren, navigableSlot, index, model.autoFocusIndex, helpers),
       ];
       if (shouldSeparateAfterSlot(slot)) {
         children.push(createDivider(createElement, `top-back-divider-${index}`));
@@ -2354,6 +2383,9 @@
     const slotIndexOffset = topSlots.length;
     const slotChildren = slots.flatMap((slot, index) => {
       const slotIndex = slotIndexOffset + index;
+      const navigableSlot = helpers.getSlotDirectionalButtonProps
+        ? { ...slot, buttonProps: helpers.getSlotDirectionalButtonProps(slot, slotIndex) }
+        : slot;
       const sectionHeaders = getInlineSectionHeaders(model, index).map((section, sectionIndex) =>
         createInlineSectionHeader(
           createElement,
@@ -2364,7 +2396,7 @@
       );
       const children = [
         ...sectionHeaders,
-        createButtonSlot(state, createElement, withChildren, slot, slotIndex, model.autoFocusIndex, helpers),
+        createButtonSlot(state, createElement, withChildren, navigableSlot, slotIndex, model.autoFocusIndex, helpers),
       ];
 
       if (hasDividerAfter(model, index) || shouldSeparateAfterSlot(slot)) {
@@ -2403,6 +2435,10 @@
                   "div",
                   withChildren(
                     { className: "steamloader-title-wrap" },
+                    createElement("div", {
+                      className: "steamloader-header-eyebrow",
+                      children: model.routeKey === "root" ? "QUICK ACCESS" : "TOOLS FOR STEAM  /  PLUGINS",
+                    }),
                     createElement("h1", {
                       className: "steamloader-title",
                       children: model.title,
@@ -2439,15 +2475,24 @@
               ),
             )
           : null,
+        model.status
+          ? createElement("div", { className: "steamloader-status", children: model.status })
+          : null,
         model.error
           ? createElement("div", {
               className: "steamloader-error",
               children: model.error,
             })
           : null,
-        ...(Array.isArray(model.cards)
-          ? model.cards.map((card, index) => createInfoCard(createElement, withChildren, card, index))
-          : []),
+        Array.isArray(model.cards) && model.cards.length
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-card-grid" },
+                ...model.cards.map((card, index) => createInfoCard(createElement, withChildren, card, index)),
+              ),
+            )
+          : null,
         model.editor ? createEditorCard(state, createElement, withChildren, model.editor, helpers) : null,
         ...(Array.isArray(model.editors)
           ? model.editors.map((editor, index) =>
@@ -2466,6 +2511,9 @@
         ),
         model.volumePanel
           ? createVolumePanel(state, createElement, withChildren, model.volumePanel, helpers)
+          : null,
+        model.note
+          ? createElement("div", { className: "steamloader-note", children: model.note })
           : null,
         createFooterLegend(createElement, withChildren, model.footerLegend),
       ),
@@ -3345,7 +3393,7 @@
         createPanelShell,
       },
       diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 47,
+        libraryVersion: window.STFrontendLib?.version || 48,
         sdkVersion: "1.0.0",
         pluginId,
       }),
@@ -3357,7 +3405,7 @@
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 47,
+      version: 48,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3425,7 +3473,7 @@
   }
 
   window.STFrontendLib = {
-    version: 47,
+    version: 48,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,

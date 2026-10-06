@@ -19,7 +19,6 @@ internal sealed record GogInstallProbe(
 internal static class GogInstallStateTracker
 {
     private static readonly TimeSpan ProbeCacheLifetime = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan IdleInstalledProbeInterval = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan RegistrySnapshotLifetime = TimeSpan.FromSeconds(4);
     private static readonly ConcurrentDictionary<string, (DateTimeOffset AtUtc, GogInstallProbe Probe)>
         ProbeCache = new(StringComparer.OrdinalIgnoreCase);
@@ -120,37 +119,23 @@ internal static class GogInstallStateTracker
         return missing;
     }
 
-    public static async Task RunAsync(CancellationToken cancellationToken)
+    public static void Reconcile(
+        UnifySteamStoreConfiguration store,
+        IReadOnlyDictionary<string, UnifySteamDownloadStatus> statuses,
+        StoreSyncSettingsStore settings,
+        Action<string, IReadOnlyCollection<string>>? onInstalledStateChanged,
+        bool includeIdleInstalled)
     {
-        var settings = new StoreSyncSettingsStore(
-            Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json"));
-        var lastIdleProbeAtUtc = DateTimeOffset.MinValue;
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
-        while (await timer.WaitForNextTickAsync(cancellationToken))
+        if (!store.Enabled || store.Cache?.Games is null)
         {
-            try
-            {
-                var configuration = settings.Load();
-                if (!configuration.UnifySteam.Stores.TryGetValue(
-                        "gog-galaxy",
-                        out var store) ||
-                    store?.Cache?.Games is null)
-                {
-                    continue;
-                }
+            return;
+        }
 
-                var statuses = UnifySteamDownloadStatusStore.GetAll();
                 var transactions = GogOperationJournal.GetAll()
                     .ToDictionary(
                         transaction => transaction.GameId,
                         StringComparer.OrdinalIgnoreCase);
                 var now = DateTimeOffset.UtcNow;
-                var includeIdleInstalled =
-                    now - lastIdleProbeAtUtc >= IdleInstalledProbeInterval;
-                if (includeIdleInstalled)
-                {
-                    lastIdleProbeAtUtc = now;
-                }
                 IReadOnlySet<string> registeredGameIds = includeIdleInstalled
                     ? GetRegistrySnapshot(force: true).Keys.ToHashSet(
                         StringComparer.OrdinalIgnoreCase)
@@ -167,14 +152,10 @@ internal static class GogInstallStateTracker
                         statuses,
                         "gog-galaxy",
                         game.Id);
-                    var operationRelevant =
-                        transactions.ContainsKey(game.Id) ||
-                        status.Status is
-                            "action-required" or
-                            "uninstall-action-required" or
-                            "uninstalling" or
-                            "finalizing" or
-                            "failed";
+                    transactions.TryGetValue(game.Id, out var transaction);
+                    var operationRelevant = IsOperationRelevant(
+                        status.Status,
+                        transaction);
                     if (!operationRelevant &&
                         !(
                             includeIdleInstalled &&
@@ -214,9 +195,8 @@ internal static class GogInstallStateTracker
                         }
 
                         if (status.Status == "action-required" ||
-                            transactions.TryGetValue(game.Id, out var installTransaction) &&
-                            installTransaction.IsInstall &&
-                            installTransaction.Phase == GogOperationPhases.Ready)
+                            transaction?.IsInstall == true &&
+                            transaction.Phase == GogOperationPhases.Ready)
                         {
                             UnifySteamDownloadStatusStore.Update(
                                 "gog-galaxy",
@@ -246,8 +226,7 @@ internal static class GogInstallStateTracker
 
                     var uninstallPending =
                         status.Status is "uninstall-action-required" or "uninstalling" ||
-                        transactions.TryGetValue(game.Id, out var uninstallTransaction) &&
-                        uninstallTransaction.IsUninstall;
+                        transaction?.IsUninstall == true;
                     if ((game.Installed || uninstallPending) &&
                         ConfirmMissing(game.Id, now))
                     {
@@ -259,7 +238,7 @@ internal static class GogInstallStateTracker
 
                 if (changed.Count == 0 && cleared.Count == 0)
                 {
-                    continue;
+                    return;
                 }
 
                 settings.Update(latest =>
@@ -295,17 +274,37 @@ internal static class GogInstallStateTracker
                         }
                     }
                 });
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch
-            {
-                // The next two-second pass retries only the affected local
-                // probes. No remote catalog or artwork operation is involved.
-            }
-        }
+
+                try
+                {
+                    onInstalledStateChanged?.Invoke(
+                        "gog-galaxy",
+                        changed.Keys
+                            .Concat(cleared)
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToArray());
+                }
+                catch
+                {
+                    // The next local install-state pass or startup check can retry.
+                }
+    }
+
+    internal static bool IsOperationRelevant(
+        string status,
+        GogOperationTransaction? transaction)
+    {
+        return status is
+                   "action-required" or
+                   "uninstall-action-required" or
+                   "uninstall-failed" or
+                   "uninstalling" or
+                   "failed" ||
+               transaction?.Phase is
+                   GogOperationPhases.WaitingForGalaxy or
+                   GogOperationPhases.Ready or
+                   GogOperationPhases.Uninstalling or
+                   GogOperationPhases.Failed;
     }
 
     private static string ResolveExecutable(string installRoot, string gameId)

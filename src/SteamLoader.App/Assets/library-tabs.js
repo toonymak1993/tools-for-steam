@@ -4,12 +4,20 @@
 // This layer separates those shortcuts into enabled store tabs and removes them from
 // NON-STEAM without creating a persistent Steam collection.
 (() => {
-  const stateVersion = "omnilibrary-store-tabs-v66-standalone";
+  const stateVersion = "omnilibrary-store-tabs-v68-tabmaster";
   const xboxTabId = "tfs-xbox";
   const xboxCloudTabId = "tfs-xbox-cloud";
   const epicTabId = "tfs-epic";
   const gogTabId = "tfs-gog";
   const legacyManagedTabIds = new Set(["tfs-emulator"]);
+  const steamNativeTabIds = new Set([
+    "AllGames",
+    "Installed",
+    "DesktopApps",
+    "Favorites",
+    "GreatOnDeck",
+    "Soundtracks",
+  ]);
   const tabTopology = window.__steamLoaderOmniLibraryTabTopology;
   const retiredTabRuntimeKey = ["__steamLoader", "Tab", "Hero"].join("");
   const retiredCustomTabPrefix = ["tab", "hero-"].join("");
@@ -409,14 +417,11 @@
           navigationCursorAt: 0,
           nativeRouteEchoTabId: "",
           navigationHandlers: new WeakMap(),
-          nativeTabTemplates: new Map(
-            previousState?.nativeTabTemplates instanceof Map
-              ? previousState.nativeTabTemplates
-              : [],
-          ),
-          nativeTabOrder: Array.isArray(previousState?.nativeTabOrder)
-            ? [...previousState.nativeTabOrder]
-            : [],
+          // A new runtime version deliberately relearns templates from the
+          // current Steam tree. Carrying old entries across versions could
+          // resurrect a TabMaster custom tab that the user later removed.
+          nativeTabTemplates: new Map(),
+          nativeTabOrder: [],
           virtualCollections: new WeakMap(),
           derivedTopologyCache: null,
           activationResolved: false,
@@ -779,6 +784,7 @@
       const snapshot = await omniLibraryStateStore.refresh(force);
       const wasRuntimeActive = isLibraryTabRuntimeEnabled();
       const activationWasResolved = state.activationResolved === true;
+      const previousPluginEnabled = state.pluginEnabled === true;
       const previousEnabledSignature = getEnabledStoreDefinitions()
         .map((definition) => definition.id)
         .join("|");
@@ -867,7 +873,8 @@
         );
       }
       const signature = signatureParts.join("|");
-      if (signature !== state.xboxAppIdsSignature) {
+      const signatureChanged = signature !== state.xboxAppIdsSignature;
+      if (signatureChanged) {
         state.storeStates = nextStoreStates;
         state.managedAppIds = allManagedAppIds;
         state.managedInstalledAppIds = allInstalledAppIds;
@@ -906,6 +913,11 @@
           scheduleXboxTileBadges();
         }
       }
+      const libraryStateChanged =
+        !activationWasResolved ||
+        previousPluginEnabled !== state.pluginEnabled ||
+        definitionsChanged ||
+        signatureChanged;
       const runtimeActive = isLibraryTabRuntimeEnabled();
       const omniLibraryRuntimeActive =
         state.pluginEnabled && getEnabledStoreDefinitions().length > 0;
@@ -936,11 +948,16 @@
           scheduleXboxTabPatch();
         }
       } else {
-        if (omniLibraryRuntimeActive && recoverXboxTabStateFromDom()) {
+        const recoveredTabState =
+          omniLibraryRuntimeActive && recoverXboxTabStateFromDom();
+        if (recoveredTabState) {
           state.routeRefreshRequested = true;
         }
         ensureActiveRuntimeTimers();
-        if (omniLibraryRuntimeActive) {
+        if (
+          omniLibraryRuntimeActive &&
+          (libraryStateChanged || !state.downloadRefreshTimer)
+        ) {
           scheduleDownloadStateRefresh(0);
         }
         ensureXboxTileObserver();
@@ -948,7 +965,14 @@
         // The summary may resolve after Steam has already mounted the Library,
         // or before it mounts. This handles the former; the observer handles
         // the latter without introducing another recurring poll.
-        scheduleXboxTabPatch();
+        if (
+          libraryStateChanged ||
+          recoveredTabState ||
+          !state.navigationRuntime ||
+          libraryTabLayoutNeedsPatch()
+        ) {
+          scheduleXboxTabPatch();
+        }
       }
     } catch (error) {
       state.lastError = String(error?.message || error);
@@ -1381,7 +1405,10 @@
   }
 
   function ensureXboxTileObserver() {
-    if (!isLibraryTabRuntimeEnabled()) {
+    if (
+      !isLibraryTabRuntimeEnabled() ||
+      document.visibilityState === "hidden"
+    ) {
       return;
     }
     if (state.pluginEnabled && getEnabledStoreDefinitions().length > 0) {
@@ -1392,6 +1419,9 @@
     }
 
     state.tileObserver = new MutationObserver((mutations) => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
       const touchesLibraryTabs = mutations.some((mutation) => {
         if (mutation.target?.closest?.('[role="tablist"]')) {
           return true;
@@ -1457,7 +1487,7 @@
     document.addEventListener("focusin", state.tileActivationHandler, true);
   }
 
-  function disableXboxTileObserver() {
+  function suspendXboxTileObserver() {
     if (state.tilePatchTimer) {
       window.clearTimeout(state.tilePatchTimer);
       state.tilePatchTimer = 0;
@@ -1471,6 +1501,10 @@
       document.removeEventListener("focusin", state.tileActivationHandler, true);
     }
     state.tileActivationHandler = null;
+  }
+
+  function disableXboxTileObserver() {
+    suspendXboxTileObserver();
     refreshXboxTileBadges();
   }
 
@@ -1507,7 +1541,11 @@
     }
 
     const ids = new Set(tabs.map((tab) => String(tab?.id || "")));
-    return ids.has("AllGames") && ids.has("Installed") && ids.has("DesktopApps");
+    return (
+      (ids.has("AllGames") && ids.has("Installed") && ids.has("DesktopApps")) ||
+      tabs.some((tab) => isInjectedXboxTab(tab)) ||
+      tabTopology?.hasTabMasterOwnership?.(tabs) === true
+    );
   }
 
   function isVisibleLibraryTabIdSet(ids) {
@@ -1745,20 +1783,32 @@
     };
   }
 
+  function withoutTabMasterFooter(tab) {
+    if (!tabTopology?.isTabMasterOwnedTab?.(tab)) {
+      return tab;
+    }
+
+    const footer = { ...(tab.footer || {}) };
+    delete footer.onMenuButton;
+    delete footer.onMenuActionDescription;
+    return { ...tab, footer };
+  }
+
   function buildXboxTab(templateTab, collection, definition) {
+    const cleanTemplate = withoutTabMasterFooter(templateTab);
     return {
-      ...templateTab,
+      ...cleanTemplate,
       id: definition.tabId,
       key: definition.tabId,
       title: definition.title,
       content: cloneContentElement(
-        templateTab.content,
-        getContentCollection(templateTab.content),
+        cleanTemplate.content,
+        getContentCollection(cleanTemplate.content),
         collection,
         `${definition.tabId}-native-content`,
       ),
-      renderTabAddon: buildCountAddon(templateTab, collection),
-      __steamLoaderNativeDesktopTab: templateTab,
+      renderTabAddon: buildCountAddon(cleanTemplate, collection),
+      __steamLoaderNativeDesktopTab: cleanTemplate,
       __steamLoaderOmniLibraryStoreFilter: definition.id,
       __steamLoaderTabOwner: "omnilibrary",
       __steamLoaderProtectedTab: true,
@@ -1796,7 +1846,7 @@
     return restored;
   }
 
-  function rememberNativeTabTemplates(tabs) {
+  function rememberNativeTabTemplates(tabs, tabMasterOwnsLayout = false) {
     for (const tab of Array.isArray(tabs) ? tabs : []) {
       const template = getNativeTemplateTab(tab);
       const id = String(template?.id || "");
@@ -1808,8 +1858,15 @@
       ) {
         continue;
       }
-      state.nativeTabTemplates.set(id, template);
-      if (!state.nativeTabOrder.includes(id)) {
+      if (tabMasterOwnsLayout && !steamNativeTabIds.has(id)) {
+        state.nativeTabTemplates.delete(id);
+        continue;
+      }
+      state.nativeTabTemplates.set(id, withoutTabMasterFooter(template));
+      // TabMaster's list is the user's authoritative visible order. Its tabs
+      // may be custom or intentionally hidden, so they must never enter the
+      // native fallback order that repairs Steam's transient route arrays.
+      if (!tabMasterOwnsLayout && !state.nativeTabOrder.includes(id)) {
         state.nativeTabOrder.push(id);
       }
     }
@@ -1837,62 +1894,65 @@
       return tabs;
     }
 
-    rememberNativeTabTemplates(tabs);
+    const tabMasterOwnsLayout =
+      tabTopology?.hasTabMasterOwnership?.(tabs) === true;
+    rememberNativeTabTemplates(tabs, tabMasterOwnsLayout);
     const baseTabs = tabs.filter((tab) => !isInjectedXboxTab(tab));
     const enabledDefinitions = getEnabledStoreDefinitions();
-    const restoredTabs = restoreRememberedNativeTabs(
-      baseTabs.map(getNativeTemplateTab),
-    );
+    const visibleTabs = baseTabs.map(getNativeTemplateTab);
+    // Missing entries in a TabMaster-owned list are user intent, not a
+    // transient Steam render. Preserve that visible list byte-for-byte.
+    const restoredTabs = tabMasterOwnsLayout
+      ? visibleTabs
+      : restoreRememberedNativeTabs(visibleTabs);
     if (!enabledDefinitions.length) {
       return restoredTabs;
     }
     const currentDesktopTab = restoredTabs.find((tab) => tab?.id === "DesktopApps" && tab?.content);
-    const nativeDesktopTab = currentDesktopTab?.__steamLoaderNativeDesktopTab || currentDesktopTab;
+    const rememberedDesktopTab = state.nativeTabTemplates.get("DesktopApps");
     const currentAllGamesTab = restoredTabs.find((tab) => tab?.id === "AllGames" && tab?.content);
     const nativeAllGamesTab = currentAllGamesTab?.__steamLoaderNativeAllGamesTab || currentAllGamesTab;
     const currentInstalledTab = restoredTabs.find((tab) => tab?.id === "Installed" && tab?.content);
     const nativeInstalledTab = currentInstalledTab?.__steamLoaderNativeInstalledTab || currentInstalledTab;
-    const nativeCollection = getContentCollection(nativeDesktopTab?.content);
+    const storeTemplateTab =
+      currentDesktopTab?.__steamLoaderNativeDesktopTab ||
+      currentDesktopTab ||
+      rememberedDesktopTab ||
+      nativeAllGamesTab ||
+      nativeInstalledTab ||
+      restoredTabs.find((tab) => tab?.content);
+    const nativeCollection = getContentCollection(storeTemplateTab?.content);
     const nativeAllGamesCollection = getContentCollection(nativeAllGamesTab?.content);
     const nativeInstalledCollection = getContentCollection(nativeInstalledTab?.content);
-    if (
-      !nativeAllGamesTab ||
-      !nativeAllGamesCollection ||
-      (enabledDefinitions.length > 0 && (
-        !nativeDesktopTab ||
-        !nativeCollection ||
-        !nativeInstalledTab ||
-        !nativeInstalledCollection
-      ))
-    ) {
+    if (!storeTemplateTab || !nativeCollection) {
       setStatus("waiting for Steam's Library collections");
       return restoredTabs;
     }
 
-    const filteredDesktopCollection = enabledDefinitions.length
+    const filteredDesktopCollection = currentDesktopTab
       ? getVirtualCollection(nativeCollection, "nonSteam")
       : null;
     const storeCollections = new Map(enabledDefinitions.map((definition) => [
       definition.id,
       getVirtualCollection(nativeCollection, definition.mode),
     ]));
-    const allGamesCollection = enabledDefinitions.length
+    const allGamesCollection = nativeAllGamesCollection
       ? getVirtualCollection(nativeAllGamesCollection, "allGames")
-      : nativeAllGamesCollection;
-    const installedCollection = enabledDefinitions.length
+      : null;
+    const installedCollection = nativeInstalledCollection
       ? getVirtualCollection(nativeInstalledCollection, "installed")
-      : nativeInstalledCollection;
+      : null;
     const normalizedTabs = restoredTabs.map((tab) =>
-      enabledDefinitions.length && tab?.id === "DesktopApps"
-        ? buildFilteredDesktopTab(nativeDesktopTab, filteredDesktopCollection)
-        : enabledDefinitions.length && tab?.id === "AllGames"
+      tab?.id === "DesktopApps" && currentDesktopTab && filteredDesktopCollection
+        ? buildFilteredDesktopTab(currentDesktopTab, filteredDesktopCollection)
+        : tab?.id === "AllGames" && nativeAllGamesTab && allGamesCollection
           ? buildExpandedSystemTab(
               nativeAllGamesTab,
               allGamesCollection,
               "tfs-all-games-content",
               "__steamLoaderNativeAllGamesTab",
             )
-          : enabledDefinitions.length && tab?.id === "Installed"
+          : tab?.id === "Installed" && nativeInstalledTab && installedCollection
             ? buildExpandedSystemTab(
                 nativeInstalledTab,
                 installedCollection,
@@ -1902,21 +1962,25 @@
         : tab,
     );
     const storeTabs = enabledDefinitions.map((definition) =>
-      buildXboxTab(nativeDesktopTab, storeCollections.get(definition.id), definition));
-    const desktopIndex = normalizedTabs.findIndex((tab) => tab?.id === "DesktopApps");
-    const soundtrackIndex = normalizedTabs.findIndex((tab) => tab?.id === "Soundtracks");
-    const insertIndex = desktopIndex >= 0
-      ? desktopIndex + 1
-      : soundtrackIndex >= 0
-        ? soundtrackIndex
-        : normalizedTabs.length;
+      buildXboxTab(storeTemplateTab, storeCollections.get(definition.id), definition));
+    if (tabTopology?.buildCanonicalTabOrder) {
+      const storeTabsById = new Map(storeTabs.map((tab) => [String(tab.id), tab]));
+      return tabTopology
+        .buildCanonicalTabOrder(
+          normalizedTabs,
+          enabledDefinitions,
+          storeDefinitions,
+        )
+        .map((tab) => storeTabsById.get(String(tab?.id || "")) || tab);
+    }
 
-    const combinedTabs = [
+    const desktopIndex = normalizedTabs.findIndex((tab) => tab?.id === "DesktopApps");
+    const insertIndex = desktopIndex >= 0 ? desktopIndex + 1 : normalizedTabs.length;
+    return [
       ...normalizedTabs.slice(0, insertIndex),
       ...storeTabs,
       ...normalizedTabs.slice(insertIndex),
     ];
-    return combinedTabs;
   }
 
   function tabsSignature(tabs) {
@@ -2889,7 +2953,7 @@
   }
 
   function scheduleXboxTabPatch() {
-    if (state.patchSoonTimer) {
+    if (state.patchSoonTimer || document.visibilityState === "hidden") {
       return;
     }
 
@@ -3737,7 +3801,10 @@
   }
 
   function ensureActiveRuntimeTimers() {
-    if (!isLibraryTabRuntimeEnabled()) {
+    if (
+      !isLibraryTabRuntimeEnabled() ||
+      document.visibilityState === "hidden"
+    ) {
       disableActiveRuntimeTimers();
       return;
     }
@@ -3773,7 +3840,9 @@
       state.channel = new window.BroadcastChannel(omniLibraryStoreChannelName);
       state.channel.addEventListener("message", (event) => {
         if (event?.data?.type === "stores-changed") {
-          requestOmniLibraryStoreStateRefresh();
+          if (document.visibilityState !== "hidden") {
+            requestOmniLibraryStoreStateRefresh();
+          }
         } else if (event?.data?.type === "download-status-changed") {
           const appId = Number(event.data.appId || 0);
           const next = new Set(state.managedActiveDownloadAppIds);
@@ -3806,7 +3875,9 @@
   if (!state.storageHandler) {
     state.storageHandler = (event) => {
       if (event?.key === omniLibraryStoreStorageKey) {
-        requestOmniLibraryStoreStateRefresh();
+        if (document.visibilityState !== "hidden") {
+          requestOmniLibraryStoreStateRefresh();
+        }
       } else if (event?.key === activeStoreTabSessionKey) {
         const remoteTabId = String(event.newValue || "");
         const remoteStoreTabId = isManagedStoreTabId(remoteTabId)
@@ -3829,6 +3900,8 @@
   if (!state.visibilityHandler) {
     state.visibilityHandler = () => {
       if (document.visibilityState !== "hidden") {
+        ensureActiveRuntimeTimers();
+        ensureXboxTileObserver();
         void refreshXboxAppIds();
         void refreshOmniLibraryDownloadStates();
         if (
@@ -3838,6 +3911,9 @@
           state.forceRenderRequested = true;
           scheduleXboxTabPatch();
         }
+      } else {
+        disableActiveRuntimeTimers();
+        suspendXboxTileObserver();
       }
     };
     document.addEventListener("visibilitychange", state.visibilityHandler);
@@ -3845,7 +3921,10 @@
 
   if (!state.omniLibraryStateUnsubscribe) {
     state.omniLibraryStateUnsubscribe = omniLibraryStateStore.subscribe(() => {
-      if (!state.libraryRequestInFlight) {
+      if (
+        document.visibilityState !== "hidden" &&
+        !state.libraryRequestInFlight
+      ) {
         void refreshXboxAppIds();
       }
     });
@@ -3853,9 +3932,15 @@
 
   if (!state.libraryRefreshTimer) {
     state.libraryRefreshTimer = window.setInterval(() => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
       void refreshXboxAppIds();
     }, libraryRefreshIntervalMs);
   }
 
-  void refreshXboxAppIds(true);
+  if (document.visibilityState !== "hidden") {
+    void refreshXboxAppIds(true);
+  }
 })();

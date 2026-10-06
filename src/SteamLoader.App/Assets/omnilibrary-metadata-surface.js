@@ -5,7 +5,7 @@
 // controller hints and layouts remain untouched.
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 23;
+  const stateVersion = 28;
   const legacyPanelId = "steamtools-omnilibrary-metadata-panel";
   const legacyStyleId = "steamtools-omnilibrary-metadata-style";
   const achievementNoticeId =
@@ -13,8 +13,12 @@
   const storageKey = "ToolsForSteamOmniLibraryStoresChanged";
   const channelName = "ToolsForSteamOmniLibraryStores";
   const nativeMetadataMessageType = "native-metadata";
+  const metadataSnapshotStorageKey =
+    "ToolsForSteamOmniLibraryMetadataSnapshotsV1";
+  const maxPersistedSnapshots = 12;
+  const maxPersistedSnapshotBytes = 2_500_000;
   const readyRefreshMs = 60000;
-  const updatingRefreshMs = 2500;
+  const updatingRefreshMs = 750;
   const postPlayMinimumMs = 45000;
   const postPlayDelayMs = 8000;
   const postPlayThrottleMs = 10 * 60 * 1000;
@@ -51,6 +55,13 @@
     "INFOS DU JEU",
     "INFORMAZIONI SUL GIOCO",
   ]);
+  const gameInfoTabLabels = new Set([
+    "GAME INFO",
+    "SPIELINFO",
+    "SPIELINFORMATIONEN",
+    "INFOS DU JEU",
+    "INFORMAZIONI SUL GIOCO",
+  ].map(normalizeText));
   const featureCategories = Object.freeze({
     "MULTIPLAYER": 1,
     "SINGLE-PLAYER": 2,
@@ -122,6 +133,7 @@
     version: stateVersion,
     summary: null,
     currentAppId: 0,
+    lastOpenedAppId: 0,
     requestInFlight: false,
     refreshPending: false,
     forceRefreshPending: false,
@@ -142,6 +154,7 @@
     summaryUnsubscribe: null,
     channel: null,
     nativeSnapshots: new Map(),
+    persistedSnapshotSignatures: new Map(),
     nativeActivity: new Map(),
     nativeAchievements: new Map(),
     achievementStorePayloads: new Map(),
@@ -157,11 +170,73 @@
     patchedAchievementStore: null,
     patchedAjaxRequest: null,
     patchedSectionsPrototype: null,
+    renderedOverviewTargets: new WeakSet(),
+    renderedSectionTargets: new WeakSet(),
     disposed: false,
     ensureActive: null,
     dispose: null,
   };
   window.__steamToolsOmniLibraryMetadataState = state;
+
+  function persistedSnapshotSignature(snapshot) {
+    return [
+      Number(snapshot?.revision || 0),
+      String(snapshot?.status || ""),
+      snapshot?.refreshing === true ? 1 : 0,
+      String(snapshot?.refreshedAtUtc || ""),
+      String(snapshot?.warning || ""),
+    ].join(":");
+  }
+
+  function loadPersistedNativeSnapshots() {
+    try {
+      const document = JSON.parse(
+        window.localStorage?.getItem(metadataSnapshotStorageKey) || "null",
+      );
+      for (const item of Array.isArray(document?.items) ? document.items : []) {
+        const snapshot = item?.snapshot;
+        const appId = Number(snapshot?.steamAppId || 0);
+        if (appId > 0 && snapshot && typeof snapshot === "object") {
+          state.nativeSnapshots.set(appId, snapshot);
+          state.persistedSnapshotSignatures.set(
+            appId,
+            persistedSnapshotSignature(snapshot),
+          );
+        }
+      }
+    } catch (_) {}
+  }
+
+  function persistNativeSnapshot(snapshot) {
+    const appId = Number(snapshot?.steamAppId || 0);
+    if (!appId || !snapshot || typeof snapshot !== "object") {
+      return;
+    }
+    const signature = persistedSnapshotSignature(snapshot);
+    if (state.persistedSnapshotSignatures.get(appId) === signature) {
+      return;
+    }
+    try {
+      const stored = JSON.parse(
+        window.localStorage?.getItem(metadataSnapshotStorageKey) || "null",
+      );
+      const items = (Array.isArray(stored?.items) ? stored.items : [])
+        .filter((item) => Number(item?.snapshot?.steamAppId || 0) !== appId);
+      items.unshift({ savedAt: Date.now(), snapshot });
+      items.splice(maxPersistedSnapshots);
+      let serialized = JSON.stringify({ version: 1, items });
+      while (serialized.length > maxPersistedSnapshotBytes && items.length > 1) {
+        items.pop();
+        serialized = JSON.stringify({ version: 1, items });
+      }
+      window.localStorage?.setItem(metadataSnapshotStorageKey, serialized);
+      state.persistedSnapshotSignatures.set(appId, signature);
+    } catch (_) {
+      // Local persistence is an acceleration only; the backend cache remains authoritative.
+    }
+  }
+
+  loadPersistedNativeSnapshots();
 
   function normalizeText(value) {
     return String(value || "")
@@ -289,6 +364,7 @@
         return;
       }
       state.nativeSnapshots.set(appId, snapshot);
+      persistNativeSnapshot(snapshot);
       state.lastFetchAtByApp.set(appId, Date.now());
       applyNativeSnapshot(snapshot);
       broadcastNativeSnapshot(snapshot);
@@ -510,8 +586,75 @@
     return found >= 3;
   }
 
+  function reactFiberForElement(element) {
+    if (!element) {
+      return null;
+    }
+    const key = Object.getOwnPropertyNames(element).find((name) =>
+      name.startsWith("__reactFiber$") ||
+      name.startsWith("__reactInternalInstance$"));
+    return key ? element[key] : null;
+  }
+
+  function visibleDetailTab() {
+    const labels = new Set(detailTabLabels.map(normalizeText));
+    const tabs = Array.from(document.querySelectorAll("[role='tab']"))
+      .filter((element) =>
+        labels.has(normalizeText(element.textContent)) &&
+        isVisibleElement(element));
+    return tabs.find((element) =>
+      element.getAttribute("aria-selected") === "true") || tabs[0] || null;
+  }
+
+  function renderedGameDetails() {
+    const tab = visibleDetailTab();
+    let fiber = reactFiberForElement(tab);
+    let overview = null;
+    let details = null;
+    let sectionsHost = null;
+    for (let depth = 0; fiber && depth < 128; depth += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps || fiber.pendingProps;
+      overview ||= props?.overview || fiber.stateNode?.props?.overview || null;
+      details ||= props?.details || fiber.stateNode?.props?.details || null;
+      if (
+        !sectionsHost &&
+        typeof fiber.stateNode?.GetSections === "function" &&
+        typeof fiber.stateNode?.forceUpdate === "function"
+      ) {
+        sectionsHost = fiber.stateNode;
+      }
+    }
+    const appId = Number(
+      overview?.appid ??
+        details?.unAppID ??
+        details?.appid ??
+        details?.nAppID ??
+        0,
+    );
+    return { appId, overview, details, sectionsHost, tab };
+  }
+
+  function visibleGameInfoSelected(appId) {
+    const rendered = renderedGameDetails();
+    return rendered.appId === Number(appId) &&
+      rendered.tab?.getAttribute("aria-selected") === "true" &&
+      gameInfoTabLabels.has(normalizeText(rendered.tab.textContent));
+  }
+
+  function renderedManagedAppId() {
+    const appId = renderedGameDetails().appId;
+    return isManagedAppId(appId) ? appId : 0;
+  }
+
   function currentManagedAppId() {
-    const detected = routeAppId() || artworkAppId();
+    // Steam's full-screen document can retain the preceding route while the
+    // visible React tree already shows another game. Prefer the mounted page
+    // identity so metadata is fetched for what the user can actually see.
+    const rendered = renderedManagedAppId();
+    const hasDetailsPage = hasNativeDetailTabs();
+    const detected = rendered ||
+      (hasDetailsPage ? artworkAppId() || routeAppId() : 0) ||
+      (window.appDetailsStore && window.appStore ? routeAppId() : 0);
     if (isManagedAppId(detected)) {
       return detected;
     }
@@ -521,10 +664,41 @@
     return 0;
   }
 
-  function metadataAppIdForRequest(value) {
-    const requestedAppId = Number(value);
+  function isManagedGameInfoRoute(appId) {
+    if (!isManagedAppId(appId)) {
+      return false;
+    }
+    const route =
+      `${window.location.pathname || ""}${window.location.hash || ""}${window.location.search || ""}`;
+    return new RegExp(
+      `/(?:library/(?:[^/?#]+/)?app|library/details|appdetails)/${appId}/tab/(?:GameInfo|Info)(?:[/?#]|$)`,
+      "i",
+    ).test(route);
+  }
+
+  function appIdFromNativeRequest(value) {
+    if (value && typeof value === "object") {
+      return Number(
+        value.appid ??
+          value.appId ??
+          value.unAppID ??
+          value.unAppId ??
+          value.nAppID ??
+          value.props?.overview?.appid ??
+          0,
+      );
+    }
+    return Number(value);
+  }
+
+  function metadataAppIdForRequest(value, context) {
+    const requestedAppId =
+      appIdFromNativeRequest(value) || appIdFromNativeRequest(context);
     if (isManagedAppId(requestedAppId)) {
       return requestedAppId;
+    }
+    if (!requestedAppId) {
+      return currentManagedAppId();
     }
     // SteamUI sometimes asks the details stores for the matched Steam app
     // instead of the managed shortcut. Reject unrelated Steam app requests
@@ -945,6 +1119,102 @@
     }
   }
 
+  function managedNativeSections(sections, appId) {
+    const nativeSections = sections instanceof Set
+      ? new Set(sections)
+      : new Set(sections || []);
+    const supportedSections = new Set([
+      "info",
+      "notes",
+      "screenshots",
+      "activity",
+      "community",
+      "achievements",
+      "controller",
+      "offline",
+    ]);
+    for (const section of nativeSections) {
+      if (!supportedSections.has(section)) {
+        nativeSections.delete(section);
+      }
+    }
+    nativeSections.delete("nonsteam");
+    nativeSections.add("info");
+    nativeSections.add("activity");
+    nativeSections.add("community");
+    const snapshot = state.nativeSnapshots.get(appId);
+    if ((snapshot?.achievements?.items || []).length > 0) {
+      nativeSections.add("achievements");
+    } else {
+      nativeSections.delete("achievements");
+    }
+    nativeSections.add("screenshots");
+    return nativeSections;
+  }
+
+  function patchRenderedGameDetails(preferredAppId = 0, forceRender = false) {
+    const rendered = renderedGameDetails();
+    const appId = Number(rendered.appId || 0);
+    if (
+      !isManagedAppId(appId) ||
+      (preferredAppId && Number(preferredAppId) !== appId) ||
+      !state.nativeSnapshots.has(appId)
+    ) {
+      return false;
+    }
+
+    let changed = false;
+    const overview = rendered.overview;
+    if (
+      overview &&
+      typeof overview.BIsModOrShortcut === "function" &&
+      !state.renderedOverviewTargets.has(overview)
+    ) {
+      state.renderedOverviewTargets.add(overview);
+      addUnpatcher(patchMethod(
+        overview,
+        "BIsModOrShortcut",
+        (_thisValue, original) =>
+          visibleGameInfoSelected(appId) ? false : original(),
+      ));
+      changed = true;
+    }
+
+    const sectionsHost = rendered.sectionsHost;
+    if (
+      sectionsHost &&
+      typeof sectionsHost.GetSections === "function" &&
+      !state.renderedSectionTargets.has(sectionsHost)
+    ) {
+      state.renderedSectionTargets.add(sectionsHost);
+      addUnpatcher(patchMethod(
+        sectionsHost,
+        "GetSections",
+        (thisValue, original, args) => {
+          const hostOverview = args[0] || thisValue?.props?.overview;
+          const hostAppId = Number(hostOverview?.appid || appId);
+          const sections = original();
+          if (!isManagedAppId(hostAppId) || !state.nativeSnapshots.has(hostAppId)) {
+            return sections;
+          }
+          const nativeSections = managedNativeSections(sections, hostAppId);
+          if ("m_setSectionsMemo" in thisValue) {
+            thisValue.m_setSectionsMemo = nativeSections;
+          }
+          return nativeSections;
+        },
+      ));
+      changed = true;
+    }
+
+    if ((changed || forceRender) && typeof sectionsHost?.forceUpdate === "function") {
+      try {
+        sectionsHost.forceUpdate();
+      } catch (_) {}
+    }
+    return changed || Boolean(sectionsHost || overview);
+  }
+
   function getWebpackRequire() {
     if (window.__steamToolsOmniMetadataWebpackRequire) {
       return window.__steamToolsOmniMetadataWebpackRequire;
@@ -1056,6 +1326,8 @@
     state.patchedAchievementStore = null;
     state.patchedAjaxRequest = null;
     state.patchedSectionsPrototype = null;
+    state.renderedOverviewTargets = new WeakSet();
+    state.renderedSectionTargets = new WeakSet();
   }
 
   function ensureDetailSafety(appId, appData) {
@@ -1750,7 +2022,7 @@
   }
 
   function ensureNativeDescriptions(appId, snapshot, appData) {
-    if (!appData?.details) {
+    if (!appData) {
       return null;
     }
     const descriptions = nativeDescriptionData(snapshot);
@@ -1763,7 +2035,48 @@
       appData.descriptionsData = descriptions;
       cacheNativeDetails(appId, "descriptions", 1, descriptions);
     }
-    return appData.descriptionsData || descriptions;
+    // Let Steam finish creating its native details model before replacing a
+    // getter result. The data is already primed above and will be returned on
+    // the next native render without destabilizing first-open bootstrap.
+    return appData.details ? appData.descriptionsData || descriptions : null;
+  }
+
+  function nativeAssociationData(snapshot) {
+    const gameInfo = snapshot?.gameInfo || {};
+    return {
+      rgDevelopers: (gameInfo.developers || []).map((name) => ({
+        strName: String(name),
+        strURL: "",
+      })),
+      rgPublishers: (gameInfo.publishers || []).map((name) => ({
+        strName: String(name),
+        strURL: "",
+      })),
+      rgFranchises: [],
+    };
+  }
+
+  function ensureNativeAssociations(appId, snapshot, appData) {
+    if (!appData) {
+      return null;
+    }
+    const associations = nativeAssociationData(snapshot);
+    const current = appData.associationData;
+    const currentSignature = JSON.stringify([
+      current?.rgDevelopers || [],
+      current?.rgPublishers || [],
+      current?.rgFranchises || [],
+    ]);
+    const nextSignature = JSON.stringify([
+      associations.rgDevelopers,
+      associations.rgPublishers,
+      associations.rgFranchises,
+    ]);
+    if (currentSignature !== nextSignature) {
+      appData.associationData = associations;
+      cacheNativeDetails(appId, "associations", 1, associations);
+    }
+    return appData.details ? appData.associationData || associations : null;
   }
 
   function primeAchievementStores(appId, payload) {
@@ -2019,10 +2332,11 @@
     if (!isManagedAppId(appId)) {
       return false;
     }
+    const renderedPatched = patchRenderedGameDetails(appId, true);
     const appData = window.appDetailsStore?.GetAppData?.(appId);
     const overview = window.appStore?.GetAppOverviewByAppID?.(appId);
     if (!appData || !overview) {
-      return false;
+      return renderedPatched;
     }
     const revision = Number(snapshot?.revision || 0);
     const applied = state.appliedSnapshotByApp.get(appId);
@@ -2033,6 +2347,7 @@
       applied?.overview === overview
     ) {
       ensureNativeDescriptions(appId, snapshot, appData);
+      ensureNativeAssociations(appId, snapshot, appData);
       const payload = managedAchievementPayload(appId);
       primeAchievementStores(appId, payload);
       state.nativeSnapshots.set(appId, snapshot);
@@ -2045,17 +2360,7 @@
 
     const gameInfo = snapshot?.gameInfo || {};
     const descriptions = nativeDescriptionData(snapshot);
-    const associations = {
-      rgDevelopers: (gameInfo.developers || []).map((name) => ({
-        strName: String(name),
-        strURL: "",
-      })),
-      rgPublishers: (gameInfo.publishers || []).map((name) => ({
-        strName: String(name),
-        strURL: "",
-      })),
-      rgFranchises: [],
-    };
+    const associations = nativeAssociationData(snapshot);
     const screenshots = nativeScreenshots(snapshot);
     const screenshotData = {
       rgScreenshots: screenshots,
@@ -2139,6 +2444,7 @@
       { detail: { appId, revision: Number(snapshot?.revision || 0) } },
     ));
     scheduleMetadataUiRender();
+    patchRenderedGameDetails(appId, true);
     return true;
   }
 
@@ -2220,14 +2526,15 @@
   }
 
   function installNativePatches() {
+    const renderedPatched = patchRenderedGameDetails();
     const detailsStore = window.appDetailsStore;
     const appStore = window.appStore;
     const activityStore = window.appActivityStore;
     const achievementStore = findAchievementStore();
     const ajaxRequest = window.steamAjaxRequest;
     const sectionsPrototype = findDetailsSectionsPrototype();
-    if (!detailsStore || !appStore || !sectionsPrototype) {
-      return false;
+    if (!detailsStore || !appStore) {
+      return renderedPatched;
     }
     if (
       state.patchedDetailsStore === detailsStore &&
@@ -2237,7 +2544,7 @@
       state.patchedAjaxRequest === ajaxRequest &&
       state.patchedSectionsPrototype === sectionsPrototype
     ) {
-      return true;
+      return sectionsPrototype !== null;
     }
 
     uninstallNativePatches();
@@ -2255,43 +2562,46 @@
       ? Object.getPrototypeOf(overviewSample)
       : null;
 
-    addUnpatcher(patchMethod(
-      sectionsPrototype,
-      "GetSections",
-      (thisValue, original, args) => {
-        const sections = original();
-        const overview = args[0] || thisValue?.props?.overview;
-        const appId = Number(overview?.appid || 0);
-        if (!isManagedAppId(appId)) {
-          return sections;
-        }
-        const nativeSections = sections instanceof Set
-          ? new Set(sections)
-          : new Set(sections || []);
-        // Steam restricts shortcuts to nonsteam/notes/screenshots. Keep that
-        // native base and opt our managed games into the same native sections
-        // PlayHub enables for enriched non-Steam entries.
-        nativeSections.add("activity");
-        nativeSections.add("community");
-        const snapshot = state.nativeSnapshots.get(appId);
-        if ((snapshot?.achievements?.items || []).length > 0) {
-          nativeSections.add("achievements");
-        } else {
-          nativeSections.delete("achievements");
-        }
-        nativeSections.add("screenshots");
-        if ("m_setSectionsMemo" in thisValue) {
-          thisValue.m_setSectionsMemo = nativeSections;
-        }
-        return nativeSections;
-      },
-    ));
+    if (sectionsPrototype) {
+      addUnpatcher(patchMethod(
+        sectionsPrototype,
+        "GetSections",
+        (thisValue, original, args) => {
+          const sections = original();
+          const overview = args[0] || thisValue?.props?.overview;
+          const appId = Number(overview?.appid || 0);
+          if (!isManagedAppId(appId)) {
+            return sections;
+          }
+          // Steam's `nonsteam` section is a hard-coded explanation and never
+          // reads GetDescriptions/GetAssociations. Managed games have real
+          // metadata, so route them through Steam's native `info` section.
+          // Keep the section set deliberately narrow because Game Info briefly
+          // presents this shortcut as a store-backed app to the renderer.
+          const nativeSections = managedNativeSections(sections, appId);
+          if ("m_setSectionsMemo" in thisValue) {
+            thisValue.m_setSectionsMemo = nativeSections;
+          }
+          return nativeSections;
+        },
+      ));
+    }
+
+    const descriptionTarget = typeof detailsProto?.GetDescriptions === "function"
+      ? detailsProto
+      : detailsStore;
+    const associationTarget = typeof detailsProto?.GetAssociations === "function"
+      ? detailsProto
+      : detailsStore;
+    const achievementTarget = typeof detailsProto?.GetAchievements === "function"
+      ? detailsProto
+      : detailsStore;
 
     addUnpatcher(patchMethod(
-      detailsProto,
+      descriptionTarget,
       "GetDescriptions",
-      (_thisValue, original, args) => {
-        const appId = metadataAppIdForRequest(args[0]);
+      (thisValue, original, args) => {
+        const appId = metadataAppIdForRequest(args[0], thisValue);
         const originalResult = original();
         const snapshot = state.nativeSnapshots.get(appId);
         if (!snapshot || !appId) {
@@ -2306,25 +2616,28 @@
       },
     ));
     addUnpatcher(patchMethod(
-      detailsProto,
+      associationTarget,
       "GetAssociations",
-      (_thisValue, original, args) => {
-        const appId = metadataAppIdForRequest(args[0]);
+      (thisValue, original, args) => {
+        const appId = metadataAppIdForRequest(args[0], thisValue);
         const originalResult = original();
         const snapshot = state.nativeSnapshots.get(appId);
         if (!snapshot || !appId) {
           return originalResult;
         }
         applyNativeSnapshot(snapshot);
-        return detailsStore.GetAppData?.(appId)?.associationData ||
-          originalResult;
+        return ensureNativeAssociations(
+          appId,
+          snapshot,
+          detailsStore.GetAppData?.(appId),
+        ) || originalResult;
       },
     ));
     addUnpatcher(patchMethod(
-      detailsProto,
+      achievementTarget,
       "GetAchievements",
-      (_thisValue, original, args) => {
-        const appId = metadataAppIdForRequest(args[0]);
+      (thisValue, original, args) => {
+        const appId = metadataAppIdForRequest(args[0], thisValue);
         return appId
           ? managedAchievementPayload(appId)
           : original();
@@ -2332,6 +2645,22 @@
     ));
 
     if (overviewProto) {
+      addUnpatcher(patchMethod(
+        overviewProto,
+        "BIsModOrShortcut",
+        (thisValue, original) => {
+          const originalResult = original();
+          const appId = Number(thisValue?.appid || 0);
+          if (
+            originalResult === true &&
+            state.nativeSnapshots.has(appId) &&
+            isManagedGameInfoRoute(appId)
+          ) {
+            return false;
+          }
+          return originalResult;
+        },
+      ));
       addUnpatcher(patchMethod(
         overviewProto,
         "BHasStoreCategory",
@@ -2435,7 +2764,7 @@
     for (const snapshot of state.nativeSnapshots.values()) {
       applyNativeSnapshot(snapshot);
     }
-    return true;
+    return sectionsPrototype !== null;
   }
 
   function schedulePatchRetry() {
@@ -2523,13 +2852,18 @@
     const appId = currentManagedAppId();
     if (!appId) {
       state.currentAppId = 0;
+      state.lastOpenedAppId = 0;
       return;
     }
+    const openingGame = state.lastOpenedAppId !== appId;
+    state.lastOpenedAppId = appId;
     state.currentAppId = appId;
     const cachedSnapshot = state.nativeSnapshots.get(appId);
     const lastFetchAt = Number(state.lastFetchAtByApp.get(appId) || 0);
-    if (!force && cachedSnapshot && Date.now() - lastFetchAt < 5000) {
+    if (cachedSnapshot) {
       applyNativeSnapshot(cachedSnapshot);
+    }
+    if (!force && cachedSnapshot && Date.now() - lastFetchAt < 5000) {
       broadcastNativeSnapshot(cachedSnapshot);
       scheduleNextRefresh(cachedSnapshot);
       return;
@@ -2538,7 +2872,9 @@
     scheduleMetadataUiRender(0);
     try {
       const response = await fetch(
-        `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}`,
+        `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}${
+          !force && openingGame ? "?open=true" : ""
+        }`,
         {
           method: force ? "POST" : "GET",
           cache: "no-store",
@@ -2555,6 +2891,7 @@
         return;
       }
       state.nativeSnapshots.set(appId, snapshot);
+      persistNativeSnapshot(snapshot);
       state.lastFetchAtByApp.set(appId, Date.now());
       applyNativeSnapshot(snapshot);
       broadcastNativeSnapshot(snapshot);
@@ -2600,6 +2937,7 @@
               node.querySelector?.("[role='tab'], img, video")
             )))
       ) {
+        window.queueMicrotask?.(() => patchRenderedGameDetails());
         queueRefresh();
         scheduleMetadataUiRender();
       }
@@ -2614,7 +2952,24 @@
     if (state.detailsUiHandler || state.disposed) {
       return;
     }
-    state.detailsUiHandler = () => scheduleMetadataUiRender();
+    state.detailsUiHandler = () => {
+      scheduleMetadataUiRender();
+      const reapply = () => {
+        if (state.disposed || !isPluginEnabled()) {
+          return;
+        }
+        const appId = currentManagedAppId() || Number(state.currentAppId || 0);
+        const snapshot = state.nativeSnapshots.get(appId);
+        if (snapshot) {
+          applyNativeSnapshot(snapshot);
+        } else if (isManagedAppId(appId)) {
+          queueRefresh(0);
+        }
+        patchRenderedGameDetails(appId);
+      };
+      window.queueMicrotask?.(reapply);
+      window.setTimeout(reapply, 120);
+    };
     document.addEventListener("click", state.detailsUiHandler, true);
     document.addEventListener("focusin", state.detailsUiHandler, true);
     window.addEventListener("popstate", state.detailsUiHandler);
@@ -2650,6 +3005,7 @@
     uninstallPostPlaySync();
     uninstallDetailsUiTracking();
     state.currentAppId = 0;
+    state.lastOpenedAppId = 0;
     removeAchievementNotice();
     removeLegacySurface();
   }
@@ -2698,6 +3054,7 @@
               return;
             }
             state.nativeSnapshots.set(appId, snapshot);
+            persistNativeSnapshot(snapshot);
             state.lastFetchAtByApp.set(appId, Date.now());
             installNativePatches() || schedulePatchRetry();
             applyNativeSnapshot(snapshot);

@@ -155,6 +155,57 @@ test("hidden native tabs are restored as internal templates without duplicating 
   assert.equal(new Set(restored.map((tab) => tab.id)).size, restored.length);
 });
 
+test("TabMaster keeps complete authority over visibility and native/custom tab order", () => {
+  const tabMasterFooter = { onMenuActionDescription: "Tab Master" };
+  const definitions = topology.buildDefinitionsFromSummary(stores, fallback)
+    .filter((definition) => ["tfs-xbox", "tfs-gog"].includes(definition.tabId));
+  const tabs = topology.buildCanonicalTabOrder(
+    [
+      { id: "custom-recent", footer: tabMasterFooter },
+      { id: "DesktopApps", footer: tabMasterFooter },
+      { id: "custom-backlog", footer: tabMasterFooter },
+      { id: "AllGames", footer: tabMasterFooter },
+    ],
+    definitions,
+    definitions,
+  );
+
+  assert.equal(topology.hasTabMasterOwnership(tabs), true);
+  assert.deepEqual(
+    Array.from(tabs, (tab) => tab.id),
+    [
+      "custom-recent",
+      "DesktopApps",
+      "tfs-xbox",
+      "tfs-gog",
+      "custom-backlog",
+      "AllGames",
+    ],
+  );
+  assert.equal(tabs.some((tab) => tab.id === "Installed"), false);
+  assert.equal(tabs.some((tab) => tab.id === "Soundtracks"), false);
+});
+
+test("OmniLibrary appends after TabMaster's order when Non-Steam is hidden", () => {
+  const tabMasterFooter = { onMenuActionDescription: "Tab Master" };
+  const definitions = topology.buildDefinitionsFromSummary(stores, fallback)
+    .filter((definition) => ["tfs-xbox", "tfs-gog"].includes(definition.tabId));
+  const tabs = topology.buildCanonicalTabOrder(
+    [
+      { id: "Soundtracks", footer: tabMasterFooter },
+      { id: "custom-favorites", footer: tabMasterFooter },
+      { id: "AllGames", footer: tabMasterFooter },
+    ],
+    definitions,
+    definitions,
+  );
+
+  assert.deepEqual(
+    Array.from(tabs, (tab) => tab.id),
+    ["Soundtracks", "custom-favorites", "AllGames", "tfs-xbox", "tfs-gog"],
+  );
+});
+
 test("LB and RB traverse and wrap through all canonical tabs in both directions", () => {
   const definitions = topology.buildDefinitionsFromSummary(stores, fallback);
   const tabs = topology.buildCanonicalTabOrder(nativeTabs, definitions, definitions);

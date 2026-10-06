@@ -14,6 +14,7 @@ public static class SteamLoaderPluginCatalog
         new("store-sync", "Store Sync", "Launcher sync, Steam shortcuts, artwork updates, and store collections.", true, false),
         new("omnilibrary", "OmniLibrary", "Bring Xbox and Epic libraries into dedicated Steam tabs with download, play, and safe uninstall actions.", true, false),
         new("auto-sisr", "Auto SISR", "Starts SISR marker mode for selected non-Steam games.", true, false),
+        new("curtain", "TFS Curtain", "Covers launchers and desktop transitions until the game is ready.", true),
         new("artwork", "SteamGridDB", "Context menu artwork picker and manual artwork settings.", true),
         new("audio", "Audio", "Output device switching and system volume controls.", true),
         new("display", "Display", "Display switching, resolution, and refresh rate controls.", true),

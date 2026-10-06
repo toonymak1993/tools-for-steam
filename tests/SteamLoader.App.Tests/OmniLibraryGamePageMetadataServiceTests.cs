@@ -272,6 +272,181 @@ public sealed class OmniLibraryGamePageMetadataServiceTests
         }
     }
 
+    [Fact]
+    public async Task GetAsync_OpenReturnsPersistedMetadataBeforeBackgroundRefresh()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            using (var seedClient = new HttpClient(new MetadataHttpHandler()))
+            using (var seedService = CreateService(root, seedClient))
+            {
+                var seeded = await seedService.GetAsync(
+                    ShortcutAppId,
+                    forceRefresh: false,
+                    CancellationToken.None);
+                Assert.Equal("A reliable cached description.", seeded?.GameInfo.Description);
+            }
+
+            var refreshHandler = new MetadataHttpHandler
+            {
+                FailMetadataRequests = true,
+            };
+            using var refreshClient = new HttpClient(refreshHandler);
+            using var refreshService = CreateService(root, refreshClient);
+
+            var immediate = await refreshService.GetAsync(
+                ShortcutAppId,
+                forceRefresh: false,
+                refreshOnOpen: true,
+                CancellationToken.None);
+
+            Assert.NotNull(immediate);
+            Assert.True(immediate.Cached);
+            Assert.True(immediate.Refreshing);
+            Assert.Equal("updating", immediate.Status);
+            Assert.Equal(
+                "A reliable cached description.",
+                immediate.GameInfo.Description);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_FirstOpenReturnsLoadingSnapshotAndFillsCacheAsynchronously()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler();
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var immediate = await service.GetAsync(
+                ShortcutAppId,
+                forceRefresh: false,
+                refreshOnOpen: true,
+                CancellationToken.None);
+
+            Assert.NotNull(immediate);
+            Assert.False(immediate.Cached);
+            Assert.True(immediate.Refreshing);
+            Assert.Equal("updating", immediate.Status);
+            Assert.True(File.Exists(Path.Combine(root, "metadata.json")));
+
+            OmniLibraryGamePageMetadataSnapshot? completed = null;
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                completed = await service.GetAsync(
+                    ShortcutAppId,
+                    forceRefresh: false,
+                    CancellationToken.None);
+                if (completed is { Refreshing: false, Status: "ready" })
+                {
+                    break;
+                }
+                await Task.Delay(10);
+            }
+
+            Assert.NotNull(completed);
+            Assert.Equal("ready", completed.Status);
+            Assert.Equal(
+                "A reliable cached description.",
+                completed.GameInfo.Description);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SearchSteamMatchesAsync_ReturnsRankedCandidatesForManualCorrection()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler
+            {
+                SearchJson =
+                    """{"total":2,"items":[{"id":990081,"name":"Example Game 3","tiny_image":"https://cdn.example/3.jpg"},{"id":990080,"name":"Example Game 2","tiny_image":"https://cdn.example/2.jpg","price":{"final_formatted":"19,99€"}}]}""",
+            };
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var matches = await service.SearchSteamMatchesAsync(
+                ShortcutAppId,
+                "Example Game 2",
+                CancellationToken.None);
+
+            Assert.Equal(2, matches.Count);
+            Assert.Equal(990080, matches[0].SteamAppId);
+            Assert.Equal(0, matches[0].MatchScore);
+            Assert.Equal("19,99€", matches[0].Price);
+            Assert.Equal(990081, matches[1].SteamAppId);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SetSteamMatchAsync_PersistsManualChoiceUntilItIsCleared()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var firstHandler = new MetadataHttpHandler();
+            using (var firstClient = new HttpClient(firstHandler))
+            using (var firstService = CreateService(root, firstClient))
+            {
+                var selected = await firstService.SetSteamMatchAsync(
+                    ShortcutAppId,
+                    990080,
+                    CancellationToken.None);
+
+                Assert.NotNull(selected);
+                Assert.Equal(990080, selected.SourceSteamAppId);
+                Assert.Equal("manual", selected.MatchMode);
+                Assert.Equal("Steam (selected)", selected.SourceLabel);
+            }
+
+            var secondHandler = new MetadataHttpHandler
+            {
+                SearchJson = """{"total":0,"items":[]}""",
+            };
+            using var secondClient = new HttpClient(secondHandler);
+            using var secondService = CreateService(root, secondClient);
+            var refreshed = await secondService.GetAsync(
+                ShortcutAppId,
+                forceRefresh: true,
+                CancellationToken.None);
+
+            Assert.NotNull(refreshed);
+            Assert.Equal(990080, refreshed.SourceSteamAppId);
+            Assert.Equal("manual", refreshed.MatchMode);
+            Assert.DoesNotContain(
+                secondHandler.RequestUris,
+                uri => uri.AbsoluteUri.Contains("storesearch", StringComparison.OrdinalIgnoreCase));
+
+            var automatic = await secondService.ClearSteamMatchAsync(
+                ShortcutAppId,
+                CancellationToken.None);
+
+            Assert.NotNull(automatic);
+            Assert.Null(automatic.SourceSteamAppId);
+            Assert.Equal("automatic", automatic.MatchMode);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private const uint ShortcutAppId = 0x8abc1234;
 
     private static OmniLibraryGamePageMetadataService CreateService(

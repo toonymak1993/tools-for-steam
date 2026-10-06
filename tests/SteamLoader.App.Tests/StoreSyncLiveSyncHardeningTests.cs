@@ -217,6 +217,176 @@ public sealed class StoreSyncLiveSyncHardeningTests
     }
 
     [Fact]
+    public void TryBuildLiveShortcutMirrorEntries_CollapsesOmniLibraryPathMigrationDuplicates()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeDefinitionType = serviceType.GetNestedType("StoreDefinition", BindingFlags.NonPublic);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var analysisType = serviceType.GetNestedType("StoreSyncAnalysis", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var cleanupCandidateType = serviceType.GetNestedType("StoreSyncCleanupCandidate", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryBuildLiveShortcutMirrorEntries", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeDefinitionType);
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(actionKindType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(analysisType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(cleanupCandidateType);
+        Assert.NotNull(method);
+
+        const uint oldAppId = 4127582867u;
+        const uint currentAppId = 3911608839u;
+        const string titleId = "unifysteam-33-immortals";
+        const string launchOptions = "--unifysteam-launch xbox-game-pass:9P8LR42PTRGJ";
+        var currentExecutable = Path.Combine(AppContext.BaseDirectory, "ToolsForSteam.exe");
+        var currentDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+
+        Dictionary<string, object?> BuildEntry(uint appId, string executable, string startDirectory) =>
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["appid"] = unchecked((int)appId),
+                ["appname"] = "33 Immortals",
+                ["Exe"] = $"\"{executable}\"",
+                ["StartDir"] = $"\"{startDirectory}\"",
+                ["LaunchOptions"] = launchOptions,
+                ["ShortcutPath"] = "steamloader://managed",
+                ["LastPlayTime"] = 42,
+                ["tags"] = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["0"] = "Tools for Steam",
+                    ["1"] = "Store Sync",
+                    ["2"] = "unifysteam",
+                    ["3"] = titleId,
+                },
+            };
+
+        var oldEntry = BuildEntry(oldAppId, @"D:\OldTFS\ToolsForSteam.exe", @"D:\OldTFS");
+        var currentEntry = BuildEntry(currentAppId, currentExecutable, currentDirectory);
+        var oldShortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            0,
+            oldAppId,
+            "33 Immortals",
+            @"D:\OldTFS\ToolsForSteam.exe",
+            @"D:\OldTFS",
+            launchOptions,
+            true,
+            "unifysteam",
+            titleId,
+            oldEntry);
+        var currentShortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            1,
+            currentAppId,
+            "33 Immortals",
+            currentExecutable,
+            currentDirectory,
+            launchOptions,
+            true,
+            "unifysteam",
+            titleId,
+            currentEntry);
+        var definition = CreateNonPublicInstance(
+            storeDefinitionType!,
+            "unifysteam",
+            "Storefront",
+            "Test store",
+            true,
+            false);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "xbox-game-pass:9P8LR42PTRGJ",
+            "33 Immortals",
+            currentExecutable,
+            currentDirectory,
+            launchOptions);
+        var item = CreateNonPublicInstance(
+            analysisItemType!,
+            titleId,
+            titleId,
+            definition,
+            game,
+            new StoreSyncTitleOverride(),
+            "33 Immortals",
+            "33 Immortals",
+            currentAppId,
+            Enum.Parse(actionKindType!, "RefreshManaged"),
+            "Refresh Managed",
+            string.Empty,
+            currentShortcut,
+            null,
+            null,
+            Array.Empty<string>());
+        var cleanupCandidate = CreateNonPublicInstance(
+            cleanupCandidateType!,
+            "omnilibrary-duplicate-old",
+            "33 Immortals",
+            "OmniLibrary",
+            oldShortcut,
+            null,
+            Array.Empty<string>());
+        var analysisItems = Array.CreateInstance(analysisItemType!, 1);
+        analysisItems.SetValue(item, 0);
+        var cleanupCandidates = Array.CreateInstance(cleanupCandidateType!, 1);
+        cleanupCandidates.SetValue(cleanupCandidate, 0);
+        var analysis = CreateNonPublicInstance(
+            analysisType!,
+            analysisItems,
+            cleanupCandidates,
+            0,
+            new StoreSyncPreviewState(0, 1, 0, 0, 0, 1, 0, []));
+        var arguments = new object?[]
+        {
+            new List<Dictionary<string, object?>> { oldEntry, currentEntry },
+            analysis,
+            new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
+            {
+                [titleId] = currentAppId,
+            },
+            null,
+        };
+
+        var changed = (bool?)method!.Invoke(null, arguments);
+
+        Assert.True(changed);
+        var mirroredEntry = Assert.Single(
+            Assert.IsType<List<Dictionary<string, object?>>>(arguments[3]));
+        Assert.Equal(unchecked((int)currentAppId), mirroredEntry["appid"]);
+        Assert.Equal($"\"{currentExecutable}\"", mirroredEntry["Exe"]);
+        Assert.Equal(launchOptions, mirroredEntry["LaunchOptions"]);
+    }
+
+    [Fact]
+    public void CopyOmniLibraryArtwork_MigratesPortraitAndHyphenIconToNewAppId()
+    {
+        var method = typeof(StoreSyncService).GetMethod(
+            "CopyOmniLibraryArtwork",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var gridDirectory = Directory.CreateTempSubdirectory("tfs-artwork-migration-").FullName;
+        try
+        {
+            File.WriteAllText(Path.Combine(gridDirectory, "100p.jpg"), "portrait");
+            File.WriteAllText(Path.Combine(gridDirectory, "100-icon.png"), "icon");
+
+            method!.Invoke(null, [gridDirectory, 100u, 200u]);
+
+            Assert.Equal("portrait", File.ReadAllText(Path.Combine(gridDirectory, "200p.jpg")));
+            Assert.Equal("icon", File.ReadAllText(Path.Combine(gridDirectory, "200-icon.png")));
+        }
+        finally
+        {
+            Directory.Delete(gridDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void TryBuildLiveShortcutMirrorEntries_RefreshesManagedShortcutWithoutDroppingPlaytime()
     {
         var serviceType = typeof(StoreSyncService);
@@ -346,9 +516,11 @@ public sealed class StoreSyncLiveSyncHardeningTests
     public void ResolveActionKind_KeepsManagedManifestOnRefresh_WhenShortcutIsTemporarilyMissing()
     {
         var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
         var actionKindType = serviceType.GetNestedType("StoreSyncActionKind", BindingFlags.NonPublic);
         var method = serviceType.GetMethod("ResolveActionKind", BindingFlags.NonPublic | BindingFlags.Static);
 
+        Assert.NotNull(storeGameEntryType);
         Assert.NotNull(actionKindType);
         Assert.NotNull(method);
 
@@ -365,7 +537,17 @@ public sealed class StoreSyncLiveSyncHardeningTests
             ManagedShortcut = true,
         };
 
-        var result = method!.Invoke(null, [configuration, new StoreSyncTitleOverride(), manifestEntry, null]);
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "xbox-game-pass",
+            manifestEntry.StoreItemId,
+            manifestEntry.Title,
+            manifestEntry.ExecutablePath,
+            @"C:\XboxGames\DOOM 3\Content",
+            string.Empty);
+        var result = method!.Invoke(
+            null,
+            [configuration, game, new StoreSyncTitleOverride(), manifestEntry, null]);
 
         Assert.Equal(Enum.Parse(actionKindType!, "RefreshManaged"), result);
     }
@@ -597,6 +779,144 @@ public sealed class StoreSyncLiveSyncHardeningTests
     }
 
     [Fact]
+    public void TryFindExistingShortcut_AdoptsUniqueLegacyOmniLibraryTitle()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryFindExistingShortcut", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "xbox-game-pass:PRODUCT-A",
+            "Forza Horizon 5",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch xbox-game-pass:PRODUCT-A");
+        var entries = Array.CreateInstance(existingShortcutEntryType!, 1);
+        entries.SetValue(
+            CreateNonPublicInstance(
+                existingShortcutEntryType!,
+                0,
+                4040u,
+                "Forza Horizon 5",
+                @"D:\OldToolsForSteam\SteamLoader.exe",
+                @"D:\OldToolsForSteam",
+                "--legacy-unifysteam xbox:PRODUCT-A",
+                false,
+                string.Empty,
+                string.Empty,
+                new Dictionary<string, object?>()),
+            0);
+
+        var arguments = new object?[] { entries, game, null, "Forza Horizon 5", null };
+        var matched = (bool?)method!.Invoke(null, arguments);
+
+        Assert.True(matched);
+        Assert.NotNull(arguments[4]);
+        Assert.Equal(
+            4040u,
+            (uint?)existingShortcutEntryType!.GetProperty("AppId")?.GetValue(arguments[4]));
+    }
+
+    [Fact]
+    public void TryFindExistingShortcut_DoesNotGuessBetweenAmbiguousLegacyTitles()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryFindExistingShortcut", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "gog:123",
+            "DOOM",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch gog:123");
+        var entries = Array.CreateInstance(existingShortcutEntryType!, 2);
+        for (var index = 0; index < 2; index++)
+        {
+            entries.SetValue(
+                CreateNonPublicInstance(
+                    existingShortcutEntryType!,
+                    index,
+                    (uint)(5000 + index),
+                    "DOOM",
+                    $@"C:\Games\Doom{index}\doom.exe",
+                    $@"C:\Games\Doom{index}",
+                    string.Empty,
+                    false,
+                    string.Empty,
+                    string.Empty,
+                    new Dictionary<string, object?>()),
+                index);
+        }
+
+        var arguments = new object?[] { entries, game, null, "DOOM", null };
+        var matched = (bool?)method!.Invoke(null, arguments);
+
+        Assert.False(matched);
+        Assert.Null(arguments[4]);
+    }
+
+    [Fact]
+    public void ResolveActionKind_RefreshesMatchedOmniLibraryShortcutInPlace()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("ResolveActionKind", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "epic:abc",
+            "Control",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch epic:abc");
+        var shortcut = CreateNonPublicInstance(
+            existingShortcutEntryType!,
+            0,
+            6060u,
+            "Control",
+            @"D:\OldToolsForSteam\SteamLoader.exe",
+            @"D:\OldToolsForSteam",
+            string.Empty,
+            false,
+            string.Empty,
+            string.Empty,
+            new Dictionary<string, object?>());
+
+        var action = method!.Invoke(
+            null,
+            [
+                new StoreSyncConfiguration { TakeOverExistingShortcuts = false },
+                game,
+                new StoreSyncTitleOverride(),
+                null,
+                shortcut,
+            ]);
+
+        Assert.Equal("RefreshManaged", action?.ToString());
+    }
+
+    [Fact]
     public void OwnershipRepairMatches_RejectsDifferentLaunchOptions_ForSharedExecutables()
     {
         var serviceType = typeof(StoreSyncService);
@@ -745,6 +1065,7 @@ public sealed class StoreSyncLiveSyncHardeningTests
         var createBlock = expression.Substring(createStart, updateStart - createStart);
         Assert.Contains("\"AddShortcut\"", createBlock, StringComparison.Ordinal);
         Assert.DoesNotContain("tryApplyToShortcut", createBlock, StringComparison.Ordinal);
+        Assert.Contains("await invoke(\"RemoveShortcut\", originalAppId);", expression, StringComparison.Ordinal);
     }
 
     [Fact]

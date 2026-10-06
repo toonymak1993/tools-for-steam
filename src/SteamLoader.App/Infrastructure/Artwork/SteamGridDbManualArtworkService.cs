@@ -15,35 +15,35 @@ public sealed class SteamGridDbManualArtworkService
         {
             ["grid_p"] = new(
                 Id: "grid_p",
-                ApiPath: "grids/game/{0}?types=static&dimensions=600x900,342x482,660x930&mimes=image/png,image/jpeg,image/webp&page={1}",
+                ApiPath: "grids/game/{0}?types=static,animated&dimensions=600x900,342x482,660x930&mimes=image/png,image/jpeg,image/webp&epilepsy=false&page={1}",
                 FileStemBuilder: appId => $"{appId}p",
                 SteamAssetType: 0,
                 DefaultExtension: ".png",
                 DefaultMime: "image/png"),
             ["grid_l"] = new(
                 Id: "grid_l",
-                ApiPath: "grids/game/{0}?types=static&dimensions=920x430,460x215&mimes=image/png,image/jpeg,image/webp&page={1}",
+                ApiPath: "grids/game/{0}?types=static,animated&dimensions=920x430,460x215&mimes=image/png,image/jpeg,image/webp&epilepsy=false&page={1}",
                 FileStemBuilder: appId => appId.ToString(),
                 SteamAssetType: 3,
                 DefaultExtension: ".png",
                 DefaultMime: "image/png"),
             ["hero"] = new(
                 Id: "hero",
-                ApiPath: "heroes/game/{0}?types=static&dimensions=1920x620,3840x1240,1600x650&mimes=image/png,image/jpeg,image/webp&page={1}",
+                ApiPath: "heroes/game/{0}?types=static,animated&dimensions=1920x620,3840x1240,1600x650&mimes=image/png,image/jpeg,image/webp&epilepsy=false&page={1}",
                 FileStemBuilder: appId => $"{appId}_hero",
                 SteamAssetType: 1,
                 DefaultExtension: ".png",
                 DefaultMime: "image/png"),
             ["logo"] = new(
                 Id: "logo",
-                ApiPath: "logos/game/{0}?types=static&mimes=image/png,image/webp&page={1}",
+                ApiPath: "logos/game/{0}?types=static,animated&mimes=image/png,image/webp&epilepsy=false&page={1}",
                 FileStemBuilder: appId => $"{appId}_logo",
                 SteamAssetType: 2,
                 DefaultExtension: ".png",
                 DefaultMime: "image/png"),
             ["icon"] = new(
                 Id: "icon",
-                ApiPath: "icons/game/{0}?types=static&mimes=image/png,image/vnd.microsoft.icon&page={1}",
+                ApiPath: "icons/game/{0}?types=static,animated&mimes=image/png,image/vnd.microsoft.icon&epilepsy=false&page={1}",
                 FileStemBuilder: appId => $"{appId}-icon",
                 SteamAssetType: 4,
                 DefaultExtension: ".png",
@@ -233,7 +233,8 @@ public sealed class SteamGridDbManualArtworkService
                 asset.Width,
                 asset.Height,
                 asset.Mime ?? string.Empty,
-                asset.Style ?? string.Empty))
+                asset.Style ?? string.Empty,
+                IsAnimatedPreview(asset.Thumb)))
             .Take(configuration.ResultLimit)
             .ToArray() ?? [];
     }
@@ -278,8 +279,13 @@ public sealed class SteamGridDbManualArtworkService
             return CreateFailedResult(appId, assetType, "The selected artwork download was empty.");
         }
 
-        var extension = ResolveExtension(assetUri, downloadedArtwork.Mime, slot.DefaultExtension);
-        var mime = downloadedArtwork.Mime ?? ResolveMime(extension, slot.DefaultMime);
+        var sourceExtension = ResolveExtension(assetUri, downloadedArtwork.Mime, slot.DefaultExtension);
+        var mime = downloadedArtwork.Mime ?? ResolveMime(sourceExtension, slot.DefaultMime);
+        // Steam's client API expects animated WebP artwork to be labelled as PNG.
+        // The bytes stay untouched so every animation frame is preserved.
+        var extension = sourceExtension.Equals(".webp", StringComparison.OrdinalIgnoreCase)
+            ? ".png"
+            : sourceExtension;
         var steamPathState = _steamInstallationService.GetState();
         var writtenPath = TryWriteSteamGridFile(appId, slot, extension, bytes);
 
@@ -400,7 +406,7 @@ public sealed class SteamGridDbManualArtworkService
     private static string GetEffectiveApiKey(ArtworkConfiguration configuration)
     {
         return string.IsNullOrWhiteSpace(configuration.SteamGridDbApiKey)
-            ? SteamGridDbArtworkDownloader.BuiltInApiKey
+            ? OmniLibraryArtworkPipeline.BuiltInApiKey
             : configuration.SteamGridDbApiKey.Trim();
     }
 
@@ -533,6 +539,13 @@ public sealed class SteamGridDbManualArtworkService
             "image/png" => ".png",
             _ => fallback,
         };
+    }
+
+    private static bool IsAnimatedPreview(string? thumbnailUrl)
+    {
+        return Uri.TryCreate(thumbnailUrl, UriKind.Absolute, out var thumbnailUri) &&
+               Path.GetExtension(thumbnailUri.AbsolutePath)
+                   .Equals(".webm", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ResolveMime(string extension, string fallback)

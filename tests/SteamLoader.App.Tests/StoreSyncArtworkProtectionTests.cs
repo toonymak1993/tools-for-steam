@@ -133,14 +133,14 @@ public sealed class StoreSyncArtworkProtectionTests
                 new Uri(portraitPath).AbsoluteUri,
                 new Uri(heroPath).AbsoluteUri);
 
-            var summary = await new SteamGridDbArtworkDownloader().DownloadLocalFirstAsync(
+            var summary = await new OmniLibraryArtworkPipeline().DownloadLocalFirstAsync(
                 gridDirectory,
                 [target],
                 string.Empty,
                 CancellationToken.None);
 
             Assert.Equal(1, summary.UpdatedTitleCount);
-            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.True(OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId));
         }
         finally
         {
@@ -215,14 +215,14 @@ public sealed class StoreSyncArtworkProtectionTests
                 new Uri(heroPath).AbsoluteUri,
                 ForceReload: true);
 
-            var summary = await new SteamGridDbArtworkDownloader().DownloadLocalFirstAsync(
+            var summary = await new OmniLibraryArtworkPipeline().DownloadLocalFirstAsync(
                 gridDirectory,
                 [target],
                 string.Empty,
                 CancellationToken.None);
 
             Assert.Equal(1, summary.UpdatedTitleCount);
-            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.True(OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId));
             Assert.NotEqual(
                 portraitBefore,
                 File.ReadAllBytes(Path.Combine(gridDirectory, $"{gridId}p.png")));
@@ -254,17 +254,17 @@ public sealed class StoreSyncArtworkProtectionTests
             File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}p.png"), ValidPngBytes());
             File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_hero.png"), ValidPngBytes());
 
-            Assert.True(SteamGridDbArtworkDownloader.HasPrimaryArtworkSet(gridDirectory, appId));
-            Assert.False(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.True(OmniLibraryArtworkPipeline.HasPrimaryArtworkSet(gridDirectory, appId));
+            Assert.False(OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId));
             Assert.Equal(
                 ["logo", "icon"],
-                SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+                OmniLibraryArtworkPipeline.GetMissingArtworkSlots(gridDirectory, appId));
 
             File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_logo.png"), ValidPngBytes());
             File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}-icon.png"), ValidPngBytes());
 
-            Assert.True(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
-            Assert.Empty(SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+            Assert.True(OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.Empty(OmniLibraryArtworkPipeline.GetMissingArtworkSlots(gridDirectory, appId));
         }
         finally
         {
@@ -297,10 +297,10 @@ public sealed class StoreSyncArtworkProtectionTests
 
             File.WriteAllBytes(Path.Combine(gridDirectory, $"{gridId}_hero.png"), new byte[512]);
 
-            Assert.False(SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId));
+            Assert.False(OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId));
             Assert.Contains(
                 "hero",
-                SteamGridDbArtworkDownloader.GetMissingArtworkSlots(gridDirectory, appId));
+                OmniLibraryArtworkPipeline.GetMissingArtworkSlots(gridDirectory, appId));
         }
         finally
         {
@@ -319,7 +319,7 @@ public sealed class StoreSyncArtworkProtectionTests
             var sourcePath = Path.Combine(root, "source.png");
             File.WriteAllBytes(sourcePath, ValidPngBytes());
             using var httpClient = new HttpClient();
-            var method = typeof(SteamGridDbArtworkDownloader).GetMethod(
+            var method = typeof(OmniLibraryArtworkPipeline).GetMethod(
                 "DownloadAssetToTemporaryFileAsync",
                 BindingFlags.NonPublic | BindingFlags.Static);
 

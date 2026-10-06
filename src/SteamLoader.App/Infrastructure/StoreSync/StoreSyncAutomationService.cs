@@ -25,7 +25,8 @@ public sealed class StoreSyncAutomationService
         };
 
     private readonly StoreSyncService _storeSyncService;
-    private readonly Func<bool> _isPluginEnabled;
+    private readonly Func<bool> _isStoreSyncEnabled;
+    private readonly Func<bool> _isOmniLibraryEnabled;
     private readonly object _gate = new();
     private readonly Dictionary<string, FileSystemWatcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _watcherStoreIds = new(StringComparer.OrdinalIgnoreCase);
@@ -39,11 +40,16 @@ public sealed class StoreSyncAutomationService
 
     public StoreSyncAutomationService(
         StoreSyncService storeSyncService,
-        Func<bool>? isPluginEnabled = null)
+        Func<bool>? isStoreSyncEnabled = null,
+        Func<bool>? isOmniLibraryEnabled = null)
     {
         _storeSyncService = storeSyncService;
-        _isPluginEnabled = isPluginEnabled ?? (() => true);
+        _isStoreSyncEnabled = isStoreSyncEnabled ?? (() => true);
+        _isOmniLibraryEnabled = isOmniLibraryEnabled ?? (() => true);
     }
+
+    internal static bool ShouldRunWatchers(bool storeSyncEnabled, bool omniLibraryEnabled) =>
+        storeSyncEnabled || omniLibraryEnabled;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -54,7 +60,9 @@ public sealed class StoreSyncAutomationService
             while (!cancellationToken.IsCancellationRequested)
             {
                 var now = DateTimeOffset.UtcNow;
-                if (!_isPluginEnabled())
+                var storeSyncEnabled = _isStoreSyncEnabled();
+                var omniLibraryEnabled = _isOmniLibraryEnabled();
+                if (!ShouldRunWatchers(storeSyncEnabled, omniLibraryEnabled))
                 {
                     if (automationActive)
                     {
@@ -71,7 +79,7 @@ public sealed class StoreSyncAutomationService
 
                 if (!automationActive)
                 {
-                    RefreshWatchers();
+                    RefreshWatchers(storeSyncEnabled, omniLibraryEnabled);
                     automationActive = true;
                     _nextPollAtUtc = now;
                     _nextWatcherRefreshAtUtc = now.Add(WatcherRefreshInterval);
@@ -79,13 +87,13 @@ public sealed class StoreSyncAutomationService
 
                 if (now >= _nextWatcherRefreshAtUtc)
                 {
-                    RefreshWatchers();
+                    RefreshWatchers(storeSyncEnabled, omniLibraryEnabled);
                     _nextWatcherRefreshAtUtc = now.Add(WatcherRefreshInterval);
                 }
 
                 if (now >= _nextPollAtUtc)
                 {
-                    if (_isPluginEnabled())
+                    if (storeSyncEnabled)
                     {
                         _storeSyncService.TryRunAutomaticUnifySteamRefresh();
                     }
@@ -118,6 +126,11 @@ public sealed class StoreSyncAutomationService
 
     private void TryCheckOmniLibraryStores(IReadOnlyCollection<string> storeIds)
     {
+        if (!_isOmniLibraryEnabled())
+        {
+            return;
+        }
+
         foreach (var storeId in storeIds)
         {
             try
@@ -134,7 +147,7 @@ public sealed class StoreSyncAutomationService
     {
         try
         {
-            if (!_isPluginEnabled())
+            if (!_isStoreSyncEnabled())
             {
                 return;
             }
@@ -185,24 +198,41 @@ public sealed class StoreSyncAutomationService
             _lastWatcherEventAtUtc = null;
         }
 
-        if (omniLibraryStoreIds.Length > 0)
+        if (omniLibraryStoreIds.Length > 0 && _isOmniLibraryEnabled())
         {
             TryCheckOmniLibraryStores(omniLibraryStoreIds);
         }
 
-        if (!_storeSyncService.TryQueueLocalLibraryDelta(changedPath))
+        if (_isOmniLibraryEnabled() &&
+            Path.GetFileName(changedPath).Equals(
+                "shortcuts.vdf",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var storeId in _storeSyncService.GetEnabledUnifySteamStoreIds())
+            {
+                _storeSyncService.QueueOmniLibraryLocalReconciliation(
+                    storeId,
+                    "omnilibrary-shortcuts-watch");
+            }
+            return;
+        }
+
+        if (!_storeSyncService.TryQueueLocalLibraryDelta(changedPath) &&
+            _isStoreSyncEnabled())
         {
             TryRunAutomaticSync(triggerSource);
         }
     }
 
-    private void RefreshWatchers()
+    private void RefreshWatchers(bool storeSyncEnabled, bool omniLibraryEnabled)
     {
         IReadOnlyList<StoreSyncService.StoreSyncWatchTarget> targets;
 
         try
         {
-            targets = _storeSyncService.GetAutomationWatchTargets();
+            targets = _storeSyncService.GetAutomationWatchTargets(
+                storeSyncEnabled,
+                omniLibraryEnabled);
         }
         catch
         {

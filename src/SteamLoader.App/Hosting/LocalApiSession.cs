@@ -88,9 +88,7 @@ public static class LocalApiSession
         }
 
         return path.Equals("/health", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWith("/api/plugin-store/images/built-in/", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWith("/api/plugin-store/images/catalog/", StringComparison.OrdinalIgnoreCase) ||
-            IsCommunityPluginFilePath(path);
+            path.StartsWith("/api/plugin-activator/images/", StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsAuthorized(string expectedToken, string? headerToken, string? queryToken, string method)
@@ -116,10 +114,4 @@ public static class LocalApiSession
             char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
     }
 
-    private static bool IsCommunityPluginFilePath(string path)
-    {
-        const string prefix = "/api/plugin-store/community/";
-        return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/files/", StringComparison.OrdinalIgnoreCase);
-    }
 }

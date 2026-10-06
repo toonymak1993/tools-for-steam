@@ -129,6 +129,21 @@ internal static class GogOperationJournal
         return result;
     }
 
+    public static long GetRevision()
+    {
+        try
+        {
+            var file = new FileInfo(FilePath);
+            return file.Exists
+                ? HashCode.Combine(file.LastWriteTimeUtc.Ticks, file.Length)
+                : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     public static GogOperationTransaction BeginInstall(
         string gameId,
         string installRoot,

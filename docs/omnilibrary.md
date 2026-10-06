@@ -6,7 +6,7 @@ OmniLibrary brings external account libraries into Steam's native Library UI. Th
 
 1. Open **OmniLibrary** in Quick Access and enable only the stores you want.
 2. Use **Download Center** at the top of the plugin to inspect all current and recent store transfers.
-3. Xbox reuses the signed-in official Xbox app. Epic and GOG sign in through TFS's isolated browser window.
+3. Xbox, Epic, and GOG sign in through TFS's isolated browser window. Xbox library detection also reuses the official Xbox app's local installation state.
 4. Let the initial catalog and artwork preparation finish.
 5. Use **Restart Steam Now** when OmniLibrary reports that a restart is required.
 6. Browse the dedicated **Xbox**, optional **Xbox Cloud**, **Epic**, and **GOG** tabs with LB/RB.
@@ -19,7 +19,39 @@ The plugin page contains settings plus the shared Download Center. Browsing and 
 
 Catalog items are represented by managed non-Steam entries with stable provider IDs. Delta sync updates only added, changed, or removed games after the first preparation; unchanged artwork is reused. Each enabled, connected, fully prepared provider is published as its own tab. Disabled or disconnected providers do no polling and do not expose a tab.
 
+Before creating a shortcut, OmniLibrary first matches the durable provider game
+identity and then an unambiguous normalized title. A single existing non-Steam
+entry is taken into OmniLibrary's managed sync, even when it came from an older
+installation with another executable path or launch format. Its Steam app ID
+is preserved while the executable, launch identity, and ownership metadata are
+refreshed in place. Ambiguous same-title entries are never guessed. Duplicate
+entries already carrying OmniLibrary ownership or launch metadata are collapsed
+to one canonical entry.
+
 The detail-page surface first resolves the current Steam app ID against OmniLibrary's own cache. It changes labels and exposes managed context actions only for that exact managed entry. Native Steam games and unrelated non-Steam games are not modified.
+
+### Game data matching
+
+OmniLibrary requests Steam descriptions, developers, publishers, release data,
+ratings, screenshots, and activity in the current Windows language and market.
+Automatic matching stays conservative so numbered sequels and similarly named
+games are never guessed.
+
+Every successfully resolved game page is stored in TFS's durable metadata cache
+and mirrored into a small, bounded Steam UI snapshot cache. Reopening a game
+therefore paints its last good Game Info, activity, screenshots, and achievements
+immediately without waiting for a provider. Entering the page starts one
+asynchronous refresh; completed sections are published progressively while
+failures retain the last good data. The UI cache keeps at most twelve recent
+games and the backend removes entries that have not been used for 90 days.
+
+When a title is missing data or was matched incorrectly, open its Steam context
+menu and choose **Fix Game Data...**. The controller-native correction screen
+can search Steam with a cleaned-up title, preview the current source, save one
+explicit Steam app match, refresh it, or return to automatic matching. Manual
+matches are stored against the durable `<provider>:<providerGameId>` identity,
+not the generated shortcut app ID, so they survive shortcut repair and Steam
+restarts. Changing one title invalidates only that title's metadata cache.
 
 ## Download Center
 
@@ -36,10 +68,13 @@ The first section in OmniLibrary is a controller-native Download Center shared b
 
 ## Sync and performance
 
-- A lightweight change check runs every five minutes for each enabled provider.
+- Two seconds after the TFS background host starts, every enabled provider gets an offline local consistency check. It queues only missing, duplicated, moved, or incompletely illustrated shortcuts and never blocks startup on a provider network call.
+- Remote catalog checks begin after a separate 20-second startup grace period. A lightweight check then runs roughly every five minutes per enabled provider, with small jitter and isolated exponential backoff after failures.
+- Provider refreshes use independent per-store gates and cancellation. A slow Xbox request therefore cannot hold GOG or Epic's scheduled check behind the same global lock.
+- OmniLibrary owns its `shortcuts.vdf`, ROM-folder, and launcher-manifest watchers even when the legacy Store Sync plugin is disabled. An external Steam rewrite queues an offline repair instead of forcing a catalog download.
 - Only catalog or install-state deltas queue shortcut and artwork work.
-- Active downloads are observed more frequently only while their game page is visible.
-- Active install and uninstall lifecycles use the lightweight two-second status path. Completion triggers one compact installed-state delta refresh; it never queues a catalog or artwork rebuild.
+- Active downloads use the lightweight two-second local status path independently of the visible Steam page.
+- A confirmed install or uninstall triggers one asynchronous, game-scoped shortcut reconciliation. Download percentage updates never queue sync work, and the five-minute remote catalog check remains only a safety net for entitlement changes.
 - Active managed downloads block system sleep but do not force the display to remain on.
 - The native Steam action animates while work is active, and a compact phase panel explains preparation, queueing, transfer, reconnect, pause, finalization, required store action, or a confirmed failure.
 - Network, processing, disk throughput, downloaded size, and estimated remaining time are shown when the provider exposes those values.
@@ -49,11 +84,15 @@ The first section in OmniLibrary is a controller-native Download Center shared b
 - File mutations are serialized per provider so simultaneous Epic or GOG installs and uninstalls cannot corrupt helper state.
 - A failed recovery or cleanup remains isolated to that game; it cannot prevent another store's transfer from resuming.
 - The first preparation may require substantial artwork work; later syncs reuse cached assets.
+- Each store exposes its last local check, last successful remote check, next scheduled attempt, and current retry detail in the OmniLibrary UI. Artwork source failures are bounded and journaled per title instead of being swallowed silently.
 
 ### Artwork source order
 
-Artwork is filled progressively without replacing a usable Steam slot. The source
-order is fixed so SteamGridDB is never a single point of failure:
+Xbox, Xbox Cloud, Epic, GOG, and every ROM/emulator integration feed the same
+provider-neutral `OmniLibraryArtworkPipeline`; provider catalog code only
+supplies metadata and never downloads community artwork itself. Artwork is
+filled progressively without replacing a usable Steam slot. The source order is
+fixed so SteamGridDB is never a single point of failure:
 
 1. Existing Steam grid files, Steam's local `appcache\librarycache`, explicit
    `file://` images, ROM sidecars, bounded artwork folders inside an installed
@@ -76,6 +115,8 @@ Steam games and unrelated non-Steam shortcuts are never included.
 ## Xbox behavior
 
 The Xbox library combines the public PC Game Pass PC catalog, optional cloud catalog data, and locally detected `XboxGames` manifests. A configured library path is scanned in addition to standard fixed-drive roots.
+
+Xbox achievement progress uses Microsoft's public desktop OAuth flow with PKCE and the same public-client registration as ORBIT. TFS never asks for or stores the Microsoft password and requires no client secret. The long-lived refresh token is protected with Windows DPAPI; Microsoft access tokens plus Xbox/XSTS service tokens remain in process memory. Achievement definitions, progress, unlock timestamps, icons, and exact title-history mappings are fetched directly from Xbox Live only when a matching game page is opened, manually refreshed, or refreshed after play. Existing OpenXBL credentials remain readable for backward compatibility but are no longer required for a new Xbox connection.
 
 **Download** makes a best-effort request through Windows' Store installation broker. That broker is protected by a private Microsoft capability, so a normal public build can be denied. The safe fallback opens only `msxbox://game/?productId=<id>` for the exact product and never clicks or confirms anything on the user's behalf. Download percentages are best-effort observations of Windows/Xbox deployment events and are reconciled with the installed package scan at completion.
 
@@ -153,8 +194,8 @@ upstream version, hash, license, and corresponding source.
 
 ## Local data and security
 
-- Xbox passwords and tokens stay inside the official Xbox app.
-- TFS checks only whether Microsoft's account/token cache has sign-in state; it never copies token contents.
+- Xbox sign-in happens on Microsoft's page inside an isolated WebView2 profile; TFS never receives the password.
+- The Xbox refresh token is encrypted for the current Windows user with DPAPI. Short-lived Microsoft access and Xbox/XSTS service tokens are never exposed to the frontend or written to logs.
 - Epic and GOG session data is isolated from their official launchers and can be removed from OmniLibrary settings.
 - Provider and game IDs are validated against the cached library before launch, install, or uninstall workers start.
 - Worker arguments use `ProcessStartInfo.ArgumentList`; game IDs are never concatenated into a shell command.

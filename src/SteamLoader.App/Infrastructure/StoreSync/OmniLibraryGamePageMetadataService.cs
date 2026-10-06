@@ -31,6 +31,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
     private static readonly TimeSpan UnmatchedSourceMatchLifetime = TimeSpan.FromHours(6);
     private static readonly TimeSpan FailureBackoff = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan UnusedEntryLifetime = TimeSpan.FromDays(90);
+    private static readonly TimeSpan OpenRefreshThrottle = TimeSpan.FromSeconds(5);
     private static readonly Regex HtmlTagPattern = HtmlTagRegex();
     private static readonly Regex BbCodePattern = BbCodeRegex();
     private static readonly Regex ImageUrlPattern = ImageUrlRegex();
@@ -45,9 +46,14 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly OmniLibraryAchievementProvider _achievementProvider;
-    private readonly SemaphoreSlim _networkGate = new(2, 2);
+    // Metadata is requested per visible title. Keep the fan-out bounded, but
+    // allow several page refreshes to overlap so background work for a game
+    // the user just left cannot delay the next game page.
+    private readonly SemaphoreSlim _networkGate = new(4, 4);
     private readonly object _cacheGate = new();
     private readonly ConcurrentDictionary<string, Lazy<Task<CacheEntry>>> _refreshes =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _openRefreshes =
         new(StringComparer.OrdinalIgnoreCase);
     private CacheDocument? _cache;
     private long _revision;
@@ -81,6 +87,19 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         bool forceRefresh,
         CancellationToken cancellationToken)
     {
+        return await GetAsync(
+            shortcutAppId,
+            forceRefresh,
+            refreshOnOpen: false,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<OmniLibraryGamePageMetadataSnapshot?> GetAsync(
+        uint shortcutAppId,
+        bool forceRefresh,
+        bool refreshOnOpen,
+        CancellationToken cancellationToken)
+    {
         ThrowIfDisposed();
         var gameDetail = _gameProvider(shortcutAppId);
         if (gameDetail.Game is null ||
@@ -103,6 +122,30 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         if (!validIdentity)
         {
             entry = null;
+        }
+
+        if (!forceRefresh && refreshOnOpen)
+        {
+            var hadCachedEntry = entry is not null;
+            entry ??= CreateInitialEntry(identity, gameDetail, now);
+            var lastOpenRefresh = _openRefreshes.GetOrAdd(identity, now);
+            var refreshAllowed = !hadCachedEntry ||
+                                 lastOpenRefresh == now ||
+                                 now - lastOpenRefresh >= OpenRefreshThrottle;
+            if (refreshAllowed)
+            {
+                _openRefreshes[identity] = now;
+                _ = StartRefreshAsync(
+                    identity,
+                    gameDetail,
+                    entry,
+                    forceRefresh: true);
+            }
+            TouchEntry(identity, now);
+            return BuildSnapshot(
+                entry,
+                refreshing: refreshAllowed || _refreshes.ContainsKey(identity),
+                cached: hadCachedEntry);
         }
 
         var achievementFingerprint =
@@ -156,6 +199,165 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
             return BuildUnavailableSnapshot(gameDetail, FriendlyError(error));
         }
+    }
+
+    private CacheEntry CreateInitialEntry(
+        string identity,
+        UnifySteamGameDetailSnapshot gameDetail,
+        DateTimeOffset now)
+    {
+        var game = gameDetail.Game!;
+        var manualSteamAppId = GetSteamMatchOverride(identity);
+        var entry = new CacheEntry
+        {
+            Revision = Interlocked.Increment(ref _revision),
+            ShortcutAppId = game.SteamAppId,
+            StoreId = gameDetail.StoreId,
+            GameId = game.Id,
+            Title = game.Title.Trim(),
+            SourceSteamAppId = manualSteamAppId,
+            MetadataSource = manualSteamAppId.HasValue
+                ? "Steam (selected)"
+                : string.Empty,
+            MatchMode = manualSteamAppId.HasValue ? "manual" : "automatic",
+            SourceMatchedAtUtc = manualSteamAppId.HasValue ? now : null,
+            AchievementConfigurationFingerprint =
+                _achievementProvider.GetConfigurationFingerprint(gameDetail),
+            LastAccessedAtUtc = now,
+            GameInfo = EmptyGameInfo(game.Title, manualSteamAppId),
+            Achievements = StoreAchievementPlaceholder(gameDetail.StoreId),
+        };
+        entry.ContentHash = ComputeContentHash(entry);
+        SaveEntry(identity, entry);
+        return entry;
+    }
+
+    public async Task<IReadOnlyList<OmniLibraryMetadataSearchResult>> SearchSteamMatchesAsync(
+        uint shortcutAppId,
+        string? query,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        var gameDetail = _gameProvider(shortcutAppId);
+        if (gameDetail.Game is null ||
+            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
+            gameDetail.Game.SteamAppId != shortcutAppId)
+        {
+            return [];
+        }
+
+        var term = string.IsNullOrWhiteSpace(query)
+            ? gameDetail.Game.Title.Trim()
+            : query.Trim();
+        if (string.IsNullOrWhiteSpace(term))
+        {
+            return [];
+        }
+
+        await _networkGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var (language, market) = GetSteamLocale();
+            var url =
+                $"https://store.steampowered.com/api/storesearch/?term={Uri.EscapeDataString(term)}" +
+                $"&l={Uri.EscapeDataString(language)}&cc={Uri.EscapeDataString(market)}";
+            using var response = await _httpClient.GetAsync(url, cancellationToken)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken)
+                .ConfigureAwait(false);
+            using var document = await JsonDocument.ParseAsync(
+                stream,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (!document.RootElement.TryGetProperty("items", out var items) ||
+                items.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            var requested = NormalizeTitle(term);
+            return items.EnumerateArray()
+                .Take(30)
+                .Select(item =>
+                {
+                    var appId = item.TryGetProperty("id", out var idNode) &&
+                                idNode.TryGetInt32(out var parsedId)
+                        ? parsedId
+                        : 0;
+                    var title = GetString(item, "name");
+                    var imageUrl = GetString(item, "tiny_image");
+                    var price = item.TryGetProperty("price", out var priceNode)
+                        ? GetString(priceNode, "final_formatted")
+                        : string.Empty;
+                    return new OmniLibraryMetadataSearchResult(
+                        appId,
+                        title,
+                        imageUrl,
+                        price,
+                        ScoreSearchResult(requested, NormalizeTitle(title)));
+                })
+                .Where(item => item.SteamAppId > 0 && !string.IsNullOrWhiteSpace(item.Title))
+                .GroupBy(item => item.SteamAppId)
+                .Select(group => group.First())
+                .OrderBy(item => item.MatchScore)
+                .ThenBy(item => item.Title, StringComparer.CurrentCultureIgnoreCase)
+                .Take(12)
+                .ToArray();
+        }
+        finally
+        {
+            _networkGate.Release();
+        }
+    }
+
+    public async Task<OmniLibraryGamePageMetadataSnapshot?> SetSteamMatchAsync(
+        uint shortcutAppId,
+        int steamAppId,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        if (steamAppId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(steamAppId),
+                "A positive Steam app ID is required.");
+        }
+
+        var gameDetail = _gameProvider(shortcutAppId);
+        if (gameDetail.Game is null ||
+            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
+            gameDetail.Game.SteamAppId != shortcutAppId)
+        {
+            return null;
+        }
+
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game.Id);
+        await AwaitActiveRefreshBeforeMatchChangeAsync(identity, cancellationToken)
+            .ConfigureAwait(false);
+        SaveSteamMatchOverride(identity, steamAppId);
+        return await GetAsync(shortcutAppId, forceRefresh: true, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<OmniLibraryGamePageMetadataSnapshot?> ClearSteamMatchAsync(
+        uint shortcutAppId,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        var gameDetail = _gameProvider(shortcutAppId);
+        if (gameDetail.Game is null ||
+            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
+            gameDetail.Game.SteamAppId != shortcutAppId)
+        {
+            return null;
+        }
+
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game.Id);
+        await AwaitActiveRefreshBeforeMatchChangeAsync(identity, cancellationToken)
+            .ConfigureAwait(false);
+        SaveSteamMatchOverride(identity, null);
+        return await GetAsync(shortcutAppId, forceRefresh: true, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public void Dispose()
@@ -234,18 +436,24 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
             var game = gameDetail.Game!;
             var title = game.Title.Trim();
-            var sourceSteamAppId = previous?.SourceSteamAppId;
+            var manualSteamAppId = GetSteamMatchOverride(identity);
+            var sourceSteamAppId = manualSteamAppId ?? previous?.SourceSteamAppId;
             var sourceMatchedAtUtc = previous?.SourceMatchedAtUtc;
+            if (manualSteamAppId.HasValue)
+            {
+                sourceMatchedAtUtc = now;
+            }
             var sourceMatchLifetime = sourceSteamAppId.HasValue
                 ? SourceMatchLifetime
                 : UnmatchedSourceMatchLifetime;
             var needsSourceMatch =
-                forceRefresh ||
+                !manualSteamAppId.HasValue &&
+                (forceRefresh ||
                 !sourceMatchedAtUtc.HasValue ||
                 now - sourceMatchedAtUtc.Value >= sourceMatchLifetime ||
                 !NormalizeTitle(previous?.Title ?? string.Empty).Equals(
                     NormalizeTitle(title),
-                    StringComparison.Ordinal);
+                    StringComparison.Ordinal));
             if (needsSourceMatch)
             {
                 sourceSteamAppId = await ResolveSteamAppIdAsync(
@@ -281,7 +489,71 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             var refreshedAnySection = false;
             var failures = new List<string>();
 
-            if (gameDetail.StoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
+            CacheEntry PersistProgress()
+            {
+                var next = new CacheEntry
+                {
+                    ShortcutAppId = game.SteamAppId,
+                    StoreId = gameDetail.StoreId,
+                    GameId = game.Id,
+                    Title = title,
+                    SourceSteamAppId = sourceSteamAppId,
+                    MetadataSource = metadataSource,
+                    MatchMode = manualSteamAppId.HasValue ? "manual" : "automatic",
+                    SourceMatchedAtUtc = sourceMatchedAtUtc,
+                    InfoRefreshedAtUtc = infoRefreshedAtUtc,
+                    ActivityRefreshedAtUtc = activityRefreshedAtUtc,
+                    AchievementsRefreshedAtUtc = achievementDefinitionsRefreshedAtUtc,
+                    AchievementDefinitionsRefreshedAtUtc =
+                        achievementDefinitionsRefreshedAtUtc,
+                    AchievementProgressRefreshedAtUtc =
+                        achievementProgressRefreshedAtUtc,
+                    AchievementRetryAfterUtc = achievementRetryAfterUtc,
+                    AchievementLastError = achievementLastError,
+                    AchievementProviderState = achievementProviderState,
+                    AchievementConfigurationFingerprint =
+                        achievementConfigurationFingerprint,
+                    LastAccessedAtUtc = now,
+                    RefreshedAtUtc = refreshedAnySection
+                        ? now
+                        : previous?.RefreshedAtUtc,
+                    RetryAfterUtc = failures.Count > 0
+                        ? now.Add(FailureBackoff)
+                        : null,
+                    LastError = string.Join(
+                        " ",
+                        failures.Append(achievementLastError)
+                            .Where(value => !string.IsNullOrWhiteSpace(value))),
+                    GameInfo = gameInfo,
+                    Activity = activity,
+                    Community = community,
+                    Achievements = achievements,
+                };
+                next.ContentHash = ComputeContentHash(next);
+
+                if (previous is not null &&
+                    previous.ContentHash.Equals(next.ContentHash, StringComparison.Ordinal) &&
+                    previous.ShortcutAppId == next.ShortcutAppId)
+                {
+                    next.Revision = previous.Revision;
+                }
+                else
+                {
+                    next.Revision = Interlocked.Increment(ref _revision);
+                }
+
+                SaveEntry(identity, next);
+                previous = next;
+                return next;
+            }
+
+            if (needsSourceMatch)
+            {
+                PersistProgress();
+            }
+
+            if (!manualSteamAppId.HasValue &&
+                gameDetail.StoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
                 (forceRefresh ||
                  !metadataSource.Equals("Xbox", StringComparison.OrdinalIgnoreCase) ||
                  !infoRefreshedAtUtc.HasValue ||
@@ -298,6 +570,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     metadataSource = "Xbox";
                     infoRefreshedAtUtc = now;
                     refreshedAnySection = true;
+                    PersistProgress();
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
@@ -317,9 +590,12 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                         cancellationToken).ConfigureAwait(false);
                     gameInfo = details.GameInfo;
                     community = details.Community;
-                    metadataSource = "Steam";
+                    metadataSource = manualSteamAppId.HasValue
+                        ? "Steam (selected)"
+                        : "Steam";
                     infoRefreshedAtUtc = now;
                     refreshedAnySection = true;
+                    PersistProgress();
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
@@ -340,6 +616,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                         cancellationToken).ConfigureAwait(false);
                     activityRefreshedAtUtc = now;
                     refreshedAnySection = true;
+                    PersistProgress();
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
@@ -394,6 +671,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     achievementConfigurationFingerprint =
                         _achievementProvider.GetConfigurationFingerprint(gameDetail);
                     refreshedAnySection = true;
+                    PersistProgress();
                 }
                 else
                 {
@@ -416,6 +694,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     }
                     achievementDefinitionsRefreshedAtUtc = now;
                     refreshedAnySection = true;
+                    PersistProgress();
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
@@ -433,58 +712,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     "No high-confidence Steam match was found. The store artwork and shortcut remain unchanged.");
             }
 
-            var next = new CacheEntry
-            {
-                ShortcutAppId = game.SteamAppId,
-                StoreId = gameDetail.StoreId,
-                GameId = game.Id,
-                Title = title,
-                SourceSteamAppId = sourceSteamAppId,
-                MetadataSource = metadataSource,
-                SourceMatchedAtUtc = sourceMatchedAtUtc,
-                InfoRefreshedAtUtc = infoRefreshedAtUtc,
-                ActivityRefreshedAtUtc = activityRefreshedAtUtc,
-                AchievementsRefreshedAtUtc = achievementDefinitionsRefreshedAtUtc,
-                AchievementDefinitionsRefreshedAtUtc =
-                    achievementDefinitionsRefreshedAtUtc,
-                AchievementProgressRefreshedAtUtc =
-                    achievementProgressRefreshedAtUtc,
-                AchievementRetryAfterUtc = achievementRetryAfterUtc,
-                AchievementLastError = achievementLastError,
-                AchievementProviderState = achievementProviderState,
-                AchievementConfigurationFingerprint =
-                    achievementConfigurationFingerprint,
-                LastAccessedAtUtc = now,
-                RefreshedAtUtc = refreshedAnySection
-                    ? now
-                    : previous?.RefreshedAtUtc,
-                RetryAfterUtc = failures.Count > 0
-                    ? now.Add(FailureBackoff)
-                    : null,
-                LastError = string.Join(
-                    " ",
-                    failures.Append(achievementLastError)
-                        .Where(value => !string.IsNullOrWhiteSpace(value))),
-                GameInfo = gameInfo,
-                Activity = activity,
-                Community = community,
-                Achievements = achievements,
-            };
-            next.ContentHash = ComputeContentHash(next);
-
-            if (previous is not null &&
-                previous.ContentHash.Equals(next.ContentHash, StringComparison.Ordinal) &&
-                previous.ShortcutAppId == next.ShortcutAppId)
-            {
-                next.Revision = previous.Revision;
-            }
-            else
-            {
-                next.Revision = Interlocked.Increment(ref _revision);
-            }
-
-            SaveEntry(identity, next);
-            return next;
+            return PersistProgress();
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
@@ -529,8 +757,10 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
         foreach (var term in searchTerms)
         {
+            var (language, market) = GetSteamLocale();
             var url =
-                $"https://store.steampowered.com/api/storesearch/?term={Uri.EscapeDataString(term)}&l=english&cc=US";
+                $"https://store.steampowered.com/api/storesearch/?term={Uri.EscapeDataString(term)}" +
+                $"&l={Uri.EscapeDataString(language)}&cc={Uri.EscapeDataString(market)}";
             using var response = await _httpClient.GetAsync(url, cancellationToken)
                 .ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
@@ -596,8 +826,10 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             string fallbackTitle,
             CancellationToken cancellationToken)
     {
+        var (language, market) = GetSteamLocale();
         var url =
-            $"https://store.steampowered.com/api/appdetails?appids={steamAppId}&l=english&cc=US";
+            $"https://store.steampowered.com/api/appdetails?appids={steamAppId}" +
+            $"&l={Uri.EscapeDataString(language)}&cc={Uri.EscapeDataString(market)}";
         using var response = await _httpClient.GetAsync(url, cancellationToken)
             .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
@@ -1166,6 +1398,61 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         }
     }
 
+    private int? GetSteamMatchOverride(string identity)
+    {
+        lock (_cacheGate)
+        {
+            var cache = LoadCacheLocked();
+            return cache.SteamAppIdOverrides.TryGetValue(identity, out var appId) && appId > 0
+                ? appId
+                : null;
+        }
+    }
+
+    private async Task AwaitActiveRefreshBeforeMatchChangeAsync(
+        string identity,
+        CancellationToken cancellationToken)
+    {
+        if (!_refreshes.TryGetValue(identity, out var refresh))
+        {
+            return;
+        }
+        try
+        {
+            await refresh.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // A failed automatic refresh must not prevent an explicit user fix.
+        }
+    }
+
+    private void SaveSteamMatchOverride(string identity, int? steamAppId)
+    {
+        lock (_cacheGate)
+        {
+            var cache = LoadCacheLocked();
+            if (steamAppId is > 0)
+            {
+                cache.SteamAppIdOverrides[identity] = steamAppId.Value;
+            }
+            else
+            {
+                cache.SteamAppIdOverrides.Remove(identity);
+            }
+
+            // Metadata, activity and achievement definitions can all be tied to
+            // the previous match. Rebuild the game-scoped entry without touching
+            // any other title or provider cache.
+            cache.Entries.Remove(identity);
+            SaveCacheLocked(cache);
+        }
+    }
+
     private CacheDocument LoadCacheLocked()
     {
         if (_cache is not null)
@@ -1187,12 +1474,21 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         }
 
         _cache ??= new CacheDocument();
+        _cache.SchemaVersion = 2;
         _cache.Entries ??=
             new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
+        _cache.SteamAppIdOverrides ??=
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         if (_cache.Entries.Comparer != StringComparer.OrdinalIgnoreCase)
         {
             _cache.Entries = new Dictionary<string, CacheEntry>(
                 _cache.Entries,
+                StringComparer.OrdinalIgnoreCase);
+        }
+        if (_cache.SteamAppIdOverrides.Comparer != StringComparer.OrdinalIgnoreCase)
+        {
+            _cache.SteamAppIdOverrides = new Dictionary<string, int>(
+                _cache.SteamAppIdOverrides,
                 StringComparer.OrdinalIgnoreCase);
         }
 
@@ -1320,6 +1616,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 : entry.SourceSteamAppId.HasValue
                     ? "Steam"
                     : entry.StoreId,
+            entry.MatchMode,
             entry.LastError,
             entry.GameInfo,
             entry.Activity,
@@ -1345,6 +1642,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             DateTimeOffset.UtcNow.Add(FailureBackoff),
             null,
             gameDetail.StoreId,
+            "automatic",
             warning,
             EmptyGameInfo(game.Title, null),
             [],
@@ -1425,6 +1723,68 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             return 1;
         }
         return -1;
+    }
+
+    private static int ScoreSearchResult(string requested, string candidate)
+    {
+        var exactScore = ScoreTitleMatch(requested, candidate);
+        if (exactScore >= 0)
+        {
+            return exactScore;
+        }
+        if (string.IsNullOrWhiteSpace(requested) || string.IsNullOrWhiteSpace(candidate))
+        {
+            return 1000;
+        }
+
+        var requestedNumbers = ExtractNumbers(requested);
+        var candidateNumbers = ExtractNumbers(candidate);
+        var numberPenalty = requestedNumbers.SetEquals(candidateNumbers) ? 0 : 100;
+        var containmentScore = requested.Contains(candidate, StringComparison.Ordinal) ||
+                               candidate.Contains(requested, StringComparison.Ordinal)
+            ? 10
+            : 30;
+        return numberPenalty + containmentScore + Math.Abs(requested.Length - candidate.Length);
+    }
+
+    private static (string Language, string Market) GetSteamLocale()
+    {
+        var culture = CultureInfo.CurrentUICulture;
+        var language = culture.TwoLetterISOLanguageName.ToLowerInvariant() switch
+        {
+            "de" => "german",
+            "fr" => "french",
+            "it" => "italian",
+            "es" => "spanish",
+            "pt" when culture.Name.Equals("pt-BR", StringComparison.OrdinalIgnoreCase) => "brazilian",
+            "pt" => "portuguese",
+            "pl" => "polish",
+            "ru" => "russian",
+            "uk" => "ukrainian",
+            "tr" => "turkish",
+            "cs" => "czech",
+            "hu" => "hungarian",
+            "nl" => "dutch",
+            "da" => "danish",
+            "fi" => "finnish",
+            "no" => "norwegian",
+            "sv" => "swedish",
+            "ja" => "japanese",
+            "ko" => "koreana",
+            "zh" when culture.Name.Contains("Hans", StringComparison.OrdinalIgnoreCase) ||
+                      culture.Name.EndsWith("CN", StringComparison.OrdinalIgnoreCase) => "schinese",
+            "zh" => "tchinese",
+            _ => "english",
+        };
+        var market = "US";
+        try
+        {
+            market = new RegionInfo(culture.Name).TwoLetterISORegionName.ToUpperInvariant();
+        }
+        catch
+        {
+        }
+        return (language, market);
     }
 
     private static HashSet<string> ExtractNumbers(string title) =>
@@ -1545,9 +1905,12 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
     private sealed class CacheDocument
     {
-        public int SchemaVersion { get; set; } = 1;
+        public int SchemaVersion { get; set; } = 2;
 
         public Dictionary<string, CacheEntry> Entries { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<string, int> SteamAppIdOverrides { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
     }
 
@@ -1566,6 +1929,8 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         public int? SourceSteamAppId { get; init; }
 
         public string MetadataSource { get; init; } = string.Empty;
+
+        public string MatchMode { get; init; } = "automatic";
 
         public DateTimeOffset? SourceMatchedAtUtc { get; init; }
 

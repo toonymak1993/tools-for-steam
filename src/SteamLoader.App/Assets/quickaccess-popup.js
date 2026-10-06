@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 149;
+  const stateVersion = 156;
   const popupScriptVersion = "__STEAMLOADER_SCRIPT_VERSION__";
   const globalBackSlotKey = "global-back";
   const sliderCommitSettleDelayMs = 180;
@@ -24,6 +24,15 @@
     delete window[retiredTabRuntimeKey];
     window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroSettings.v1"].join(""));
     window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroCatalog.v1"].join(""));
+  } catch (_) {}
+
+  try {
+    for (const plugin of Object.values(window.ToolsForSteamCommunityPlugins || {})) {
+      plugin?.dispose?.();
+    }
+    delete window.ToolsForSteamCommunityPlugins;
+    document.querySelectorAll("[id^='steamloader-community-plugin-script-']")
+      .forEach((element) => element.remove());
   } catch (_) {}
 
   window.__steamLoaderApiBase = apiBase;
@@ -80,6 +89,7 @@
 
   if (window.__steamLoaderFocusRepairHandler) {
     document.removeEventListener("focusout", window.__steamLoaderFocusRepairHandler, true);
+    window.removeEventListener("blur", window.__steamLoaderFocusRepairHandler, true);
     window.__steamLoaderFocusRepairHandler = null;
   }
 
@@ -198,7 +208,42 @@
     }
 
     try {
+      previousState?.fallbackControllerNavigation?.registration?.unregister?.();
+    } catch {
+    }
+
+    if (previousState?.fallbackControllerNavigation?.keyHandler) {
+      document.removeEventListener(
+        "keydown",
+        previousState.fallbackControllerNavigation.keyHandler,
+        true,
+      );
+    }
+
+    if (previousState?.fallbackControllerNavigation?.nativeFocusRepairTimer) {
+      window.clearTimeout(previousState.fallbackControllerNavigation.nativeFocusRepairTimer);
+    }
+
+    if (previousState?.nativeUi?.captureTimer) {
+      window.clearInterval(previousState.nativeUi.captureTimer);
+    }
+    if (previousState?.nativeUi?.captureHandler) {
+      document.removeEventListener("focusin", previousState.nativeUi.captureHandler, true);
+      document.removeEventListener("pointerdown", previousState.nativeUi.captureHandler, true);
+      document.removeEventListener("click", previousState.nativeUi.captureHandler, true);
+    }
+
+    try {
       previousState?.[["tab", "Hero"].join("")]?.unsubscribe?.();
+    } catch {
+    }
+
+    if (previousState?.nativeQuickAccessHost?.syncTimer) {
+      window.clearInterval(previousState.nativeQuickAccessHost.syncTimer);
+    }
+
+    try {
+      previousState?.nativeQuickAccessHost?.restore?.();
     } catch {
     }
 
@@ -510,7 +555,7 @@
             previousCatchAllGamepadInput: null,
             catchAllButtonState: {},
           },
-          homeHeaderFocusKey: "header-action:wishlist",
+          panelHeaderFocusKey: "header-action:wishlist",
           autoSisir: {
             loading: false,
             saving: false,
@@ -534,6 +579,10 @@
           },
           nativeUi: {
             dialogButtonType: null,
+            captureTimer: 0,
+            captureHandler: null,
+            priming: false,
+            primeAttempts: 0,
             componentCandidates: null,
             registrySnapshot: null,
             registryLoading: false,
@@ -551,6 +600,26 @@
           trackedPanelFocusHandler: null,
           trackedPanelFocusOutHandler: null,
           panelVisible: false,
+          panelNavigationZone: "panel",
+          panelFocusLostAt: 0,
+          panelEntryPendingUntil: 0,
+          nativeQuickAccessHost: {
+            syncTimer: 0,
+            mainWindow: null,
+            placeholder: null,
+            browser: null,
+            expanded: false,
+            restore: null,
+          },
+          fallbackControllerNavigation: {
+            registration: null,
+            keyHandler: null,
+            lastBackAt: 0,
+            lastActivateAt: 0,
+            lastMoveAction: "",
+            lastMoveAt: 0,
+            nativeFocusRepairTimer: 0,
+          },
           pendingEntryAutoFocus: true,
           lastSelectedIndexByRoute: {},
           lastSelectedSlotKeyByRoute: {},
@@ -574,6 +643,7 @@
           liveUpdates: {
             source: null,
             connected: false,
+            topicsKey: "",
             retryTimer: 0,
             lastMessageAt: 0,
           },
@@ -839,7 +909,7 @@
       source,
     });
 
-    fetch(`${apiBase}api/plugin-store/overlay/input`, {
+    fetch(`${apiBase}api/plugin-activator/overlay/input`, {
       method: "POST",
       cache: "no-store",
       headers: {
@@ -1039,6 +1109,7 @@
     }
 
     updatePluginStoreRemoteUi();
+    updatePluginStoreBridgePolling();
   }
 
   function consumePluginStoreOverlayState(raw) {
@@ -1106,13 +1177,25 @@
       window.addEventListener("storage", bridge.overlayStateStorageHandler);
     }
 
-    if (!bridge.overlayStatePollTimer) {
+    updatePluginStoreBridgePolling();
+  }
+
+  function updatePluginStoreBridgePolling() {
+    const bridge = state.pluginStoreBridge;
+    const shouldPoll = state.panelVisible || bridge.remoteActive;
+    if (!shouldPoll && bridge.overlayStatePollTimer) {
+      window.clearInterval(bridge.overlayStatePollTimer);
+      bridge.overlayStatePollTimer = 0;
+      return;
+    }
+
+    if (shouldPoll && !bridge.overlayStatePollTimer) {
       bridge.overlayStatePollTimer = window.setInterval(() => {
         try {
           consumePluginStoreOverlayState(localStorage.getItem(pluginStoreOverlayStateStorageKey));
         } catch {
         }
-      }, 250);
+      }, 1000);
     }
   }
 
@@ -1565,15 +1648,21 @@
     },
     {
       id: "artwork",
-      title: "SteamGridDB",
-      description: "Change game artwork from the context menu",
+      title: "TFS Artworks",
+      description: "Choose game artwork with visible quality guidance",
       pages: [
         {
           id: "settings",
           title: "Settings",
-          description: "Context menu and SteamGridDB behavior",
+          description: "Artwork picker and SteamGridDB provider settings",
         },
       ],
+    },
+    {
+      id: "curtain",
+      title: "TFS Curtain",
+      description: "Hide launchers and desktop transitions until each game is ready",
+      pages: [],
     },
     {
       id: "audio",
@@ -1742,8 +1831,7 @@
   }
 
   function getCommunityRuntimePlugins() {
-    const pluginsSnapshot = state.communityPlugins.snapshot?.plugins;
-    return Array.isArray(pluginsSnapshot) ? pluginsSnapshot : [];
+    return [];
   }
 
   function getCommunityRegistry() {
@@ -1991,14 +2079,24 @@
     }
 
     style.textContent = `
+      #quickaccess_content_7 {
+        width: min(760px, calc(100vw - 58px)) !important;
+        max-width: min(760px, calc(100vw - 58px)) !important;
+        flex: 0 1 min(760px, calc(100vw - 58px)) !important;
+      }
+
       .steamloader-panel {
         display: flex;
         flex-direction: column;
+        width: 100%;
         min-height: 100%;
         padding: 18px 16px 24px;
         box-sizing: border-box;
         color: #d9e0e8;
-        background: #0f151d;
+        background:
+          radial-gradient(circle at 88% -8%, rgba(80, 156, 224, 0.2) 0%, rgba(80, 156, 224, 0) 34%),
+          radial-gradient(circle at 8% 88%, rgba(39, 91, 139, 0.14) 0%, rgba(39, 91, 139, 0) 38%),
+          linear-gradient(152deg, #111b25 0%, #0c141d 48%, #080d13 100%);
         overflow-y: auto;
       }
 
@@ -4058,65 +4156,232 @@
       }
 
       .steamloader-panel-home {
-        padding: 8px 10px 14px;
+        padding: 18px 20px 16px;
       }
 
       .steamloader-panel-home .steamloader-header {
         align-items: center;
-        margin-bottom: 8px;
-        gap: 8px;
+        margin-bottom: 16px;
+        gap: 14px;
+        padding: 14px 16px;
+        border: 1px solid rgba(132, 177, 219, 0.14);
+        border-radius: 20px;
+        background:
+          linear-gradient(135deg, rgba(42, 63, 82, 0.76) 0%, rgba(22, 34, 46, 0.88) 62%, rgba(15, 24, 33, 0.92) 100%);
+        box-shadow: 0 16px 38px rgba(0, 0, 0, 0.2);
       }
 
       body.steamloader-accent-active .steamloader-panel-home .steamloader-header {
-        padding: 10px 12px;
-        border-radius: 16px;
-        background: linear-gradient(45deg, transparent 0%, transparent 50%, color-mix(in srgb, var(--tfs-accent, #66c0f4) 30%, transparent) 100%);
+        background:
+          linear-gradient(
+            135deg,
+            rgba(42, 63, 82, 0.76) 0%,
+            rgba(22, 34, 46, 0.88) 58%,
+            color-mix(in srgb, var(--tfs-accent, #66c0f4) 28%, #111a23) 100%
+          );
         transition: background 200ms ease;
       }
 
       .steamloader-panel-home .steamloader-header-main {
         align-items: center;
-        gap: 8px;
+        gap: 12px;
       }
 
       .steamloader-panel-home .steamloader-header-mark {
-        width: 28px;
-        height: 28px;
-        border-radius: 9px;
+        width: 48px;
+        height: 48px;
+        border-radius: 16px;
+        background:
+          linear-gradient(145deg, rgba(116, 195, 244, 0.24), rgba(255, 255, 255, 0.055));
+        box-shadow:
+          inset 0 0 0 1px rgba(173, 218, 250, 0.12),
+          0 10px 24px rgba(0, 0, 0, 0.2);
       }
 
       .steamloader-panel-home .steamloader-header-mark svg {
-        width: 14px;
-        height: 14px;
+        width: 25px;
+        height: 25px;
       }
 
       .steamloader-panel-home .steamloader-header-action-shell {
-        width: 30px;
-        height: 30px;
+        width: 40px;
+        height: 40px;
       }
 
       .steamloader-panel-home .steamloader-header-actions {
-        gap: 4px;
+        gap: 7px;
+      }
+
+      .steamloader-panel-home .steamloader-header-action-button,
+      .steamloader-panel-home [data-header-action="true"] {
+        min-width: 40px !important;
+        min-height: 40px !important;
+        width: 40px !important;
+        height: 40px !important;
+        padding: 0 !important;
+        border-radius: 13px !important;
+        background: rgba(255, 255, 255, 0.055) !important;
+      }
+
+      .steamloader-panel-home .steamloader-header-action-button:hover,
+      .steamloader-panel-home .steamloader-header-action-button:focus-visible,
+      .steamloader-panel-home .steamloader-header-action-button.gpfocus,
+      .steamloader-panel-home [data-header-action="true"]:hover,
+      .steamloader-panel-home [data-header-action="true"]:focus-visible,
+      .steamloader-panel-home [data-header-action="true"].gpfocus {
+        background: #edf3f8 !important;
+        box-shadow:
+          0 0 0 2px rgba(126, 190, 244, 0.68),
+          0 10px 24px rgba(0, 0, 0, 0.22) !important;
       }
 
       .steamloader-panel-home .steamloader-title {
-        font-size: clamp(16px, 1.9vw, 24px);
-        line-height: 1.08;
+        font-size: clamp(22px, 2.55vw, 30px);
+        line-height: 1.04;
+        letter-spacing: -0.025em;
       }
 
-      .steamloader-panel-home .steamloader-stack {
-        gap: 4px;
+      .steamloader-panel-home .steamloader-subtitle {
+        margin-top: 5px;
+        color: rgba(176, 193, 208, 0.84);
+        font-size: clamp(11px, 1.15vw, 13px);
+      }
+
+      .steamloader-panel-home > .steamloader-stack:not(.steamloader-top-stack) {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        align-content: start;
+      }
+
+      .steamloader-panel-home .steamloader-top-stack {
+        gap: 8px;
+      }
+
+      .steamloader-panel-home .steamloader-dialog-button-home,
+      .steamloader-panel-home [data-slot-key^="home-plugin-"] {
+        min-height: 76px !important;
+        height: 100%;
+        padding: 12px 14px !important;
+        border: 1px solid rgba(128, 166, 201, 0.12) !important;
+        border-radius: 17px !important;
+        background:
+          linear-gradient(145deg, rgba(35, 50, 65, 0.92) 0%, rgba(19, 29, 39, 0.94) 100%) !important;
+        box-shadow: 0 12px 26px rgba(0, 0, 0, 0.15);
+        transition:
+          transform 150ms ease,
+          border-color 150ms ease,
+          box-shadow 150ms ease,
+          background 150ms ease;
+      }
+
+      .steamloader-panel-home .steamloader-dialog-button-home:hover,
+      .steamloader-panel-home .steamloader-dialog-button-home:focus-visible,
+      .steamloader-panel-home .steamloader-dialog-button-home.gpfocus,
+      .steamloader-panel-home [data-slot-key^="home-plugin-"]:hover,
+      .steamloader-panel-home [data-slot-key^="home-plugin-"]:focus-visible,
+      .steamloader-panel-home [data-slot-key^="home-plugin-"].gpfocus {
+        transform: translateY(-1px);
+        border-color: rgba(140, 202, 252, 0.68) !important;
+        background:
+          linear-gradient(
+            145deg,
+            color-mix(in srgb, var(--tfs-accent, #66c0f4) 32%, #263747) 0%,
+            rgba(21, 33, 44, 0.98) 100%
+          ) !important;
+        box-shadow:
+          0 0 0 2px rgba(104, 181, 240, 0.5),
+          0 16px 32px rgba(0, 0, 0, 0.24) !important;
+      }
+
+      .steamloader-panel-home .steamloader-row-shell-home {
+        grid-template-columns: 46px minmax(0, 1fr);
+        gap: 12px;
+        align-items: center;
+      }
+
+      .steamloader-panel-home .steamloader-row-shell-home .steamloader-row-icon {
+        width: 46px;
+        height: 46px;
+        border-radius: 15px;
+        background:
+          linear-gradient(145deg, rgba(112, 190, 241, 0.16), rgba(255, 255, 255, 0.045));
+        box-shadow: inset 0 0 0 1px rgba(154, 205, 242, 0.08);
+      }
+
+      .steamloader-panel-home .steamloader-row-shell-home .steamloader-row-icon svg {
+        width: 23px;
+        height: 23px;
+      }
+
+      .steamloader-panel-home .steamloader-row-shell-home .steamloader-row-title {
+        color: rgba(235, 241, 247, 0.96);
+        font-size: clamp(15px, 1.55vw, 18px);
+        line-height: 1.12;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      .steamloader-panel-home .steamloader-row-shell-home .steamloader-row-copy {
+        display: -webkit-box;
+        margin-top: 5px;
+        color: rgba(156, 173, 188, 0.88);
+        font-size: clamp(10px, 1.02vw, 12px);
+        line-height: 1.3;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
       }
 
       .steamloader-panel-home .steamloader-status,
       .steamloader-panel-home .steamloader-note {
-        margin-bottom: 6px;
-        padding: 8px 10px;
-        border-radius: 13px;
+        margin-bottom: 10px;
+        padding: 10px 12px;
+        border: 1px solid rgba(127, 166, 202, 0.1);
+        border-radius: 14px;
+        background: rgba(12, 20, 28, 0.54);
       }
 
       .steamloader-panel-home .steamloader-footer-legend {
-        padding-top: 8px;
+        margin-top: 12px;
+        padding: 10px 12px;
+        border: 1px solid rgba(127, 166, 202, 0.1);
+        border-radius: 14px;
+        background: rgba(10, 17, 24, 0.56);
+      }
+
+      @media (max-width: 620px) {
+        #quickaccess_content_7 {
+          width: calc(100vw - 48px) !important;
+          max-width: calc(100vw - 48px) !important;
+          flex-basis: calc(100vw - 48px) !important;
+        }
+
+        .steamloader-panel-home {
+          padding: 12px 12px 14px;
+        }
+
+        .steamloader-panel-home > .steamloader-stack:not(.steamloader-top-stack) {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 8px;
+        }
+
+        .steamloader-panel-home .steamloader-dialog-button-home,
+        .steamloader-panel-home [data-slot-key^="home-plugin-"] {
+          min-height: 72px !important;
+          padding: 10px 12px !important;
+        }
+
+        .steamloader-panel-home .steamloader-row-shell-home {
+          grid-template-columns: 40px minmax(0, 1fr);
+          gap: 10px;
+        }
+
+        .steamloader-panel-home .steamloader-row-shell-home .steamloader-row-icon {
+          width: 40px;
+          height: 40px;
+          border-radius: 13px;
+        }
       }
 
       .steamloader-panel-themes-store {
@@ -4188,6 +4453,170 @@
           rgba(118, 180, 238, 0) 100%
         );
       }
+
+      /* Shared wide-QAM language for every built-in and SDK plugin screen. */
+      .steamloader-panel:not(.steamloader-panel-home) {
+        padding: 18px 20px 24px;
+        gap: 0;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-header {
+        align-items: center;
+        min-height: 92px;
+        margin-bottom: 14px;
+        padding: 15px 18px;
+        border: 1px solid rgba(144, 188, 226, 0.17);
+        border-radius: 21px;
+        background:
+          radial-gradient(circle at 90% 0%, color-mix(in srgb, var(--tfs-accent, #66c0f4) 24%, transparent), transparent 48%),
+          linear-gradient(130deg, rgba(43, 64, 83, 0.92), rgba(17, 28, 39, 0.96));
+        box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+        box-sizing: border-box;
+      }
+
+      .steamloader-header-eyebrow {
+        margin-bottom: 6px;
+        color: color-mix(in srgb, var(--tfs-accent, #66c0f4) 70%, white);
+        font-size: 10px;
+        font-weight: 850;
+        line-height: 1.1;
+        letter-spacing: 0.14em;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-header-mark {
+        width: 52px;
+        height: 52px;
+        border: 1px solid rgba(154, 209, 248, 0.16);
+        border-radius: 17px;
+        background: linear-gradient(145deg, rgba(111, 190, 242, 0.22), rgba(255, 255, 255, 0.05));
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-title {
+        font-size: clamp(22px, 2.6vw, 30px);
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-subtitle {
+        max-width: 440px;
+        font-size: 12px;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack) {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        align-content: start;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > .steamloader-inline-section,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > .steamloader-divider,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > .steamloader-section-slot,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > [data-slot-layout="slider"],
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > [data-slot-layout="stepper"],
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > [data-slot-layout="accordion"],
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > [data-slot-layout="feature"],
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack > [data-slot-layout="progress"] {
+        grid-column: 1 / -1;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-inline-section {
+        margin-top: 14px;
+        padding: 11px 4px 2px;
+        border-top: 1px solid rgba(129, 173, 211, 0.14);
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-inline-section-title {
+        color: #eaf3fb;
+        font-size: 12px;
+        letter-spacing: 0.09em;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack) > [data-slot-button] {
+        min-width: 0;
+        min-height: 68px;
+        height: 100%;
+        padding: 12px 13px !important;
+        border: 1px solid rgba(143, 183, 217, 0.14) !important;
+        border-radius: 16px !important;
+        background: linear-gradient(145deg, rgba(34, 50, 65, 0.94), rgba(18, 28, 39, 0.96)) !important;
+        box-shadow: 0 10px 23px rgba(0, 0, 0, 0.14);
+        box-sizing: border-box;
+        transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack) > [data-slot-button].gpfocus,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack) > [data-slot-button]:focus-visible,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack) > [data-slot-button]:hover {
+        border-color: rgba(158, 216, 255, 0.86) !important;
+        background: linear-gradient(135deg, #eaf6ff, #b8dcf5) !important;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--tfs-accent, #66c0f4) 55%, transparent), 0 16px 30px rgba(0, 0, 0, 0.24) !important;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-row-icon {
+        width: 38px;
+        height: 38px;
+        border: 1px solid rgba(150, 202, 244, 0.1);
+        border-radius: 12px;
+        background: linear-gradient(145deg, rgba(112, 191, 241, 0.19), rgba(255, 255, 255, 0.04));
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-row-title {
+        font-size: 14px;
+        font-weight: 750;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) .steamloader-row-copy {
+        font-size: 11px;
+        line-height: 1.3;
+      }
+
+      .steamloader-card-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .steamloader-card-grid > .steamloader-card {
+        min-width: 0;
+        margin-top: 0;
+        border: 1px solid rgba(145, 186, 224, 0.15);
+        background: linear-gradient(150deg, rgba(39, 57, 73, 0.88), rgba(18, 29, 40, 0.93));
+      }
+
+      .steamloader-card-grid > .steamloader-card:only-child {
+        grid-column: 1 / -1;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-status,
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-note {
+        margin: 0 0 12px;
+        padding: 10px 13px;
+        border: 1px solid rgba(139, 188, 226, 0.16);
+        border-radius: 13px;
+        background: rgba(15, 27, 39, 0.72);
+        color: rgba(195, 214, 230, 0.9);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+
+      .steamloader-panel:not(.steamloader-panel-home) > .steamloader-note {
+        margin: 12px 0 0;
+        border-color: rgba(139, 188, 226, 0.1);
+        color: rgba(157, 180, 198, 0.82);
+      }
+
+      @media (max-width: 620px) {
+        .steamloader-panel:not(.steamloader-panel-home) {
+          padding: 12px;
+        }
+        .steamloader-panel:not(.steamloader-panel-home) > .steamloader-stack:not(.steamloader-top-stack),
+        .steamloader-card-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .steamloader-panel:not(.steamloader-panel-home) > .steamloader-header {
+          padding: 12px;
+        }
+      }
     `;
   }
 
@@ -4230,6 +4659,190 @@
 
     const fiberKey = getReactPropertyKey(element, "__reactFiber");
     return fiberKey ? element[fiberKey] : null;
+  }
+
+  function getNativeQuickAccessMainWindow() {
+    try {
+      const windowStore = window.opener?.SteamUIStore?.m_WindowStore;
+      return (
+        windowStore?.GamepadUIMainWindowInstance?.BrowserWindow ||
+        windowStore?.MainWindowInstance?.BrowserWindow ||
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function getFiberBrowserViewProps(element) {
+    const rootFiber = getReactFiber(element);
+    for (const initialFiber of [rootFiber, rootFiber?.alternate]) {
+      let fiber = initialFiber;
+      for (let depth = 0; fiber && depth < 4; depth += 1) {
+        const props = fiber.memoizedProps || fiber.pendingProps;
+        if (props?.browser?.SetBounds && props?.browser?.GetBounds) {
+          return props;
+        }
+        fiber = fiber.return;
+      }
+    }
+
+    return null;
+  }
+
+  function findNativeQuickAccessHost() {
+    const mainWindow = getNativeQuickAccessMainWindow();
+    const mainDocument = mainWindow?.document;
+    if (!mainWindow || !mainDocument?.documentElement) {
+      return null;
+    }
+
+    const expectedWidth = Math.max(window.innerWidth || 0, 300);
+    const expectedHeight = Math.max(window.innerHeight || 0, 300);
+    let bestMatch = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+
+    for (const element of mainDocument.querySelectorAll("div")) {
+      const props = getFiberBrowserViewProps(element);
+      if (!props?.browser) {
+        continue;
+      }
+
+      const rect = element.getBoundingClientRect();
+      const style = mainWindow.getComputedStyle(element);
+      const right = Number.parseFloat(style.right);
+      const isRightAnchored = Number.isFinite(right) && Math.abs(right) <= 1;
+      const hasQuickAccessMotion = String(props.animateIn?.fnStep || "").includes("x:");
+      const widthDelta = Math.abs(rect.width - expectedWidth);
+      const heightDelta = Math.abs(rect.height - expectedHeight);
+      let score = 0;
+
+      if (props.visible) score += 8;
+      if (isRightAnchored) score += 8;
+      if (style.position === "absolute") score += 4;
+      if (hasQuickAccessMotion) score += 4;
+      if (widthDelta <= 12) score += 8;
+      else if (widthDelta <= 80) score += 3;
+      if (heightDelta <= 90) score += 5;
+      if (rect.width >= 300 && rect.height >= 300) score += 4;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = {
+          mainWindow,
+          mainDocument,
+          placeholder: element,
+          browser: props.browser,
+        };
+      }
+    }
+
+    return bestScore >= 20 ? bestMatch : null;
+  }
+
+  function ensureNativeQuickAccessHostStyle(mainDocument) {
+    if (!mainDocument?.head || mainDocument.getElementById("steamloader-native-qam-host-style")) {
+      return;
+    }
+
+    const style = mainDocument.createElement("style");
+    style.id = "steamloader-native-qam-host-style";
+    style.textContent = `
+      [data-steamloader-native-qam-expanded="true"] {
+        transform: translateX(0px) !important;
+      }
+    `;
+    mainDocument.head.appendChild(style);
+  }
+
+  async function syncNativeQuickAccessHost(expanded = state.panelVisible) {
+    const nativeState =
+      state.nativeQuickAccessHost ||
+      (state.nativeQuickAccessHost = {
+        syncTimer: 0,
+        mainWindow: null,
+        placeholder: null,
+        browser: null,
+        expanded: false,
+        restore: null,
+      });
+    const currentHost = findNativeQuickAccessHost();
+    const host = currentHost ||
+      (nativeState.placeholder?.isConnected && nativeState.browser
+        ? nativeState
+        : null);
+    if (!host?.placeholder || !host?.browser) {
+      return false;
+    }
+
+    const mainDocument = host.mainDocument || host.placeholder.ownerDocument;
+    const wasExpanded = Boolean(nativeState.expanded);
+    ensureNativeQuickAccessHostStyle(mainDocument);
+    if (expanded) {
+      host.placeholder.setAttribute("data-steamloader-native-qam-expanded", "true");
+    } else {
+      host.placeholder.removeAttribute("data-steamloader-native-qam-expanded");
+    }
+
+    nativeState.mainWindow = host.mainWindow || mainDocument.defaultView;
+    nativeState.mainDocument = mainDocument;
+    nativeState.placeholder = host.placeholder;
+    nativeState.browser = host.browser;
+    nativeState.expanded = Boolean(expanded);
+    nativeState.restore = () => syncNativeQuickAccessHost(false);
+
+    const rect = host.placeholder.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+
+    let bounds = null;
+    try {
+      bounds = await host.browser.GetBounds();
+    } catch {
+    }
+
+    const boundsDiffer =
+      !bounds ||
+      Math.abs(Number(bounds.x) - rect.x) > 1 ||
+      Math.abs(Number(bounds.y) - rect.y) > 1 ||
+      Math.abs(Number(bounds.width) - rect.width) > 1 ||
+      Math.abs(Number(bounds.height) - rect.height) > 1;
+    if (boundsDiffer) {
+      host.browser.SetBounds(rect.x, rect.y, rect.width, rect.height);
+    }
+
+    if (expanded && (!wasExpanded || boundsDiffer)) {
+      try {
+        host.browser.SetFocus(true);
+      } catch {
+      }
+
+      window.setTimeout(() => {
+        if (!state.panelVisible) {
+          return;
+        }
+
+        window.focus?.();
+        requestRouteEntryFocus(state.route);
+        queuePendingFocusRestore(state.route);
+      }, 0);
+    }
+
+    return true;
+  }
+
+  function ensureNativeQuickAccessHostSync() {
+    const nativeState =
+      state.nativeQuickAccessHost ||
+      (state.nativeQuickAccessHost = { syncTimer: 0 });
+    if (nativeState.syncTimer) {
+      return;
+    }
+
+    nativeState.syncTimer = window.setInterval(() => {
+      void syncNativeQuickAccessHost(state.panelVisible);
+    }, 400);
   }
 
   function getPanelHost() {
@@ -4574,6 +5187,10 @@
       return false;
     }
 
+    state.panelNavigationZone = "panel";
+    state.panelFocusLostAt = 0;
+    state.panelEntryPendingUntil = 0;
+
     const panel = focusedNode.closest(".steamloader-panel");
     const panelRouteKey = getPanelRouteKey(panel);
     const routeKey = getRouteKey(state.route);
@@ -4676,7 +5293,7 @@
           return;
         }
 
-        if (document.activeElement === document.body) {
+        if (state.panelNavigationZone === "panel" && document.activeElement === document.body) {
           queuePendingFocusRestore(state.route);
         }
       });
@@ -4903,22 +5520,49 @@
     return null;
   }
 
-  function consumeHomeDirectionalFocus(event) {
+  function consumePanelDirectionalFocus(event) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
     event?.stopImmediatePropagation?.();
     return true;
   }
 
-  function focusHomeControlElement(target, event, options = {}) {
-    consumeHomeDirectionalFocus(event);
+  function keepPanelElementInNearestView(panel, target) {
+    if (!(panel instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const panelRect = panel.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const edgePadding = 6;
+    const visibleTop = panelRect.top + edgePadding;
+    const visibleBottom = panelRect.bottom - edgePadding;
+
+    if (targetRect.top < visibleTop) {
+      panel.scrollTop = Math.max(0, panel.scrollTop - (visibleTop - targetRect.top));
+    } else if (targetRect.bottom > visibleBottom) {
+      panel.scrollTop += targetRect.bottom - visibleBottom;
+    }
+  }
+
+  function focusPanelControlElement(target, event) {
+    consumePanelDirectionalFocus(event);
     const panel = getPanelScrollContainer();
     if (
-      state.route.screen !== "root" ||
       !(panel instanceof HTMLElement) ||
       !isFocusableSlotElement(target)
     ) {
       return true;
+    }
+
+    state.panelNavigationZone = "panel";
+    state.panelFocusLostAt = 0;
+    state.panelEntryPendingUntil = 0;
+
+    try {
+      state.nativeQuickAccessHost?.browser?.SetFocus?.(true);
+      window.focus?.();
+    } catch {
     }
 
     try {
@@ -4933,22 +5577,15 @@
 
     const focusKey = normalizeFocusSlotKey(target.getAttribute("data-slot-key"));
     if (focusKey?.startsWith("header-action:")) {
-      state.homeHeaderFocusKey = focusKey;
+      state.panelHeaderFocusKey = focusKey;
     }
     rememberSlotElementFocus(target);
-
-    if (options.alignTop === true && panel.scrollTop > 1) {
-      try {
-        panel.scrollTo({ top: 0, behavior: "smooth" });
-      } catch {
-        panel.scrollTop = 0;
-      }
-    }
+    keepPanelElementInNearestView(panel, target);
 
     return true;
   }
 
-  function getFocusableHomeHeaderActions() {
+  function getFocusablePanelHeaderActions() {
     const panel = getPanelScrollContainer();
     if (!(panel instanceof HTMLElement)) {
       return [];
@@ -4958,27 +5595,30 @@
       .filter((element) => isFocusableSlotElement(element));
   }
 
-  function moveHomeHeaderActionFocus(currentFocusKey, direction, event) {
-    const actions = getFocusableHomeHeaderActions();
+  function movePanelHeaderActionFocus(currentFocusKey, direction, event) {
+    const actions = getFocusablePanelHeaderActions();
     const currentIndex = actions.findIndex(
       (element) => normalizeFocusSlotKey(element.getAttribute("data-slot-key")) === currentFocusKey,
     );
     const nextIndex = currentIndex + direction;
-    if (currentIndex < 0 || nextIndex < 0 || nextIndex >= actions.length) {
-      return consumeHomeDirectionalFocus(event);
+    if (currentIndex < 0 || nextIndex >= actions.length) {
+      return consumePanelDirectionalFocus(event);
+    }
+    if (nextIndex < 0) {
+      return focusSteamQuickAccessTab(event);
     }
 
-    return focusHomeControlElement(actions[nextIndex], event, { alignTop: true });
+    return focusPanelControlElement(actions[nextIndex], event);
   }
 
-  function moveHomeHeaderToContent(event) {
+  function movePanelHeaderToContent(event) {
     const panel = getPanelScrollContainer();
-    return focusHomeControlElement(findFirstFocusableSlotElement(panel), event);
+    return focusPanelControlElement(findFirstFocusableSlotElement(panel), event);
   }
 
-  function moveHomeContentToHeader(event) {
-    const actions = getFocusableHomeHeaderActions();
-    const rememberedFocusKey = normalizeFocusSlotKey(state.homeHeaderFocusKey);
+  function movePanelContentToHeader(event) {
+    const actions = getFocusablePanelHeaderActions();
+    const rememberedFocusKey = normalizeFocusSlotKey(state.panelHeaderFocusKey);
     const target =
       actions.find(
         (element) => normalizeFocusSlotKey(element.getAttribute("data-slot-key")) === rememberedFocusKey,
@@ -4988,19 +5628,180 @@
       ) ||
       actions[0] ||
       null;
-    return focusHomeControlElement(target, event, { alignTop: true });
+    return focusPanelControlElement(target, event);
   }
 
-  function getHomeHeaderNavigationProps(key) {
+  function movePanelControlVerticalFocus(currentFocusKey, direction, event) {
+    return movePanelControlFocus(currentFocusKey, direction, event);
+  }
+
+  function focusSteamQuickAccessTab(event) {
+    const tab = document.getElementById("quickaccess_tab_7");
+    if (!(tab instanceof HTMLElement)) {
+      return consumePanelDirectionalFocus(event);
+    }
+
+    consumePanelDirectionalFocus(event);
+    state.panelNavigationZone = "tabs";
+    state.panelFocusLostAt = 0;
+    state.panelEntryPendingUntil = 0;
+    clearPendingFocusRestore();
+    try {
+      tab.focus({ preventScroll: true });
+    } catch {
+      tab.focus();
+    }
+    return true;
+  }
+
+  function movePanelControlFocus(currentFocusKey, direction, event) {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement)) {
+      return consumePanelDirectionalFocus(event);
+    }
+
+    const normalizedFocusKey = normalizeFocusSlotKey(currentFocusKey);
+    const rows = Array.from(
+      panel.querySelectorAll('[data-slot-button]:not([data-header-action="true"])'),
+    ).filter((element) => isFocusableSlotElement(element));
+    const current = rows.find((element) => {
+      const slotKey = normalizeFocusSlotKey(element.getAttribute("data-slot-key"));
+      const slotButton = normalizeFocusSlotKey(element.getAttribute("data-slot-button"));
+      return slotKey === normalizedFocusKey || slotButton === normalizedFocusKey;
+    }) || getFocusedFallbackSlot();
+    if (!rows.includes(current)) {
+      return consumePanelDirectionalFocus(event);
+    }
+
+    const currentRect = current.getBoundingClientRect();
+    const currentX = (currentRect.left + currentRect.right) / 2;
+    const currentY = (currentRect.top + currentRect.bottom) / 2;
+    const horizontal = direction === "left" || direction === "right";
+    const candidates = rows.flatMap((element) => {
+      if (element === current) return [];
+      const rect = element.getBoundingClientRect();
+      const x = (rect.left + rect.right) / 2;
+      const y = (rect.top + rect.bottom) / 2;
+      const primary = horizontal
+        ? (direction === "left" ? currentX - x : x - currentX)
+        : (direction === "up" ? currentY - y : y - currentY);
+      if (primary < 8) return [];
+      // Horizontal moves stay in the current visual row; vertical moves keep
+      // their column when the expanded QAM displays two controls side by side.
+      if (horizontal && rect.top >= currentRect.bottom - 4) return [];
+      if (horizontal && rect.bottom <= currentRect.top + 4) return [];
+      if (!horizontal && rect.top < currentRect.bottom - 4 && rect.bottom > currentRect.top + 4) return [];
+      const cross = horizontal ? Math.abs(y - currentY) : Math.abs(x - currentX);
+      return [{ element, score: primary + cross * (horizontal ? 3 : 2) }];
+    });
+    candidates.sort((left, right) => left.score - right.score);
+    if (candidates[0]) {
+      return focusPanelControlElement(candidates[0].element, event);
+    }
+    if (direction === "left") {
+      return focusSteamQuickAccessTab(event);
+    }
+    if (direction === "up" && getFocusablePanelHeaderActions().length) {
+      return movePanelContentToHeader(event);
+    }
+    return consumePanelDirectionalFocus(event);
+  }
+
+  function getHomeGridColumnCount(panel = getPanelScrollContainer()) {
+    if (!(panel instanceof HTMLElement)) {
+      return 1;
+    }
+
+    const grid = Array.from(panel.children).find(
+      (child) =>
+        child instanceof HTMLElement &&
+        child.classList.contains("steamloader-stack") &&
+        !child.classList.contains("steamloader-top-stack"),
+    );
+    if (!(grid instanceof HTMLElement)) {
+      return 1;
+    }
+
+    const resolvedColumns = window.getComputedStyle(grid).gridTemplateColumns;
+    if (!resolvedColumns || resolvedColumns === "none") {
+      return 1;
+    }
+
+    return Math.max(1, resolvedColumns.split(/\s+/).filter(Boolean).length);
+  }
+
+  function findPanelSlotElementByKey(slotKey) {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement)) {
+      return null;
+    }
+
+    return Array.from(panel.querySelectorAll('[data-slot-button]:not([data-header-action="true"])'))
+      .find(
+        (element) =>
+          isFocusableSlotElement(element) &&
+          normalizeFocusSlotKey(element.getAttribute("data-slot-key")) === slotKey,
+      ) || null;
+  }
+
+  function moveHomeGridFocus(pluginId, direction, event) {
+    const homePlugins = getHomePlugins();
+    const currentIndex = homePlugins.findIndex((plugin) => plugin.id === pluginId);
+    if (currentIndex < 0) {
+      return consumePanelDirectionalFocus(event);
+    }
+
+    const columnCount = getHomeGridColumnCount();
+    const rowStart = Math.floor(currentIndex / columnCount) * columnCount;
+    const rowEnd = Math.min(homePlugins.length, rowStart + columnCount) - 1;
+    let targetIndex = currentIndex;
+
+    if (direction === "left") {
+      if (currentIndex <= rowStart) {
+        return focusSteamQuickAccessTab(event);
+      }
+      targetIndex -= 1;
+    } else if (direction === "right") {
+      if (currentIndex >= rowEnd) {
+        return consumePanelDirectionalFocus(event);
+      }
+      targetIndex += 1;
+    } else if (direction === "up") {
+      targetIndex -= columnCount;
+      if (targetIndex < 0) {
+        const leadingSlot = findPanelSlotElementByKey("external-game-close-current");
+        return leadingSlot
+          ? focusPanelControlElement(leadingSlot, event)
+          : movePanelContentToHeader(event);
+      }
+    } else if (direction === "down") {
+      targetIndex += columnCount;
+      if (targetIndex >= homePlugins.length) {
+        return consumePanelDirectionalFocus(event);
+      }
+    } else {
+      return consumePanelDirectionalFocus(event);
+    }
+
+    const targetPlugin = homePlugins[targetIndex];
+    const target = targetPlugin
+      ? findPanelSlotElementByKey(`home-plugin-${targetPlugin.id}`)
+      : null;
+    return target
+      ? focusPanelControlElement(target, event)
+      : consumePanelDirectionalFocus(event);
+  }
+
+  function getPanelHeaderNavigationProps(key) {
     const focusKey = `header-action:${normalizeFocusSlotKey(key)}`;
     return {
       onGamepadFocus: () => {
-        state.homeHeaderFocusKey = focusKey;
+        state.panelHeaderFocusKey = focusKey;
       },
-      onMoveLeft: (event) => moveHomeHeaderActionFocus(focusKey, -1, event),
-      onMoveRight: (event) => moveHomeHeaderActionFocus(focusKey, 1, event),
-      onMoveUp: (event) => consumeHomeDirectionalFocus(event),
-      onMoveDown: (event) => moveHomeHeaderToContent(event),
+      onMoveLeft: (event) => movePanelHeaderActionFocus(focusKey, -1, event),
+      onMoveRight: (event) => movePanelHeaderActionFocus(focusKey, 1, event),
+      onMoveUp: (event) => consumePanelDirectionalFocus(event),
+      onMoveDown: (event) => movePanelHeaderToContent(event),
     };
   }
 
@@ -5042,6 +5843,9 @@
   }
 
   function restoreRouteFocus(route = state.route) {
+    if (state.panelNavigationZone === "tabs") {
+      return true;
+    }
     const panel = getPanelScrollContainer();
     if (!(panel instanceof HTMLElement) || !hasPanelLayout(panel)) {
       return false;
@@ -5094,7 +5898,10 @@
     // gamepad-focus re-evaluation, causing the "A SELECT" label and the selected
     // element's highlight to flicker visually. Skip the focus restore in that case.
     const gpFocusedSlot = panel.querySelector("[data-slot-button].gpfocus");
-    if (gpFocusedSlot instanceof HTMLElement) {
+    if (
+      gpFocusedSlot instanceof HTMLElement &&
+      (activeElement === document.body || panel.contains(activeElement))
+    ) {
       rememberSlotElementFocus(gpFocusedSlot);
       return true;
     }
@@ -5120,6 +5927,7 @@
     }
 
     rememberSlotElementFocus(target);
+    keepPanelElementInNearestView(panel, target);
     return document.activeElement === target || target.contains(document.activeElement);
   }
 
@@ -5164,8 +5972,20 @@
     applyRestore();
   }
 
+  function isPanelOwnedOverlayFocus(element) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    return Boolean(
+      element.closest(
+        '[role="dialog"], [role="listbox"], [role="menu"], .ModalPosition, .DialogBody, .contextMenu',
+      ),
+    );
+  }
+
   function repairPanelFocusIfNeeded() {
-    if (!state.panelVisible || document.activeElement !== document.body) {
+    if (!state.panelVisible) {
       return;
     }
 
@@ -5174,20 +5994,84 @@
       return;
     }
 
+    const activeElement = document.activeElement;
+    const documentHasFocus = typeof document.hasFocus !== "function" || document.hasFocus();
+    const focusedQuickAccessControl = document.querySelector('#QuickAccess-Menu .gpfocus');
+    if (focusedQuickAccessControl instanceof HTMLElement) {
+      if (
+        state.panelEntryPendingUntil > Date.now() &&
+        focusedQuickAccessControl.id === "quickaccess_tab_7"
+      ) {
+        return;
+      }
+      state.panelNavigationZone = panel.contains(focusedQuickAccessControl) ? "panel" : "tabs";
+      state.panelFocusLostAt = 0;
+      return;
+    }
+    if (
+      state.panelNavigationZone === "tabs" ||
+      activeElement?.closest?.('#QuickAccess-Menu [role="tab"]')
+    ) {
+      state.panelNavigationZone = "tabs";
+      state.panelFocusLostAt = 0;
+      return;
+    }
+    if (
+      documentHasFocus &&
+      activeElement instanceof HTMLElement &&
+      activeElement !== document.body &&
+      !panel.contains(activeElement)
+    ) {
+      state.panelFocusLostAt = 0;
+      return;
+    }
+    if (
+      documentHasFocus &&
+      activeElement !== document.body &&
+      (panel.contains(activeElement) || isPanelOwnedOverlayFocus(activeElement))
+    ) {
+      state.panelFocusLostAt = 0;
+      return;
+    }
+
+    if (!documentHasFocus && (state.editorFocusActive || isEditableFocusTarget(activeElement))) {
+      return;
+    }
+
     const panelRouteKey = getPanelRouteKey(panel);
     if (panelRouteKey && panelRouteKey !== getRouteKey(state.route)) {
       return;
+    }
+
+    state.panelFocusLostAt ||= Date.now();
+    if (Date.now() - state.panelFocusLostAt < 260) {
+      return;
+    }
+
+    try {
+      state.nativeQuickAccessHost?.browser?.SetFocus?.(true);
+      window.focus?.();
+    } catch {
     }
 
     queuePendingFocusRestore(state.route);
   }
 
   function ensureFocusRepairTimer() {
-    if (window.__steamLoaderFocusRepairTimer) {
+    if (!state.panelVisible || window.__steamLoaderFocusRepairTimer) {
       return;
     }
 
-    window.__steamLoaderFocusRepairTimer = window.setInterval(repairPanelFocusIfNeeded, 500);
+    window.__steamLoaderFocusRepairTimer = window.setInterval(repairPanelFocusIfNeeded, 120);
+  }
+
+  function stopFocusRepairTimer() {
+    if (!window.__steamLoaderFocusRepairTimer) {
+      return;
+    }
+
+    window.clearInterval(window.__steamLoaderFocusRepairTimer);
+    window.__steamLoaderFocusRepairTimer = 0;
   }
 
   function ensureFocusRepairHandler() {
@@ -5197,8 +6081,10 @@
 
     window.__steamLoaderFocusRepairHandler = () => {
       window.requestAnimationFrame(repairPanelFocusIfNeeded);
+      window.setTimeout(repairPanelFocusIfNeeded, 32);
     };
     document.addEventListener("focusout", window.__steamLoaderFocusRepairHandler, true);
+    window.addEventListener("blur", window.__steamLoaderFocusRepairHandler, true);
   }
 
   function preparePanelReplacement() {
@@ -5555,8 +6441,15 @@
   function navigateBackFromRoute(route = state.route) {
     const backNavigation = getBackNavigation(route);
     if (!backNavigation) {
-      return;
+      return false;
     }
+
+    const navigation = getFallbackControllerNavigationState();
+    const now = Date.now();
+    if (now - navigation.lastBackAt < 280) {
+      return false;
+    }
+    navigation.lastBackAt = now;
 
     requestFocusForRoute(
       backNavigation.route,
@@ -5564,6 +6457,327 @@
       backNavigation.fallbackSlotKey,
     );
     setRoute(backNavigation.route);
+    return true;
+  }
+
+  function getFallbackControllerNavigationState() {
+    state.fallbackControllerNavigation ??= {
+      registration: null,
+      keyHandler: null,
+      lastBackAt: 0,
+      lastActivateAt: 0,
+      lastMoveAction: "",
+      lastMoveAt: 0,
+      nativeFocusRepairTimer: 0,
+    };
+    return state.fallbackControllerNavigation;
+  }
+
+  function getFocusedFallbackSlot() {
+    const panel = getPanelScrollContainer();
+    if (!(panel instanceof HTMLElement)) {
+      return null;
+    }
+
+    const focused =
+      panel.querySelector("[data-slot-button].gpfocus") ||
+      document.activeElement?.closest?.(".steamloader-panel [data-slot-button]") ||
+      getFocusRestoreTarget(state.route);
+    return focused instanceof HTMLElement ? focused : null;
+  }
+
+  function activateFocusedFallbackSlot() {
+    if (state.nativeUi.dialogButtonType || !state.panelVisible) {
+      return false;
+    }
+
+    const focused = getFocusedFallbackSlot();
+    if (!isFocusableSlotElement(focused)) {
+      return false;
+    }
+
+    const navigation = getFallbackControllerNavigationState();
+    const now = Date.now();
+    if (now - navigation.lastActivateAt < 280) {
+      return true;
+    }
+
+    navigation.lastActivateAt = now;
+    focused.click();
+    return true;
+  }
+
+  function getFallbackDirectionFromSteamButton(button) {
+    const namedButton = String(button || "").toUpperCase();
+    if (/(DPAD|GAMEPAD|ARROW).*UP|\bUP\b/.test(namedButton)) {
+      return "up";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*DOWN|\bDOWN\b/.test(namedButton)) {
+      return "down";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*LEFT|\bLEFT\b/.test(namedButton)) {
+      return "left";
+    }
+    if (/(DPAD|GAMEPAD|ARROW).*RIGHT|\bRIGHT\b/.test(namedButton)) {
+      return "right";
+    }
+
+    return ({ 9: "up", 10: "down", 11: "left", 12: "right" })[Number(button)] || "";
+  }
+
+  function getFallbackDirectionFromKey(key) {
+    if (key === "ArrowUp" || key === "GamepadUp" || key === "GamepadDPadUp") {
+      return "up";
+    }
+    if (key === "ArrowDown" || key === "GamepadDown" || key === "GamepadDPadDown") {
+      return "down";
+    }
+    if (key === "ArrowLeft" || key === "GamepadLeft" || key === "GamepadDPadLeft") {
+      return "left";
+    }
+    if (key === "ArrowRight" || key === "GamepadRight" || key === "GamepadDPadRight") {
+      return "right";
+    }
+    return "";
+  }
+
+  function isTfsQuickAccessTabFocused() {
+    const tab = document.getElementById("quickaccess_tab_7");
+    return Boolean(
+      tab instanceof HTMLElement &&
+      tab.getAttribute("aria-selected") === "true" &&
+      (tab.classList.contains("gpfocus") || tab === document.activeElement),
+    );
+  }
+
+  function enterPanelFromSteamTab(event = null) {
+    if (!state.panelVisible || !isTfsQuickAccessTabFocused()) {
+      return false;
+    }
+
+    consumePanelDirectionalFocus(event);
+    state.panelNavigationZone = "panel";
+    state.panelFocusLostAt = 0;
+    state.panelEntryPendingUntil = Date.now() + 400;
+    // Steam may finish its own tab-navigation pass after the input callback.
+    // Restore after that pass so D-Pad Right reliably enters the remembered row.
+    window.setTimeout(() => {
+      if (
+        !state.panelVisible ||
+        Date.now() > state.panelEntryPendingUntil ||
+        document.getElementById("quickaccess_tab_7")?.getAttribute("aria-selected") !== "true"
+      ) return;
+      state.panelNavigationZone = "panel";
+      const target = getFocusRestoreTarget(state.route);
+      if (target) focusPanelControlElement(target);
+      state.panelEntryPendingUntil = Date.now() + 160;
+    }, 32);
+    return true;
+  }
+
+  function invokeFallbackSlotMoveHandler(focused, direction, event = null) {
+    const rawIndex = focused?.getAttribute?.("data-slot-button") || "";
+    const index = Number.parseInt(rawIndex, 10);
+    if (!Number.isInteger(index)) {
+      return false;
+    }
+
+    const slot = state.renderedSlots?.[index];
+    const handlerName = `onMove${direction[0].toUpperCase()}${direction.slice(1)}`;
+    const handler =
+      slot?.buttonProps?.[handlerName] ||
+      ((direction === "left" || direction === "right")
+        ? slot?.panel?.slider?.[handlerName]
+        : null);
+    if (typeof handler !== "function") {
+      return false;
+    }
+
+    handler(event);
+    consumePanelDirectionalFocus(event);
+    return true;
+  }
+
+  function moveFallbackPanelFocus(direction, event = null) {
+    const panel = getPanelScrollContainer();
+    const focused = getFocusedFallbackSlot();
+    if (!(panel instanceof HTMLElement) || !(focused instanceof HTMLElement)) {
+      return false;
+    }
+
+    if (invokeFallbackSlotMoveHandler(focused, direction, event)) {
+      return true;
+    }
+
+    const isHeaderAction = focused.getAttribute("data-header-action") === "true";
+    if (direction === "left" || direction === "right") {
+      if (isHeaderAction) {
+        const focusKey = normalizeFocusSlotKey(focused.getAttribute("data-slot-key"));
+        return movePanelHeaderActionFocus(focusKey, direction === "left" ? -1 : 1, event);
+      }
+      return movePanelControlFocus(focused.getAttribute("data-slot-key"), direction, event);
+    }
+
+    if (isHeaderAction) {
+      return direction === "down"
+        ? movePanelHeaderToContent(event)
+        : consumePanelDirectionalFocus(event);
+    }
+
+    return movePanelControlFocus(focused.getAttribute("data-slot-key"), direction, event);
+  }
+
+  function maybeMoveFallbackPanelFocus(direction, event = null) {
+    if (!direction) {
+      return false;
+    }
+
+    const navigation = getFallbackControllerNavigationState();
+    const now = Date.now();
+    if (navigation.lastMoveAction === direction && now - navigation.lastMoveAt < 120) {
+      consumePanelDirectionalFocus(event);
+      return true;
+    }
+
+    navigation.lastMoveAction = direction;
+    navigation.lastMoveAt = now;
+    const moved = moveFallbackPanelFocus(direction, event);
+    if (!moved) {
+      return false;
+    }
+
+    if (state.panelNavigationZone === "tabs") {
+      return true;
+    }
+
+    const intendedFocusKey = normalizeFocusSlotKey(
+      getFocusedFallbackSlot()?.getAttribute?.("data-slot-key"),
+    );
+    if (!intendedFocusKey) {
+      return true;
+    }
+
+    if (navigation.nativeFocusRepairTimer) {
+      window.clearTimeout(navigation.nativeFocusRepairTimer);
+    }
+    navigation.nativeFocusRepairTimer = window.setTimeout(() => {
+      navigation.nativeFocusRepairTimer = 0;
+      if (!state.panelVisible) {
+        return;
+      }
+
+      const panel = getPanelScrollContainer();
+      const target = Array.from(panel?.querySelectorAll?.("[data-slot-key]") || [])
+        .find((element) => element.getAttribute("data-slot-key") === intendedFocusKey);
+      if (target instanceof HTMLElement) {
+        focusPanelControlElement(target);
+      }
+    }, 32);
+
+    return true;
+  }
+
+  function handleFallbackControllerNavigation(controllerIndex, button, pressed) {
+    if (!pressed || !state.panelVisible) {
+      return;
+    }
+
+    if (shouldSuppressGlobalHotkeysForTextInput()) {
+      return;
+    }
+
+    const direction = getFallbackDirectionFromSteamButton(button);
+    if (direction === "right" && enterPanelFromSteamTab()) {
+      return;
+    }
+    if (state.nativeUi.dialogButtonType) {
+      return;
+    }
+    if (direction) {
+      maybeMoveFallbackPanelFocus(direction);
+      return;
+    }
+
+    const namedButton = String(button || "").toUpperCase();
+    const isBackButton = Number(button) === 2 || /\b(B|BACK|CANCEL)\b/.test(namedButton);
+    const isAcceptButton = Number(button) === 1 || /\b(A|ACCEPT|SELECT)\b/.test(namedButton);
+    if (isBackButton && getBackNavigation(state.route)) {
+      navigateBackFromRoute();
+      return;
+    }
+
+    if (isAcceptButton) {
+      activateFocusedFallbackSlot();
+    }
+  }
+
+  function handleFallbackNavigationKey(event) {
+    if (
+      event.type !== "keydown" ||
+      !state.panelVisible ||
+      shouldSuppressGlobalHotkeysForTextInput()
+    ) {
+      return;
+    }
+
+    const key = event.key || event.code || "";
+    const direction = getFallbackDirectionFromKey(key);
+    if (direction === "right" && enterPanelFromSteamTab(event)) {
+      return;
+    }
+    if (state.nativeUi.dialogButtonType) {
+      return;
+    }
+    if (direction) {
+      maybeMoveFallbackPanelFocus(direction, event);
+      return;
+    }
+
+    if (event.repeat) {
+      return;
+    }
+
+    if (key === "Escape" || key === "Backspace" || key === "GamepadB") {
+      if (!getBackNavigation(state.route)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      navigateBackFromRoute();
+      return;
+    }
+
+    if (key === "Enter" || key === " " || key === "Space" || key === "GamepadA") {
+      if (!activateFocusedFallbackSlot()) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+    }
+  }
+
+  function ensureFallbackControllerNavigation() {
+    const navigation = getFallbackControllerNavigationState();
+    if (!navigation.keyHandler) {
+      navigation.keyHandler = handleFallbackNavigationKey;
+      document.addEventListener("keydown", navigation.keyHandler, true);
+    }
+
+    if (navigation.registration || !window.SteamClient?.Input?.RegisterForControllerInputMessages) {
+      return;
+    }
+
+    try {
+      navigation.registration = window.SteamClient.Input.RegisterForControllerInputMessages(
+        handleFallbackControllerNavigation,
+      );
+    } catch {
+      navigation.registration = null;
+    }
   }
 
   function resolveAutoFocusIndex(route) {
@@ -5669,11 +6883,19 @@
 
   function monitorPanelVisibility() {
     const visible = isVisible(getPanelHost());
+    void syncNativeQuickAccessHost(visible);
 
     if (visible && !state.panelVisible) {
       state.panelVisible = true;
+      state.panelNavigationZone = "panel";
+      state.panelFocusLostAt = 0;
+      state.panelEntryPendingUntil = 0;
       updateHomeReorderInputCapture();
       ensurePanelInteractionTracker();
+      ensureFocusRepairTimer();
+      setupPluginStoreBridge();
+      refreshLiveUpdateSubscription();
+      refreshLiveUpdatePollingFallbacks();
 
       if (state.route.screen === "root") {
         state.pendingEntryAutoFocus = true;
@@ -5694,11 +6916,19 @@
       return;
     }
 
-    if (!visible) {
+    if (!visible && state.panelVisible) {
       if (state.homeReorder.active) {
         clearHomeReorderState({ restoreOriginalOrder: true });
       }
       state.panelVisible = false;
+      state.panelNavigationZone = "tabs";
+      state.panelFocusLostAt = 0;
+      state.panelEntryPendingUntil = 0;
+      clearLiveUpdateRetryTimer();
+      closeLiveUpdateSource();
+      stopFocusRepairTimer();
+      updatePluginStoreBridgePolling();
+      refreshLiveUpdatePollingFallbacks();
       clearPendingFocusRestore();
       clearEditorFocus();
       updateHomeReorderInputCapture();
@@ -5746,6 +6976,121 @@
     return Boolean(state.nativeUi.dialogButtonType);
   }
 
+  function stopNativeQuickAccessUiCapture() {
+    if (state.nativeUi.captureTimer) {
+      window.clearInterval(state.nativeUi.captureTimer);
+      state.nativeUi.captureTimer = 0;
+    }
+    if (state.nativeUi.captureHandler) {
+      document.removeEventListener("focusin", state.nativeUi.captureHandler, true);
+      document.removeEventListener("pointerdown", state.nativeUi.captureHandler, true);
+      document.removeEventListener("click", state.nativeUi.captureHandler, true);
+      state.nativeUi.captureHandler = null;
+    }
+  }
+
+  function promoteNativeQuickAccessUi() {
+    if (
+      state.nativeUi.dialogButtonType ||
+      !window.STFrontendLib?.captureNativeUi ||
+      !document.querySelector(".DialogButton") ||
+      !captureNativeUi()
+    ) {
+      return false;
+    }
+
+    stopNativeQuickAccessUiCapture();
+
+    state.renderRevision += 1;
+    window.setTimeout(() => {
+      if (state.installed) {
+        refreshQuickAccessPanel();
+        invalidate();
+      }
+    }, 0);
+    return true;
+  }
+
+  function ensureNativeQuickAccessUiCapture() {
+    if (state.nativeUi.dialogButtonType) {
+      stopNativeQuickAccessUiCapture();
+      return;
+    }
+    if (!window.STFrontendLib?.captureNativeUi) {
+      return;
+    }
+
+    if (!state.nativeUi.captureHandler) {
+      state.nativeUi.captureHandler = (event) => {
+        if (event.target?.closest?.("#quickaccess_tab_7")) {
+          promoteNativeQuickAccessUi();
+        }
+      };
+      document.addEventListener("focusin", state.nativeUi.captureHandler, true);
+      document.addEventListener("pointerdown", state.nativeUi.captureHandler, true);
+      document.addEventListener("click", state.nativeUi.captureHandler, true);
+    }
+
+    if (!state.nativeUi.captureTimer) {
+      state.nativeUi.captureTimer = window.setInterval(() => {
+        if (isVisible(document.getElementById("QuickAccess-Menu"))) {
+          if (!promoteNativeQuickAccessUi()) {
+            void primeNativeQuickAccessUi();
+          }
+        }
+      }, 150);
+    }
+  }
+
+  async function primeNativeQuickAccessUi() {
+    const nativeUi = state.nativeUi;
+    const tfsTab = document.getElementById("quickaccess_tab_7");
+    if (
+      nativeUi.dialogButtonType ||
+      nativeUi.priming ||
+      nativeUi.primeAttempts >= 2 ||
+      !state.panelVisible ||
+      document.querySelector('[role="tab"][aria-selected="true"]') !== tfsTab
+    ) {
+      return;
+    }
+
+    const nativeTab = document.getElementById(
+      nativeUi.primeAttempts === 0 ? "quickaccess_tab_5" : "quickaccess_tab_3",
+    );
+    if (!nativeTab || !tfsTab) {
+      return;
+    }
+
+    nativeUi.priming = true;
+    nativeUi.primeAttempts += 1;
+    try {
+      nativeTab.click();
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 20));
+        if (!isVisible(document.getElementById("QuickAccess-Menu"))) {
+          break;
+        }
+        if (nativeUi.dialogButtonType || promoteNativeQuickAccessUi()) {
+          break;
+        }
+        const selected = document.querySelector('[role="tab"][aria-selected="true"]');
+        if (selected !== nativeTab && selected !== tfsTab) {
+          break;
+        }
+      }
+    } finally {
+      if (
+        isVisible(document.getElementById("QuickAccess-Menu")) &&
+        document.querySelector('[role="tab"][aria-selected="true"]') === nativeTab
+      ) {
+        tfsTab.click();
+      }
+      nativeUi.priming = false;
+      monitorPanelVisibility();
+    }
+  }
+
   function shouldLoadFrontendComponentRegistry() {
     if (
       !window.STFrontendLib?.refreshComponentRegistry ||
@@ -5785,6 +7130,31 @@
     }
   }
 
+  function createFunctionalForceHost(node) {
+    let hook = node?.memoizedState || null;
+    while (hook) {
+      if (
+        typeof hook.queue?.dispatch === "function" &&
+        typeof hook.queue?.lastRenderedState === "boolean"
+      ) {
+        const dispatch = hook.queue.dispatch;
+        return {
+          forceUpdate() {
+            // Current Steam builds render Quick Access with function components.
+            // Toggle a private boolean twice so React schedules one neutral render
+            // without changing the component's final focus/navigation state.
+            dispatch((value) => !value);
+            dispatch((value) => !value);
+          },
+        };
+      }
+
+      hook = hook.next;
+    }
+
+    return null;
+  }
+
   function findRuntime(rootFiber = getQuickAccessRootFiber()) {
     if (!rootFiber) {
       return null;
@@ -5818,6 +7188,17 @@
 
       let current = node;
       while (current) {
+        const currentProps = current.memoizedProps || current.pendingProps || {};
+        if (
+          !qamNode &&
+          Object.hasOwn(currentProps, "active") &&
+          Object.hasOwn(currentProps, "visible") &&
+          Object.hasOwn(currentProps, "expanded") &&
+          Object.hasOwn(currentProps, "showHeaderAndFooter")
+        ) {
+          qamNode = current;
+        }
+
         if (current.stateNode && typeof current.stateNode.forceUpdate === "function") {
           forceHosts.push(current.stateNode);
         }
@@ -5827,6 +7208,13 @@
 
     if (!soundtrackTab) {
       return null;
+    }
+
+    if (!forceHosts.length && qamNode) {
+      const functionalForceHost = createFunctionalForceHost(qamNode);
+      if (functionalForceHost) {
+        forceHosts.push(functionalForceHost);
+      }
     }
 
     return {
@@ -7552,7 +8940,9 @@
       leadingIcon: BackIcon,
       buttonClassName: "steamloader-dialog-button steamloader-dialog-button-global-back",
       buttonStyle: null,
-      buttonProps: null,
+      buttonProps: {
+        onMoveUp: (event) => movePanelContentToHeader(event),
+      },
       rowClassName: "steamloader-row-shell-global-back",
       slotKey: globalBackSlotKey,
       selected: false,
@@ -7599,6 +8989,13 @@
       options.key ||
       options.className ||
       "control";
+    const directionalProps = {
+      onMoveLeft: (event) => movePanelControlFocus(focusKey, "left", event),
+      onMoveRight: (event) => movePanelControlFocus(focusKey, "right", event),
+      onMoveUp: (event) => movePanelControlVerticalFocus(focusKey, "up", event),
+      onMoveDown: (event) => movePanelControlVerticalFocus(focusKey, "down", event),
+      ...extraProps,
+    };
     const wrappedOnClick = (event) => {
       requestUiHaptic("confirm");
       onClick?.(event);
@@ -7606,7 +9003,7 @@
     const wrappedOptions = {
       ...options,
       extraProps: {
-        ...extraProps,
+        ...directionalProps,
         onGamepadFocus: (event) => {
           requestUiFocusHaptic(String(focusKey));
           originalGamepadFocus?.(event);
@@ -8334,17 +9731,40 @@
     );
   }
 
+  function getSlotDirectionalButtonProps(slot, index) {
+    const buttonProps = { ...(slot?.buttonProps || {}) };
+    const focusKey = resolveSlotFocusKey(slot, index) || String(index);
+    if (typeof buttonProps.onMoveLeft !== "function") {
+      buttonProps.onMoveLeft = (event) => movePanelControlFocus(focusKey, "left", event);
+    }
+    if (typeof buttonProps.onMoveRight !== "function") {
+      buttonProps.onMoveRight = (event) => movePanelControlFocus(focusKey, "right", event);
+    }
+    if (typeof buttonProps.onMoveUp !== "function") {
+      buttonProps.onMoveUp = (event) => movePanelControlVerticalFocus(focusKey, "up", event);
+    }
+    if (typeof buttonProps.onMoveDown !== "function") {
+      buttonProps.onMoveDown = (event) => movePanelControlVerticalFocus(focusKey, "down", event);
+    }
+    return buttonProps;
+  }
+
   function createButtonSlot(slot, index, autoFocusIndex) {
     if (typeof slot?.customRenderer === "function") {
       return slot.customRenderer(slot, index, autoFocusIndex);
     }
+
+    const slotWithNavigation = {
+      ...slot,
+      buttonProps: getSlotDirectionalButtonProps(slot, index),
+    };
 
     if (!slot?.forceFallback && window.STFrontendLib?.createButtonSlot) {
       return window.STFrontendLib.createButtonSlot(
         state,
         createElement,
         withChildren,
-        slot,
+        slotWithNavigation,
         index,
         autoFocusIndex,
         {
@@ -8360,6 +9780,7 @@
     }
 
     const backNavigation = getBackNavigation();
+    const directionalButtonProps = slotWithNavigation.buttonProps;
     const trailingContent = renderTrailingContent(slot);
     const buttonContent =
       slot.layout === "accordion"
@@ -8433,9 +9854,10 @@
         slotKey: slot.slotKey || null,
         className: slot.buttonClassName || "steamloader-dialog-button",
         extraProps: {
-          ...(slot.buttonProps || {}),
+          ...directionalButtonProps,
           "data-slot-button": String(index),
           "data-slot-key": resolveSlotFocusKey(slot, index) || undefined,
+          "data-slot-layout": slot.layout || undefined,
           autoFocus: Number.isInteger(autoFocusIndex) && index === autoFocusIndex,
           style: slot.buttonStyle || undefined,
           onGamepadFocus: () => {
@@ -11801,6 +13223,7 @@
       rememberCurrentRouteIndex,
       rememberCurrentRouteSlot,
       resolveSlotFocusKey,
+      getSlotDirectionalButtonProps,
       consumeVolumeActionAutoFocus,
       rememberVolumeActionFocus,
       getActiveVolumeActionIndex: () => state.audio.activeVolumeActionIndex,
@@ -11809,6 +13232,18 @@
 
   function SteamLoaderPanelShell() {
     let model = withGlobalBackSlot(buildScreenModel());
+    if (state.route.screen !== "root" && Array.isArray(model.slots)) {
+      model = {
+        ...model,
+        slots: model.slots.map((slot) => {
+          if (slot?.leadingIcon || ["slider", "stepper", "accordion", "progress"].includes(slot?.layout)) {
+            return slot;
+          }
+          const leadingIcon = resolveDefaultSlotLeadingIcon(slot);
+          return leadingIcon ? { ...slot, leadingIcon } : slot;
+        }),
+      };
+    }
     const forceCustomShell = isPerformanceOverlayRoute() || isAudioDashboardRoute();
     const topFocusSlots = Array.isArray(model.topSlots) ? model.topSlots : [];
     const contentFocusSlots = Array.isArray(model.slots) ? model.slots : [];
@@ -11915,8 +13350,12 @@
                 createElement(
                   "div",
                   withChildren(
-                    { className: "steamloader-title-wrap" },
-                    createElement("h1", {
+                  { className: "steamloader-title-wrap" },
+                  createElement("div", {
+                    className: "steamloader-header-eyebrow",
+                    children: state.route.screen === "root" ? "QUICK ACCESS" : "TOOLS FOR STEAM  /  PLUGINS",
+                  }),
+                  createElement("h1", {
                       className: "steamloader-title",
                       children: model.title,
                     }),
@@ -11957,15 +13396,24 @@
               ),
             )
           : null,
+        model.status
+          ? createElement("div", { className: "steamloader-status", children: model.status })
+          : null,
         model.error
           ? createElement("div", {
               className: "steamloader-error",
               children: model.error,
             })
           : null,
-        ...(Array.isArray(model.cards)
-          ? model.cards.map((card, index) => createInfoCard(card, index))
-          : []),
+        Array.isArray(model.cards) && model.cards.length
+          ? createElement(
+              "div",
+              withChildren(
+                { className: "steamloader-card-grid" },
+                ...model.cards.map((card, index) => createInfoCard(card, index)),
+              ),
+            )
+          : null,
         model.audioDashboard ? createAudioDashboard(model.audioDashboard, topSlots.length) : null,
         model.editor ? createEditorCard(model.editor) : null,
         ...(Array.isArray(model.editors)
@@ -11982,6 +13430,9 @@
             ...slotChildren,
           ),
         ),
+        model.note
+          ? createElement("div", { className: "steamloader-note", children: model.note })
+          : null,
         createFooterLegend(model.footerLegend),
       ),
     );
@@ -14084,6 +15535,9 @@
       title: "OmniLibrary",
       lines: [
         `${installedCount} installed / ${libraryCount} in library`,
+        snapshot?.watchersActive
+          ? `Live monitoring active - ${snapshot.watcherCount || 0} watched location${snapshot?.watcherCount === 1 ? "" : "s"}`
+          : "Live monitoring is starting.",
         ...preparationLines,
         snapshot?.statusText || "Waiting for setup.",
         snapshot?.detailText || "Sign in and refresh Epic or GOG to build the cached library.",
@@ -14100,10 +15554,29 @@
       `${store.installedCount || 0} installed / ${store.availableCount || 0} total`,
       store.accountName ? `Signed in as ${store.accountName}` : store.statusText || "",
       store.steamRestartRequired ? "Restart Steam once to activate this store tab." : "",
+      buildOmniLibrarySyncHealthCopy(store),
       store.detailText || "",
     ]
       .filter(Boolean)
       .join(" - ");
+  }
+
+  function buildOmniLibrarySyncHealthCopy(store) {
+    const health = store?.syncHealth || null;
+    if (!health) {
+      return "";
+    }
+
+    const lastRemote = health.lastRemoteSuccessAtUtc
+      ? new Date(health.lastRemoteSuccessAtUtc).toLocaleTimeString()
+      : "not yet";
+    const nextRemote = health.nextRemoteCheckAtUtc
+      ? new Date(health.nextRemoteCheckAtUtc).toLocaleTimeString()
+      : "pending";
+    const retrying = String(health.trigger || "").toLowerCase() === "remote-retry";
+    return retrying
+      ? `Sync retry ${nextRemote}: ${health.detail || "provider temporarily unavailable"}`
+      : `Last remote sync ${lastRemote} - next ${nextRemote}`;
   }
 
   function buildOmniLibraryPreparationProgress(store) {
@@ -16778,156 +18251,6 @@
     }
   }
 
-  function buildCommunityScriptUrl(plugin) {
-    const scriptUrl = String(plugin?.scriptUrl || "").replace(/^\/+/, "");
-    if (!scriptUrl) {
-      return "";
-    }
-
-    const separator = scriptUrl.includes("?") ? "&" : "?";
-    return `${apiBase}${scriptUrl}${separator}v=${encodeURIComponent(plugin.version || plugin.installedVersion || Date.now())}`;
-  }
-
-  function loadCommunityPluginScript(plugin) {
-    const pluginId = String(plugin?.id || "").trim();
-    const version = String(plugin?.version || "").trim();
-    const scriptUrl = buildCommunityScriptUrl(plugin);
-    if (!pluginId || !scriptUrl) {
-      return Promise.resolve(false);
-    }
-
-    window.ToolsForSteamCommunityPlugins ??= {};
-
-    if (
-      state.communityPlugins.scriptVersionsById[pluginId] === version &&
-      window.ToolsForSteamCommunityPlugins[pluginId]
-    ) {
-      return Promise.resolve(true);
-    }
-
-    if (state.communityPlugins.scriptPromisesById[pluginId]) {
-      return state.communityPlugins.scriptPromisesById[pluginId];
-    }
-
-    const scriptId = `steamloader-community-plugin-script-${pluginId}`;
-    document.getElementById(scriptId)?.remove();
-    state.communityPlugins.sdkById ??= {};
-    window.ToolsForSteamCommunityPlugins?.[pluginId]?.dispose?.();
-    state.communityPlugins.sdkById[pluginId]?.dispose?.();
-    delete state.communityPlugins.sdkById[pluginId];
-    delete window.ToolsForSteamCommunityPlugins[pluginId];
-
-    const promise = new Promise((resolve, reject) => {
-      const script = document.createElement("script");
-      script.id = scriptId;
-      script.src = typeof window.__steamLoaderApiUrl === "function"
-        ? window.__steamLoaderApiUrl(scriptUrl)
-        : scriptUrl;
-      script.async = false;
-      script.onload = () => {
-        state.communityPlugins.scriptVersionsById[pluginId] = version;
-        delete state.communityPlugins.scriptErrorsById[pluginId];
-        delete state.communityPlugins.scriptPromisesById[pluginId];
-        resolve(true);
-      };
-      script.onerror = () => {
-        const message = `${plugin?.title || pluginId} could not be loaded.`;
-        state.communityPlugins.scriptErrorsById[pluginId] = message;
-        delete state.communityPlugins.scriptPromisesById[pluginId];
-        reject(new Error(message));
-      };
-      document.head.append(script);
-    });
-
-    state.communityPlugins.scriptPromisesById[pluginId] = promise;
-    return promise;
-  }
-
-  async function loadCommunityPluginScripts(pluginsSnapshot) {
-    const loadResults = await Promise.allSettled(
-      (Array.isArray(pluginsSnapshot) ? pluginsSnapshot : []).map((plugin) =>
-        loadCommunityPluginScript(plugin),
-      ),
-    );
-
-    const failed = loadResults.filter((result) => result.status === "rejected");
-    if (failed.length) {
-      state.communityPlugins.error = `${failed.length} community plugin${failed.length === 1 ? "" : "s"} could not be loaded.`;
-    }
-  }
-
-  async function loadCommunityPluginsState(options = {}) {
-    if (state.communityPlugins.loading) {
-      return;
-    }
-
-    const showLoading = options.showLoading !== false;
-    state.communityPlugins.loading = true;
-    state.communityPlugins.error = "";
-    if (showLoading) {
-      rerenderHomePanel();
-    }
-
-    try {
-      const response = await fetch(`${apiBase}api/plugin-store/community/installed`, {
-        cache: "no-store",
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.message || `Community plugins could not be loaded (${response.status}).`);
-      }
-
-      state.communityPlugins.snapshot = payload && typeof payload === "object"
-        ? payload
-        : { plugins: [] };
-      state.communityPlugins.sdkById ??= {};
-      const installedPluginIds = new Set(
-        state.communityPlugins.snapshot.plugins.map((plugin) => String(plugin?.id || "")).filter(Boolean),
-      );
-      for (const pluginId of Object.keys(state.communityPlugins.sdkById)) {
-        if (!installedPluginIds.has(pluginId)) {
-          window.ToolsForSteamCommunityPlugins?.[pluginId]?.dispose?.();
-          state.communityPlugins.sdkById[pluginId]?.dispose?.();
-          delete state.communityPlugins.sdkById[pluginId];
-          document.getElementById(`steamloader-community-plugin-script-${pluginId}`)?.remove();
-          delete window.ToolsForSteamCommunityPlugins?.[pluginId];
-        }
-      }
-      await loadCommunityPluginScripts(state.communityPlugins.snapshot.plugins);
-    } catch (error) {
-      state.communityPlugins.error = error instanceof Error ? error.message : String(error);
-      state.communityPlugins.snapshot = { plugins: [] };
-    } finally {
-      state.communityPlugins.loading = false;
-      rerenderHomePanel();
-    }
-  }
-
-  function getCommunityPluginSdk(plugin, registryEntry, runtime) {
-    const pluginId = String(plugin?.id || "").trim();
-    if (!pluginId) {
-      return null;
-    }
-
-    state.communityPlugins.sdkById ??= {};
-    const registeredSdk = registryEntry?.sdk;
-    if (registeredSdk && !registeredSdk.lifecycle?.disposed) {
-      state.communityPlugins.sdkById[pluginId] = registeredSdk;
-      return registeredSdk;
-    }
-
-    const existingSdk = state.communityPlugins.sdkById[pluginId];
-    if (existingSdk && !existingSdk.lifecycle?.disposed) {
-      return existingSdk;
-    }
-
-    const sdk = window.TfsPluginSdk?.create?.(registryEntry?.manifest || runtime || {}, { pluginId }) || null;
-    if (sdk) {
-      state.communityPlugins.sdkById[pluginId] = sdk;
-    }
-    return sdk;
-  }
-
   async function loadUpdateState(options = {}) {
     const force = options.force === true;
     const showLoading = options.showLoading !== false;
@@ -18454,7 +19777,7 @@
     closeQuickAccessMenuForPluginStoreSession();
 
     try {
-      const response = await fetch(`${apiBase}api/plugin-store/overlay/open`, {
+      const response = await fetch(`${apiBase}api/plugin-activator/overlay/open`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -18489,6 +19812,10 @@
       if (!response.ok) {
         throw new Error(payload.message || `OmniLibrary could not be opened (${response.status}).`);
       }
+      postPluginStoreBridgeMessage({
+        type: "overlay-open-request",
+        source: "unifystore",
+      });
     } catch (error) {
       setPluginStoreRemoteActive(false);
       state.storeSync.error = error instanceof Error ? error.message : String(error);
@@ -18586,7 +19913,12 @@
 
     const snapshot = getUpdateSnapshot();
     const updatesVisible = isUpdatesVisibleRoute();
-    if (!updatesVisible || !snapshot?.installInProgress || !shouldUseLiveUpdatePollingFallback()) {
+    if (
+      !state.panelVisible ||
+      !updatesVisible ||
+      !snapshot?.installInProgress ||
+      !shouldUseLiveUpdatePollingFallback()
+    ) {
       return;
     }
 
@@ -21692,6 +23024,7 @@
             key: "audio-refresh",
             title: "Refresh Audio",
             icon: RefreshActionIcon,
+            ...getPanelHeaderNavigationProps("audio-refresh"),
             disabled: state.audio.dashboardLoading || state.audio.loading,
             onClick: () => {
               void loadAudioDashboardState();
@@ -23749,13 +25082,13 @@
 
       return {
         ...defaultModel,
-        title: "SteamGridDB",
+        title: "TFS Artworks",
         subtitle: "Settings",
         status: resolveArtworkStatusText(),
         error: state.artwork.error,
-        note: "Control the Change Artwork context-menu entry and the SteamGridDB key used for manual artwork browsing.",
+        note: "Control the TFS Artworks picker and the SteamGridDB provider used for manual artwork browsing.",
         sectionHeaders: [
-          createSectionHeader(0, "Artwork Picker", "Control how the Big Picture Change Artwork action behaves.", {
+          createSectionHeader(0, "Artwork Picker", "Control how the Big Picture TFS Artworks action behaves.", {
             icon: ArtworkPluginIcon,
           }),
           createSectionHeader(2, "SteamGridDB Access", "Save or clear the API key used for manual artwork browsing.", {
@@ -23775,7 +25108,7 @@
           {
             title: "Artwork Picker",
             lines: [
-              "Open a game context menu in Big Picture and choose Change Artwork to browse SteamGridDB.",
+              "Open a game context menu in Big Picture and choose TFS Artworks to browse quality-ranked images.",
               `API key: ${settings?.steamGridDbApiKeyPreview || "Built-in key"}`,
               `Results per tab: ${resultLimit}`,
               `Steam path: ${steamPathValue}`,
@@ -23812,7 +25145,7 @@
             "artwork",
             "context-menu-enabled",
             "Context Menu Entry",
-            "Show Change Artwork in Steam game context menus.",
+            "Show TFS Artworks in Steam game context menus.",
             settings?.contextMenuEnabled !== false,
             () => toggleArtworkSetting("context-menu-enabled"),
             {
@@ -27924,10 +29257,8 @@
                     },
                   ),
                   makeCommandSlot(
-                    xbox.authReady ? "Open Xbox Account" : "Sign in to Xbox",
-                    xbox.authReady
-                      ? "Your Xbox account is available. Open the official app to change it."
-                      : xbox.detailText || "Open the official Xbox app and sign in.",
+                    "Sign in to Xbox",
+                    "Connect your Microsoft/Xbox account in OmniLibrary's isolated window. This enables Xbox achievement progress; TFS never receives your password.",
                     () => startUnifyStoreLogin("xbox-game-pass"),
                     {
                       slotKey: "unifystore-xbox-login",
@@ -28719,11 +30050,7 @@
         ? formatUpdateInstallStatus(updateSnapshot)
       : updateReady
         ? getUpdateHeadline(updateSnapshot)
-      : state.communityPlugins.loading
-        ? "Loading community plugins..."
-      : state.communityPlugins.error
-        ? state.communityPlugins.error
-        : "";
+      : "";
     const homeDebugNote = getDeveloperDebugNote("home-reorder", "waiting for Y input...");
     const homeNote = externalGameActive
       ? `Steam Quick Access is shown in front of ${externalGameState?.gameTitle || "the current game"}. Press B to return to the game.`
@@ -28753,7 +30080,9 @@
 
     return {
       ...defaultModel,
-      headerIcon: null,
+      title: "Tools for Steam",
+      subtitle: `${homePlugins.length} tools ready · Library, system, and desktop controls`,
+      headerIcon: SteamLoaderIcon,
       panelClassName: "steamloader-panel-home",
       status: homeStatus,
       note: homeNote,
@@ -28788,7 +30117,7 @@
                 key: "update",
                 title: `Install ${updateSnapshot?.latestVersion || "Update"}`,
                 icon: HeaderUpdateIcon,
-                ...getHomeHeaderNavigationProps("update"),
+                ...getPanelHeaderNavigationProps("update"),
                 disabled: state.homeReorder.active || state.generalSettings.saving || isUpdatesBusy(),
                 buttonStyle: {
                   width: "30px",
@@ -28807,7 +30136,7 @@
           key: "wishlist",
           title: "Wishlist",
           icon: HeaderWishlistIcon,
-          ...getHomeHeaderNavigationProps("wishlist"),
+          ...getPanelHeaderNavigationProps("wishlist"),
           disabled: state.homeReorder.active || state.generalSettings.saving,
           buttonStyle: {
             width: "30px",
@@ -28821,10 +30150,10 @@
           },
         },
         {
-          key: "store",
-          title: "Store",
-          icon: HeaderStoreIcon,
-          ...getHomeHeaderNavigationProps("store"),
+          key: "plugins",
+          title: "Plugin Activator",
+          icon: SteamLoaderIcon,
+          ...getPanelHeaderNavigationProps("plugins"),
           disabled: state.homeReorder.active || state.generalSettings.saving,
           buttonStyle: {
             width: "30px",
@@ -28841,7 +30170,7 @@
           key: "settings",
           title: "Settings",
           icon: HeaderSettingsIcon,
-          ...getHomeHeaderNavigationProps("settings"),
+          ...getPanelHeaderNavigationProps("settings"),
           disabled: state.homeReorder.active || state.generalSettings.saving,
           buttonStyle: {
             width: "30px",
@@ -28860,7 +30189,7 @@
       dividerAfterIndex: null,
       slots: homePlugins.map((plugin, pluginIndex) => {
         const isMoving = state.homeReorder.active && plugin.id === movingPluginId;
-        return makeNavigationSlot(plugin.title, "", () => {
+        return makeNavigationSlot(plugin.title, plugin.description, () => {
           if (state.homeReorder.active) {
             if (!state.homeReorder.activationLocked) {
               void commitHomeReorder();
@@ -28908,11 +30237,10 @@
                 },
               }
             : {
-                ...(pluginIndex === 0
-                  ? {
-                      onMoveUp: (event) => moveHomeContentToHeader(event),
-                    }
-                  : {}),
+                onMoveLeft: (event) => moveHomeGridFocus(plugin.id, "left", event),
+                onMoveRight: (event) => moveHomeGridFocus(plugin.id, "right", event),
+                onMoveUp: (event) => moveHomeGridFocus(plugin.id, "up", event),
+                onMoveDown: (event) => moveHomeGridFocus(plugin.id, "down", event),
                 onSecondaryButton: () => {
                   return startHomeReorderFromFocusedPlugin("onSecondaryButton", plugin.id);
                 },
@@ -29302,6 +30630,7 @@
       void loadUpdateState();
     }
 
+    refreshLiveUpdateSubscription();
     updateProcessesPolling();
     updateAudioMixerPolling();
     updateStoreSyncPolling();
@@ -29311,6 +30640,10 @@
     updateHomeReorderInputCapture();
 
     refreshQuickAccessPanel();
+    // Route changes must repaint even when Steam temporarily unmounts the
+    // Quick Access tab collection. In that state install() cannot observe a
+    // changed tab node and therefore cannot request the React update itself.
+    invalidate();
     queuePendingScrollRestore();
     queuePendingFocusRestore(state.route);
   }
@@ -29985,6 +31318,47 @@
     return typeof EventSource === "function";
   }
 
+  function getLiveUpdateTopicsForRoute(route = state.route) {
+    const topics = new Set(["notifications.show"]);
+    const pluginId = route?.pluginId || "";
+
+    if (route?.screen === "root") {
+      topics.add("settings.state");
+      topics.add("updates.state");
+      topics.add("external-game-quick-access.state");
+    }
+
+    if (pluginId === "settings") {
+      topics.add("settings.state");
+      topics.add("plugin-store.state");
+      if (route?.pageId === "updates") {
+        topics.add("updates.state");
+      }
+      if (isOemSettingsRoute()) {
+        topics.add("handheld-performance.state");
+      }
+    } else if (pluginId === "processes") {
+      topics.add("processes.state");
+    } else if (pluginId === "audio") {
+      topics.add("audio.dashboard");
+      topics.add("audio.mixer");
+    } else if (pluginId === "store-sync" || pluginId === "omnilibrary") {
+      topics.add("store-sync.state");
+    } else if (pluginId === "performance") {
+      topics.add("performance.state");
+    } else if (pluginId === "app-start") {
+      topics.add("app-start.state");
+    } else if (pluginId === "smart-home") {
+      topics.add("smart-home.state");
+    } else if (pluginId === "discord") {
+      topics.add("discord.state");
+    } else if (pluginId === "handheld-performance") {
+      topics.add("handheld-performance.state");
+    }
+
+    return Array.from(topics).sort();
+  }
+
   function hasConnectedLiveUpdates() {
     return supportsLiveUpdates() && state.liveUpdates.connected;
   }
@@ -30015,10 +31389,16 @@
 
     state.liveUpdates.source = null;
     state.liveUpdates.connected = false;
+    state.liveUpdates.topicsKey = "";
   }
 
   function scheduleLiveUpdateReconnect(delayMs = 3000) {
-    if (!supportsLiveUpdates() || state.liveUpdates.retryTimer || state.liveUpdates.source) {
+    if (
+      !state.panelVisible ||
+      !supportsLiveUpdates() ||
+      state.liveUpdates.retryTimer ||
+      state.liveUpdates.source
+    ) {
       return;
     }
 
@@ -30026,6 +31406,22 @@
       state.liveUpdates.retryTimer = 0;
       ensureLiveUpdateConnection();
     }, delayMs);
+  }
+
+  function refreshLiveUpdateSubscription() {
+    if (!state.panelVisible || !supportsLiveUpdates()) {
+      clearLiveUpdateRetryTimer();
+      closeLiveUpdateSource();
+      return;
+    }
+
+    const topicsKey = getLiveUpdateTopicsForRoute().join(",");
+    if (state.liveUpdates.source && state.liveUpdates.topicsKey === topicsKey) {
+      return;
+    }
+
+    closeLiveUpdateSource();
+    ensureLiveUpdateConnection();
   }
 
   function refreshLiveUpdatePollingFallbacks() {
@@ -30223,11 +31619,7 @@
         return true;
       }
       case "plugin-store.state":
-        void loadCommunityPluginsState({ showLoading: false });
-        if (state.panelVisible && state.route?.screen === "root") {
-          rerenderHomePanel();
-        }
-
+        void loadGeneralSettingsState({ showLoading: false });
         return true;
       case "updates.state":
         setUpdateSnapshot(payload);
@@ -30322,19 +31714,23 @@
   }
 
   function ensureLiveUpdateConnection() {
-    if (!supportsLiveUpdates() || state.liveUpdates.source) {
+    if (!state.panelVisible || !supportsLiveUpdates() || state.liveUpdates.source) {
       return;
     }
 
     clearLiveUpdateRetryTimer();
 
     try {
-      const eventUrl = typeof window.__steamLoaderApiUrl === "function"
+      const topicsKey = getLiveUpdateTopicsForRoute().join(",");
+      const eventBaseUrl = typeof window.__steamLoaderApiUrl === "function"
         ? window.__steamLoaderApiUrl("api/events")
         : `${apiBase}api/events`;
+      const separator = eventBaseUrl.includes("?") ? "&" : "?";
+      const eventUrl = `${eventBaseUrl}${separator}topics=${encodeURIComponent(topicsKey)}`;
       const source = new EventSource(eventUrl);
       state.liveUpdates.source = source;
       state.liveUpdates.connected = false;
+      state.liveUpdates.topicsKey = topicsKey;
 
       source.onopen = () => {
         if (state.liveUpdates.source !== source) {
@@ -30386,7 +31782,11 @@
       window.__steamToolsProcessesPollTimer = null;
     }
 
-    if (state.route.pluginId !== "processes" || !shouldUseLiveUpdatePollingFallback()) {
+    if (
+      !state.panelVisible ||
+      state.route.pluginId !== "processes" ||
+      !shouldUseLiveUpdatePollingFallback()
+    ) {
       return;
     }
 
@@ -30403,7 +31803,7 @@
       window.__steamToolsAudioMixerPollTimer = null;
     }
 
-    if (state.route?.pluginId !== "audio") {
+    if (!state.panelVisible || state.route?.pluginId !== "audio") {
       return;
     }
 
@@ -30454,6 +31854,7 @@
     }
 
     if (
+      !state.panelVisible ||
       (state.route?.pluginId !== "store-sync" && state.route?.pluginId !== "omnilibrary") ||
       !shouldUseLiveUpdatePollingFallback()
     ) {
@@ -30478,7 +31879,11 @@
       window.__steamToolsSmartHomePollTimer = null;
     }
 
-    if (state.route?.pluginId !== "smart-home" || !shouldUseLiveUpdatePollingFallback()) {
+    if (
+      !state.panelVisible ||
+      state.route?.pluginId !== "smart-home" ||
+      !shouldUseLiveUpdatePollingFallback()
+    ) {
       return;
     }
 
@@ -30496,6 +31901,7 @@
     }
 
     if (
+      !state.panelVisible ||
       state.route?.screen !== "page" ||
       state.route?.pluginId !== "settings" ||
       state.route?.pageId !== "system-bluetooth" ||
@@ -30837,15 +32243,16 @@
     applyActiveThemeCss();
     cleanupLegacyNodes();
     captureNativeUi();
-    ensureLiveUpdateConnection();
+    ensureNativeQuickAccessUiCapture();
     setupPluginStoreBridge();
     ensureOmniLibraryDownloadStatusChannel();
     ensureVolumeSliderHotkeys();
     ensureAudioDashboardHotkeys();
     ensurePerformanceSliderHotkeys();
     ensureHomeReorderHotkeys();
-    ensureFocusRepairTimer();
+    ensureFallbackControllerNavigation();
     ensureFocusRepairHandler();
+    ensureNativeQuickAccessHostSync();
     updateHomeReorderInputCapture();
 
     if (shouldLoadFrontendComponentRegistry()) {
@@ -30858,10 +32265,6 @@
 
     if (!state.generalSettings.loading && !state.generalSettings.snapshot && !state.generalSettings.error) {
       void loadGeneralSettingsState();
-    }
-
-    if (!state.communityPlugins.loading && !state.communityPlugins.snapshot && !state.communityPlugins.error) {
-      void loadCommunityPluginsState({ showLoading: false });
     }
 
     if (!state.externalGameQuickAccess.loading && state.externalGameQuickAccess.snapshot === null) {
@@ -30880,6 +32283,7 @@
 
     state.reactElementSymbol = runtime.soundtrackTab.tab.$$typeof;
     state.qamNode = runtime.qamNode;
+    state.forceHosts = runtime.forceHosts;
     const liveTabsChanged = mutateLiveTabs(rootFiber);
     ensurePanelObserver();
 
@@ -30974,7 +32378,6 @@
   window.__steamLoaderPluginStoreOverlayBridge = {
     togglePluginEnabled,
     refreshSettings: () => loadGeneralSettingsState({ showLoading: false }),
-    refreshCommunityPlugins: () => loadCommunityPluginsState({ showLoading: false }),
     refreshVisiblePanel: () => {
       state.renderRevision += 1;
       renderPanelState();

@@ -20,7 +20,7 @@ test("Wishlist is a permanent core header action with a dedicated full-screen op
   assert.doesNotMatch(popup, /\{\s*id: "store",\s*title: "Wishlist",\s*description: "Cross-store games/);
   assert.match(popup, /function HeaderWishlistIcon\(\)/);
   assert.match(popup, /key: "wishlist",[\s\S]*?title: "Wishlist",[\s\S]*?icon: HeaderWishlistIcon,[\s\S]*?openStoreOverlay\(\)/);
-  assert.match(popup, /key: "wishlist",[\s\S]*?key: "store",[\s\S]*?title: "Store"/);
+  assert.match(popup, /key: "wishlist",[\s\S]*?key: "plugins",[\s\S]*?title: "Plugin Activator"/);
   assert.doesNotMatch(popup, /plugin\.id === "store"/);
   assert.match(backgroundHost, /storeService\.RunRefreshLoopAsync\(\s*static \(\) => true,/);
   assert.doesNotMatch(backgroundHost, /IsPluginEnabled\("store"\)/);

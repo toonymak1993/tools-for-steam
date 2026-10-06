@@ -77,9 +77,7 @@ public sealed class TfsGamepadHelperHost
             var controllerShortcutService = new ControllerShortcutService(
                 isEnabled: () => true,
                 isBigPictureForeground: SteamBigPictureForegroundDetector.IsBigPictureForeground,
-                isGameInForeground: () =>
-                    !SteamBigPictureForegroundDetector.IsBigPictureForeground() &&
-                    PerformanceForegroundTargetResolver.TryResolve() is not null,
+                isGameInForeground: () => PerformanceForegroundTargetResolver.TryResolve() is not null,
                 isHidMenuButtonDown: () => hidMenuButtonMonitor.IsMenuDown,
                 openSteamMenuAsync: () => TryOpenSteamPanelAsync(controllerApiClient, "api/control/steam-menu"),
                 openQuickAccessMenuAsync: () => TryOpenSteamPanelAsync(controllerApiClient, "api/control/quick-access"),

@@ -19,8 +19,9 @@ namespace SteamLoader.App.Services;
 public sealed class ControllerShortcutService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(25);
+    private static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ContextRefreshInterval = TimeSpan.FromMilliseconds(150);
-    private static readonly TimeSpan SettingsRefreshInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan SettingsRefreshInterval = TimeSpan.FromSeconds(2);
 
     private const int SteamMenuDigit = 1;    // Ctrl+1 -> STEAM menu (left)
     private const int QuickAccessDigit = 2;  // Ctrl+2 -> Quick Access menu (right)
@@ -123,7 +124,10 @@ public sealed class ControllerShortcutService
                     Log($"poll-error type={exception.GetType().Name} message={exception.Message}");
                 }
 
-                await Task.Delay(PollInterval, cancellationToken);
+                var delay = _detectedContext == ShortcutContext.None
+                    ? IdlePollInterval
+                    : PollInterval;
+                await Task.Delay(delay, cancellationToken);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -150,6 +154,21 @@ public sealed class ControllerShortcutService
                     : ShortcutContext.None;
         }
         var context = _detectedContext;
+        if (context == ShortcutContext.None)
+        {
+            if (context != _context)
+            {
+                Log($"context previous={_context} current={context}");
+                _context = context;
+                _steamMenuPress.EnterContext(false, nowUtc);
+                _steamQuickAccessPress.EnterContext(false, nowUtc);
+                _inGameOverlayPress.EnterContext(false, nowUtc);
+                _inGameQuickAccessPress.EnterContext(false, nowUtc);
+            }
+
+            return;
+        }
+
         var settings = GetSettings(nowUtc);
         var controllerButtonMasks = ReadConnectedControllerButtonMasks().ToList();
         foreach (var hidMask in _hidControllerButtonMasksProvider())

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http.Headers;
@@ -33,8 +32,8 @@ internal sealed class UnifySteamService
     {
         Timeout = TimeSpan.FromSeconds(20)
     };
+    private static readonly AsyncLocal<CancellationToken> ActiveRefreshCancellation = new();
 
-    private static readonly ConcurrentDictionary<string, string> SteamGridDbPortraitCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object XboxInstalledCacheGate = new();
     private static readonly Dictionary<string, XboxInstalledCacheState> XboxInstalledCache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -165,7 +164,22 @@ internal sealed class UnifySteamService
                 .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id) && game.SteamAppId != 0)
                 .GroupBy(game => game.Id, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(group => group.Key, group => group.First().SteamAppId, StringComparer.OrdinalIgnoreCase);
-            var result = RefreshStore(definition, storeConfiguration, lightweight, quiet);
+            var previousCancellation = ActiveRefreshCancellation.Value;
+            ActiveRefreshCancellation.Value = cancellationToken;
+            UnifySteamStoreRefreshResult result;
+            try
+            {
+                result = RefreshStore(
+                    definition,
+                    storeConfiguration,
+                    lightweight,
+                    quiet,
+                    cancellationToken);
+            }
+            finally
+            {
+                ActiveRefreshCancellation.Value = previousCancellation;
+            }
             cancellationToken.ThrowIfCancellationRequested();
             if (result.Succeeded)
             {
@@ -219,6 +233,16 @@ internal sealed class UnifySteamService
         var definition = ResolveDefinition(storeId);
         var storeConfiguration = GetStoreConfiguration(configuration, definition.Id);
 
+        if (definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
+        {
+            _journal.Append(
+                "info",
+                "omnilibrary",
+                "Prepared secure Xbox sign-in.",
+                "Tools for Steam opens Microsoft's isolated OAuth window and stores only the encrypted refresh token.");
+            return;
+        }
+
         if (definition.Supports(OmniLibraryStoreCapabilities.ManagedWebSignIn))
         {
             storeConfiguration.AuthPath = definition.Id switch
@@ -232,17 +256,6 @@ internal sealed class UnifySteamService
                 "omnilibrary",
                 $"Prepared secure {definition.Title} sign-in.",
                 $"Tools for Steam opens {definition.Title} in an isolated sign-in window and captures the authorization response automatically.");
-            return;
-        }
-
-        if (definition.Id.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase))
-        {
-            OpenInDefaultBrowser("msxbox://signIn/");
-            _journal.Append(
-                "info",
-                "omnilibrary",
-                "Opened Xbox sign-in.",
-                "Sign in with the Windows account that owns Game Pass, then choose Sync Xbox Library in OmniLibrary.");
             return;
         }
 
@@ -577,6 +590,13 @@ internal sealed class UnifySteamService
                     "psp",
                     StringComparison.OrdinalIgnoreCase))?.EmulatorPath ?? string.Empty
                 : effectiveToolPath,
+            SyncHealth = new OmniLibrarySyncHealthState(
+                storeConfiguration.LastLocalCheckAtUtc,
+                storeConfiguration.LastRemoteCheckAtUtc,
+                storeConfiguration.LastRemoteSuccessAtUtc,
+                storeConfiguration.NextRemoteCheckAtUtc,
+                storeConfiguration.LastSyncTrigger,
+                storeConfiguration.LastSyncDetail),
         };
     }
 
@@ -655,6 +675,7 @@ internal sealed class UnifySteamService
         return descriptor.SetupKind switch
         {
             "openxbl" => !string.IsNullOrWhiteSpace(provider.Credential),
+            "xbox-account" => !string.IsNullOrWhiteSpace(provider.SecondaryCredential),
             "store-account" => storeAuthReady,
             "local-path" => !string.IsNullOrWhiteSpace(provider.DataPath),
             "username-api-key" =>
@@ -686,6 +707,13 @@ internal sealed class UnifySteamService
         if (!configuration.UnifySteam.GameData.Enabled || !provider.Enabled)
         {
             return "Achievements and enhanced metadata are disabled for this provider.";
+        }
+
+        if (descriptor.SetupKind.Equals("xbox-account", StringComparison.OrdinalIgnoreCase))
+        {
+            return !string.IsNullOrWhiteSpace(provider.SecondaryCredential)
+                ? $"Uses the connected Xbox account{(string.IsNullOrWhiteSpace(provider.AccountName) ? string.Empty : $" ({provider.AccountName})")} and refreshes achievements only for opened or recently played titles."
+                : "Sign in to Xbox from the Xbox store settings to show verified achievement progress.";
         }
 
         if (descriptor.Supports(OmniLibraryGameDataCapabilities.StoreAccount))
@@ -1438,10 +1466,12 @@ internal sealed class UnifySteamService
         OmniLibraryStoreDescriptor definition,
         UnifySteamStoreConfiguration storeConfiguration,
         bool lightweight,
-        bool quiet)
+        bool quiet,
+        CancellationToken cancellationToken)
     {
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             switch (definition.Id)
             {
                 case OmniLibraryRomSystemRegistry.StoreId:
@@ -1475,6 +1505,10 @@ internal sealed class UnifySteamService
                 "catalog",
                 cache.Games.Count > 0 ? "ready" : "empty");
             return new UnifySteamStoreRefreshResult(definition.Id, true, string.Empty);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception exception)
         {
@@ -2567,14 +2601,17 @@ internal sealed class UnifySteamService
 
         var locale = NormalizeXboxWebLocale(language);
         var requestUri = $"https://www.xbox.com/{Uri.EscapeDataString(locale)}/play";
-        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        using var response = HttpClient.GetAsync(
+            requestUri,
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException(
                 $"The Xbox Cloud Gaming catalog could not be loaded. HTTP {(int)response.StatusCode}.");
         }
 
-        var page = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var page = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         return ExtractXboxCloudProductIds(page);
     }
 
@@ -2613,13 +2650,16 @@ internal sealed class UnifySteamService
 
     private static JsonDocument LoadRequiredJson(string requestUri, string failureMessage)
     {
-        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        using var response = HttpClient.GetAsync(
+            requestUri,
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"{failureMessage} HTTP {(int)response.StatusCode}.");
         }
 
-        using var stream = response.Content.ReadAsStream();
+        using var stream = response.Content.ReadAsStream(
+            ActiveRefreshCancellation.Value);
         return JsonDocument.Parse(stream);
     }
 
@@ -2977,7 +3017,6 @@ internal sealed class UnifySteamService
     internal static Dictionary<string, UnifySteamGameCacheEntry>
         LoadXboxInstalledGamesForReconciliation()
     {
-        var installed = LoadXboxInstalledGames(forceRefresh: true);
         try
         {
             var configuration = new StoreSyncSettingsStore(
@@ -2985,21 +3024,30 @@ internal sealed class UnifySteamService
             if (!configuration.UnifySteam.Stores.TryGetValue("xbox-game-pass", out var store) ||
                 store?.Cache?.Games is null)
             {
-                return installed;
+                return LoadXboxInstalledGames(forceRefresh: true);
             }
 
-            foreach (var catalogGame in store.Cache.Games.Where(game =>
-                         game is not null && !string.IsNullOrWhiteSpace(game.Id)))
-            {
-                if (TryResolveXboxInstalledGame(catalogGame, installed, out var installedGame))
-                {
-                    installed[catalogGame.Id] = installedGame;
-                }
-            }
+            return LoadXboxInstalledGamesForReconciliation(store.Cache.Games);
         }
         catch
         {
             // The regular catalog refresh remains the fallback.
+            return LoadXboxInstalledGames(forceRefresh: true);
+        }
+    }
+
+    internal static Dictionary<string, UnifySteamGameCacheEntry>
+        LoadXboxInstalledGamesForReconciliation(
+            IEnumerable<UnifySteamGameCacheEntry> catalogGames)
+    {
+        var installed = LoadXboxInstalledGames(forceRefresh: true);
+        foreach (var catalogGame in catalogGames.Where(game =>
+                     game is not null && !string.IsNullOrWhiteSpace(game.Id)))
+        {
+            if (TryResolveXboxInstalledGame(catalogGame, installed, out var installedGame))
+            {
+                installed[catalogGame.Id] = installedGame;
+            }
         }
 
         return installed;
@@ -3225,7 +3273,7 @@ internal sealed class UnifySteamService
         return true;
     }
 
-    // The artwork pipeline (SteamGridDbArtworkDownloader) already reads a
+    // The OmniLibrary artwork pipeline already reads a
     // file:// URL straight off disk with no network call, so a tile image
     // bundled with the install is a free, always-correct source. It only
     // fills the ImageUrl gap for locally-scanned entries: catalog-fetched
@@ -3659,13 +3707,16 @@ internal sealed class UnifySteamService
 
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Authorization = new("Bearer", accessToken);
-            using var response = HttpClient.Send(request);
+            using var response = HttpClient.Send(
+                request,
+                ActiveRefreshCancellation.Value);
             if (!response.IsSuccessStatusCode)
             {
                 throw new InvalidOperationException($"Epic library could not be loaded (HTTP {(int)response.StatusCode}). Sign in again and retry.");
             }
 
-            var payload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var payload = response.Content.ReadAsStringAsync(
+                ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
             using var document = JsonDocument.Parse(payload);
             if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
@@ -4080,7 +4131,6 @@ internal sealed class UnifySteamService
     internal static Dictionary<string, UnifySteamGameCacheEntry>
         LoadEpicInstalledGamesForReconciliation()
     {
-        var installed = LoadEpicLauncherInstalledGames();
         try
         {
             var configuration = new StoreSyncSettingsStore(
@@ -4088,40 +4138,49 @@ internal sealed class UnifySteamService
             if (!configuration.UnifySteam.Stores.TryGetValue("epic-games", out var store) ||
                 store?.Cache?.Games is null)
             {
-                return installed;
+                return LoadEpicLauncherInstalledGames();
             }
 
-            foreach (var game in store.Cache.Games.Where(game =>
-                         game is not null &&
-                         game.RequiresExternalLauncher &&
-                         !string.IsNullOrWhiteSpace(game.Id) &&
-                         !string.IsNullOrWhiteSpace(game.RegistryPath)))
-            {
-                if (!TryReadEpicExternalInstallPath(
-                        game.RegistryPath,
-                        game.RegistryValueName,
-                        out var installPath))
-                {
-                    continue;
-                }
-
-                installed[game.Id] = new UnifySteamGameCacheEntry
-                {
-                    Id = game.Id,
-                    Title = game.Title,
-                    Installed = true,
-                    InstallPath = installPath,
-                    ExecutablePath = FindEpicExternalExecutable(
-                        installPath,
-                        game.ProcessNames),
-                    Version = game.Version,
-                };
-            }
+            return LoadEpicInstalledGamesForReconciliation(store.Cache.Games);
         }
         catch
         {
             // The five-minute catalog refresh remains the fallback. This
             // local reconciliation path must never make the host unstable.
+            return LoadEpicLauncherInstalledGames();
+        }
+    }
+
+    internal static Dictionary<string, UnifySteamGameCacheEntry>
+        LoadEpicInstalledGamesForReconciliation(
+            IEnumerable<UnifySteamGameCacheEntry> catalogGames)
+    {
+        var installed = LoadEpicLauncherInstalledGames();
+        foreach (var game in catalogGames.Where(game =>
+                     game is not null &&
+                     game.RequiresExternalLauncher &&
+                     !string.IsNullOrWhiteSpace(game.Id) &&
+                     !string.IsNullOrWhiteSpace(game.RegistryPath)))
+        {
+            if (!TryReadEpicExternalInstallPath(
+                    game.RegistryPath,
+                    game.RegistryValueName,
+                    out var installPath))
+            {
+                continue;
+            }
+
+            installed[game.Id] = new UnifySteamGameCacheEntry
+            {
+                Id = game.Id,
+                Title = game.Title,
+                Installed = true,
+                InstallPath = installPath,
+                ExecutablePath = FindEpicExternalExecutable(
+                    installPath,
+                    game.ProcessNames),
+                Version = game.Version,
+            };
         }
 
         return installed;
@@ -4317,13 +4376,16 @@ internal sealed class UnifySteamService
         }
 
         var requestUri = $"{BuildGogTokenBaseUri()}&grant_type=refresh_token&refresh_token={Uri.EscapeDataString(current.RefreshToken)}";
-        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        using var response = HttpClient.GetAsync(
+            requestUri,
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException("The saved GOG login could not be refreshed. Sign in again.");
         }
 
-        var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var json = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         using var document = JsonDocument.Parse(json);
         var token = ParseGogToken(document.RootElement);
         SaveGogCredentials(authPath, token);
@@ -4421,13 +4483,16 @@ internal sealed class UnifySteamService
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, "https://embed.gog.com/user/data/games");
         request.Headers.Authorization = new("Bearer", accessToken);
-        using var response = HttpClient.Send(request);
+        using var response = HttpClient.Send(
+            request,
+            ActiveRefreshCancellation.Value);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"The GOG ownership list could not be loaded (HTTP {(int)response.StatusCode}). Sign in again and retry.");
         }
 
-        var payload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var payload = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         using var document = JsonDocument.Parse(payload);
         var ids = new List<string>();
         if (document.RootElement.ValueKind == JsonValueKind.Object &&
@@ -4459,7 +4524,8 @@ internal sealed class UnifySteamService
             try
             {
                 using var response = HttpClient.GetAsync(
-                    $"https://api.gog.com/products?ids={string.Join(',', batch)}").GetAwaiter().GetResult();
+                    $"https://api.gog.com/products?ids={string.Join(',', batch)}",
+                    ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
                 if (!response.IsSuccessStatusCode)
                 {
                     _journal.Append(
@@ -4470,7 +4536,8 @@ internal sealed class UnifySteamService
                     continue;
                 }
 
-                var payload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                var payload = response.Content.ReadAsStringAsync(
+                    ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
                 using var document = JsonDocument.Parse(payload);
                 if (document.RootElement.ValueKind != JsonValueKind.Array)
                 {
@@ -4546,216 +4613,6 @@ internal sealed class UnifySteamService
         }
     }
 
-    private static Dictionary<string, string> LoadSteamGridDbPortraitArtworkBatch(IReadOnlyList<string> titles)
-    {
-        var uniqueTitles = titles
-            .Where(title => !string.IsNullOrWhiteSpace(title))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (uniqueTitles.Length == 0)
-        {
-            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        }
-
-        var artworkByTitle = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        Parallel.ForEach(
-            uniqueTitles,
-            new ParallelOptions { MaxDegreeOfParallelism = 3 },
-            title =>
-            {
-                var artworkUrl = ResolveSteamGridDbPortraitArtworkUrl(title);
-                if (!string.IsNullOrWhiteSpace(artworkUrl))
-                {
-                    artworkByTitle[title] = artworkUrl;
-                }
-            });
-
-        return artworkByTitle.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static string ResolveSteamGridDbPortraitArtworkUrl(string title)
-    {
-        var cacheKey = NormalizeArtworkLookupTitle(title);
-        if (string.IsNullOrWhiteSpace(cacheKey))
-        {
-            return string.Empty;
-        }
-
-        if (SteamGridDbPortraitCache.TryGetValue(cacheKey, out var cachedArtworkUrl))
-        {
-            return cachedArtworkUrl;
-        }
-
-        var artworkUrl = string.Empty;
-        try
-        {
-            var gameId = ResolveSteamGridDbGameId(title, cacheKey);
-            if (gameId > 0)
-            {
-                artworkUrl = ResolveSteamGridDbPortraitAssetUrl(gameId);
-            }
-        }
-        catch (Exception)
-        {
-            artworkUrl = string.Empty;
-        }
-
-        artworkUrl = NormalizeImageUrl(artworkUrl);
-        SteamGridDbPortraitCache[cacheKey] = artworkUrl;
-        return artworkUrl;
-    }
-
-    private static int ResolveSteamGridDbGameId(string title, string normalizedTitle)
-    {
-        using var document = LoadSteamGridDbJson($"search/autocomplete/{Uri.EscapeDataString(title.Trim())}");
-        if (document is null ||
-            document.RootElement.ValueKind != JsonValueKind.Object ||
-            !document.RootElement.TryGetProperty("data", out var data) ||
-            data.ValueKind != JsonValueKind.Array)
-        {
-            return 0;
-        }
-
-        var bestGameId = 0;
-        var bestScore = int.MinValue;
-        foreach (var match in data.EnumerateArray())
-        {
-            var gameId = GetJsonInt(match, "id");
-            var matchName = GetJsonString(match, "name");
-            if (gameId <= 0 || string.IsNullOrWhiteSpace(matchName))
-            {
-                continue;
-            }
-
-            var score = ScoreSteamGridDbMatch(normalizedTitle, matchName);
-            if (score > bestScore)
-            {
-                bestScore = score;
-                bestGameId = gameId;
-            }
-        }
-
-        return bestGameId;
-    }
-
-    private static string ResolveSteamGridDbPortraitAssetUrl(int gameId)
-    {
-        var requestPaths = new[]
-        {
-            $"grids/game/{gameId}?types=static&dimensions=600x900&mimes=image/png,image/jpeg",
-            $"grids/game/{gameId}?types=static&mimes=image/png,image/jpeg",
-        };
-
-        foreach (var requestPath in requestPaths)
-        {
-            using var document = LoadSteamGridDbJson(requestPath);
-            if (document is null ||
-                document.RootElement.ValueKind != JsonValueKind.Object ||
-                !document.RootElement.TryGetProperty("data", out var data) ||
-                data.ValueKind != JsonValueKind.Array)
-            {
-                continue;
-            }
-
-            var artworkUrl = SelectSteamGridDbPortraitUrl(data);
-            if (!string.IsNullOrWhiteSpace(artworkUrl))
-            {
-                return artworkUrl;
-            }
-        }
-
-        return string.Empty;
-    }
-
-    private static JsonDocument? LoadSteamGridDbJson(string requestPath)
-    {
-        using var request = new HttpRequestMessage(
-            HttpMethod.Get,
-            $"https://www.steamgriddb.com/api/v2/{requestPath}");
-        request.Headers.Authorization = new AuthenticationHeaderValue(
-            "Bearer",
-            SteamGridDbArtworkDownloader.BuiltInApiKey);
-
-        using var response = HttpClient.Send(request);
-        if (!response.IsSuccessStatusCode)
-        {
-            return null;
-        }
-
-        var payload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        return JsonDocument.Parse(payload);
-    }
-
-    private static string SelectSteamGridDbPortraitUrl(JsonElement data)
-    {
-        var bestUrl = string.Empty;
-        var bestScore = int.MinValue;
-        foreach (var asset in data.EnumerateArray())
-        {
-            var url = GetJsonString(asset, "url");
-            if (string.IsNullOrWhiteSpace(url))
-            {
-                continue;
-            }
-
-            var width = GetJsonInt(asset, "width");
-            var height = GetJsonInt(asset, "height");
-            var score = 0;
-            if (width == 600 && height == 900)
-            {
-                score += 10000;
-            }
-
-            if (height > width)
-            {
-                score += 5000;
-            }
-
-            score += Math.Min(width, 1600) + Math.Min(height, 2400);
-            if (score > bestScore)
-            {
-                bestScore = score;
-                bestUrl = url;
-            }
-        }
-
-        return bestUrl;
-    }
-
-    private static int ScoreSteamGridDbMatch(string normalizedTitle, string matchName)
-    {
-        var normalizedMatch = NormalizeArtworkLookupTitle(matchName);
-        if (string.IsNullOrWhiteSpace(normalizedMatch))
-        {
-            return 0;
-        }
-
-        if (string.Equals(normalizedMatch, normalizedTitle, StringComparison.Ordinal))
-        {
-            return 1000;
-        }
-
-        if (normalizedMatch.StartsWith(normalizedTitle, StringComparison.Ordinal) ||
-            normalizedTitle.StartsWith(normalizedMatch, StringComparison.Ordinal))
-        {
-            return 800;
-        }
-
-        if (normalizedMatch.Contains(normalizedTitle, StringComparison.Ordinal) ||
-            normalizedTitle.Contains(normalizedMatch, StringComparison.Ordinal))
-        {
-            return 600;
-        }
-
-        return 100;
-    }
-
-    private static string NormalizeArtworkLookupTitle(string title)
-    {
-        var normalized = Regex.Replace(title.ToLowerInvariant(), @"[^a-z0-9]+", " ");
-        return Regex.Replace(normalized, @"\s+", " ").Trim();
-    }
-
     private static List<UnifySteamGameCacheEntry> MergeGogProductDetails(
         IReadOnlyList<UnifySteamGameCacheEntry> games,
         IReadOnlyList<UnifySteamGameCacheEntry> productDetails)
@@ -4804,13 +4661,16 @@ internal sealed class UnifySteamService
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, "https://embed.gog.com/account/getFilteredProducts?mediaType=1&page=1");
         request.Headers.Authorization = new("Bearer", accessToken);
-        using var response = HttpClient.Send(request);
+        using var response = HttpClient.Send(
+            request,
+            ActiveRefreshCancellation.Value);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"GOG library could not be loaded (HTTP {(int)response.StatusCode}). Sign in again and retry.");
         }
 
-        var firstPayload = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var firstPayload = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         JsonDocument firstDocument;
         try
         {
@@ -4849,13 +4709,16 @@ internal sealed class UnifySteamService
         {
             using var pageRequest = new HttpRequestMessage(HttpMethod.Get, $"https://embed.gog.com/account/getFilteredProducts?mediaType=1&page={page}");
             pageRequest.Headers.Authorization = new("Bearer", accessToken);
-            using var pageResponse = HttpClient.Send(pageRequest);
+            using var pageResponse = HttpClient.Send(
+                pageRequest,
+                ActiveRefreshCancellation.Value);
             if (!pageResponse.IsSuccessStatusCode)
             {
                 throw new InvalidOperationException($"GOG library page {page} could not be loaded.");
             }
 
-            var pagePayload = pageResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var pagePayload = pageResponse.Content.ReadAsStringAsync(
+                ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
             using var pageDocument = JsonDocument.Parse(pagePayload);
             AppendGogGames(pageDocument.RootElement, games);
         }
@@ -4933,13 +4796,16 @@ internal sealed class UnifySteamService
     {
         var requestUri =
             $"{BuildGogTokenBaseUri()}&grant_type=authorization_code&code={Uri.EscapeDataString(authCode)}&redirect_uri={Uri.EscapeDataString(GogRedirectUri)}";
-        using var response = HttpClient.GetAsync(requestUri).GetAwaiter().GetResult();
+        using var response = HttpClient.GetAsync(
+            requestUri,
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException("GOG rejected the code. Open the login page again and paste a fresh code.");
         }
 
-        var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var json = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         using var document = JsonDocument.Parse(json);
         return ParseGogToken(document.RootElement);
     }
@@ -4992,8 +4858,11 @@ internal sealed class UnifySteamService
             "Basic",
             Convert.ToBase64String(Encoding.UTF8.GetBytes($"{EpicClientId}:{EpicClientSecret}")));
 
-        using var response = HttpClient.Send(request);
-        var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using var response = HttpClient.Send(
+            request,
+            ActiveRefreshCancellation.Value);
+        var json = response.Content.ReadAsStringAsync(
+            ActiveRefreshCancellation.Value).GetAwaiter().GetResult();
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException(failureMessage);

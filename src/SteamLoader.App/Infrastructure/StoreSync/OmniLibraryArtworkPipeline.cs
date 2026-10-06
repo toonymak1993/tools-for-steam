@@ -9,7 +9,11 @@ using System.Text.RegularExpressions;
 
 namespace SteamLoader.App.Infrastructure.StoreSync;
 
-internal sealed class SteamGridDbArtworkDownloader
+/// <summary>
+/// Provider-neutral OmniLibrary artwork pipeline. Every integration uses the
+/// same local-first source order before optional public and community sources.
+/// </summary>
+internal sealed class OmniLibraryArtworkPipeline
 {
     public const string BuiltInApiKey = "96b06c7e805c21ee48af894587118c4c";
     private const long MaximumArtworkBytes = 32L * 1024 * 1024;
@@ -139,6 +143,7 @@ internal sealed class SteamGridDbArtworkDownloader
         var updatedTitleCount = 0;
         var updatedFileCount = 0;
         var updatedTitleIds = new List<string>();
+        var failures = new List<string>();
 
         foreach (var target in targets
                      .GroupBy(target => target.AppId)
@@ -176,12 +181,22 @@ internal sealed class SteamGridDbArtworkDownloader
                     updatedTitleIds.Add(target.TitleId);
                 }
             }
-            catch
+            catch (OperationCanceledException)
             {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                AddArtworkFailure(failures, target, exception);
             }
         }
 
-        return new StoreSyncArtworkSummary(updatedTitleCount, updatedFileCount, updatedTitleIds);
+        return new StoreSyncArtworkSummary(
+            updatedTitleCount,
+            updatedFileCount,
+            updatedTitleIds,
+            failures.Count,
+            failures);
     }
 
     /// <summary>
@@ -225,6 +240,7 @@ internal sealed class SteamGridDbArtworkDownloader
         var localArtworkResolver = new OmniLibraryLocalArtworkResolver();
         var updatedTitleIds = new List<string>();
         var updatedFileCount = 0;
+        var failures = new List<string>();
 
         var uniqueTargets = targets
             .GroupBy(target => target.AppId)
@@ -408,9 +424,10 @@ internal sealed class SteamGridDbArtworkDownloader
             {
                 throw;
             }
-            catch
+            catch (Exception exception)
             {
                 // One missing/broken source must not stop the progressive queue.
+                AddArtworkFailure(failures, target, exception);
             }
             finally
             {
@@ -430,7 +447,29 @@ internal sealed class SteamGridDbArtworkDownloader
         return new StoreSyncArtworkSummary(
             updatedTitleIds.Count,
             updatedFileCount,
-            updatedTitleIds);
+            updatedTitleIds,
+            failures.Count,
+            failures);
+    }
+
+    private static void AddArtworkFailure(
+        ICollection<string> failures,
+        StoreSyncArtworkTarget target,
+        Exception exception)
+    {
+        if (failures.Count >= 24)
+        {
+            return;
+        }
+
+        var message = Regex.Replace(exception.Message ?? string.Empty, "\\s+", " ").Trim();
+        if (message.Length > 240)
+        {
+            message = message[..240];
+        }
+        failures.Add(
+            $"{target.StoreId}/{target.Title}: {exception.GetType().Name}" +
+            (string.IsNullOrWhiteSpace(message) ? string.Empty : $" - {message}"));
     }
 
     private static async Task<int> ImportLocalArtworkSetAsync(
@@ -2442,7 +2481,9 @@ internal sealed record StoreSyncArtworkTarget(
 internal sealed record StoreSyncArtworkSummary(
     int UpdatedTitleCount,
     int UpdatedFileCount,
-    IReadOnlyList<string> UpdatedTitleIds);
+    IReadOnlyList<string> UpdatedTitleIds,
+    int FailureCount = 0,
+    IReadOnlyList<string>? FailureDetails = null);
 
 internal sealed record StoreSyncArtworkMatch(
     int GameId,

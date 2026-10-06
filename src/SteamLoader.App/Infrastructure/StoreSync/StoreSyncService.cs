@@ -196,11 +196,11 @@ public sealed class StoreSyncService
     ];
 
     private readonly object _gate = new();
-    private readonly SemaphoreSlim _unifyRefreshGate = new(1, 1);
+    private readonly OmniLibraryStoreGateSet _unifyStoreRefreshGates = new();
     private readonly SemaphoreSlim _unifySnapshotBuildGate = new(1, 1);
     private readonly StoreSyncSettingsStore _settingsStore;
     private readonly SteamShortcutFile _shortcutFile;
-    private readonly SteamGridDbArtworkDownloader _artworkDownloader;
+    private readonly OmniLibraryArtworkPipeline _artworkPipeline;
     private readonly WindowsShellService _shellService;
     private readonly SteamInstallationService _steamInstallationService;
     private readonly SteamDevToolsClient _steamDevToolsClient;
@@ -255,7 +255,7 @@ public sealed class StoreSyncService
     internal StoreSyncService(
         StoreSyncSettingsStore settingsStore,
         SteamShortcutFile shortcutFile,
-        SteamGridDbArtworkDownloader artworkDownloader,
+        OmniLibraryArtworkPipeline artworkPipeline,
         WindowsShellService shellService,
         SteamInstallationService steamInstallationService,
         SteamDevToolsClient steamDevToolsClient,
@@ -263,7 +263,7 @@ public sealed class StoreSyncService
     {
         _settingsStore = settingsStore;
         _shortcutFile = shortcutFile;
-        _artworkDownloader = artworkDownloader;
+        _artworkPipeline = artworkPipeline;
         _shellService = shellService;
         _steamInstallationService = steamInstallationService;
         _steamDevToolsClient = steamDevToolsClient;
@@ -466,6 +466,14 @@ public sealed class StoreSyncService
             }
 
             var snapshot = _unifySteamService.BuildSnapshot(configuration, []);
+            lock (_gate)
+            {
+                snapshot = snapshot with
+                {
+                    WatchersActive = _automationWatchersActive,
+                    WatcherCount = _automationWatcherCount,
+                };
+            }
             var activeLifecycle = UnifySteamDownloadStatusStore.GetAll().Values.Any(status =>
                 UnifySteamDownloadStatusStore.IsBusyOperation(status.Status) ||
                 status.Status is "paused" or "uninstalling" or "uninstall-action-required");
@@ -660,7 +668,7 @@ public sealed class StoreSyncService
         var profile = ResolveSteamProfile() ??
             throw new InvalidOperationException("Steam profile could not be resolved.");
         var gridDirectory = BuildGridDirectory(profile);
-        var missing = SteamGridDbArtworkDownloader.GetMissingArtworkSlots(
+        var missing = OmniLibraryArtworkPipeline.GetMissingArtworkSlots(
             gridDirectory,
             appId);
         if (missing.Count == 0)
@@ -710,7 +718,7 @@ public sealed class StoreSyncService
                 cachedGame?.RomPath ?? game.RomPath),
             cachedGame?.InstallPath ?? game.InstallPath,
             cachedGame?.ExecutablePath ?? game.ExecutablePath);
-        var steamGridDbApiKey = _artworkDownloader.GetEffectiveApiKey(
+        var steamGridDbApiKey = _artworkPipeline.GetEffectiveApiKey(
             configuration.SteamGridDbApiKey);
         lock (_gate)
         {
@@ -769,7 +777,7 @@ public sealed class StoreSyncService
                 "No enabled OmniLibrary games with a managed Steam shortcut were found.");
         }
 
-        var steamGridDbApiKey = _artworkDownloader.GetEffectiveApiKey(
+        var steamGridDbApiKey = _artworkPipeline.GetEffectiveApiKey(
             configuration.SteamGridDbApiKey);
         lock (_gate)
         {
@@ -1226,6 +1234,152 @@ public sealed class StoreSyncService
         }
     }
 
+    internal void RecordOmniLibraryLocalCheck(
+        string storeId,
+        string trigger,
+        string detail)
+    {
+        RecordOmniLibrarySyncHealth(
+            storeId,
+            store =>
+            {
+                store.LastLocalCheckAtUtc = DateTimeOffset.UtcNow;
+                store.LastSyncTrigger = string.IsNullOrWhiteSpace(trigger)
+                    ? "local"
+                    : trigger.Trim();
+                store.LastSyncDetail = detail?.Trim() ?? string.Empty;
+            });
+    }
+
+    internal void RecordOmniLibraryRemoteSchedule(
+        string storeId,
+        DateTimeOffset nextCheckAtUtc,
+        string trigger)
+    {
+        RecordOmniLibrarySyncHealth(
+            storeId,
+            store =>
+            {
+                store.NextRemoteCheckAtUtc = nextCheckAtUtc;
+                store.LastSyncTrigger = trigger?.Trim() ?? string.Empty;
+                store.LastSyncDetail = "Remote catalog check scheduled.";
+            });
+    }
+
+    internal void RecordOmniLibraryRemoteCheck(
+        string storeId,
+        bool succeeded,
+        string detail,
+        DateTimeOffset nextCheckAtUtc)
+    {
+        RecordOmniLibrarySyncHealth(
+            storeId,
+            store =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                store.LastRemoteCheckAtUtc = now;
+                if (succeeded)
+                {
+                    store.LastRemoteSuccessAtUtc = now;
+                }
+                store.NextRemoteCheckAtUtc = nextCheckAtUtc;
+                store.LastSyncTrigger = succeeded ? "remote-success" : "remote-retry";
+                store.LastSyncDetail = detail?.Trim() ?? string.Empty;
+            });
+    }
+
+    private void RecordOmniLibrarySyncHealth(
+        string storeId,
+        Action<UnifySteamStoreConfiguration> update)
+    {
+        if (!OmniLibraryStoreRegistry.TryGet(storeId, out _))
+        {
+            return;
+        }
+
+        try
+        {
+            _settingsStore.Update(configuration =>
+            {
+                if (configuration.UnifySteam.Stores.TryGetValue(storeId, out var store) &&
+                    store is not null)
+                {
+                    update(store);
+                }
+            });
+        }
+        catch (Exception exception)
+        {
+            _journal.Append(
+                "warning",
+                "omnilibrary-health",
+                $"Could not persist sync health for {storeId}.",
+                exception.Message);
+        }
+    }
+
+    public int QueueOmniLibraryLocalReconciliation(
+        string storeId,
+        string triggerSource,
+        IReadOnlyCollection<string>? requestedGameIds = null)
+    {
+        var normalizedStoreId = storeId?.Trim() ?? string.Empty;
+        if (!StorefrontFeatureFlags.Enabled ||
+            !OmniLibraryStoreRegistry.TryGet(normalizedStoreId, out _))
+        {
+            return 0;
+        }
+
+        var configuration = _settingsStore.Load();
+        if (!configuration.UnifySteam.Stores.TryGetValue(normalizedStoreId, out var store) ||
+            store?.Enabled != true ||
+            store.Cache?.Games is null)
+        {
+            return 0;
+        }
+
+        var knownGameIds = store.Cache.Games
+            .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id))
+            .Select(game => game.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var gameIds = requestedGameIds is null
+            ? GetOmniLibraryShortcutRepairGameIds(normalizedStoreId, store)
+                .Concat(GetOmniLibraryIncompleteGameIds(configuration, normalizedStoreId))
+                .Where(knownGameIds.Contains)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : requestedGameIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Select(id => id.Trim())
+                .Where(knownGameIds.Contains)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        if (gameIds.Length == 0)
+        {
+            RecordOmniLibraryLocalCheck(
+                normalizedStoreId,
+                triggerSource,
+                "Local Steam state is already consistent.");
+            return 0;
+        }
+
+        _journal.Append(
+            "info",
+            string.IsNullOrWhiteSpace(triggerSource)
+                ? "omnilibrary-local"
+                : triggerSource.Trim(),
+            $"Queued local OmniLibrary reconciliation for {gameIds.Length} title(s).",
+            $"Store: {normalizedStoreId}. No remote catalog call is required.");
+        QueueOmniLibraryShortcutSync(normalizedStoreId, gameIds, []);
+        RecordOmniLibraryLocalCheck(
+            normalizedStoreId,
+            triggerSource,
+            $"Queued {gameIds.Length} local reconciliation title(s).");
+        return gameIds.Length;
+    }
+
     internal static OmniLibraryCatalogDelta ComputeOmniLibraryCatalogDelta(
         IEnumerable<string> beforeGameIds,
         IEnumerable<string> afterGameIds)
@@ -1276,7 +1430,9 @@ public sealed class StoreSyncService
         UnifySteamStoreRefreshResult? refreshResult = null;
         var acceptedRefresh = false;
 
-        _unifyRefreshGate.Wait(cancellationToken);
+        using var refreshLease = _unifyStoreRefreshGates.Enter(
+            normalizedStoreId,
+            cancellationToken);
         try
         {
             var configuration = _settingsStore.Load();
@@ -1334,7 +1490,9 @@ public sealed class StoreSyncService
             var changedGameIds = ComputeOmniLibraryChangedGameIds(
                 beforeGameFingerprints,
                 store);
-            shortcutRepairGameIds = GetOmniLibraryDuplicateSteamAppIdGameIds(store);
+            shortcutRepairGameIds = GetOmniLibraryShortcutRepairGameIds(
+                normalizedStoreId,
+                store);
             upsertGameIds = addedGameIds
                 .Concat(changedGameIds)
                 .Concat(shortcutRepairGameIds)
@@ -1389,7 +1547,6 @@ public sealed class StoreSyncService
         }
         finally
         {
-            _unifyRefreshGate.Release();
         }
 
         if (!acceptedRefresh)
@@ -1803,8 +1960,8 @@ public sealed class StoreSyncService
             return localPreview;
         }
 
-        var apiKey = _artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
-        var remotePreview = await _artworkDownloader.ResolvePreviewAsync(
+        var apiKey = _artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
+        var remotePreview = await _artworkPipeline.ResolvePreviewAsync(
             item.EffectiveArtworkTitle,
             new[] { item.Game.Title, item.EffectiveTitle, item.Game.ExecutablePath, item.Game.StartDirectory },
             apiKey,
@@ -2361,7 +2518,27 @@ public sealed class StoreSyncService
                     "Enable Achievements & Metadata and this provider before testing it.");
             }
 
-            if (providerId.Equals("retroachievements", StringComparison.OrdinalIgnoreCase))
+            if (providerId.Equals("xbox-live", StringComparison.OrdinalIgnoreCase))
+            {
+                var refreshToken = provider.SecondaryCredential?.Trim() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(refreshToken))
+                {
+                    throw new InvalidOperationException(
+                        "Sign in to Xbox from the Xbox store settings first.");
+                }
+                using var client = new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(60),
+                };
+                var session = await XboxLiveAuthService.RefreshSessionAsync(
+                    refreshToken,
+                    client,
+                    cancellationToken).ConfigureAwait(false);
+                XboxLiveAuthService.PersistSession(_settingsStore, session);
+                resolvedAccountName = session.Gamertag;
+                detail = $"Connected as {session.Gamertag}. Xbox achievement progress is available on demand.";
+            }
+            else if (providerId.Equals("retroachievements", StringComparison.OrdinalIgnoreCase))
             {
                 var username = provider.AccountName?.Trim() ?? string.Empty;
                 var apiKey = provider.Credential?.Trim() ?? string.Empty;
@@ -2488,7 +2665,12 @@ public sealed class StoreSyncService
         var acceptedStoreIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         StoreSyncConfiguration persistedConfiguration;
 
-        _unifyRefreshGate.Wait(cancellationToken);
+        var requestedStoreIds = string.IsNullOrWhiteSpace(storeId)
+            ? OmniLibraryStoreRegistry.Ids
+            : [storeId.Trim()];
+        using var refreshLease = _unifyStoreRefreshGates.EnterMany(
+            requestedStoreIds,
+            cancellationToken);
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -2545,7 +2727,9 @@ public sealed class StoreSyncService
                 var changedGameIds = ComputeOmniLibraryChangedGameIds(
                     beforeGameFingerprints,
                     refreshedStore);
-                var shortcutRepairGameIds = GetOmniLibraryDuplicateSteamAppIdGameIds(refreshedStore);
+                var shortcutRepairGameIds = GetOmniLibraryShortcutRepairGameIds(
+                    result.StoreId,
+                    refreshedStore);
                 var addedGameIds = catalogDelta.AddedGameIds
                     .Concat(changedGameIds)
                     .Concat(shortcutRepairGameIds)
@@ -2609,7 +2793,6 @@ public sealed class StoreSyncService
         }
         finally
         {
-            _unifyRefreshGate.Release();
         }
 
         foreach (var delta in candidateDeltas.Values.Where(delta => acceptedStoreIds.Contains(delta.StoreId)))
@@ -2677,7 +2860,7 @@ public sealed class StoreSyncService
                 !string.IsNullOrWhiteSpace(game.Id) &&
                 (game.SteamAppId == 0 ||
                  (!string.IsNullOrWhiteSpace(gridDirectory) &&
-                  !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
+                  !OmniLibraryArtworkPipeline.HasCompleteArtworkSet(
                       gridDirectory,
                       game.SteamAppId))))
             .Select(game => game.Id)
@@ -2701,6 +2884,72 @@ public sealed class StoreSyncService
             .Where(gameIds => gameIds.Length > 1)
             .SelectMany(gameIds => gameIds)
             .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private string[] GetOmniLibraryShortcutRepairGameIds(
+        string storeId,
+        UnifySteamStoreConfiguration store)
+    {
+        var repairGameIds = GetOmniLibraryDuplicateSteamAppIdGameIds(store)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var profile = ResolveSteamProfile();
+        if (profile is null)
+        {
+            return repairGameIds
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        var expectedExecutablePath = NormalizePath(Environment.ProcessPath ?? string.Empty);
+        var shortcutsByGameId = LoadExistingShortcuts(profile)
+            .Select(entry => new
+            {
+                Entry = entry,
+                Identity = NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions),
+            })
+            .Select(candidate =>
+            {
+                var resolved = TryResolveOmniLibraryGameIdentity(
+                    candidate.Identity,
+                    out var shortcutStoreId,
+                    out var gameId);
+                return new
+                {
+                    candidate.Entry,
+                    Resolved = resolved,
+                    StoreId = shortcutStoreId,
+                    GameId = gameId,
+                };
+            })
+            .Where(candidate =>
+                candidate.Resolved &&
+                candidate.StoreId.Equals(storeId, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(candidate => candidate.GameId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(candidate => candidate.Entry).ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+
+        foreach (var game in (store.Cache?.Games ?? [])
+                     .Where(game => game is not null && !string.IsNullOrWhiteSpace(game.Id)))
+        {
+            shortcutsByGameId.TryGetValue(game.Id, out var matches);
+            matches ??= [];
+            if (matches.Length != 1 ||
+                string.IsNullOrWhiteSpace(expectedExecutablePath) ||
+                !string.Equals(
+                    matches[0].ExecutablePath,
+                    expectedExecutablePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                repairGameIds.Add(game.Id);
+            }
+        }
+
+        return repairGameIds
             .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -3107,7 +3356,7 @@ public sealed class StoreSyncService
 
     public StoreSyncSnapshot StartUnifySteamLogin(string storeId)
     {
-        _unifyRefreshGate.Wait();
+        using var refreshLease = _unifyStoreRefreshGates.Enter(storeId);
         try
         {
             var configuration = _settingsStore.Load();
@@ -3138,14 +3387,12 @@ public sealed class StoreSyncService
         }
         finally
         {
-            _unifyRefreshGate.Release();
         }
     }
 
     public StoreSyncSnapshot CompleteUnifySteamManualAuth(string storeId, string value)
     {
-        _unifyRefreshGate.Wait();
-        try
+        using (_unifyStoreRefreshGates.Enter(storeId))
         {
             var configuration = _settingsStore.Load();
             if (!StorefrontFeatureFlags.Enabled)
@@ -3166,10 +3413,6 @@ public sealed class StoreSyncService
                 target.AuthPath = source.AuthPath;
                 target.Cache = source.Cache;
             });
-        }
-        finally
-        {
-            _unifyRefreshGate.Release();
         }
 
         // Load and prepare the library immediately so successful sign-in needs no
@@ -3213,7 +3456,7 @@ public sealed class StoreSyncService
 
         IReadOnlyList<string> removedGameIds = [];
         StoreSyncSnapshot snapshot;
-        _unifyRefreshGate.Wait();
+        using var refreshLease = _unifyStoreRefreshGates.Enter(normalizedStoreId);
         try
         {
             switch (normalizedStoreId)
@@ -3265,7 +3508,6 @@ public sealed class StoreSyncService
         }
         finally
         {
-            _unifyRefreshGate.Release();
         }
 
         foreach (var gameId in removedGameIds)
@@ -3628,8 +3870,8 @@ public sealed class StoreSyncService
         return new StoreSyncSnapshot(
             profile,
             new StoreSyncSettingsState(
-                SteamGridDbApiKeyConfigured: !string.IsNullOrWhiteSpace(_artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey)),
-                SteamGridDbApiKeyPreview: _artworkDownloader.GetPreview(configuration.SteamGridDbApiKey),
+                SteamGridDbApiKeyConfigured: !string.IsNullOrWhiteSpace(_artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey)),
+                SteamGridDbApiKeyPreview: _artworkPipeline.GetPreview(configuration.SteamGridDbApiKey),
                 DownloadArtwork: configuration.DownloadArtwork,
                 PreferAnimatedArtwork: configuration.PreferAnimatedArtwork,
                 CloseSteamBeforeSync: configuration.CloseSteamBeforeSync,
@@ -3684,8 +3926,8 @@ public sealed class StoreSyncService
         return new StoreSyncSnapshot(
             profile,
             new StoreSyncSettingsState(
-                SteamGridDbApiKeyConfigured: !string.IsNullOrWhiteSpace(_artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey)),
-                SteamGridDbApiKeyPreview: _artworkDownloader.GetPreview(configuration.SteamGridDbApiKey),
+                SteamGridDbApiKeyConfigured: !string.IsNullOrWhiteSpace(_artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey)),
+                SteamGridDbApiKeyPreview: _artworkPipeline.GetPreview(configuration.SteamGridDbApiKey),
                 DownloadArtwork: configuration.DownloadArtwork,
                 PreferAnimatedArtwork: configuration.PreferAnimatedArtwork,
                 CloseSteamBeforeSync: configuration.CloseSteamBeforeSync,
@@ -3860,7 +4102,8 @@ public sealed class StoreSyncService
             _lastUnifyAutoRefreshAtUtc = DateTimeOffset.UtcNow;
             _activeUnifyRefreshTask = Task.Run(() =>
             {
-                _unifyRefreshGate.Wait();
+                using var refreshLease = _unifyStoreRefreshGates.EnterMany(
+                    OmniLibraryStoreRegistry.Ids);
                 try
                 {
                     var configuration = _settingsStore.Load();
@@ -3905,13 +4148,14 @@ public sealed class StoreSyncService
                 }
                 finally
                 {
-                    _unifyRefreshGate.Release();
                 }
             });
         }
     }
 
-    internal IReadOnlyList<StoreSyncWatchTarget> GetAutomationWatchTargets()
+    internal IReadOnlyList<StoreSyncWatchTarget> GetAutomationWatchTargets(
+        bool includeStoreSync = true,
+        bool includeOmniLibrary = true)
     {
         var configuration = _settingsStore.Load();
         var targets = new Dictionary<string, StoreSyncWatchTarget>(StringComparer.OrdinalIgnoreCase);
@@ -3950,12 +4194,15 @@ public sealed class StoreSyncService
             targets[key] = new StoreSyncWatchTarget(parentDirectory, fileName, IncludeSubdirectories: false, StoreId: storeId);
         }
 
-        addFileTarget(profile?.ShortcutsPath);
+        if (includeStoreSync || includeOmniLibrary)
+        {
+            addFileTarget(profile?.ShortcutsPath);
+        }
 
         var romLibrary = GetUnifySteamStoreConfiguration(
             configuration,
             OmniLibraryRomSystemRegistry.StoreId);
-        if (romLibrary.Enabled)
+        if (includeOmniLibrary && romLibrary.Enabled)
         {
             addDirectoryTarget(
                 OmniLibraryRomSystemRegistry.ResolveRootPath(
@@ -3978,7 +4225,9 @@ public sealed class StoreSyncService
                     omniLibraryWatchStoreId,
                     out var omniLibraryStore) &&
                 omniLibraryStore?.Enabled == true;
-            if (!storeConfiguration.Enabled && !omniLibraryStoreEnabled)
+            var includeClassicStore = includeStoreSync && storeConfiguration.Enabled;
+            var includeOmniStore = includeOmniLibrary && omniLibraryStoreEnabled;
+            if (!includeClassicStore && !includeOmniStore)
             {
                 continue;
             }
@@ -4363,7 +4612,12 @@ public sealed class StoreSyncService
                 matchedManagedShortcutIndices.Add(existingShortcut.Index);
             }
 
-            var actionKind = ResolveActionKind(configuration, overrideState, manifestEntry, existingShortcut);
+            var actionKind = ResolveActionKind(
+                configuration,
+                game,
+                overrideState,
+                manifestEntry,
+                existingShortcut);
             var shortcutExecutablePath = ResolveShortcutExecutablePath(game);
             var targetAppId = actionKind is StoreSyncActionKind.RefreshManaged or StoreSyncActionKind.AdoptExisting or StoreSyncActionKind.SkipExisting
                 ? existingShortcut?.AppId ?? SteamShortcutIds.ComputeAppId(effectiveTitle, shortcutExecutablePath)
@@ -4488,11 +4742,11 @@ public sealed class StoreSyncService
                 ? string.Empty
                 : NormalizePath(ResolveShortcutExecutablePath(item.Game));
             var canonical = group
-                .OrderBy(candidate => matchedManagedShortcutIndices.Contains(candidate.Entry.Index) ? 0 : 1)
-                .ThenBy(candidate => !string.IsNullOrWhiteSpace(desiredExecutablePath) &&
+                .OrderBy(candidate => !string.IsNullOrWhiteSpace(desiredExecutablePath) &&
                                      string.Equals(candidate.Entry.ExecutablePath, desiredExecutablePath, StringComparison.OrdinalIgnoreCase)
                     ? 0
                     : 1)
+                .ThenBy(candidate => matchedManagedShortcutIndices.Contains(candidate.Entry.Index) ? 0 : 1)
                 .ThenByDescending(candidate => candidate.Entry.IsManaged)
                 .ThenBy(candidate => candidate.Entry.Index)
                 .First();
@@ -4515,8 +4769,55 @@ public sealed class StoreSyncService
             }
         }
 
+        // Older OmniLibrary builds did not always persist the current launch
+        // identity. Once one of those entries has been adopted, collapse any
+        // other recognizable OmniLibrary shortcut with the same canonical
+        // title as well. Unrelated user shortcuts are deliberately excluded.
+        var alreadyQueuedIndices = result
+            .Select(candidate => candidate.ExistingShortcut.Index)
+            .ToHashSet();
+        foreach (var group in existingShortcuts
+                     .Where(IsOmniLibraryShortcutCandidate)
+                     .Select(entry => new
+                     {
+                         Entry = entry,
+                         TitleKey = NormalizeUnifyTitleKey(entry.AppName),
+                     })
+                     .Where(candidate => !string.IsNullOrWhiteSpace(candidate.TitleKey))
+                     .GroupBy(candidate => candidate.TitleKey, StringComparer.OrdinalIgnoreCase)
+                     .Where(group => group.Count() > 1))
+        {
+            var canonical = group
+                .OrderBy(candidate => matchedManagedShortcutIndices.Contains(candidate.Entry.Index) ? 0 : 1)
+                .ThenByDescending(candidate => candidate.Entry.IsManaged)
+                .ThenBy(candidate => candidate.Entry.Index)
+                .First();
+
+            foreach (var duplicate in group.Where(candidate =>
+                         candidate.Entry.Index != canonical.Entry.Index &&
+                         !alreadyQueuedIndices.Contains(candidate.Entry.Index)))
+            {
+                result.Add(new StoreSyncCleanupCandidate(
+                    $"omnilibrary-title-duplicate-{duplicate.Entry.AppId:x8}-{duplicate.Entry.Index}",
+                    canonical.Entry.AppName,
+                    "OmniLibrary",
+                    duplicate.Entry,
+                    null,
+                    [
+                        $"Duplicate OmniLibrary title {canonical.Entry.AppName} was detected.",
+                        $"Shortcut {duplicate.Entry.AppId:x8} will be removed; {canonical.Entry.AppId:x8} remains canonical.",
+                    ]));
+                alreadyQueuedIndices.Add(duplicate.Entry.Index);
+            }
+        }
+
         return result;
     }
+
+    private static bool IsOmniLibraryShortcutCandidate(ExistingShortcutEntry entry) =>
+        (entry.IsManaged &&
+         entry.ManagedStoreId.Equals(UnifySteamStoreId, StringComparison.OrdinalIgnoreCase)) ||
+        !string.IsNullOrWhiteSpace(NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions));
 
     private static bool TryResolveCleanupOmniLibraryGameIdentity(
         StoreSyncCleanupCandidate candidate,
@@ -4751,7 +5052,7 @@ public sealed class StoreSyncService
         StoreSyncConfiguration configuration,
         StoreSyncAnalysis analysis)
     {
-        var effectiveApiKey = _artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
+        var effectiveApiKey = _artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
         var payload = new
         {
             downloadArtwork = configuration.DownloadArtwork,
@@ -4867,6 +5168,7 @@ public sealed class StoreSyncService
 
     private static StoreSyncActionKind ResolveActionKind(
         StoreSyncConfiguration configuration,
+        StoreGameEntry game,
         StoreSyncTitleOverride overrideState,
         StoreSyncManifestEntry? manifestEntry,
         ExistingShortcutEntry? existingShortcut)
@@ -4888,6 +5190,15 @@ public sealed class StoreSyncService
 
         if (existingShortcut is not null)
         {
+            // OmniLibrary is an ownership boundary of its own. A uniquely
+            // matched shortcut may be an older OmniLibrary instance, so keep
+            // its Steam app id but refresh its executable, launch identity and
+            // ownership metadata instead of creating a second game.
+            if (game.StoreId.Equals(UnifySteamStoreId, StringComparison.OrdinalIgnoreCase))
+            {
+                return StoreSyncActionKind.RefreshManaged;
+            }
+
             return configuration.TakeOverExistingShortcuts
                 ? StoreSyncActionKind.AdoptExisting
                 : StoreSyncActionKind.SkipExisting;
@@ -7017,6 +7328,11 @@ public sealed class StoreSyncService
                     {
                         liveShortcutAppIds[pair.Key] = pair.Value;
                     }
+
+                    MigrateOmniLibraryArtworkForLiveSync(
+                        profile,
+                        analysis,
+                        liveShortcutAppIds);
                 }
             }
 
@@ -7225,7 +7541,7 @@ public sealed class StoreSyncService
             if (!omniLibraryOnly && configuration.DownloadArtwork)
             {
                 var gridDirectory = BuildGridDirectory(profile);
-                var apiKey = _artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
+                var apiKey = _artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
                 var artworkWorkItems = analysis.Items
                     .Where(item =>
                     {
@@ -7263,12 +7579,21 @@ public sealed class StoreSyncService
                         ResolveLiveShortcutAppId(item, liveShortcutAppIds));
                 }
 
-                artworkSummary = await _artworkDownloader.DownloadAsync(
+                artworkSummary = await _artworkPipeline.DownloadAsync(
                     gridDirectory,
                     artworkTargets.Values.ToList(),
                     apiKey,
                     configuration.PreferAnimatedArtwork,
                     cancellationToken);
+
+                if (artworkSummary.FailureCount > 0)
+                {
+                    _journal.Append(
+                        "warning",
+                        "artwork",
+                        $"Artwork sources failed for {artworkSummary.FailureCount} title(s).",
+                        string.Join("; ", artworkSummary.FailureDetails ?? []));
+                }
 
                 foreach (var titleId in artworkSummary.UpdatedTitleIds)
                 {
@@ -7561,6 +7886,7 @@ public sealed class StoreSyncService
             $"{appId}_hero",
             $"{appId}_logo",
             $"{appId}_icon",
+            $"{appId}-icon",
         };
         try
         {
@@ -7581,6 +7907,90 @@ public sealed class StoreSyncService
         }
     }
 
+    private static void MigrateOmniLibraryArtworkForLiveSync(
+        SteamProfileInfo profile,
+        StoreSyncAnalysis analysis,
+        IReadOnlyDictionary<string, uint> liveShortcutAppIds)
+    {
+        var gridDirectory = BuildGridDirectory(profile);
+        if (string.IsNullOrWhiteSpace(gridDirectory) || !Directory.Exists(gridDirectory))
+        {
+            return;
+        }
+
+        foreach (var item in analysis.Items.Where(item =>
+                     item.Game.StoreId.Equals(UnifySteamStoreId, StringComparison.OrdinalIgnoreCase)))
+        {
+            var targetAppId = ResolveLiveShortcutAppId(item, liveShortcutAppIds);
+            if (targetAppId == 0)
+            {
+                continue;
+            }
+
+            var sourceAppIds = new HashSet<uint>();
+            if (item.ExistingShortcut is { AppId: not 0 } existingShortcut &&
+                existingShortcut.AppId != targetAppId)
+            {
+                sourceAppIds.Add(existingShortcut.AppId);
+            }
+
+            var identity = NormalizeOmniLibraryLaunchIdentity(
+                ResolveShortcutLaunchOptions(item.Game));
+            foreach (var cleanupCandidate in analysis.CleanupCandidates.Where(candidate =>
+                         string.Equals(
+                             NormalizeOmniLibraryLaunchIdentity(candidate.ExistingShortcut.LaunchOptions),
+                             identity,
+                             StringComparison.OrdinalIgnoreCase)))
+            {
+                if (cleanupCandidate.ExistingShortcut.AppId != 0 &&
+                    cleanupCandidate.ExistingShortcut.AppId != targetAppId)
+                {
+                    sourceAppIds.Add(cleanupCandidate.ExistingShortcut.AppId);
+                }
+            }
+
+            foreach (var sourceAppId in sourceAppIds)
+            {
+                CopyOmniLibraryArtwork(gridDirectory, sourceAppId, targetAppId);
+            }
+        }
+    }
+
+    private static void CopyOmniLibraryArtwork(
+        string gridDirectory,
+        uint sourceAppId,
+        uint targetAppId)
+    {
+        if (sourceAppId == 0 || targetAppId == 0 || sourceAppId == targetAppId)
+        {
+            return;
+        }
+
+        var sourceGridId = SteamShortcutIds.BuildGridId(sourceAppId);
+        var targetGridId = SteamShortcutIds.BuildGridId(targetAppId);
+        foreach (var suffix in new[] { string.Empty, "p", "_hero", "_logo", "_icon", "-icon" })
+        {
+            foreach (var extension in new[] { ".png", ".jpg", ".jpeg", ".webp", ".gif" })
+            {
+                var sourcePath = Path.Combine(gridDirectory, sourceGridId + suffix + extension);
+                var targetPath = Path.Combine(gridDirectory, targetGridId + suffix + extension);
+                if (!File.Exists(sourcePath) || File.Exists(targetPath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    File.Copy(sourcePath, targetPath, overwrite: false);
+                }
+                catch
+                {
+                    // Artwork is a cache. The normal local-first pipeline can retry later.
+                }
+            }
+        }
+    }
+
     private void QueueOmniLibraryArtworkSync(
         SteamProfileInfo profile,
         StoreSyncConfiguration configuration,
@@ -7591,7 +8001,7 @@ public sealed class StoreSyncService
     {
         cancellationToken.ThrowIfCancellationRequested();
         var gridDirectory = BuildGridDirectory(profile);
-        var apiKey = _artworkDownloader.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
+        var apiKey = _artworkPipeline.GetEffectiveApiKey(configuration.SteamGridDbApiKey);
         configuration.UnifySteam.GameData.Providers.TryGetValue(
             "retroachievements",
             out var retroAchievementsProvider);
@@ -7638,7 +8048,7 @@ public sealed class StoreSyncService
                             game.Id.Equals(gameId, StringComparison.OrdinalIgnoreCase))
                         : null;
                 return appId == 0 ||
-                       SteamGridDbArtworkDownloader.HasCompleteArtworkSet(gridDirectory, appId)
+                       OmniLibraryArtworkPipeline.HasCompleteArtworkSet(gridDirectory, appId)
                     ? null
                     : new StoreSyncArtworkTarget(
                         item.TitleId,
@@ -7786,7 +8196,7 @@ public sealed class StoreSyncService
                 {
                     await concurrencyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
                     gateEntered = true;
-                    var summary = await _artworkDownloader.DownloadLocalFirstAsync(
+                    var summary = await _artworkPipeline.DownloadLocalFirstAsync(
                         gridDirectory,
                         group.Value,
                         apiKey,
@@ -7803,12 +8213,20 @@ public sealed class StoreSyncService
                             $"Downloaded {summary.UpdatedFileCount} Steam Library artwork file(s) for " +
                             $"{summary.UpdatedTitleCount} {group.Key} title(s).");
                     }
+                    if (summary.FailureCount > 0)
+                    {
+                        _journal.Append(
+                            "warning",
+                            "omnilibrary-artwork",
+                            $"Artwork sources failed for {summary.FailureCount} {group.Key} title(s).",
+                            string.Join("; ", summary.FailureDetails ?? []));
+                    }
 
                     var incompleteTitles = group.Value
                         .Select(target => new
                         {
                             Target = target,
-                            MissingSlots = SteamGridDbArtworkDownloader.GetMissingArtworkSlots(
+                            MissingSlots = OmniLibraryArtworkPipeline.GetMissingArtworkSlots(
                                 gridDirectory,
                                 target.AppId),
                         })
@@ -7948,7 +8366,7 @@ public sealed class StoreSyncService
                          !string.IsNullOrWhiteSpace(game.Id) &&
                          !string.IsNullOrWhiteSpace(game.Title) &&
                          (includeComplete ||
-                          !SteamGridDbArtworkDownloader.HasCompleteArtworkSet(
+                          !OmniLibraryArtworkPipeline.HasCompleteArtworkSet(
                               gridDirectory,
                               game.SteamAppId))))
             {
@@ -8449,18 +8867,23 @@ public sealed class StoreSyncService
             string.Equals(item.Game.StoreId, UnifySteamStoreId, StringComparison.OrdinalIgnoreCase);
         indices = parsedEntries
             .Where(entry =>
-                OwnershipRepairMatches(
-                    entry,
-                    item,
-                    requiresStrictIdentity ? 0 : targetAppId) ||
-                (!requiresStrictIdentity &&
-                 item.ExistingShortcut is not null &&
-                 entry.AppId == item.ExistingShortcut.AppId) ||
-                (!string.IsNullOrWhiteSpace(entry.ManagedTitleId) &&
-                 string.Equals(entry.ManagedTitleId, item.TitleId, StringComparison.OrdinalIgnoreCase)))
+                requiresStrictIdentity
+                    ? string.Equals(
+                          NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions),
+                          NormalizeOmniLibraryLaunchIdentity(ResolveShortcutLaunchOptions(item.Game)),
+                          StringComparison.OrdinalIgnoreCase) ||
+                      (!string.IsNullOrWhiteSpace(entry.ManagedTitleId) &&
+                       string.Equals(entry.ManagedTitleId, item.TitleId, StringComparison.OrdinalIgnoreCase))
+                    : OwnershipRepairMatches(entry, item, targetAppId) ||
+                      (item.ExistingShortcut is not null &&
+                       entry.AppId == item.ExistingShortcut.AppId) ||
+                      (!string.IsNullOrWhiteSpace(entry.ManagedTitleId) &&
+                       string.Equals(entry.ManagedTitleId, item.TitleId, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(entry => item.ExistingShortcut is not null && entry.Index == item.ExistingShortcut.Index ? 0 : 1)
+            .ThenBy(entry => entry.AppId == targetAppId ? 0 : 1)
+            .ThenBy(entry => entry.Index)
             .Select(entry => entry.Index)
             .Distinct()
-            .OrderBy(index => index)
             .ToArray();
 
         return indices.Length > 0;
@@ -9028,7 +9451,8 @@ public sealed class StoreSyncService
     for (const operation of plan.updateOperations ?? []) {
       attemptedCount += 1;
       try {
-        let liveAppId = operation.appId >>> 0;
+        const originalAppId = operation.appId >>> 0;
+        let liveAppId = originalAppId;
         let appliedToExistingShortcut = false;
         if (!operation.forceCreate) {
           appliedToExistingShortcut = await tryApplyToShortcut(liveAppId, operation);
@@ -9055,6 +9479,10 @@ public sealed class StoreSyncService
 
           liveAppId = createdAppId >>> 0;
           await applyShortcutFields(liveAppId, operation);
+
+          if (originalAppId && originalAppId !== liveAppId) {
+            await invoke("RemoveShortcut", originalAppId);
+          }
         }
 
         appIdsByTitleId[operation.titleId] = liveAppId;
@@ -9202,7 +9630,7 @@ public sealed class StoreSyncService
                 continue;
             }
 
-            var match = await _artworkDownloader.ResolveMatchAsync(
+            var match = await _artworkPipeline.ResolveMatchAsync(
                 item.EffectiveArtworkTitle,
                 new[] { item.Game.Title, item.EffectiveTitle, item.Game.ExecutablePath, item.Game.StartDirectory },
                 apiKey,
@@ -10354,9 +10782,36 @@ public sealed class StoreSyncService
             })
             .Where(candidate => candidate.Score < int.MaxValue)
             .OrderBy(candidate => candidate.Score)
+            .ThenBy(candidate =>
+                string.Equals(
+                    candidate.Entry.ExecutablePath,
+                    normalizedExecutablePath,
+                    StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : 1)
             .ThenBy(candidate => candidate.Entry.Index)
             .Select(candidate => candidate.Entry)
             .FirstOrDefault();
+
+        if (existingShortcut is null)
+        {
+            var titleMatches = existingEntries
+                .Where(entry => TitleMatches(entry, normalizedRawTitle, normalizedEffectiveTitle))
+                .ToArray();
+
+            // Prefer a single recognizable legacy OmniLibrary entry. If no
+            // ownership markers survived an old installation, a unique title
+            // match across Steam's non-Steam shortcuts is still safe to adopt:
+            // ambiguity is rejected instead of guessing between two games.
+            var legacyMatches = titleMatches
+                .Where(IsOmniLibraryShortcutCandidate)
+                .ToArray();
+            existingShortcut = legacyMatches.Length == 1
+                ? legacyMatches[0]
+                : titleMatches.Length == 1
+                    ? titleMatches[0]
+                    : null;
+        }
 
         return existingShortcut is not null;
     }

@@ -9,6 +9,16 @@
     return `${normalizeId(definition?.sourceStoreId)}:${normalizeId(definition?.tabId)}`;
   }
 
+  function isTabMasterOwnedTab(tab) {
+    return String(tab?.footer?.onMenuActionDescription || "")
+      .trim()
+      .toLowerCase() === "tab master";
+  }
+
+  function hasTabMasterOwnership(tabs) {
+    return Array.isArray(tabs) && tabs.some(isTabMasterOwnedTab);
+  }
+
   function buildDefinitionsFromSummary(stores, fallbackDefinitions = []) {
     const result = [];
     const seen = new Set();
@@ -85,9 +95,10 @@
     }));
     const desktopIndex = nativeTabs.findIndex((tab) => normalizeId(tab?.id) === "DesktopApps");
     const soundtracksIndex = nativeTabs.findIndex((tab) => normalizeId(tab?.id) === "Soundtracks");
+    const tabMasterOwnsOrder = hasTabMasterOwnership(sourceTabs);
     const insertIndex = desktopIndex >= 0
       ? desktopIndex + 1
-      : soundtracksIndex >= 0
+      : !tabMasterOwnsOrder && soundtracksIndex >= 0
         ? soundtracksIndex
         : nativeTabs.length;
     return [
@@ -222,6 +233,8 @@
   root.__steamLoaderOmniLibraryTabTopology = Object.freeze({
     buildDefinitionsFromSummary,
     buildCanonicalTabOrder,
+    hasTabMasterOwnership,
+    isTabMasterOwnedTab,
     restoreMissingTabs,
     getAdjacentTabId,
     chooseDistinctBackingRoute,

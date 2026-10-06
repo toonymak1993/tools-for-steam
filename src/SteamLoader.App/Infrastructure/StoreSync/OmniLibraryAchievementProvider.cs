@@ -65,6 +65,7 @@ internal sealed class OmniLibraryAchievementProvider
                     return await RefreshXboxAsync(
                         context.GameDetail,
                         context.Store,
+                        context.Provider,
                         cancellationToken).ConfigureAwait(false);
                 }),
             new DelegatingOmniLibraryAchievementSource(
@@ -115,7 +116,7 @@ internal sealed class OmniLibraryAchievementProvider
         var identity = descriptor.Id.Equals(
                 "xbox-live",
                 StringComparison.OrdinalIgnoreCase)
-                ? $"{game?.StoreTitleId}|{ResolvedStoredXboxTitleId(provider, store, game)}|{HashSecret(provider.Credential)}|{provider.AccountId}"
+                ? $"{game?.StoreTitleId}|{ResolvedStoredXboxTitleId(provider, store, game)}|{HashSecret(provider.Credential)}|{HashSecret(provider.SecondaryCredential)}|{provider.AccountId}"
             : descriptor.Id.Equals(
                 "epic-games",
                 StringComparison.OrdinalIgnoreCase)
@@ -258,15 +259,27 @@ internal sealed class OmniLibraryAchievementProvider
     private async Task<OmniLibraryAchievementRefreshResult> RefreshXboxAsync(
         UnifySteamGameDetailSnapshot gameDetail,
         UnifySteamStoreConfiguration store,
+        OmniLibraryGameDataProviderConfiguration provider,
         CancellationToken cancellationToken)
     {
+        var refreshToken = provider.SecondaryCredential?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(refreshToken))
+        {
+            return await RefreshXboxLiveAsync(
+                gameDetail,
+                store,
+                provider,
+                refreshToken,
+                cancellationToken).ConfigureAwait(false);
+        }
+
         var apiKey = store.OpenXblApiKey?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             return Unavailable(
-                "OpenXBL",
+                "Xbox Network",
                 "not-configured",
-                "Add your personal OpenXBL API key in Xbox settings to show verified achievement progress.",
+                "Sign in to Xbox from OmniLibrary settings to show verified achievement progress.",
                 DateTimeOffset.UtcNow.AddDays(1));
         }
 
@@ -348,6 +361,169 @@ internal sealed class OmniLibraryAchievementProvider
             }),
             RetryAfterUtc: null,
             Error: string.Empty);
+    }
+
+    private async Task<OmniLibraryAchievementRefreshResult> RefreshXboxLiveAsync(
+        UnifySteamGameDetailSnapshot gameDetail,
+        UnifySteamStoreConfiguration store,
+        OmniLibraryGameDataProviderConfiguration provider,
+        string refreshToken,
+        CancellationToken cancellationToken)
+    {
+        XboxLiveSession session;
+        try
+        {
+            session = await XboxLiveAuthService.RefreshSessionAsync(
+                refreshToken,
+                _httpClient,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException error)
+        {
+            throw new AchievementProviderException(
+                $"{error.Message} Sign in to Xbox again in OmniLibrary settings.",
+                DateTimeOffset.UtcNow.Add(AuthenticationFailureBackoff));
+        }
+
+        PersistXboxLiveSession(refreshToken, session);
+        provider.SecondaryCredential = session.RefreshToken;
+        provider.AccountId = session.Xuid;
+        provider.AccountName = session.Gamertag;
+
+        var titleId = ResolvedStoredXboxTitleId(provider, store, gameDetail.Game);
+        if (!IsNumericXboxTitleId(titleId))
+        {
+            var catalogTitleId = gameDetail.Game?.StoreTitleId?.Trim() ?? string.Empty;
+            titleId = IsNumericXboxTitleId(catalogTitleId)
+                ? catalogTitleId
+                : string.Empty;
+        }
+        if (!IsNumericXboxTitleId(titleId) &&
+            TryResolveXboxTitleIdFromInstall(gameDetail.Game, out var localTitleId))
+        {
+            titleId = localTitleId;
+        }
+        if (!IsNumericXboxTitleId(titleId))
+        {
+            titleId = await ResolveXboxLiveTitleIdAsync(
+                gameDetail.Game,
+                session,
+                cancellationToken).ConfigureAwait(false);
+        }
+        if (!IsNumericXboxTitleId(titleId))
+        {
+            return Unavailable(
+                "Xbox Network",
+                "mapping-unavailable",
+                "Xbox did not publish an exact Title ID for this game. Play it once on this account, then retry.",
+                DateTimeOffset.UtcNow.AddDays(1));
+        }
+
+        var productId = gameDetail.Game?.Id?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(productId))
+        {
+            PersistXboxLiveTitleId(session.RefreshToken, productId, titleId);
+        }
+
+        var url =
+            $"https://achievements.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/achievements" +
+            $"?titleId={Uri.EscapeDataString(titleId)}&maxItems=1000";
+        using var document = await SendXboxLiveAsync(
+            url,
+            session,
+            contractVersion: "2",
+            cancellationToken).ConfigureAwait(false);
+        var achievements = ParseXboxAchievements(document.RootElement);
+        var metadata = achievements.Count == 0
+            ? new OmniLibraryAchievementMetadata(
+                "Xbox Network",
+                "no-achievements",
+                "Xbox returned no achievements for this title.",
+                0,
+                0,
+                [])
+            : new OmniLibraryAchievementMetadata(
+                "Xbox Network",
+                "ready",
+                $"Verified Xbox achievement progress for {session.Gamertag}.",
+                achievements.Count(item => item.Unlocked),
+                achievements.Count,
+                achievements);
+        return new OmniLibraryAchievementRefreshResult(
+            metadata,
+            DefinitionsRefreshed: true,
+            ProgressRefreshed: true,
+            ProviderState: JsonSerializer.Serialize(new
+            {
+                titleId,
+                accountId = session.Xuid,
+            }),
+            RetryAfterUtc: null,
+            Error: string.Empty);
+    }
+
+    private async Task<string> ResolveXboxLiveTitleIdAsync(
+        UnifySteamGameState? game,
+        XboxLiveSession session,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new List<XboxTitleCandidate>();
+        var continuationToken = string.Empty;
+        for (var page = 0; page < 20; page++)
+        {
+            var url =
+                $"https://titlehub.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/titles/titlehistory/decoration/detail?maxItems=100";
+            if (!string.IsNullOrWhiteSpace(continuationToken))
+            {
+                url += "&continuationToken=" + Uri.EscapeDataString(continuationToken);
+            }
+            using var document = await SendXboxLiveAsync(
+                url,
+                session,
+                contractVersion: "2",
+                cancellationToken).ConfigureAwait(false);
+            candidates.AddRange(ParseXboxTitleCandidates(document.RootElement));
+            continuationToken = ReadXboxContinuationToken(document.RootElement);
+            if (string.IsNullOrWhiteSpace(continuationToken))
+            {
+                break;
+            }
+        }
+        return MatchXboxTitleCandidate(game, candidates)?.TitleId ?? string.Empty;
+    }
+
+    private async Task<JsonDocument> SendXboxLiveAsync(
+        string url,
+        XboxLiveSession session,
+        string contractVersion,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.TryAddWithoutValidation(
+            "Authorization",
+            $"XBL3.0 x={session.UserHash};{session.Token}");
+        request.Headers.TryAddWithoutValidation("x-xbl-contract-version", contractVersion);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        using var response = await _httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw BuildProviderHttpError("Xbox Network", response);
+        }
+        return await JsonDocument.ParseAsync(
+            await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false),
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string ReadXboxContinuationToken(JsonElement root)
+    {
+        if (root.TryGetProperty("pagingInfo", out var pagingInfo))
+        {
+            return FirstJsonString(pagingInfo, "continuationToken");
+        }
+        return string.Empty;
     }
 
     private async Task<OmniLibraryAchievementRefreshResult> RefreshEpicAsync(
@@ -1720,6 +1896,72 @@ internal sealed class OmniLibraryAchievementProvider
         }
     }
 
+    private void PersistXboxLiveSession(
+        string expectedRefreshToken,
+        XboxLiveSession session)
+    {
+        if (_settingsStore is null)
+        {
+            return;
+        }
+        _settingsStore.Update(configuration =>
+        {
+            if (!configuration.UnifySteam.GameData.Providers.TryGetValue(
+                    "xbox-live",
+                    out var provider) ||
+                provider is null ||
+                !string.Equals(
+                    provider.SecondaryCredential,
+                    expectedRefreshToken,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+            provider.SecondaryCredential = session.RefreshToken;
+            provider.AccountId = session.Xuid;
+            provider.AccountName = session.Gamertag;
+            provider.ConnectionStatus = "ready";
+            provider.ConnectionDetail = $"Connected as {session.Gamertag}.";
+            provider.ConnectionCheckedAtUtc = DateTimeOffset.UtcNow;
+            provider.UpdatedAtUtc = DateTimeOffset.UtcNow;
+
+            var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
+            xbox.OpenXblAccountId = session.Xuid;
+            xbox.OpenXblAccountName = session.Gamertag;
+            xbox.OpenXblAccountCheckedAtUtc = DateTimeOffset.UtcNow;
+        });
+        InvalidateConfigurationCache();
+    }
+
+    private void PersistXboxLiveTitleId(
+        string refreshToken,
+        string productId,
+        string titleId)
+    {
+        if (_settingsStore is null ||
+            string.IsNullOrWhiteSpace(productId) ||
+            !IsNumericXboxTitleId(titleId))
+        {
+            return;
+        }
+        _settingsStore.Update(configuration =>
+        {
+            var provider = configuration.UnifySteam.GameData.Providers["xbox-live"];
+            if (!string.Equals(
+                    provider.SecondaryCredential,
+                    refreshToken,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+            provider.GameIdOverrides[productId.Trim()] = titleId.Trim();
+            provider.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            configuration.UnifySteam.Stores["xbox-game-pass"]
+                .OpenXblTitleIds[productId.Trim()] = titleId.Trim();
+        });
+        InvalidateConfigurationCache();
+    }
+
     private void PersistOpenXblAccount(
         string apiKey,
         string accountId,
@@ -1754,11 +1996,7 @@ internal sealed class OmniLibraryAchievementProvider
                 provider.UpdatedAtUtc = DateTimeOffset.UtcNow;
             }
         });
-        lock (_configurationGate)
-        {
-            _configurationRevision = long.MinValue;
-            _configuration = null;
-        }
+        InvalidateConfigurationCache();
     }
 
     private void PersistOpenXblTitleId(
@@ -1793,6 +2031,11 @@ internal sealed class OmniLibraryAchievementProvider
                 provider.UpdatedAtUtc = DateTimeOffset.UtcNow;
             }
         });
+        InvalidateConfigurationCache();
+    }
+
+    private void InvalidateConfigurationCache()
+    {
         lock (_configurationGate)
         {
             _configurationRevision = long.MinValue;
@@ -1852,7 +2095,7 @@ internal sealed class OmniLibraryAchievementProvider
 
     private static string ProviderName(string storeId) => storeId switch
     {
-        "xbox-game-pass" => "OpenXBL",
+        "xbox-game-pass" => "Xbox Network",
         "epic-games" => "Epic Games",
         "gog-galaxy" => "GOG",
         _ => "OmniLibrary",

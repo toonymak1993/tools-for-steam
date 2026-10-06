@@ -1,6 +1,10 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 9;
+  const stateVersion = 11;
+  const initialGameRenderCount = 60;
+  const gameRenderBatchSize = 60;
+  const closedOverlayPollIntervalMs = 3000;
+  const openOverlayPollIntervalMs = 1500;
   const overlayStateStorageKey = "ToolsForSteamPluginStoreOverlayState";
   const inputStorageKey = "ToolsForSteamPluginStoreInput";
   const channelName = "ToolsForSteamPluginStoreChannel";
@@ -67,6 +71,7 @@
     activeStoreId: "epic-games",
     selectedGameId: "",
     installingGameKeys: {},
+    visibleGameCountByStoreId: {},
     focusIndex: 0,
     authDraftByStoreId: {},
     authPanelStoreId: "",
@@ -134,9 +139,7 @@
     ensureStyle();
     ensureRoot();
     installInputListeners();
-    state.pollTimer = window.setInterval(pollOverlayState, 700);
-    state.gamepadTimer = window.setInterval(pollGamepads, 58);
-    void pollOverlayState();
+    scheduleOverlayStatePoll(0);
   }
 
   function normalizeApiPath(path) {
@@ -171,15 +174,50 @@
       }
     } catch {
       if (state.open) {
-        state.error = "OmniLibrary backend is not reachable.";
-        render();
+        const error = "OmniLibrary backend is not reachable.";
+        if (state.error !== error) {
+          state.error = error;
+          render();
+        }
       }
+    } finally {
+      scheduleOverlayStatePoll();
+    }
+  }
+
+  function scheduleOverlayStatePoll(delayMs = null) {
+    if (state.pollTimer) {
+      return;
+    }
+
+    const delay = Number.isFinite(delayMs)
+      ? Math.max(0, Number(delayMs))
+      : state.open
+        ? openOverlayPollIntervalMs
+        : closedOverlayPollIntervalMs;
+    state.pollTimer = window.setTimeout(() => {
+      state.pollTimer = 0;
+      void pollOverlayState();
+    }, delay);
+  }
+
+  function updateGamepadPolling() {
+    if (!state.open && state.gamepadTimer) {
+      window.clearInterval(state.gamepadTimer);
+      state.gamepadTimer = 0;
+      state.buttonState = {};
+      return;
+    }
+
+    if (state.open && !state.gamepadTimer) {
+      state.gamepadTimer = window.setInterval(pollGamepads, 58);
     }
   }
 
   function setOpen(open) {
     state.open = Boolean(open);
     document.body?.classList?.toggle("steamloader-unifystore-open", state.open);
+    updateGamepadPolling();
     if (state.open) {
       state.status = state.status || "Loading account libraries...";
       ensureStateBroadcast();
@@ -188,6 +226,10 @@
       state.busy = false;
       state.status = "";
       state.error = "";
+      if (state.stateBroadcastTimer) {
+        window.clearInterval(state.stateBroadcastTimer);
+        state.stateBroadcastTimer = 0;
+      }
       broadcastOverlayState(false);
     }
     render();
@@ -203,7 +245,7 @@
         return;
       }
       broadcastOverlayState(true);
-    }, 450);
+    }, 1200);
   }
 
   function getBridgeChannel() {
@@ -212,9 +254,7 @@
     }
     try {
       state.channel = new BroadcastChannel(channelName);
-      state.channelHandler = (event) => {
-        consumeBridgeInput(event.data);
-      };
+      state.channelHandler = (event) => consumeBridgeMessage(event.data);
       state.channel.addEventListener("message", state.channelHandler);
     } catch {
       state.channel = null;
@@ -260,12 +300,32 @@
     window.addEventListener("keydown", state.keyHandler, true);
 
     state.storageHandler = (event) => {
-      if (event.key === inputStorageKey) {
-        consumeBridgeInput(event.newValue);
+      if (event.key === inputStorageKey || event.key === overlayStateStorageKey) {
+        consumeBridgeMessage(event.newValue);
       }
     };
     window.addEventListener("storage", state.storageHandler);
     getBridgeChannel();
+  }
+
+  function consumeBridgeMessage(raw) {
+    if (!raw) {
+      return;
+    }
+
+    try {
+      const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (payload?.type === "overlay-open-request" && payload?.source === "unifystore") {
+        if (!state.open) {
+          setOpen(true);
+        }
+        return;
+      }
+    } catch {
+      return;
+    }
+
+    consumeBridgeInput(raw);
   }
 
   function consumeBridgeInput(raw) {
@@ -286,7 +346,9 @@
   async function loadLibrary() {
     state.loading = true;
     state.error = "";
-    render();
+    if (!state.snapshot) {
+      render();
+    }
     try {
       state.snapshot = await fetchJson("api/store-sync/state");
       reconcileInstallingGames();
@@ -307,7 +369,6 @@
     state.busy = true;
     state.error = "";
     state.status = storeId ? "Refreshing store library..." : "Refreshing Epic, GOG, and Xbox...";
-    render();
     try {
       state.snapshot = await fetchJson("api/unifystore/stores/refresh", {
         method: "POST",
@@ -328,7 +389,6 @@
     state.error = "";
     state.status = "Opening store login...";
     state.authPanelStoreId = storeId;
-    render();
     try {
       state.snapshot = await fetchJson("api/unifystore/stores/login", {
         method: "POST",
@@ -519,12 +579,26 @@
     });
   }
 
-  function getGameGroups(store) {
-    const games = getSortedGames(store);
+  function getGameGroups(store, sortedGames = null) {
+    const games = Array.isArray(sortedGames) ? sortedGames : getSortedGames(store);
     return {
       installed: games.filter((game) => game.installed),
       available: games.filter((game) => !game.installed),
     };
+  }
+
+  function getVisibleGameCount(storeId, sectionKey) {
+    const key = `${storeId}:${sectionKey}`;
+    return Math.max(
+      initialGameRenderCount,
+      Number(state.visibleGameCountByStoreId[key] || initialGameRenderCount),
+    );
+  }
+
+  function revealMoreGames(storeId, sectionKey) {
+    const key = `${storeId}:${sectionKey}`;
+    state.visibleGameCountByStoreId[key] =
+      getVisibleGameCount(storeId, sectionKey) + gameRenderBatchSize;
   }
 
   function switchStore(delta) {
@@ -1191,14 +1265,17 @@
     }
 
     const stores = getStores();
-    const activeStore = getActiveStore();
-    const groups = getGameGroups(activeStore);
-    const selectedGame = getSortedGames(activeStore)
+    const activeStore = stores.find((store) => store.id === state.activeStoreId) ||
+      stores[0] ||
+      storeFallbacks["epic-games"];
+    const sortedGames = getSortedGames(activeStore);
+    const groups = getGameGroups(activeStore, sortedGames);
+    const selectedGame = sortedGames
       .find((game) => String(game.id || "") === state.selectedGameId) || null;
     const shell = el("div", "steamloader-unifystore-shell");
 
     shell.append(
-      renderTopbar(activeStore),
+      renderTopbar(activeStore, stores),
       renderTabs(stores),
       renderMain(activeStore, groups, selectedGame),
       renderFooter(),
@@ -1208,7 +1285,7 @@
     syncFocus();
   }
 
-  function renderTopbar(activeStore) {
+  function renderTopbar(activeStore, stores) {
     const topbar = el("div", "steamloader-unifystore-topbar");
     const brand = el("div");
     brand.append(
@@ -1221,8 +1298,8 @@
       ),
     );
 
-    const totalInstalled = storesTotal("installedCount");
-    const totalAvailable = storesTotal("availableCount");
+    const totalInstalled = storesTotal("installedCount", stores);
+    const totalAvailable = storesTotal("availableCount", stores);
     const actions = el("div", "steamloader-unifystore-actions");
     actions.append(
       ...(totalInstalled > 0
@@ -1293,6 +1370,18 @@
 
     const head = el("div", "steamloader-unifystore-store-head");
     const headText = el("div");
+    const syncHealth = store?.syncHealth || null;
+    const lastRemoteSync = syncHealth?.lastRemoteSuccessAtUtc
+      ? new Date(syncHealth.lastRemoteSuccessAtUtc).toLocaleTimeString()
+      : "not yet";
+    const nextRemoteSync = syncHealth?.nextRemoteCheckAtUtc
+      ? new Date(syncHealth.nextRemoteCheckAtUtc).toLocaleTimeString()
+      : "pending";
+    const syncHealthText = syncHealth
+      ? String(syncHealth.trigger || "").toLowerCase() === "remote-retry"
+        ? `Sync retry ${nextRemoteSync}: ${syncHealth.detail || "provider temporarily unavailable"}`
+        : `Last remote sync ${lastRemoteSync} - next ${nextRemoteSync}`
+      : "";
     headText.append(
       textEl("div", "steamloader-unifystore-store-title", store.title || store.id),
       textEl(
@@ -1303,6 +1392,7 @@
           store.id === "xbox-game-pass"
             ? store.authReady ? "Xbox app detected" : "Xbox app required"
             : store.authReady ? "Account ready" : "Login required",
+          syncHealthText,
           store.detailText || "",
         ].filter(Boolean).join(" - "),
       ),
@@ -1343,7 +1433,7 @@
     }
 
     if (groups.installed.length) {
-      appendSection(main, "Installed", "Ready to launch", groups.installed, store.id);
+      appendSection(main, "Installed", "Ready to launch", groups.installed, store.id, "installed");
     }
     if (groups.available.length) {
       appendSection(
@@ -1351,7 +1441,8 @@
         "Available",
         "Select a game to open its detail page and start the download",
         groups.available,
-        store.id
+        store.id,
+        "available",
       );
     }
 
@@ -1458,7 +1549,7 @@
     return panel;
   }
 
-  function appendSection(parent, title, copy, games, storeId) {
+  function appendSection(parent, title, copy, games, storeId, sectionKey) {
     const section = el("section", "steamloader-unifystore-section");
     section.append(
       withChildren(
@@ -1470,10 +1561,22 @@
     );
     if (games.length) {
       const grid = el("div", "steamloader-unifystore-grid");
-      for (const game of games) {
+      const visibleCount = getVisibleGameCount(storeId, sectionKey);
+      for (const game of games.slice(0, visibleCount)) {
         grid.append(renderGameCard(storeId, game));
       }
       section.append(grid);
+      const remaining = Math.max(0, games.length - visibleCount);
+      if (remaining > 0) {
+        const revealButton = buttonEl(
+          `Show ${Math.min(gameRenderBatchSize, remaining)} more games (${remaining} remaining)`,
+          "steamloader-unifystore-button is-primary",
+          "show-more",
+          storeId,
+        );
+        revealButton.dataset.sectionKey = sectionKey;
+        section.append(revealButton);
+      }
     }
     parent.append(section);
   }
@@ -1542,8 +1645,8 @@
     );
   }
 
-  function storesTotal(key) {
-    return getStores().reduce((total, store) => total + (Number(store[key]) || 0), 0);
+  function storesTotal(key, stores = getStores()) {
+    return stores.reduce((total, store) => total + (Number(store[key]) || 0), 0);
   }
 
   function resolveArtworkUrl(url) {
@@ -1782,6 +1885,11 @@
     if (action === "back-to-library") {
       state.selectedGameId = "";
       state.focusIndex = 0;
+      render();
+      return;
+    }
+    if (action === "show-more") {
+      revealMoreGames(storeId, element.dataset.sectionKey || "available");
       render();
       return;
     }

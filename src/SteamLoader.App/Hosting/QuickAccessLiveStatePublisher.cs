@@ -80,25 +80,45 @@ public sealed class QuickAccessLiveStatePublisher
                     continue;
                 }
 
-                if (now >= nextProcessesAtUtc)
+                if (!_liveUpdateHub.HasSubscribersFor("processes.state"))
+                {
+                    _lastProcessesFingerprint = string.Empty;
+                    nextProcessesAtUtc = now;
+                }
+                else if (now >= nextProcessesAtUtc)
                 {
                     await PublishProcessesStateIfChangedAsync(cancellationToken);
                     nextProcessesAtUtc = now.Add(ProcessesInterval);
                 }
 
-                if (now >= nextStoreSyncAtUtc)
+                if (!_liveUpdateHub.HasSubscribersFor("store-sync.state"))
+                {
+                    _lastStoreSyncFingerprint = string.Empty;
+                    nextStoreSyncAtUtc = now;
+                }
+                else if (now >= nextStoreSyncAtUtc)
                 {
                     PublishStoreSyncStateIfChanged();
                     nextStoreSyncAtUtc = now.Add(StoreSyncInterval);
                 }
 
-                if (now >= nextSmartHomeAtUtc)
+                if (!_liveUpdateHub.HasSubscribersFor("smart-home.state"))
+                {
+                    _lastSmartHomeFingerprint = string.Empty;
+                    nextSmartHomeAtUtc = now;
+                }
+                else if (now >= nextSmartHomeAtUtc)
                 {
                     await PublishSmartHomeStateIfChangedAsync(cancellationToken);
                     nextSmartHomeAtUtc = now.Add(SmartHomeInterval);
                 }
 
-                if (now >= nextHandheldPerformanceAtUtc)
+                if (!_liveUpdateHub.HasSubscribersFor("handheld-performance.state"))
+                {
+                    _lastHandheldPerformanceFingerprint = string.Empty;
+                    nextHandheldPerformanceAtUtc = now;
+                }
+                else if (now >= nextHandheldPerformanceAtUtc)
                 {
                     PublishHandheldPerformanceStateIfChanged();
                     nextHandheldPerformanceAtUtc = now.Add(HandheldPerformanceInterval);
@@ -131,7 +151,11 @@ public sealed class QuickAccessLiveStatePublisher
 
     private async Task PublishDiscordPresenceAsync(CancellationToken cancellationToken)
     {
-        if (!_isDiscordEnabled() || !_discordService.AreFriendOnlineNotificationsEnabled())
+        var hasDiscordStateSubscriber = _liveUpdateHub.HasSubscribersFor("discord.state");
+        var hasNotificationSubscriber = _liveUpdateHub.HasSubscribersFor("notifications.show");
+        if ((!hasDiscordStateSubscriber && !hasNotificationSubscriber) ||
+            !_isDiscordEnabled() ||
+            !_discordService.AreFriendOnlineNotificationsEnabled())
         {
             _discordPresenceTracker.Reset();
             _lastDiscordFingerprint = string.Empty;

@@ -1,15 +1,9 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import vm from "node:vm";
 
 const pluginRoot = new URL("../sdk/official-plugins/crackwatch/", import.meta.url);
-const execFileAsync = promisify(execFile);
 
 test("Crackwatch is an optional full-trust Store plugin with a managed backend", async () => {
   const manifest = JSON.parse(await readFile(new URL("tfs-plugin.json", pluginRoot), "utf8"));
@@ -37,7 +31,6 @@ test("Crackwatch is an optional full-trust Store plugin with a managed backend",
   assert.deepEqual([...logo.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
   assert.deepEqual(logo, preview);
 });
-
 test("Crackwatch starts with Hot Games and renders all cracked games, favorites, and official artwork", async () => {
   const source = await readFile(new URL("dist/index.js", pluginRoot), "utf8");
 
@@ -295,77 +288,5 @@ test("Quick Access editors render plugin search fields as single-line search inp
     assert.match(source, /editor\.inputType === "search"/);
     assert.match(source, /const editorElementType = isSingleLineEditor \? "input" : "textarea"/);
     assert.match(source, /enterKeyHint: editor\.enterKeyHint/);
-  }
-});
-
-test("community Store builder packages plugin backends and consumes per-plugin metadata", async () => {
-  const [builder, pluginTool] = await Promise.all([
-    readFile(new URL("../scripts/build-community-plugin-store.ps1", import.meta.url), "utf8"),
-    readFile(new URL("../scripts/tfs-plugin.ps1", import.meta.url), "utf8"),
-  ]);
-
-  assert.match(builder, /store\.json/);
-  assert.match(builder, /\$backendSource/);
-  assert.match(builder, /category = \$catalogCategory/);
-  assert.match(builder, /tags = @\(\$catalogTags\)/);
-  assert.match(builder, /publishedAtUtc = \$localPublishedAtUtc/);
-  assert.match(builder, /Get-PluginPublishedAtUtc/);
-  assert.match(pluginTool, /store\.json/);
-  assert.match(pluginTool, /category = \$catalogCategory/);
-  assert.match(pluginTool, /tags = @\(\$catalogTags\)/);
-  assert.match(pluginTool, /publishedAtUtc = \$publishedAtUtc/);
-});
-
-test("sideload merges the public catalog and serializes single-value fields as arrays", {
-  skip: process.platform !== "win32",
-}, async () => {
-  const testRoot = await mkdtemp(path.join(tmpdir(), "tfs-crackwatch-sideload-"));
-  const runtimeData = path.join(testRoot, "data");
-  const publicCatalogPath = path.join(testRoot, "public-catalog.json");
-  const scriptPath = fileURLToPath(new URL("../scripts/tfs-plugin.ps1", import.meta.url));
-
-  try {
-    await mkdir(runtimeData, { recursive: true });
-    await writeFile(publicCatalogPath, JSON.stringify({
-      title: "Public Test",
-      description: "Public entries.",
-      plugins: [{
-        id: "public-demo",
-        title: "Public Demo",
-        description: "Public test entry.",
-        author: "Tests",
-        category: "Utility",
-        version: "1.0.0",
-        sdkVersion: "1.0.0",
-        permissions: ["frontend"],
-        networkHosts: [],
-        packageUrl: "https://example.com/public-demo.zip",
-        packageSha256: "A".repeat(64),
-        images: ["https://example.com/public-demo.png"],
-        tags: ["public"],
-      }],
-    }), "utf8");
-
-    await execFileAsync("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy", "Bypass",
-      "-File", scriptPath,
-      "sideload", fileURLToPath(pluginRoot),
-      "-RuntimeDataDirectory", runtimeData,
-      "-CommunityCatalogPath", publicCatalogPath,
-    ], { windowsHide: true });
-
-    const catalog = JSON.parse(await readFile(path.join(runtimeData, "plugin-store", "catalog.json"), "utf8"));
-    const source = JSON.parse(await readFile(path.join(runtimeData, "plugin-store", "catalog-source.json"), "utf8"));
-    const crackwatch = catalog.plugins.find((plugin) => plugin.id === "crackwatch");
-
-    assert.deepEqual(catalog.plugins.map((plugin) => plugin.id), ["public-demo", "crackwatch"]);
-    assert.ok(crackwatch);
-    assert.deepEqual(crackwatch.images, ["api/plugin-store/images/catalog/crackwatch.png"]);
-    assert.deepEqual(crackwatch.networkHosts, []);
-    assert.ok(Number.isFinite(Date.parse(crackwatch.publishedAtUtc)));
-    assert.equal(source.localDevelopment, true);
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
   }
 });

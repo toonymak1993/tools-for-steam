@@ -13,11 +13,22 @@ public sealed record OmniLibraryGamePageMetadataSnapshot(
     DateTimeOffset? NextRefreshAtUtc,
     int? SourceSteamAppId,
     string SourceLabel,
+    string MatchMode,
     string Warning,
     OmniLibraryGameInfoMetadata GameInfo,
     IReadOnlyList<OmniLibraryActivityMetadata> Activity,
     OmniLibraryAchievementMetadata Achievements,
     IReadOnlyList<OmniLibraryCommunityMetadata> Community);
+
+public sealed record OmniLibraryMetadataSearchResult(
+    int SteamAppId,
+    string Title,
+    string ImageUrl,
+    string Price,
+    int MatchScore);
+
+public sealed record SetOmniLibraryMetadataMatchRequest(
+    int SteamAppId);
 
 public sealed record OmniLibraryGameInfoMetadata(
     string ShortDescription,

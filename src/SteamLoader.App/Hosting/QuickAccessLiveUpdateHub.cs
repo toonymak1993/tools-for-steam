@@ -8,7 +8,7 @@ public sealed class QuickAccessLiveUpdateHub
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly object _gate = new();
-    private readonly Dictionary<Guid, Channel<string>> _subscribers = new();
+    private readonly Dictionary<Guid, Subscriber> _subscribers = new();
     private long _nextSequence;
 
     public bool HasSubscribers
@@ -22,7 +22,21 @@ public sealed class QuickAccessLiveUpdateHub
         }
     }
 
-    public QuickAccessLiveUpdateSubscription Subscribe()
+    public bool HasSubscribersFor(string topic)
+    {
+        if (string.IsNullOrWhiteSpace(topic))
+        {
+            return false;
+        }
+
+        var normalizedTopic = topic.Trim();
+        lock (_gate)
+        {
+            return _subscribers.Values.Any(subscriber => subscriber.Accepts(normalizedTopic));
+        }
+    }
+
+    public QuickAccessLiveUpdateSubscription Subscribe(IEnumerable<string>? topics = null)
     {
         var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
         {
@@ -30,10 +44,16 @@ public sealed class QuickAccessLiveUpdateHub
             SingleWriter = false
         });
         var subscriberId = Guid.NewGuid();
+        var normalizedTopics = topics?
+            .Where(topic => !string.IsNullOrWhiteSpace(topic))
+            .Select(topic => topic.Trim())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         lock (_gate)
         {
-            _subscribers[subscriberId] = channel;
+            _subscribers[subscriberId] = new Subscriber(
+                channel,
+                normalizedTopics is { Count: > 0 } ? normalizedTopics : null);
         }
 
         channel.Writer.TryWrite(SerializeEvent("ready"));
@@ -57,8 +77,9 @@ public sealed class QuickAccessLiveUpdateHub
             return;
         }
 
-        var serializedPayload = SerializeEvent(topic.Trim(), payload);
-        KeyValuePair<Guid, Channel<string>>[] subscribers;
+        var normalizedTopic = topic.Trim();
+        var serializedPayload = SerializeEvent(normalizedTopic, payload);
+        KeyValuePair<Guid, Subscriber>[] subscribers;
 
         lock (_gate)
         {
@@ -67,7 +88,12 @@ public sealed class QuickAccessLiveUpdateHub
 
         foreach (var subscriber in subscribers)
         {
-            if (!subscriber.Value.Writer.TryWrite(serializedPayload))
+            if (!subscriber.Value.Accepts(normalizedTopic))
+            {
+                continue;
+            }
+
+            if (!subscriber.Value.Channel.Writer.TryWrite(serializedPayload))
             {
                 RemoveSubscriber(subscriber.Key);
             }
@@ -91,13 +117,19 @@ public sealed class QuickAccessLiveUpdateHub
 
         lock (_gate)
         {
-            if (_subscribers.Remove(subscriberId, out var removedChannel))
+            if (_subscribers.Remove(subscriberId, out var removedSubscriber))
             {
-                channel = removedChannel;
+                channel = removedSubscriber.Channel;
             }
         }
 
         channel?.Writer.TryComplete();
+    }
+
+    private sealed record Subscriber(Channel<string> Channel, HashSet<string>? Topics)
+    {
+        public bool Accepts(string topic) =>
+            Topics is null || Topics.Contains(topic) || Topics.Contains("*");
     }
 }
 

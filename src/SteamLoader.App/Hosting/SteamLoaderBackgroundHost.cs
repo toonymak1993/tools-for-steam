@@ -5,6 +5,7 @@ using SteamLoader.App.Infrastructure.AppStart;
 using SteamLoader.App.Infrastructure.Audio;
 using SteamLoader.App.Infrastructure.Display;
 using SteamLoader.App.Infrastructure.Discord;
+using SteamLoader.App.Infrastructure.Curtain;
 using SteamLoader.App.Infrastructure.Helpers;
 using SteamLoader.App.Infrastructure.Hltb;
 using SteamLoader.App.Infrastructure.Handheld;
@@ -27,11 +28,6 @@ public sealed class SteamLoaderBackgroundHost
     private static readonly Uri DebugEndpoint = new("http://127.0.0.1:8080");
     private static readonly Uri ApiBaseUri = new("http://127.0.0.1:47652/");
     private static readonly Uri CssLoaderApiUri = new("http://127.0.0.1:35821/req");
-    private static readonly TimeSpan OmniLibraryStartupDelay = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan OmniLibraryCatalogCheckInterval = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan OmniLibraryMaximumFailureBackoff = TimeSpan.FromHours(1);
-    private static readonly TimeSpan OmniLibrarySchedulerWakeInterval = TimeSpan.FromMinutes(1);
-
     private readonly SteamLoaderHostState _hostState;
 
     public SteamLoaderBackgroundHost(SteamLoaderHostState hostState)
@@ -76,7 +72,7 @@ public sealed class SteamLoaderBackgroundHost
         var storeSyncService = new StoreSyncService(
             storeSyncSettingsStore,
             new SteamShortcutFile(),
-            new SteamGridDbArtworkDownloader(),
+            new OmniLibraryArtworkPipeline(),
             shellService,
             steamInstallationService,
             devToolsClient,
@@ -124,6 +120,10 @@ public sealed class SteamLoaderBackgroundHost
             SteamLoaderRuntime.ShellLaunchArguments,
             Path.Combine(dataDirectory, "tfs.json"));
         steamLoaderSettingsService.EnsureDefaultConsoleModeEnabled();
+        await using var curtainService = new CurtainService(
+            new CurtainSettingsStore(Path.Combine(dataDirectory, "curtain.json")),
+            steamInstallationService,
+            () => steamLoaderSettingsService.IsPluginEnabled("curtain"));
         var pluginStoreService = new PluginStoreService(
             httpClient,
             steamLoaderSettingsService,
@@ -131,7 +131,8 @@ public sealed class SteamLoaderBackgroundHost
         var pluginFullTrustRuntime = new PluginFullTrustRuntime(pluginStoreService, devToolsClient);
         var storeSyncAutomationService = new StoreSyncAutomationService(
             storeSyncService,
-            () => steamLoaderSettingsService.IsPluginEnabled("store-sync"));
+            () => steamLoaderSettingsService.IsPluginEnabled("store-sync"),
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"));
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
         var shellVisibilityService = new WindowsShellVisibilityService();
         var shellGuardService = new ConsoleModeShellGuardService(
@@ -205,6 +206,7 @@ public sealed class SteamLoaderBackgroundHost
             EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
             EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-metadata-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/curtain-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
             EmbeddedAssetReader.ReadText("Assets/store-overlay.js"));
@@ -260,6 +262,7 @@ public sealed class SteamLoaderBackgroundHost
             displaySwitchService,
             processWindowService,
             artworkService,
+            curtainService,
             autoSisirService,
             appStartService,
             hltbService,
@@ -327,10 +330,13 @@ public sealed class SteamLoaderBackgroundHost
         using var handheldProfileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var handheldProfileTask = handheldProfileCoordinator.RunAsync(handheldProfileCts.Token);
         using var omniLibraryRefreshCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var omniLibraryRefreshTask = RunOmniLibraryRefreshLoopAsync(
+        var omniLibraryRefreshCoordinator = new OmniLibraryRefreshCoordinator(
             storeSyncService,
             () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
-            dataDirectory,
+            message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
+                message));
+        var omniLibraryRefreshTask = omniLibraryRefreshCoordinator.RunAsync(
             omniLibraryRefreshCts.Token);
         using var omniLibraryDownloadPowerCts =
             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -340,24 +346,26 @@ public sealed class SteamLoaderBackgroundHost
         var omniLibraryDownloadPowerTask =
             OmniLibraryDownloadSleepBlocker.RunStatusMonitorAsync(
                 omniLibraryDownloadPowerCts.Token);
-        using var gogInstallStateCts =
+        using var omniLibraryInstallStateCts =
             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var gogInstallStateTask =
-            GogInstallStateTracker.RunAsync(gogInstallStateCts.Token);
-        using var xboxInstallStateCts =
-            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var xboxInstallStateTask =
-            ProviderInstallStateTracker.RunAsync(
-                "xbox-game-pass",
-                UnifySteamService.LoadXboxInstalledGamesForReconciliation,
-                xboxInstallStateCts.Token);
-        using var epicInstallStateCts =
-            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var epicInstallStateTask =
-            ProviderInstallStateTracker.RunAsync(
-                "epic-games",
-                UnifySteamService.LoadEpicInstalledGamesForReconciliation,
-                epicInstallStateCts.Token);
+        var omniLibraryInstallStateCoordinator = new OmniLibraryInstallStateCoordinator(
+            storeSyncSettingsStore,
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
+            (storeId, gameIds) =>
+            {
+                if (steamLoaderSettingsService.IsPluginEnabled("omnilibrary"))
+                {
+                    storeSyncService.QueueOmniLibraryLocalReconciliation(
+                        storeId,
+                        "omnilibrary-install-state",
+                        gameIds);
+                }
+            },
+            message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "omnilibrary-install-state.log"),
+                message));
+        var omniLibraryInstallStateTask = omniLibraryInstallStateCoordinator.RunAsync(
+            omniLibraryInstallStateCts.Token);
 
         try
         {
@@ -365,28 +373,10 @@ public sealed class SteamLoaderBackgroundHost
         }
         finally
         {
-            await gogInstallStateCts.CancelAsync();
+            await omniLibraryInstallStateCts.CancelAsync();
             try
             {
-                await gogInstallStateTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
-
-            await xboxInstallStateCts.CancelAsync();
-            try
-            {
-                await xboxInstallStateTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
-
-            await epicInstallStateCts.CancelAsync();
-            try
-            {
-                await epicInstallStateTask;
+                await omniLibraryInstallStateTask;
             }
             catch (OperationCanceledException)
             {
@@ -504,125 +494,6 @@ public sealed class SteamLoaderBackgroundHost
         {
         }
     }
-
-    private static async Task RunOmniLibraryRefreshLoopAsync(
-        StoreSyncService storeSyncService,
-        Func<bool> isEnabled,
-        string dataDirectory,
-        CancellationToken cancellationToken)
-    {
-        await Task.Delay(OmniLibraryStartupDelay, cancellationToken);
-        var schedules = new Dictionary<string, OmniLibraryStoreCheckSchedule>(
-            StringComparer.OrdinalIgnoreCase);
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            if (!isEnabled())
-            {
-                schedules.Clear();
-                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
-                continue;
-            }
-
-            var enabledStoreIds = storeSyncService.GetEnabledUnifySteamStoreIds();
-            var enabledStoreSet = enabledStoreIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var staleStoreId in schedules.Keys
-                         .Where(storeId => !enabledStoreSet.Contains(storeId))
-                         .ToArray())
-            {
-                schedules.Remove(staleStoreId);
-            }
-
-            var now = DateTimeOffset.UtcNow;
-            foreach (var storeId in enabledStoreIds)
-            {
-                schedules.TryGetValue(storeId, out var schedule);
-                if (schedule is not null && now < schedule.NextCheckAtUtc)
-                {
-                    continue;
-                }
-
-                try
-                {
-                    var result = await Task.Run(
-                        () => storeSyncService.CheckUnifySteamStoreForChanges(storeId),
-                        cancellationToken);
-                    if (!result.Checked)
-                    {
-                        schedules[storeId] = new OmniLibraryStoreCheckSchedule(
-                            FailureCount: 0,
-                            now.Add(OmniLibraryCatalogCheckInterval));
-                        continue;
-                    }
-
-                    if (result.Succeeded)
-                    {
-                        schedules[storeId] = new OmniLibraryStoreCheckSchedule(
-                            FailureCount: 0,
-                            now.Add(OmniLibraryCatalogCheckInterval));
-                        if (result.CatalogChanged || result.StateChanged)
-                        {
-                            AppendDiagnosticLog(
-                                Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
-                                $"{storeId} five-minute check: {result.Detail}");
-                        }
-                        continue;
-                    }
-
-                    var failureCount = Math.Min((schedule?.FailureCount ?? 0) + 1, 8);
-                    var backoff = ComputeOmniLibraryFailureBackoff(failureCount);
-                    schedules[storeId] = new OmniLibraryStoreCheckSchedule(
-                        failureCount,
-                        now.Add(backoff));
-                    AppendDiagnosticLog(
-                        Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
-                        $"{storeId} five-minute check failed; retry in {backoff.TotalMinutes:0} min: {result.Detail}");
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception exception)
-                {
-                    var failureCount = Math.Min((schedule?.FailureCount ?? 0) + 1, 8);
-                    var backoff = ComputeOmniLibraryFailureBackoff(failureCount);
-                    schedules[storeId] = new OmniLibraryStoreCheckSchedule(
-                        failureCount,
-                        now.Add(backoff));
-                    AppendDiagnosticLog(
-                        Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
-                        $"{storeId} five-minute check failed; retry in {backoff.TotalMinutes:0} min: " +
-                        $"{exception.GetType().Name}:{exception.Message}");
-                }
-            }
-
-            var nextCheckAtUtc = schedules.Count == 0
-                ? now.Add(OmniLibrarySchedulerWakeInterval)
-                : schedules.Values.Min(schedule => schedule.NextCheckAtUtc);
-            var delay = nextCheckAtUtc - DateTimeOffset.UtcNow;
-            if (delay < TimeSpan.FromSeconds(5))
-            {
-                delay = TimeSpan.FromSeconds(5);
-            }
-            if (delay > OmniLibrarySchedulerWakeInterval)
-            {
-                delay = OmniLibrarySchedulerWakeInterval;
-            }
-            await Task.Delay(delay, cancellationToken);
-        }
-    }
-
-    private static TimeSpan ComputeOmniLibraryFailureBackoff(int failureCount)
-    {
-        var multiplier = Math.Pow(2, Math.Max(0, failureCount - 1));
-        return TimeSpan.FromTicks(Math.Min(
-            OmniLibraryMaximumFailureBackoff.Ticks,
-            (long)(OmniLibraryCatalogCheckInterval.Ticks * multiplier)));
-    }
-
-    private sealed record OmniLibraryStoreCheckSchedule(
-        int FailureCount,
-        DateTimeOffset NextCheckAtUtc);
 
     private static async Task ExecuteOemButtonActionAsync(
         HandheldOemButtonBinding binding,

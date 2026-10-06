@@ -9,7 +9,30 @@ internal static class SteamBigPictureForegroundDetector
     private const int DwmwaCloaked = 14;
     private const int GwOwner = 4;
 
-    public static bool IsBigPictureForeground() => Capture().IsSteamForeground;
+    public static bool IsBigPictureForeground()
+    {
+        var foregroundHandle = GetForegroundWindow();
+        if (foregroundHandle == IntPtr.Zero || !IsWindowVisible(foregroundHandle))
+        {
+            return false;
+        }
+
+        _ = GetWindowThreadProcessId(foregroundHandle, out var rawProcessId);
+        if (rawProcessId == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)rawProcessId);
+            return !process.HasExited && IsSteamUiProcess(process.ProcessName);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     public static SteamWindowSnapshot Capture(string? expectedSteamRoot = null)
     {

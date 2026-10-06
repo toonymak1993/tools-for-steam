@@ -152,12 +152,9 @@ public sealed class PluginStoreService
         EnsureBuiltInImageCache();
     }
 
-    public async Task<PluginStoreSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
+    public Task<PluginStoreSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
     {
-        if (_enableCommunityCatalogBootstrap)
-        {
-            await EnsureCommunityCatalogAvailableAsync(cancellationToken);
-        }
+        _ = cancellationToken;
 
         var settingsSnapshot = _settingsService.GetSnapshot();
         var builtInById = settingsSnapshot.Plugins.ToDictionary(plugin => plugin.Id, StringComparer.OrdinalIgnoreCase);
@@ -167,18 +164,18 @@ public sealed class PluginStoreService
                 builtInById.TryGetValue(plugin.Id, out var pluginSettings);
                 var enabled = plugin.CanDisable ? pluginSettings?.Enabled ?? plugin.DefaultEnabled : true;
                 var statusText = !plugin.CanDisable
-                    ? "Built in and always available."
+                    ? "Required system plugin."
                     : enabled
-                        ? "Built in and currently visible in Home."
-                        : "Built in but currently hidden from Home.";
+                        ? "Active"
+                        : "Inactive";
 
                 return new PluginStorePluginState(
                     plugin.Id,
                     plugin.Title,
                     plugin.Description,
                     Source: "Tools for Steam",
-                    Author: "TFS Core",
-                    Category: "Built-In",
+                    Author: "Tools for Steam",
+                    Category: "Included",
                     Version: settingsSnapshot.ProductVersion,
                     InstalledVersion: settingsSnapshot.ProductVersion,
                     SdkVersion: string.Empty,
@@ -202,50 +199,31 @@ public sealed class PluginStoreService
                     CanUninstall: false,
                     HasUpdate: false,
                     StatusText: statusText,
-                    Tags: ["Built-In", plugin.CanDisable ? "Hideable" : "Core"],
+                    Tags: ["Included"],
                     Images: BuildBuiltInImages(plugin.Id, plugin.Title));
             })
             .ToArray();
 
-        var communityCatalog = await LoadCommunityCatalogAsync(cancellationToken);
-        var installedState = LoadInstalledState();
-        var communityPlugins = communityCatalog.Plugins
-            .Select(plugin => BuildCommunityPluginState(plugin, installedState))
-            .OrderByDescending(plugin => plugin.IsInstalled)
-            .ThenBy(plugin => plugin.Title, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        var installedCommunityCount = communityPlugins.Count(plugin => plugin.IsInstalled);
-        var updateCount = communityPlugins.Count(plugin => plugin.HasUpdate);
-        var isCustomCatalog = IsCustomCatalogConfigured() ||
-            communityCatalog.Plugins.Any(plugin => !string.IsNullOrWhiteSpace(plugin.PackagePath));
-
-        return new PluginStoreSnapshot(
-            StatusText: $"{builtInPlugins.Length} built-in plugin{(builtInPlugins.Length == 1 ? string.Empty : "s")} ready - {communityPlugins.Length} community plugin{(communityPlugins.Length == 1 ? string.Empty : "s")} listed.",
+        return Task.FromResult(new PluginStoreSnapshot(
+            StatusText: $"{builtInPlugins.Count(plugin => plugin.IsEnabled)} of {builtInPlugins.Length} plugins active.",
             ErrorText: string.Empty,
-            CatalogTitle: communityCatalog.Title,
-            CatalogDescription: communityCatalog.Description,
-            IsCustomCatalog: isCustomCatalog,
-            CatalogTrustText: isCustomCatalog
-                ? "Developer catalog - these plugins are not reviewed by Tools for Steam and run with full plugin access."
-                : "Curated catalog - community plugins run with full plugin access and should only be installed from trusted publishers.",
-            CommunityCatalogAvailable: communityCatalog.Available,
-            CommunityCatalogStatusText: communityCatalog.StatusText,
+            CatalogTitle: "Plugin Activator",
+            CatalogDescription: "Turn the plugins included with Tools for Steam on or off.",
+            IsCustomCatalog: false,
+            CatalogTrustText: string.Empty,
+            CommunityCatalogAvailable: false,
+            CommunityCatalogStatusText: string.Empty,
             BuiltInCount: builtInPlugins.Length,
-            CommunityCount: communityPlugins.Length,
-            InstalledCommunityCount: installedCommunityCount,
-            UpdateCount: updateCount,
+            CommunityCount: 0,
+            InstalledCommunityCount: 0,
+            UpdateCount: 0,
             BuiltInPlugins: builtInPlugins,
-            CommunityPlugins: communityPlugins);
+            CommunityPlugins: []));
     }
 
-    public async Task<PluginStoreSnapshot> RefreshAsync(CancellationToken cancellationToken)
+    public Task<PluginStoreSnapshot> RefreshAsync(CancellationToken cancellationToken)
     {
-        if (!IsLocalDeveloperCatalog())
-        {
-            await SyncCommunityCatalogAsync(cancellationToken);
-        }
-        return await GetSnapshotAsync(cancellationToken);
+        return GetSnapshotAsync(cancellationToken);
     }
 
     public bool TryGetBuiltInImage(string pluginId, out string imagePath, out string contentType)
@@ -1749,7 +1727,7 @@ public sealed class PluginStoreService
     private IReadOnlyList<PluginStoreImageState> BuildBuiltInImages(string pluginId, string title)
     {
         return TryResolveBuiltInImagePath(pluginId, out _)
-            ? [new PluginStoreImageState($"api/plugin-store/images/built-in/{Uri.EscapeDataString(pluginId)}", $"{title} preview")]
+            ? [new PluginStoreImageState($"api/plugin-activator/images/{Uri.EscapeDataString(pluginId)}", $"{title} preview")]
             : [];
     }
 

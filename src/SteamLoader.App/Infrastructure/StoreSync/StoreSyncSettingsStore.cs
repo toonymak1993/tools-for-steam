@@ -542,6 +542,8 @@ public sealed class StoreSyncSettingsStore
                 .ToList();
             unifyStoreConfiguration.PreparationStatus ??= string.Empty;
             unifyStoreConfiguration.PreparationDetail ??= string.Empty;
+            unifyStoreConfiguration.LastSyncTrigger ??= string.Empty;
+            unifyStoreConfiguration.LastSyncDetail ??= string.Empty;
             unifyStoreConfiguration.Cache ??= new UnifySteamLibraryCache();
             unifyStoreConfiguration.Cache.Games ??= [];
             foreach (var game in unifyStoreConfiguration.Cache.Games.Where(game => game is not null))
@@ -1037,6 +1039,18 @@ public sealed class UnifySteamStoreConfiguration
     public int PreparationCompletedCount { get; set; }
 
     public int PreparationTotalCount { get; set; }
+
+    public DateTimeOffset? LastLocalCheckAtUtc { get; set; }
+
+    public DateTimeOffset? LastRemoteCheckAtUtc { get; set; }
+
+    public DateTimeOffset? LastRemoteSuccessAtUtc { get; set; }
+
+    public DateTimeOffset? NextRemoteCheckAtUtc { get; set; }
+
+    public string LastSyncTrigger { get; set; } = string.Empty;
+
+    public string LastSyncDetail { get; set; } = string.Empty;
 
     public OmniLibraryStoreLifecycleConfiguration Lifecycle { get; set; } = new();
 

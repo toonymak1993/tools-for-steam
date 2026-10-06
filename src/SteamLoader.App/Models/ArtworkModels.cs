@@ -12,7 +12,8 @@ public sealed record ArtworkAssetResult(
     int? Width,
     int? Height,
     string Mime,
-    string Style);
+    string Style,
+    bool IsAnimated);
 
 public sealed record ArtworkApplyResult(
     bool Success,

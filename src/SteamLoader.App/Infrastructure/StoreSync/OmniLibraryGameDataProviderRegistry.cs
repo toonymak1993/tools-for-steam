@@ -53,11 +53,10 @@ internal static class OmniLibraryGameDataProviderRegistry
             100,
             "Xbox and Windows achievements with account-scoped progress.",
             RemoteUserProvider |
-            OmniLibraryGameDataCapabilities.ApiCredential |
             OmniLibraryGameDataCapabilities.StoreAccount |
             OmniLibraryGameDataCapabilities.LocalFiles,
             ["xbox-game-pass", "xbox", "microsoft-store", "windows-store"],
-            "openxbl",
+            "xbox-account",
             EnabledByDefault: true,
             RuntimeAvailable: true),
         new(
@@ -321,6 +320,7 @@ internal static class OmniLibraryGameDataProviderRegistry
             var configured = descriptor.SetupKind switch
             {
                 "openxbl" => !string.IsNullOrWhiteSpace(provider.Credential),
+                "xbox-account" => !string.IsNullOrWhiteSpace(provider.SecondaryCredential),
                 "store-account" => storeConnected,
                 "steam-account" => true,
                 "local-path" => !string.IsNullOrWhiteSpace(provider.DataPath),
@@ -365,6 +365,7 @@ internal static class OmniLibraryGameDataProviderRegistry
                 _ => descriptor.SetupKind switch
                 {
                     "openxbl" => "Add a personal OpenXBL API key.",
+                    "xbox-account" => "Sign in to Xbox from the Xbox store settings.",
                     "store-account" => "Connect the matching OmniLibrary store first.",
                     "local-path" => "Choose the provider's local data folder.",
                     "username-api-key" => "Enter the account name and personal API key.",

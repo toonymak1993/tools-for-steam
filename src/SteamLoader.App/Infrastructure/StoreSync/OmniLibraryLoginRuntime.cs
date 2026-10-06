@@ -95,6 +95,38 @@ internal static class OmniLibraryLoginRuntime
     private static bool TryGetProfile(string? storeId, out StoreLoginProfile profile)
     {
         var normalizedStoreId = (storeId ?? string.Empty).Trim().ToLowerInvariant();
+        if (normalizedStoreId == "xbox-game-pass")
+        {
+            var authorization = XboxLiveAuthService.CreateAuthorizationRequest();
+            profile = new StoreLoginProfile(
+                "xbox-game-pass",
+                "Xbox",
+                authorization.Url,
+                "login.microsoftonline.com",
+                "/common/oauth2/nativeclient",
+                Path.Combine(AppContext.BaseDirectory, "data", "omnilibrary", "xbox-webview2"),
+                code =>
+                {
+                    using var client = new HttpClient
+                    {
+                        Timeout = TimeSpan.FromSeconds(60),
+                    };
+                    var session = XboxLiveAuthService.CompleteLoginAsync(
+                            code,
+                            authorization.CodeVerifier,
+                            client,
+                            CancellationToken.None)
+                        .GetAwaiter()
+                        .GetResult();
+                    var settings = new StoreSyncSettingsStore(
+                        Path.Combine(AppContext.BaseDirectory, "data", "store-sync.json"));
+                    XboxLiveAuthService.PersistSession(settings, session);
+                    return session.Gamertag;
+                },
+                authorization.State,
+                XboxLiveAuthService.IsTrustedLoginUri);
+            return true;
+        }
         profile = normalizedStoreId switch
         {
             "epic-games" => new StoreLoginProfile(
@@ -249,11 +281,37 @@ internal static class OmniLibraryLoginRuntime
 
             if (IsRedirect(uri))
             {
+                if (!string.IsNullOrWhiteSpace(_profile.ExpectedState) &&
+                    !XboxLiveAuthService.ReadQueryValue(uri, "state").Equals(
+                        _profile.ExpectedState,
+                        StringComparison.Ordinal))
+                {
+                    e.Cancel = true;
+                    ShowFailure("Xbox sign-in returned an invalid security state.");
+                    return;
+                }
+                var providerError = XboxLiveAuthService.ReadQueryValue(
+                    uri,
+                    "error_description");
+                if (!string.IsNullOrWhiteSpace(providerError))
+                {
+                    e.Cancel = true;
+                    ShowFailure(providerError);
+                    return;
+                }
                 var code = ExtractAuthorizationCode(uri.Query);
                 if (!string.IsNullOrWhiteSpace(code))
                 {
+                    e.Cancel = true;
                     _ = CompleteSignInAsync(code);
                 }
+                return;
+            }
+
+            if (_profile.IsTrustedNavigation is not null &&
+                !_profile.IsTrustedNavigation(uri))
+            {
+                e.Cancel = true;
             }
         }
 
@@ -312,7 +370,9 @@ internal static class OmniLibraryLoginRuntime
         {
             e.Handled = true;
             if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) &&
-                uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
+                (_profile.IsTrustedNavigation is null ||
+                 _profile.IsTrustedNavigation(uri)))
             {
                 _webView.CoreWebView2.Navigate(uri.AbsoluteUri);
             }
@@ -331,6 +391,10 @@ internal static class OmniLibraryLoginRuntime
             try
             {
                 await Task.Run(() => _profile.Authenticate(authorizationCode));
+                if (!string.IsNullOrWhiteSpace(_profile.ExpectedState))
+                {
+                    _webView.CoreWebView2.CookieManager.DeleteAllCookies();
+                }
                 _successful = true;
                 _statusText.Text =
                     $"{_profile.Title} is connected. Your library will now sync automatically.";
@@ -421,5 +485,7 @@ internal static class OmniLibraryLoginRuntime
         string RedirectHost,
         string RedirectPath,
         string UserDataFolder,
-        Func<string, string> Authenticate);
+        Func<string, string> Authenticate,
+        string ExpectedState = "",
+        Func<Uri, bool>? IsTrustedNavigation = null);
 }

@@ -54,9 +54,10 @@ public sealed class LocalApiSessionTests
 
     [Theory]
     [InlineData("GET", "/health", true)]
-    [InlineData("GET", "/api/plugin-store/images/catalog/example.png", true)]
-    [InlineData("GET", "/api/plugin-store/community/example/files/dist/index.js", true)]
-    [InlineData("GET", "/api/plugin-store/state", false)]
+    [InlineData("GET", "/api/plugin-activator/images/audio", true)]
+    [InlineData("GET", "/api/plugin-store/images/catalog/example.png", false)]
+    [InlineData("GET", "/api/plugin-store/community/example/files/dist/index.js", false)]
+    [InlineData("GET", "/api/plugin-activator/state", false)]
     [InlineData("POST", "/api/plugin-store/community/example/files/dist/index.js", false)]
     public void IsPublicResourceRequest_OnlyAllowsReadOnlyBrowserResources(string method, string path, bool expected)
     {

@@ -8,6 +8,10 @@ public sealed record UnifySteamSnapshot(
 {
     public OmniLibraryGameDataState GameData { get; init; } =
         OmniLibraryGameDataState.Disabled;
+
+    public bool WatchersActive { get; init; }
+
+    public int WatcherCount { get; init; }
 }
 
 public sealed record OmniLibraryGameDataState(
@@ -145,6 +149,18 @@ public sealed record OmniLibraryStoreCheckResult(
     bool StateChanged,
     string Detail);
 
+public sealed record OmniLibrarySyncHealthState(
+    DateTimeOffset? LastLocalCheckAtUtc,
+    DateTimeOffset? LastRemoteCheckAtUtc,
+    DateTimeOffset? LastRemoteSuccessAtUtc,
+    DateTimeOffset? NextRemoteCheckAtUtc,
+    string Trigger,
+    string Detail)
+{
+    public static OmniLibrarySyncHealthState Empty { get; } =
+        new(null, null, null, null, string.Empty, string.Empty);
+}
+
 public sealed record UnifySteamStoreState(
     string Id,
     string Title,
@@ -199,6 +215,9 @@ public sealed record UnifySteamStoreState(
     public IReadOnlyList<OmniLibraryRomSystemState> RomSystems { get; init; } = [];
 
     public string ToolPath { get; init; } = string.Empty;
+
+    public OmniLibrarySyncHealthState SyncHealth { get; init; } =
+        OmniLibrarySyncHealthState.Empty;
 }
 
 public sealed record OmniLibraryRomSystemState(

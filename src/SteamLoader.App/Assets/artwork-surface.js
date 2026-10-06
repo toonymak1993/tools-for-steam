@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const version = 42;
+  const version = 49;
   const openRequestStorageKey = "ToolsForSteamArtworkOpenRequest";
   const inputStorageKey = "ToolsForSteamArtworkInput";
   const overlayStateStorageKey = "ToolsForSteamArtworkOverlayState";
@@ -25,11 +25,45 @@
   existingArtworkRuntime?.destroy?.();
 
   const assetTypes = [
-    { id: "grid_p", label: "Cover", hint: "Library portrait" },
-    { id: "hero", label: "Hero", hint: "Game detail header" },
-    { id: "logo", label: "Logo", hint: "Transparent title logo" },
-    { id: "icon", label: "Icon", hint: "Shortcut icon" },
-    { id: "grid_l", label: "Wide", hint: "Recent and library wide art" },
+    {
+      id: "grid_p",
+      label: "Cover",
+      hint: "Library portrait",
+      recommended: "600 x 900",
+      targetWidth: 600,
+      targetHeight: 900,
+    },
+    {
+      id: "hero",
+      label: "Hero",
+      hint: "Game detail header",
+      recommended: "1920 x 620",
+      targetWidth: 1920,
+      targetHeight: 620,
+    },
+    {
+      id: "logo",
+      label: "Logo",
+      hint: "Transparent title logo",
+      recommended: "1000 px wide",
+      targetLongEdge: 1000,
+    },
+    {
+      id: "icon",
+      label: "Icon",
+      hint: "Shortcut icon",
+      recommended: "512 x 512",
+      targetWidth: 512,
+      targetHeight: 512,
+    },
+    {
+      id: "grid_l",
+      label: "Wide",
+      hint: "Recent and library wide art",
+      recommended: "920 x 430",
+      targetWidth: 920,
+      targetHeight: 430,
+    },
   ];
 
   const state = {
@@ -41,7 +75,10 @@
     games: [],
     assets: [],
     loadingGames: false,
+    gameSearchRequestId: 0,
     loadingAssets: false,
+    assetRequestId: 0,
+    animatedPreviewObserver: null,
     applying: false,
     lastAppliedAssetKey: "",
     status: "",
@@ -95,7 +132,13 @@
     contextActivationHandler: null,
     uninstallRequests: new Set(),
     repairRequests: new Set(),
-    dataRefreshRequests: new Set(),
+    overlayMode: "artwork",
+    metadataSnapshot: null,
+    metadataMatches: [],
+    selectedMetadataSteamAppId: 0,
+    metadataLoading: false,
+    metadataApplying: false,
+    metadataStoreId: "",
     omniLibraryStateUnsubscribe: null,
     omniLibraryUninstallNoticeTimer: null,
   };
@@ -377,12 +420,15 @@
   }
 
   function injectStyles() {
-    if (document.getElementById("steamtools-artwork-style")) {
+    const existingStyle = document.getElementById("steamtools-artwork-style");
+    if (existingStyle?.dataset.steamtoolsArtworkVersion === String(version)) {
       return;
     }
+    existingStyle?.remove();
 
     const style = document.createElement("style");
     style.id = "steamtools-artwork-style";
+    style.dataset.steamtoolsArtworkVersion = String(version);
     style.textContent = `
       .steamtools-artwork-context-row {
         cursor: pointer;
@@ -398,9 +444,14 @@
         position: fixed;
         inset: 0;
         z-index: 2147483600;
+        --tfs-art-accent: #63d6ff;
+        --tfs-art-panel: rgba(16, 24, 34, 0.88);
+        --tfs-art-panel-soft: rgba(24, 35, 47, 0.74);
+        --tfs-art-line: rgba(172, 207, 230, 0.13);
         background:
-          radial-gradient(circle at 18% 8%, rgba(71, 108, 140, 0.24), transparent 34%),
-          linear-gradient(180deg, rgba(9, 14, 20, 0.98), rgba(6, 10, 15, 0.98));
+          radial-gradient(circle at 14% -4%, rgba(42, 159, 213, 0.28), transparent 31%),
+          radial-gradient(circle at 88% 2%, rgba(78, 101, 220, 0.16), transparent 27%),
+          linear-gradient(145deg, #071019 0%, #0b121b 46%, #080c12 100%);
         color: #f4f7fb;
         font-family: "Motiva Sans", Arial, sans-serif;
         overflow: hidden;
@@ -409,37 +460,67 @@
       .steamtools-artwork-shell {
         height: 100%;
         box-sizing: border-box;
-        padding: clamp(18px, 2.8vw, 38px);
+        padding: clamp(16px, 2.4vw, 34px) clamp(18px, 3.2vw, 52px) clamp(72px, 7vh, 86px);
         display: grid;
         grid-template-rows: auto auto auto minmax(0, 1fr);
-        gap: 12px;
+        gap: 11px;
       }
 
       .steamtools-artwork-head {
-        min-height: 22px;
+        min-height: 62px;
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .steamtools-artwork-brand-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .steamtools-artwork-brand-mark {
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        border-radius: 10px;
+        color: #04121b;
+        background: linear-gradient(145deg, #8fe8ff, #4fc2f2);
+        box-shadow: 0 8px 28px rgba(56, 184, 235, 0.24);
+        font-size: 13px;
+        font-weight: 950;
       }
 
       .steamtools-artwork-kicker {
-        color: #70c8ff;
-        letter-spacing: 0.12em;
+        color: var(--tfs-art-accent);
+        letter-spacing: 0.14em;
         text-transform: uppercase;
-        font-size: 14px;
-        font-weight: 800;
+        font-size: 13px;
+        font-weight: 900;
       }
 
       .steamtools-artwork-title {
-        margin-top: 8px;
-        font-size: clamp(34px, 5vw, 62px);
-        font-weight: 900;
-        line-height: 0.98;
+        margin-top: 5px;
+        max-width: min(70vw, 980px);
+        overflow: hidden;
+        color: #ffffff;
+        font-size: clamp(27px, 3.1vw, 44px);
+        font-weight: 950;
+        line-height: 1;
+        letter-spacing: -0.035em;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .steamtools-artwork-subtitle {
-        margin-top: 12px;
-        max-width: 920px;
-        color: #a9bacb;
-        font-size: clamp(18px, 2.3vw, 27px);
-        line-height: 1.28;
+        max-width: 500px;
+        color: #9db0c1;
+        font-size: clamp(13px, 1.1vw, 16px);
+        font-weight: 650;
+        line-height: 1.35;
+        text-align: right;
       }
 
       .steamtools-artwork-close {
@@ -497,18 +578,19 @@
       }
 
       .steamtools-artwork-search input {
-        min-height: 52px;
-        border: 2px solid rgba(146, 165, 185, 0.26);
-        border-radius: 16px;
-        background: #0c1219;
+        min-height: 48px;
+        border: 1px solid rgba(146, 182, 207, 0.24);
+        border-radius: 14px;
+        background: rgba(5, 11, 17, 0.76);
         color: #f3f7fb;
-        font-size: 21px;
+        font-size: 18px;
         padding: 0 18px;
       }
 
       .steamtools-artwork-search input:focus {
         outline: none;
-        border-color: rgba(112, 200, 255, 0.72);
+        border-color: var(--tfs-art-accent);
+        box-shadow: 0 0 0 2px rgba(99, 214, 255, 0.14);
       }
 
       .steamtools-artwork-search button,
@@ -525,25 +607,28 @@
       }
 
       .steamtools-artwork-search button {
-        border-radius: 16px;
+        border-radius: 14px;
         min-width: 132px;
-        font-size: 20px;
-        font-weight: 800;
+        font-size: 17px;
+        font-weight: 900;
+        background: linear-gradient(145deg, #277eaa, #17658f);
       }
 
       .steamtools-artwork-body {
         min-height: 0;
         display: grid;
-        grid-template-columns: minmax(190px, 260px) minmax(0, 1fr);
+        grid-template-columns: minmax(205px, 268px) minmax(0, 1fr);
         gap: 14px;
       }
 
       .steamtools-artwork-side,
       .steamtools-artwork-results {
         min-height: 0;
-        border-radius: 24px;
-        background: rgba(22, 29, 38, 0.82);
-        box-shadow: inset 0 0 0 1px rgba(140, 166, 190, 0.1);
+        border-radius: 20px;
+        background: var(--tfs-art-panel);
+        box-shadow:
+          inset 0 0 0 1px var(--tfs-art-line),
+          0 18px 50px rgba(0, 0, 0, 0.16);
       }
 
       .steamtools-artwork-side {
@@ -588,13 +673,67 @@
       }
 
       .steamtools-artwork-results {
-        padding: 14px;
+        padding: 15px;
         overflow: auto;
       }
 
+      .steamtools-artwork-results-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin: 0 2px 13px;
+      }
+
+      .steamtools-artwork-results-title {
+        min-width: 0;
+      }
+
+      .steamtools-artwork-results-title strong {
+        display: block;
+        color: #f7fbff;
+        font-size: clamp(17px, 1.5vw, 22px);
+        font-weight: 950;
+      }
+
+      .steamtools-artwork-results-title span {
+        display: block;
+        margin-top: 3px;
+        color: #91a6b9;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .steamtools-artwork-quality-legend {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 7px;
+      }
+
+      .steamtools-artwork-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: #9fb0c0;
+        font-size: 11px;
+        font-weight: 800;
+      }
+
+      .steamtools-artwork-legend-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #718092;
+      }
+
+      .steamtools-artwork-legend-dot.is-high { background: #57df8c; }
+      .steamtools-artwork-legend-dot.is-good { background: #63d6ff; }
+      .steamtools-artwork-legend-dot.is-usable { background: #ffc85c; }
+      .steamtools-artwork-legend-dot.is-low { background: #ff7182; }
+
       .steamtools-artwork-type-rail {
-        width: min(960px, 100%);
-        justify-self: end;
+        width: 100%;
         display: grid;
         grid-template-columns: auto minmax(0, 1fr) auto;
         align-items: center;
@@ -661,9 +800,8 @@
         grid-template-columns: auto auto minmax(0, 1fr);
         align-items: center;
         column-gap: 12px;
-        background:
-          linear-gradient(90deg, rgba(72, 82, 97, 0.92), rgba(48, 55, 66, 0.86));
-        box-shadow: inset 0 0 0 1px rgba(180, 201, 220, 0.14);
+        background: linear-gradient(90deg, rgba(33, 73, 96, 0.92), rgba(35, 45, 58, 0.86));
+        box-shadow: inset 0 0 0 1px rgba(99, 214, 255, 0.2);
       }
 
       .steamtools-artwork-type-current span {
@@ -710,41 +848,137 @@
 
       .steamtools-artwork-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(138px, 1fr));
-        gap: 11px;
+        grid-template-columns: repeat(auto-fill, minmax(154px, 1fr));
+        gap: 13px;
       }
 
       .steamtools-artwork-grid.is-wide,
       .steamtools-artwork-grid.is-hero {
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
       }
 
       .steamtools-artwork-asset {
         min-width: 0;
-        border-radius: 15px;
-        padding: 8px;
+        position: relative;
+        overflow: hidden;
+        border-radius: 16px;
+        padding: 0;
         text-align: left;
+        background: rgba(30, 41, 53, 0.92);
+        box-shadow: inset 0 0 0 1px rgba(171, 204, 226, 0.1);
       }
 
-      .steamtools-artwork-asset img {
+      .steamtools-artwork-asset img,
+      .steamtools-artwork-asset video {
         display: block;
         width: 100%;
         aspect-ratio: 2 / 3;
         object-fit: cover;
-        border-radius: 10px;
+        border-radius: 15px 15px 0 0;
         background: #0c1118;
       }
 
-      .steamtools-artwork-grid.is-wide .steamtools-artwork-asset img {
+      .steamtools-artwork-asset video {
+        pointer-events: none;
+      }
+
+      .steamtools-artwork-asset-image-wrap {
+        position: relative;
+        overflow: hidden;
+        border-radius: 15px 15px 0 0;
+        background:
+          linear-gradient(45deg, rgba(255,255,255,.035) 25%, transparent 25%),
+          linear-gradient(-45deg, rgba(255,255,255,.035) 25%, transparent 25%),
+          #0c1118;
+        background-size: 16px 16px;
+      }
+
+      .steamtools-artwork-quality-badge {
+        position: absolute;
+        top: 9px;
+        left: 9px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 25px;
+        padding: 0 9px;
+        border-radius: 999px;
+        color: #f6fbff;
+        background: rgba(17, 24, 32, 0.9);
+        box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
+        font-size: 10px;
+        font-weight: 950;
+        letter-spacing: 0.035em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-quality-badge::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: #718092;
+      }
+
+      .steamtools-artwork-quality-badge.is-high::before { background: #57df8c; }
+      .steamtools-artwork-quality-badge.is-good::before { background: #63d6ff; }
+      .steamtools-artwork-quality-badge.is-usable::before { background: #ffc85c; }
+      .steamtools-artwork-quality-badge.is-low::before { background: #ff7182; }
+
+      .steamtools-artwork-applied-badge {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        min-height: 25px;
+        padding: 0 9px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        color: #062013;
+        background: #68e39a;
+        box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
+        font-size: 10px;
+        font-weight: 950;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-motion-badge {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        z-index: 2;
+        min-height: 25px;
+        padding: 0 9px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        color: #211403;
+        background: #ffbd59;
+        box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
+        font-size: 10px;
+        font-weight: 950;
+        letter-spacing: 0.035em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-asset.is-animated .steamtools-artwork-applied-badge {
+        top: 42px;
+      }
+
+      .steamtools-artwork-grid.is-wide .steamtools-artwork-asset img,
+      .steamtools-artwork-grid.is-wide .steamtools-artwork-asset video {
         aspect-ratio: 92 / 43;
       }
 
-      .steamtools-artwork-grid.is-hero .steamtools-artwork-asset img {
+      .steamtools-artwork-grid.is-hero .steamtools-artwork-asset img,
+      .steamtools-artwork-grid.is-hero .steamtools-artwork-asset video {
         aspect-ratio: 192 / 62;
       }
 
       .steamtools-artwork-grid.is-logo .steamtools-artwork-asset img,
-      .steamtools-artwork-grid.is-icon .steamtools-artwork-asset img {
+      .steamtools-artwork-grid.is-logo .steamtools-artwork-asset video,
+      .steamtools-artwork-grid.is-icon .steamtools-artwork-asset img,
+      .steamtools-artwork-grid.is-icon .steamtools-artwork-asset video {
         aspect-ratio: 1 / 1;
         object-fit: contain;
         padding: 16px;
@@ -752,10 +986,75 @@
       }
 
       .steamtools-artwork-asset-meta {
-        margin-top: 7px;
-        color: #aebdcb;
+        padding: 10px 11px 11px;
+      }
+
+      .steamtools-artwork-asset-resolution {
+        color: #eef6fc;
         font-size: 13px;
+        font-weight: 900;
+      }
+
+      .steamtools-artwork-asset-fit {
+        margin-top: 3px;
+        color: #8fa5b8;
+        font-size: 11px;
         font-weight: 700;
+      }
+
+      .steamtools-artwork-asset.is-quality-low .steamtools-artwork-asset-fit {
+        color: #ff9ba7;
+      }
+
+      .steamtools-artwork-asset.is-quality-usable .steamtools-artwork-asset-fit {
+        color: #ffd57d;
+      }
+
+      .steamtools-metadata-preview {
+        display: grid;
+        gap: 16px;
+      }
+
+      .steamtools-metadata-card {
+        border-radius: 18px;
+        padding: clamp(18px, 2vw, 28px);
+        background: rgba(255,255,255,0.045);
+        box-shadow: inset 0 0 0 1px rgba(180, 201, 220, 0.12);
+      }
+
+      .steamtools-metadata-card h2 {
+        margin: 0 0 8px;
+        color: #ffffff;
+        font-size: clamp(22px, 2vw, 30px);
+      }
+
+      .steamtools-metadata-card p {
+        margin: 0;
+        color: #b4c6d8;
+        font-size: clamp(16px, 1.45vw, 20px);
+        line-height: 1.45;
+      }
+
+      .steamtools-metadata-source {
+        margin-bottom: 12px;
+        color: #67c1f5;
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-metadata-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .steamtools-metadata-action {
+        min-width: 180px;
+        border-radius: 14px;
+        padding: 13px 18px;
+        text-align: center;
       }
 
       .steamtools-artwork-controller-hint {
@@ -815,7 +1114,278 @@
         font-weight: 950;
       }
 
+      /* TFS Artworks is deliberately image-first: two compact control rows,
+         then the gallery owns every remaining pixel. Metadata correction keeps
+         the roomier shared layout above. */
+      .steamtools-artwork-shell.is-artwork-mode {
+        grid-template-rows: auto auto minmax(0, 1fr);
+        gap: 9px;
+        padding: 14px 22px 64px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-head {
+        min-height: 44px;
+        align-items: center;
+      }
+
+      .steamtools-artwork-lockup {
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-brand-row {
+        flex: 0 0 auto;
+        gap: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-brand-mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 9px;
+        font-size: 11px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-kicker {
+        font-size: 12px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-title {
+        margin: 0;
+        max-width: min(52vw, 760px);
+        padding-left: 16px;
+        border-left: 1px solid rgba(168, 205, 228, 0.2);
+        font-size: clamp(22px, 2.2vw, 32px);
+        letter-spacing: -0.025em;
+      }
+
+      .steamtools-artwork-head-summary {
+        flex: 0 0 auto;
+        color: #7f96a9;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .steamtools-artwork-command-bar {
+        display: grid;
+        grid-template-columns: minmax(280px, 0.72fr) minmax(560px, 1.28fr);
+        gap: 10px;
+        min-height: 46px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-search {
+        gap: 7px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-search input {
+        min-height: 44px;
+        border-radius: 12px;
+        font-size: 15px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-search button {
+        min-width: 92px;
+        border-radius: 12px;
+        font-size: 14px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-type-rail {
+        gap: 6px;
+        margin: 0;
+      }
+
+      .is-artwork-mode .steamtools-artwork-type-stack {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 5px;
+        margin: 0;
+      }
+
+      .is-artwork-mode .steamtools-artwork-type-chip,
+      .is-artwork-mode .steamtools-artwork-type-shoulder {
+        min-height: 44px;
+        border-radius: 12px;
+        padding: 0 8px;
+        font-size: 13px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-type-chip span {
+        display: none;
+      }
+
+      .is-artwork-mode .steamtools-artwork-type-shoulder {
+        min-width: 46px;
+        padding: 0 8px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-body {
+        grid-template-columns: minmax(176px, 218px) minmax(0, 1fr);
+        gap: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-side,
+      .is-artwork-mode .steamtools-artwork-results {
+        border-radius: 16px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-side {
+        padding: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-side-label {
+        padding: 4px 5px 8px;
+        font-size: 11px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-game {
+        min-height: 43px;
+        margin-bottom: 5px;
+        padding: 8px 10px;
+        border-radius: 11px;
+        font-size: 13px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-game span {
+        margin-top: 2px;
+        font-size: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-results {
+        padding: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-results-head {
+        min-height: 32px;
+        margin: 0 2px 8px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-results-title {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-results-title strong {
+        font-size: 17px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-results-title span {
+        margin: 0;
+        font-size: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-quality-legend {
+        gap: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-legend-item {
+        font-size: 10px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-grid {
+        grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+        gap: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-grid.is-wide,
+      .is-artwork-mode .steamtools-artwork-grid.is-hero {
+        grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      }
+
+      .is-artwork-mode .steamtools-artwork-asset {
+        border-radius: 12px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-asset-image-wrap,
+      .is-artwork-mode .steamtools-artwork-asset img,
+      .is-artwork-mode .steamtools-artwork-asset video {
+        border-radius: 11px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-asset-meta {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 2;
+        padding: 28px 9px 8px;
+        border-radius: 0 0 11px 11px;
+        background: linear-gradient(180deg, transparent, rgba(4, 9, 14, 0.93));
+        pointer-events: none;
+      }
+
+      .is-artwork-mode .steamtools-artwork-asset-resolution {
+        font-size: 12px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-asset-fit {
+        margin-top: 1px;
+        color: rgba(222, 234, 243, 0.72);
+        font-size: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-quality-badge,
+      .is-artwork-mode .steamtools-artwork-applied-badge,
+      .is-artwork-mode .steamtools-artwork-motion-badge {
+        top: 7px;
+        min-height: 22px;
+        padding: 0 8px;
+        font-size: 9px;
+      }
+
+      .is-artwork-mode .steamtools-artwork-quality-badge { left: 7px; }
+      .is-artwork-mode .steamtools-artwork-applied-badge,
+      .is-artwork-mode .steamtools-artwork-motion-badge { right: 7px; }
+      .is-artwork-mode .steamtools-artwork-asset.is-animated .steamtools-artwork-applied-badge { top: 36px; }
+
+      .is-artwork-mode + .steamtools-artwork-controller-hint {
+        right: 22px;
+        bottom: 12px;
+        gap: 8px;
+        padding: 7px 12px;
+        font-size: 12px;
+      }
+
+      .is-artwork-mode + .steamtools-artwork-controller-hint .steamtools-artwork-controller-key {
+        min-width: 24px;
+        height: 24px;
+        padding: 0 6px;
+        font-size: 13px;
+      }
+
+      @media (max-height: 760px) {
+        .steamtools-artwork-shell.is-artwork-mode {
+          padding-top: 10px;
+          padding-bottom: 56px;
+        }
+
+        .is-artwork-mode .steamtools-artwork-head {
+          min-height: 38px;
+        }
+
+        .is-artwork-mode .steamtools-artwork-command-bar,
+        .is-artwork-mode .steamtools-artwork-search input,
+        .is-artwork-mode .steamtools-artwork-type-chip,
+        .is-artwork-mode .steamtools-artwork-type-shoulder {
+          min-height: 40px;
+        }
+      }
+
       @media (max-width: 900px) {
+        .steamtools-artwork-shell {
+          padding: 14px 16px 72px;
+        }
+
+        .steamtools-artwork-head {
+          min-height: 52px;
+        }
+
+        .steamtools-artwork-subtitle {
+          display: none;
+        }
+
         .steamtools-artwork-body {
           grid-template-columns: 1fr;
         }
@@ -839,6 +1409,15 @@
         .steamtools-artwork-floating-status {
           max-width: calc(100vw - 48px);
           bottom: 74px;
+        }
+
+        .steamtools-artwork-results-head {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .steamtools-artwork-quality-legend {
+          justify-content: flex-start;
         }
       }
     `;
@@ -1481,6 +2060,18 @@
     }
   }
 
+  function publishOmniLibraryMetadataSnapshot(snapshot) {
+    if (!snapshot || typeof window.BroadcastChannel !== "function") {
+      return;
+    }
+    try {
+      const channel = new window.BroadcastChannel(omniLibraryStoreChannelName);
+      channel.postMessage({ type: "native-metadata", snapshot });
+      window.setTimeout(() => channel.close(), 100);
+    } catch {
+    }
+  }
+
   function installOmniLibraryContextMenuLifecycle() {
     if (state.omniLibraryStateUnsubscribe) {
       return;
@@ -1531,62 +2122,6 @@
       store?.enabled === true &&
       (store?.appIds || []).some((candidate) =>
         normalizeSteamAppId(candidate) === normalizedAppId)) || null;
-  }
-
-  async function requestOmniLibraryDataRefresh(context, storeId) {
-    const appId = normalizeSteamAppId(context?.appId);
-    const requestKey = `${storeId}:${appId}`;
-    if (!appId || !storeId || state.dataRefreshRequests.has(requestKey)) {
-      return;
-    }
-
-    state.dataRefreshRequests.add(requestKey);
-    showOmniLibraryUninstallNotice(storeId, "", {
-      kind: "refresh",
-      title: "Refreshing OmniLibrary data",
-      message: "Rechecking metadata and achievements while missing artwork is repaired in the background.",
-    });
-    try {
-      const [metadataResponse, artworkResponse] = await Promise.all([
-        fetch(
-          `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}`,
-          { method: "POST", cache: "no-store" },
-        ),
-        fetch(`${apiBase}api/unifystore/games/artwork/repair`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ steamAppId: appId }),
-        }),
-      ]);
-      const metadata = await metadataResponse.json().catch(() => null);
-      const artwork = await artworkResponse.json().catch(() => null);
-      if (!metadataResponse.ok) {
-        throw new Error(
-          metadata?.message || `Metadata refresh failed (${metadataResponse.status}).`,
-        );
-      }
-      if (!artworkResponse.ok) {
-        throw new Error(
-          artwork?.message || `Artwork repair failed (${artworkResponse.status}).`,
-        );
-      }
-
-      showOmniLibraryUninstallNotice(storeId, "", {
-        kind: "refresh",
-        title: "OmniLibrary refresh started",
-        message: artwork?.message ||
-          "Metadata and achievements are current. Missing artwork continues in the background.",
-      });
-      publishOmniLibraryLifecycleStatus(appId, "updating");
-    } catch (error) {
-      showOmniLibraryUninstallNotice(
-        storeId,
-        error instanceof Error ? error.message : String(error),
-        { kind: "refresh", title: "OmniLibrary refresh failed" },
-      );
-    } finally {
-      state.dataRefreshRequests.delete(requestKey);
-    }
   }
 
   function isRepairableOmniLibraryGame(store, appId) {
@@ -1749,7 +2284,7 @@
       lastActivationAt = now;
       event?.preventDefault?.();
       event?.stopPropagation?.();
-      void requestOmniLibraryDataRefresh(context, storeId);
+      openMetadataOverlay(context, storeId);
     };
     const templateProps = template?.props || {};
     return {
@@ -1770,7 +2305,7 @@
         onMouseUp: onSelected,
         onPointerUp: onSelected,
         onSelected,
-        children: "Refresh OmniLibrary Data...",
+        children: "Fix Game Data...",
       },
     };
   }
@@ -1844,7 +2379,46 @@
         onMouseUp: onSelected,
         onPointerUp: onSelected,
         onSelected,
-        children: "Change Artwork...",
+        children: "TFS Artworks...",
+      },
+    };
+  }
+
+  function createReactCurtainMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
+    const curtain = window.ToolsForSteamCurtain;
+    const enabled = curtain?.isGameEnabled?.(appId) === true;
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) return;
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      void curtain?.toggleGame?.(
+        appId,
+        !enabled,
+        normalizedContext?.title || "Selected game",
+      );
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-curtain-toggle",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [templateProps.className, "steamtools-curtain-context-row"]
+          .filter(Boolean)
+          .join(" "),
+        "data-steamtools-curtain-row": "true",
+        "data-steamtools-curtain-app-id": String(appId || ""),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: `TFS Curtain: ${enabled ? "On" : "Off"}`,
       },
     };
   }
@@ -1875,6 +2449,7 @@
     for (let index = items.length - 1; index >= 0; index -= 1) {
       if (
         items[index]?.key === "tfs-change-artwork" ||
+        items[index]?.key === "tfs-curtain-toggle" ||
         items[index]?.key === "tfs-omnilibrary-data-refresh" ||
         items[index]?.key === "tfs-omnilibrary-repair" ||
         items[index]?.key === "tfs-omnilibrary-uninstall"
@@ -1906,6 +2481,9 @@
     rememberArtworkContext(resolvedContext);
     const installedStore = getInstalledOmniLibraryStore(resolvedContext.appId);
     const additions = [];
+    if (window.ToolsForSteamCurtain?.snapshot?.enabled === true) {
+      additions.push(createReactCurtainMenuItem(template, resolvedContext));
+    }
     if (state.contextMenuEnabled) {
       additions.push(createReactArtworkMenuItem(template, resolvedContext));
     }
@@ -2278,6 +2856,7 @@
       "cancel",
       localizedCommands.cancel,
       "change artwork",
+      "tfs artworks",
     ]);
 
     const candidates = [...menu.querySelectorAll("h1, h2, [class*='title'], [class*='Title'], div, span")]
@@ -2561,7 +3140,7 @@
     row.setAttribute("role", propertiesRow.getAttribute("role") || "menuitem");
     row.setAttribute("tabindex", propertiesRow.getAttribute("tabindex") || "0");
     row.setAttribute("data-steamtools-artwork-row", "true");
-    replaceRowText(row, "Change Artwork...");
+    replaceRowText(row, "TFS Artworks...");
     bindContextRowAction(row, menu, context);
     return row;
   }
@@ -2666,7 +3245,7 @@
     row.setAttribute("role", propertiesRow.getAttribute("role") || "menuitem");
     row.setAttribute("tabindex", propertiesRow.getAttribute("tabindex") || "0");
     row.setAttribute("data-steamtools-omnilibrary-data-row", "true");
-    replaceRowText(row, "Refresh OmniLibrary Data...");
+    replaceRowText(row, "Fix Game Data...");
     let lastActivationAt = 0;
     const refresh = (event) => {
       const now = Date.now();
@@ -2677,7 +3256,7 @@
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation?.();
-      void requestOmniLibraryDataRefresh(
+      openMetadataOverlay(
         getArtworkContextFromRow(row, menu) || context,
         storeId,
       );
@@ -2710,7 +3289,7 @@
     let current = target;
     for (let depth = 0; current instanceof HTMLElement && depth < 6; depth += 1, current = current.parentElement) {
       const text = normalizeMenuText(textOf(current));
-      if (text === "change artwork") {
+      if (text === "change artwork" || text === "tfs artworks") {
         return current;
       }
     }
@@ -2829,7 +3408,8 @@
 
       const hasArtworkRow =
         menu.querySelector(".steamtools-artwork-context-row") ||
-        textOf(menu).toLowerCase().includes("change artwork");
+        textOf(menu).toLowerCase().includes("change artwork") ||
+        textOf(menu).toLowerCase().includes("tfs artworks");
       if (state.contextMenuEnabled && !hasArtworkRow) {
         const row = createArtworkContextRow(propertiesRow, menu, menuContext);
         parent.insertBefore(row, propertiesRow);
@@ -2887,15 +3467,29 @@
   }
 
   function canHostArtworkOverlay() {
-    if (location.href.includes("/routes/")) {
+    const hasUsableViewport = Boolean(
+      document.body &&
+      window.innerWidth >= 500 &&
+      window.innerHeight >= 300
+    );
+    if (!hasUsableViewport) {
       return false;
     }
 
-    return Boolean(
-      document.body &&
-      window.innerWidth >= 500 &&
-      window.innerHeight >= 300,
-    );
+    // Current Steam Big Picture builds navigate the primary window to /routes/*.
+    // Popup surfaces use the same route family, so the route alone can no longer
+    // distinguish the full-screen host from Quick Access and context menus.
+    const windowName = String(window.name || "");
+    const isPrimaryBigPictureWindow =
+      /^SP BPM(?:_|$)/i.test(windowName) ||
+      document.title === "Steam Big Picture Mode";
+    if (isPrimaryBigPictureWindow) {
+      return true;
+    }
+
+    // Keep supporting older Steam clients whose primary surface stayed on an
+    // about:blank document, while refusing modern routed popup surfaces.
+    return !location.href.includes("/routes/");
   }
 
   function getOpenRequestKey(appId, title) {
@@ -3073,7 +3667,116 @@
     return payload;
   }
 
+  async function loadMetadataSnapshot(forceRefresh = false) {
+    if (!state.appId) {
+      return;
+    }
+    state.metadataLoading = true;
+    state.error = "";
+    renderOverlay();
+    try {
+      state.metadataSnapshot = await fetchJson(
+        `api/unifystore/metadata/games/${encodeURIComponent(state.appId)}`,
+        { method: forceRefresh ? "POST" : "GET" },
+      );
+      state.status = forceRefresh
+        ? "Game data refreshed."
+        : "Choose a Steam match only when the automatic result is missing or wrong.";
+      publishOmniLibraryMetadataSnapshot(state.metadataSnapshot);
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.metadataLoading = false;
+      renderOverlay();
+    }
+  }
+
+  async function searchMetadataMatches(term) {
+    if (!state.appId) {
+      return;
+    }
+    state.metadataLoading = true;
+    state.error = "";
+    state.metadataMatches = [];
+    renderOverlay();
+    try {
+      const query = new URLSearchParams({
+        appId: String(state.appId),
+        term: term || state.title || "",
+      });
+      state.metadataMatches = await fetchJson(
+        `api/unifystore/metadata/search?${query.toString()}`,
+      );
+      const currentSteamAppId = Number(state.metadataSnapshot?.sourceSteamAppId || 0);
+      state.selectedMetadataSteamAppId = Number(
+        state.metadataMatches.find(
+          (match) => Number(match?.steamAppId) === currentSteamAppId,
+        )?.steamAppId || state.metadataMatches?.[0]?.steamAppId || 0,
+      );
+      state.status = state.metadataMatches.length
+        ? `Found ${state.metadataMatches.length} possible Steam match${state.metadataMatches.length === 1 ? "" : "es"}.`
+        : "No Steam matches found. Try the base title without an edition or launcher suffix.";
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.metadataLoading = false;
+      renderOverlay();
+    }
+  }
+
+  async function applyMetadataMatch(steamAppId) {
+    if (!state.appId || !steamAppId || state.metadataApplying) {
+      return;
+    }
+    state.metadataApplying = true;
+    state.error = "";
+    state.status = "Applying the selected Steam match...";
+    renderOverlay();
+    try {
+      state.metadataSnapshot = await fetchJson(
+        `api/unifystore/metadata/games/${encodeURIComponent(state.appId)}/match`,
+        {
+          method: "POST",
+          body: JSON.stringify({ steamAppId: Number(steamAppId) }),
+        },
+      );
+      state.selectedMetadataSteamAppId = Number(steamAppId);
+      state.status = "Selected match saved. Steam's game page is updating.";
+      publishOmniLibraryMetadataSnapshot(state.metadataSnapshot);
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.metadataApplying = false;
+      renderOverlay();
+    }
+  }
+
+  async function clearMetadataMatch() {
+    if (!state.appId || state.metadataApplying) {
+      return;
+    }
+    state.metadataApplying = true;
+    state.error = "";
+    state.status = "Restoring automatic matching...";
+    renderOverlay();
+    try {
+      state.metadataSnapshot = await fetchJson(
+        `api/unifystore/metadata/games/${encodeURIComponent(state.appId)}/match`,
+        { method: "DELETE" },
+      );
+      state.selectedMetadataSteamAppId = 0;
+      state.status = "Automatic matching restored. Steam's game page is updating.";
+      publishOmniLibraryMetadataSnapshot(state.metadataSnapshot);
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.metadataApplying = false;
+      renderOverlay();
+    }
+  }
+
   async function searchGames(term) {
+    const requestId = ++state.gameSearchRequestId;
     state.loadingGames = true;
     state.error = "";
     state.pendingInitialAssetsFocus = true;
@@ -3081,17 +3784,25 @@
 
     try {
       const query = encodeURIComponent(term || state.title || "");
-      state.games = await fetchJson(`api/artwork/search?term=${query}`);
+      const games = await fetchJson(`api/artwork/search?term=${query}`);
+      if (requestId !== state.gameSearchRequestId || state.overlayMode !== "artwork") {
+        return;
+      }
+      state.games = games;
       state.selectedGameId = Number(state.games?.[0]?.id || 0);
       state.status = state.games.length
         ? `Found ${state.games.length} SteamGridDB match${state.games.length === 1 ? "" : "es"}.`
         : "No SteamGridDB matches found. Try a shorter title.";
       await loadAssets();
     } catch (error) {
-      state.error = error instanceof Error ? error.message : String(error);
+      if (requestId === state.gameSearchRequestId) {
+        state.error = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      state.loadingGames = false;
-      renderOverlay();
+      if (requestId === state.gameSearchRequestId) {
+        state.loadingGames = false;
+        renderOverlay();
+      }
     }
   }
 
@@ -3102,6 +3813,9 @@
       return;
     }
 
+    const requestId = ++state.assetRequestId;
+    const requestedGameId = state.selectedGameId;
+    const requestedType = state.activeType;
     state.loadingAssets = true;
     state.error = "";
     state.assets = [];
@@ -3109,19 +3823,40 @@
 
     try {
       const query = new URLSearchParams({
-        gameId: String(state.selectedGameId),
-        type: state.activeType,
+        gameId: String(requestedGameId),
+        type: requestedType,
         page: "0",
       });
-      state.assets = await fetchJson(`api/artwork/assets?${query.toString()}`);
+      const assets = await fetchJson(`api/artwork/assets?${query.toString()}`);
+      if (
+        requestId !== state.assetRequestId ||
+        requestedGameId !== state.selectedGameId ||
+        requestedType !== state.activeType
+      ) {
+        return;
+      }
+      state.assets = [...assets].sort((left, right) => {
+        const qualityDifference = getArtworkQuality(right, requestedType).rank -
+          getArtworkQuality(left, requestedType).rank;
+        if (qualityDifference) {
+          return qualityDifference;
+        }
+
+        return getArtworkPixelCount(right) - getArtworkPixelCount(left);
+      });
+      const animatedCount = state.assets.filter((asset) => asset?.isAnimated).length;
       state.status = state.assets.length
-        ? `Showing ${state.assets.length} ${getActiveType().label.toLowerCase()} result${state.assets.length === 1 ? "" : "s"}.`
+        ? `${state.assets.length} ${getActiveType().label.toLowerCase()} option${state.assets.length === 1 ? "" : "s"}, best quality first${animatedCount ? `, including ${animatedCount} animated` : ""}.`
         : "No artwork found for this tab.";
     } catch (error) {
-      state.error = error instanceof Error ? error.message : String(error);
+      if (requestId === state.assetRequestId) {
+        state.error = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      state.loadingAssets = false;
-      renderOverlay();
+      if (requestId === state.assetRequestId) {
+        state.loadingAssets = false;
+        renderOverlay();
+      }
     }
   }
 
@@ -3175,6 +3910,174 @@
 
   function getActiveType() {
     return assetTypes.find((type) => type.id === state.activeType) || assetTypes[0];
+  }
+
+  function getArtworkPixelCount(asset) {
+    const width = Number(asset?.width || 0);
+    const height = Number(asset?.height || 0);
+    return width > 0 && height > 0 ? width * height : 0;
+  }
+
+  function disconnectAnimatedPreviewObserver() {
+    state.animatedPreviewObserver?.disconnect();
+    state.animatedPreviewObserver = null;
+  }
+
+  function createStillArtworkPreview(asset, activeType) {
+    const image = document.createElement("img");
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.src = asset.thumbnailUrl || asset.url;
+    image.alt = `${activeType.label} artwork`;
+    return image;
+  }
+
+  function createAnimatedArtworkPreview(asset, activeType) {
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.loop = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "none";
+    video.setAttribute("aria-label", `${activeType.label} animated artwork preview`);
+    video.dataset.previewSource = asset.thumbnailUrl || asset.url;
+    video.addEventListener("error", () => {
+      state.animatedPreviewObserver?.unobserve(video);
+      const fallback = createStillArtworkPreview(
+        { ...asset, thumbnailUrl: asset.url },
+        activeType,
+      );
+      video.replaceWith(fallback);
+    }, { once: true });
+
+    if (typeof window.IntersectionObserver !== "function") {
+      video.src = video.dataset.previewSource;
+      void video.play().catch(() => {});
+      return video;
+    }
+
+    if (!state.animatedPreviewObserver) {
+      state.animatedPreviewObserver = new window.IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const preview = entry.target;
+          if (entry.isIntersecting) {
+            if (!preview.src) {
+              preview.src = preview.dataset.previewSource;
+            }
+            void preview.play().catch(() => {});
+          } else {
+            preview.pause();
+          }
+        }
+      }, { rootMargin: "120px" });
+    }
+    state.animatedPreviewObserver.observe(video);
+    return video;
+  }
+
+  function getArtworkQuality(asset, typeId = state.activeType) {
+    const type = assetTypes.find((candidate) => candidate.id === typeId) || assetTypes[0];
+    const width = Number(asset?.width || 0);
+    const height = Number(asset?.height || 0);
+    if (width <= 0 || height <= 0) {
+      return {
+        level: "unknown",
+        label: "Unknown",
+        rank: 0,
+        fit: "Resolution unavailable",
+        detail: "The source did not report an image size.",
+      };
+    }
+
+    if (type.targetLongEdge) {
+      const scale = Math.max(width, height) / type.targetLongEdge;
+      if (scale >= 1) {
+        return {
+          level: "high",
+          label: "High quality",
+          rank: 4,
+          fit: "Large source",
+          detail: `At or above the recommended ${type.recommended}.`,
+        };
+      }
+      if (scale >= 0.6) {
+        return {
+          level: "good",
+          label: "Good",
+          rank: 3,
+          fit: "Good source size",
+          detail: `Below the recommended ${type.recommended}, but suitable for Steam.`,
+        };
+      }
+      if (scale >= 0.3) {
+        return {
+          level: "usable",
+          label: "Usable",
+          rank: 2,
+          fit: "Small source",
+          detail: `May look soft on large displays; recommended is ${type.recommended}.`,
+        };
+      }
+      return {
+        level: "low",
+        label: "Low quality",
+        rank: 1,
+        fit: "Very small source",
+        detail: `Likely to look blurry; recommended is ${type.recommended}.`,
+      };
+    }
+
+    const targetWidth = Number(type.targetWidth || 1);
+    const targetHeight = Number(type.targetHeight || 1);
+    const resolutionScale = Math.min(width / targetWidth, height / targetHeight);
+    const targetAspect = targetWidth / targetHeight;
+    const aspectDifference = Math.abs(width / height - targetAspect) / targetAspect;
+    const fit = aspectDifference <= 0.025
+      ? "Exact fit"
+      : aspectDifference <= 0.09
+        ? "Good fit"
+        : aspectDifference <= 0.24
+          ? "Some cropping"
+          : "Wrong shape";
+
+    if (resolutionScale >= 1 && aspectDifference <= 0.04) {
+      return {
+        level: "high",
+        label: "High quality",
+        rank: 4,
+        fit,
+        detail: `Meets the recommended ${type.recommended} target.`,
+      };
+    }
+    if (resolutionScale >= 0.7 && aspectDifference <= 0.1) {
+      return {
+        level: "good",
+        label: "Good",
+        rank: 3,
+        fit,
+        detail: `Close to the recommended ${type.recommended} target.`,
+      };
+    }
+    if (resolutionScale >= 0.45 && aspectDifference <= 0.24) {
+      return {
+        level: "usable",
+        label: "Usable",
+        rank: 2,
+        fit,
+        detail: aspectDifference > 0.1
+          ? `Large enough, but Steam will crop it toward ${type.recommended}.`
+          : `Below the recommended ${type.recommended}; it may look softer.`,
+      };
+    }
+    return {
+      level: "low",
+      label: "Low quality",
+      rank: 1,
+      fit,
+      detail: aspectDifference > 0.24
+        ? `The shape does not match the recommended ${type.recommended} target.`
+        : `Below the recommended ${type.recommended}; likely to look blurry.`,
+    };
   }
 
   function getSteamGridStem(appId, assetType) {
@@ -3426,7 +4329,10 @@
   }
 
   function getArtworkItemZone(item) {
-    return item?.classList?.contains("steamtools-artwork-asset") ? "assets" : "side";
+    return item?.classList?.contains("steamtools-artwork-asset") ||
+      item?.classList?.contains("steamtools-metadata-action")
+      ? "assets"
+      : "side";
   }
 
   function getArtworkZoneItems(zone = state.focusZone) {
@@ -3517,6 +4423,15 @@
       return;
     }
 
+    if (
+      state.overlayMode === "metadata" &&
+      ((state.focusZone === "side" && direction === "right") ||
+       (state.focusZone === "assets" && direction === "left"))
+    ) {
+      toggleArtworkFocusZone();
+      return;
+    }
+
     const zoneItems = getArtworkZoneItems();
     if (!zoneItems.length) {
       return;
@@ -3568,6 +4483,10 @@
     }
 
     const key = event.key || event.code || "";
+    const editingText = document.activeElement?.tagName === "INPUT";
+    if (editingText && key !== "Escape" && key !== "GamepadB") {
+      return;
+    }
     const lowerKey = key.toLowerCase?.() || "";
     const isPreviousTypeKey =
       key === "PageUp" ||
@@ -3645,9 +4564,9 @@
       activateArtworkFocus();
     } else if (action === "b") {
       closeOverlay();
-    } else if (action === "previous-type") {
+    } else if (action === "previous-type" && state.overlayMode === "artwork") {
       cycleArtworkType(-1);
-    } else if (action === "next-type") {
+    } else if (action === "next-type" && state.overlayMode === "artwork") {
       cycleArtworkType(1);
     } else {
       moveArtworkFocus(action);
@@ -3781,24 +4700,165 @@
     window.removeEventListener("keypress", swallowOverlayInput, true);
   }
 
-  function renderOverlay() {
-    if (!state.overlay) {
-      return;
-    }
-
-    const activeType = getActiveType();
+  function renderMetadataOverlay() {
+    disconnectAnimatedPreviewObserver();
     state.overlay.textContent = "";
+    const snapshot = state.metadataSnapshot;
+    const selectedMatch = state.metadataMatches.find(
+      (match) => Number(match?.steamAppId) === Number(state.selectedMetadataSteamAppId),
+    );
 
     const shell = createElement("div", "steamtools-artwork-shell");
     const head = createElement("div", "steamtools-artwork-head");
     const titleWrap = createElement("div");
-    titleWrap.append(createElement("div", "steamtools-artwork-kicker", "SteamGridDB"));
+    titleWrap.append(createElement("div", "steamtools-artwork-kicker", "OmniLibrary · Game Data"));
+    titleWrap.append(createElement("div", "steamtools-artwork-title", state.title));
     head.append(titleWrap);
 
     const search = createElement("div", "steamtools-artwork-search");
     const input = createElement("input");
     input.value = state.query;
-    input.placeholder = "Search SteamGridDB";
+    input.placeholder = "Search Steam for the correct game";
+    input.addEventListener("input", () => {
+      state.query = input.value;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        void searchMetadataMatches(state.query);
+      } else if (event.key === "Escape") {
+        closeOverlay();
+      }
+    });
+    search.append(input);
+    search.append(button("steamtools-artwork-search-button", "Search", () => {
+      void searchMetadataMatches(state.query);
+    }));
+
+    const body = createElement("div", "steamtools-artwork-body");
+    const side = createElement("div", "steamtools-artwork-side");
+    side.append(createElement("div", "steamtools-artwork-side-label", "Steam Match"));
+    for (const match of state.metadataMatches) {
+      const matchButton = button(
+        `steamtools-artwork-game${Number(match.steamAppId) === Number(state.selectedMetadataSteamAppId) ? " is-active" : ""}`,
+        match.title,
+        () => {
+          state.selectedMetadataSteamAppId = Number(match.steamAppId);
+          state.status = `Selected ${match.title}. Press Apply Match to save it.`;
+          renderOverlay();
+        },
+      );
+      const detail = [
+        `Steam ${match.steamAppId}`,
+        match.price || "",
+        Number(match.matchScore) <= 1 ? "Close title match" : "Search result",
+      ].filter(Boolean).join(" · ");
+      matchButton.append(createElement("span", null, detail));
+      side.append(matchButton);
+    }
+
+    const results = createElement("div", "steamtools-artwork-results");
+    const preview = createElement("div", "steamtools-metadata-preview");
+    const card = createElement("div", "steamtools-metadata-card");
+    const sourceSteamAppId = Number(snapshot?.sourceSteamAppId || 0);
+    const sourceLabel = snapshot?.sourceLabel || state.metadataStoreId || "No source";
+    const matchMode = snapshot?.matchMode === "manual" ? "Selected match" : "Automatic match";
+    card.append(createElement(
+      "div",
+      "steamtools-metadata-source",
+      `${matchMode} · ${sourceLabel}${sourceSteamAppId ? ` · Steam ${sourceSteamAppId}` : ""}`,
+    ));
+    card.append(createElement("h2", null, selectedMatch?.title || snapshot?.title || state.title));
+    card.append(createElement(
+      "p",
+      null,
+      snapshot?.gameInfo?.description ||
+        snapshot?.gameInfo?.shortDescription ||
+        "No description is available yet. Search for the correct Steam title or refresh the automatic match.",
+    ));
+    preview.append(card);
+
+    const actions = createElement("div", "steamtools-metadata-actions");
+    const applyButton = button("steamtools-metadata-action", "Apply Match", () => {
+      void applyMetadataMatch(state.selectedMetadataSteamAppId);
+    });
+    applyButton.disabled = !state.selectedMetadataSteamAppId || state.metadataApplying;
+    actions.append(applyButton);
+    const automaticButton = button("steamtools-metadata-action", "Use Automatic Match", () => {
+      void clearMetadataMatch();
+    });
+    automaticButton.disabled = snapshot?.matchMode !== "manual" || state.metadataApplying;
+    actions.append(automaticButton);
+    const refreshButton = button("steamtools-metadata-action", "Refresh Now", () => {
+      void loadMetadataSnapshot(true);
+    });
+    refreshButton.disabled = state.metadataLoading || state.metadataApplying;
+    actions.append(refreshButton);
+    preview.append(actions);
+
+    if (state.error || state.metadataLoading || state.metadataApplying || state.status) {
+      preview.append(createElement(
+        "div",
+        `steamtools-artwork-message${state.error ? " is-error" : ""}`,
+        state.error ||
+          (state.metadataApplying ? "Saving the selected match..." : "") ||
+          (state.metadataLoading ? "Loading game data..." : "") ||
+          state.status,
+      ));
+    }
+
+    results.append(preview);
+    body.append(side);
+    body.append(results);
+    shell.append(head);
+    shell.append(search);
+    shell.append(body);
+    state.overlay.append(shell);
+
+    const hint = createElement("div", "steamtools-artwork-controller-hint");
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "D-pad"));
+    hint.append(createElement("span", null, "Navigate"));
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "A"));
+    hint.append(createElement("span", null, "Select"));
+    hint.append(createElement("span", "steamtools-artwork-controller-key", "B"));
+    hint.append(createElement("span", null, "Close"));
+    state.overlay.append(hint);
+
+    window.requestAnimationFrame(() => refreshArtworkFocus());
+  }
+
+  function renderOverlay() {
+    if (!state.overlay) {
+      return;
+    }
+
+    if (state.overlayMode === "metadata") {
+      renderMetadataOverlay();
+      return;
+    }
+
+    const activeType = getActiveType();
+    disconnectAnimatedPreviewObserver();
+    state.overlay.textContent = "";
+
+    const shell = createElement("div", "steamtools-artwork-shell is-artwork-mode");
+    const head = createElement("div", "steamtools-artwork-head");
+    const titleWrap = createElement("div", "steamtools-artwork-lockup");
+    const brandRow = createElement("div", "steamtools-artwork-brand-row");
+    brandRow.append(createElement("div", "steamtools-artwork-brand-mark", "TFS"));
+    brandRow.append(createElement("div", "steamtools-artwork-kicker", "TFS Artworks"));
+    titleWrap.append(brandRow);
+    titleWrap.append(createElement("div", "steamtools-artwork-title", state.title));
+    head.append(titleWrap);
+    head.append(createElement(
+      "div",
+      "steamtools-artwork-head-summary",
+      "SteamGridDB - quality ranked",
+    ));
+
+    const search = createElement("div", "steamtools-artwork-search");
+    const input = createElement("input");
+    input.value = state.query;
+    input.placeholder = "Search games on SteamGridDB";
     input.addEventListener("input", () => {
       state.query = input.value;
     });
@@ -3813,6 +4873,9 @@
     search.append(button("steamtools-artwork-search-button", "Search", () => {
       void searchGames(state.query);
     }));
+
+    const commandBar = createElement("div", "steamtools-artwork-command-bar");
+    commandBar.append(search);
 
     const body = createElement("div", "steamtools-artwork-body");
     const side = createElement("div", "steamtools-artwork-side");
@@ -3839,12 +4902,6 @@
     }));
 
     const typeCenter = createElement("div", "steamtools-artwork-type-center");
-    const currentType = createElement("div", "steamtools-artwork-type-current");
-    currentType.append(createElement("span", null, "Artwork Type"));
-    currentType.append(createElement("strong", null, activeType.label));
-    currentType.append(createElement("em", null, `${getActiveTypeIndex() + 1} of ${assetTypes.length} - ${activeType.hint}`));
-    typeCenter.append(currentType);
-
     const typeStack = createElement("div", "steamtools-artwork-type-stack");
     for (const type of assetTypes) {
       const chip = button(
@@ -3862,6 +4919,35 @@
     typeRail.append(button("steamtools-artwork-type-shoulder", "RB", () => {
       cycleArtworkType(1);
     }));
+    commandBar.append(typeRail);
+
+    const resultHead = createElement("div", "steamtools-artwork-results-head");
+    const resultTitle = createElement("div", "steamtools-artwork-results-title");
+    const animatedCount = state.assets.filter((asset) => asset?.isAnimated).length;
+    resultTitle.append(createElement("strong", null, `${activeType.label} artwork`));
+    resultTitle.append(createElement(
+      "span",
+      null,
+      state.assets.length
+        ? `${state.assets.length} options${animatedCount ? ` - ${animatedCount} animated` : ""} - recommended ${activeType.recommended} - best quality first`
+        : `Recommended size ${activeType.recommended}`,
+    ));
+    resultHead.append(resultTitle);
+
+    const legend = createElement("div", "steamtools-artwork-quality-legend");
+    for (const item of [
+      ["high", "High"],
+      ["good", "Good"],
+      ["usable", "Usable"],
+      ["low", "Low"],
+    ]) {
+      const legendItem = createElement("span", "steamtools-artwork-legend-item");
+      legendItem.append(createElement("span", `steamtools-artwork-legend-dot is-${item[0]}`));
+      legendItem.append(createElement("span", null, item[1]));
+      legend.append(legendItem);
+    }
+    resultHead.append(legend);
+    results.append(resultHead);
 
     const showInlineMessage =
       state.error ||
@@ -3895,17 +4981,44 @@
     for (const asset of state.assets) {
       const assetKey = `${state.activeType}:${asset.id || asset.url}`;
       const isApplied = assetKey === state.lastAppliedAssetKey;
-      const assetButton = button(`steamtools-artwork-asset${isApplied ? " is-applied" : ""}`, "", () => {
+      const quality = getArtworkQuality(asset);
+      const assetButton = button(
+        `steamtools-artwork-asset is-quality-${quality.level}${asset.isAnimated ? " is-animated" : ""}${isApplied ? " is-applied" : ""}`,
+        "",
+        () => {
         void applyAsset(asset);
-      });
-      const image = document.createElement("img");
-      image.loading = "lazy";
-      image.decoding = "async";
-      image.src = asset.thumbnailUrl || asset.url;
-      image.alt = `${activeType.label} artwork`;
-      assetButton.append(image);
+        },
+      );
+      assetButton.title = `${quality.label}: ${quality.detail}`;
+      assetButton.setAttribute(
+        "aria-label",
+        `${activeType.label} ${asset.width || "unknown"} by ${asset.height || "unknown"}, ${quality.label}, ${quality.fit}${asset.isAnimated ? ", animated" : ""}. Apply artwork.`,
+      );
+      const imageWrap = createElement("div", "steamtools-artwork-asset-image-wrap");
+      imageWrap.append(asset.isAnimated
+        ? createAnimatedArtworkPreview(asset, activeType)
+        : createStillArtworkPreview(asset, activeType));
+      imageWrap.append(createElement(
+        "span",
+        `steamtools-artwork-quality-badge is-${quality.level}`,
+        quality.label,
+      ));
+      if (asset.isAnimated) {
+        imageWrap.append(createElement("span", "steamtools-artwork-motion-badge", "Animated"));
+      }
+      if (isApplied) {
+        imageWrap.append(createElement("span", "steamtools-artwork-applied-badge", "Applied"));
+      }
+      assetButton.append(imageWrap);
       const dimensions = asset.width && asset.height ? `${asset.width} x ${asset.height}` : "Unknown size";
-      assetButton.append(createElement("div", "steamtools-artwork-asset-meta", `${dimensions} · ${isApplied ? "Applied" : "Apply"}`));
+      const meta = createElement("div", "steamtools-artwork-asset-meta");
+      meta.append(createElement("div", "steamtools-artwork-asset-resolution", dimensions));
+      meta.append(createElement(
+        "div",
+        "steamtools-artwork-asset-fit",
+        `${quality.fit}${asset.isAnimated ? " - Animated" : ""} - ${isApplied ? "Applied" : "Press A to apply"}`,
+      ));
+      assetButton.append(meta);
       grid.append(assetButton);
     }
     results.append(grid);
@@ -3913,8 +5026,7 @@
     body.append(side);
     body.append(results);
     shell.append(head);
-    shell.append(search);
-    shell.append(typeRail);
+    shell.append(commandBar);
     shell.append(body);
     state.overlay.append(shell);
 
@@ -3927,11 +5039,10 @@
     hint.append(createElement("span", null, "Close"));
     state.overlay.append(hint);
 
-    if (state.error || state.status || state.applying) {
+    if (state.error || state.applying) {
       const statusText =
         state.error ||
-        (state.applying ? "Applying artwork..." : "") ||
-        state.status;
+        (state.applying ? "Applying artwork..." : "");
       const isSuccess = /applied|written/i.test(statusText || "") && !state.error && !state.applying;
       state.overlay.append(createElement(
         "div",
@@ -3952,6 +5063,7 @@
   function openOverlay(context) {
     injectStyles();
 
+    state.overlayMode = "artwork";
     state.appId = normalizeSteamAppId(context?.appId);
     state.title = context?.title || "Selected Game";
     state.query = state.title;
@@ -3982,7 +5094,47 @@
     void searchGames(state.query);
   }
 
+  function openMetadataOverlay(context, storeId) {
+    injectStyles();
+
+    state.overlayMode = "metadata";
+    state.appId = normalizeSteamAppId(context?.appId);
+    state.title = context?.title || "Selected Game";
+    state.query = state.title;
+    state.metadataStoreId = storeId || "";
+    state.metadataSnapshot = null;
+    state.metadataMatches = [];
+    state.selectedMetadataSteamAppId = 0;
+    state.metadataLoading = false;
+    state.metadataApplying = false;
+    state.status = "";
+    state.error = "";
+    state.focusZone = "side";
+    state.pendingInitialAssetsFocus = false;
+
+    closeOverlay();
+    state.overlayMode = "metadata";
+    state.ignoreOverlayInputUntil = Date.now() + 700;
+    state.currentOpenKey = `metadata:${getOpenRequestKey(state.appId, state.title)}`;
+    state.overlay = createElement("div", "steamtools-artwork-overlay");
+    state.overlay.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeOverlay();
+      }
+    });
+    document.body.append(state.overlay);
+    setRemoteOverlayActive(true);
+    attachOverlayInputTrap();
+    renderOverlay();
+    startArtworkGamepadLoop();
+    startArtworkOverlayAnnouncements();
+    void loadMetadataSnapshot(false).then(() => searchMetadataMatches(state.query));
+  }
+
   function closeOverlay() {
+    state.gameSearchRequestId += 1;
+    state.assetRequestId += 1;
+    disconnectAnimatedPreviewObserver();
     if (state.currentOpenKey) {
       state.lastClosedKey = state.currentOpenKey;
       state.lastClosedAt = Date.now();
