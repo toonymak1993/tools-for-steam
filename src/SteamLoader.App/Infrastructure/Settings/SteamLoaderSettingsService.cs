@@ -17,18 +17,25 @@ public sealed class SteamLoaderSettingsService
         WriteIndented = true
     };
     private const int MaximumWindowsShellStartDelaySeconds = 30;
+    internal const int DefaultNotificationScalePercent = 100;
+    internal const int MinimumNotificationScalePercent = 100;
+    internal const int MaximumNotificationScalePercent = 250;
+    internal const int NotificationScaleStepPercent = 25;
     private const string StartupModeMutexName = @"Local\ToolsForSteam.StartupMode";
     private const string StoreSyncPluginId = "store-sync";
     private const string OmniLibraryPluginId = "omnilibrary";
 
     private readonly WindowsAutostartService _autostartService;
     private readonly WindowsShellService _shellService;
-    private readonly IXboxModeService _xboxModeService;
+    private readonly LegacyXboxModeCleanup _legacyXboxModeCleanup;
+    private readonly IConsoleStartTask _consoleStartTask;
     private readonly string _executablePath;
-    private readonly string _shellLaunchArguments;
     private readonly string _settingsPath;
     private readonly object _gate = new();
 
+    // shellLaunchArguments is no longer used: Shell Takeover was removed and a
+    // leftover Winlogon value is recognized by WindowsShellService itself. The
+    // parameter stays so existing callers keep compiling.
     public SteamLoaderSettingsService(
         WindowsAutostartService autostartService,
         WindowsShellService shellService,
@@ -38,26 +45,29 @@ public sealed class SteamLoaderSettingsService
         : this(
             autostartService,
             shellService,
-            NoOpXboxModeService.Instance,
+            new LegacyXboxModeCleanup(),
+            new ConsoleStartTaskService(executablePath),
             executablePath,
             shellLaunchArguments,
             settingsPath)
     {
     }
 
-    public SteamLoaderSettingsService(
+    internal SteamLoaderSettingsService(
         WindowsAutostartService autostartService,
         WindowsShellService shellService,
-        IXboxModeService xboxModeService,
+        LegacyXboxModeCleanup legacyXboxModeCleanup,
+        IConsoleStartTask consoleStartTask,
         string executablePath,
         string shellLaunchArguments,
         string settingsPath)
     {
         _autostartService = autostartService;
         _shellService = shellService;
-        _xboxModeService = xboxModeService;
+        _legacyXboxModeCleanup = legacyXboxModeCleanup;
+        _consoleStartTask = consoleStartTask;
         _executablePath = executablePath;
-        _shellLaunchArguments = shellLaunchArguments;
+        _ = shellLaunchArguments;
         _settingsPath = settingsPath;
     }
 
@@ -74,31 +84,78 @@ public sealed class SteamLoaderSettingsService
         lock (_gate)
         {
             var settings = LoadSettings();
-            if (settings.ConsoleModeDefaultApplied == true || settings.RunOnWindowsSignInUserConfigured == true)
+            if (settings.HideWindowsShellDefaultOffApplied != true)
             {
-                if (ResolveStartupMode(settings) == SteamLoaderRuntime.StartupModeXbox &&
-                    !_xboxModeService.GetSupportStatus().IsSupported)
+                // Older builds stored "hide" as their default, not as a user
+                // choice. Switch it off once; a later choice in the QAM stays.
+                settings = settings with
                 {
-                    ApplyStartupMode(SteamLoaderRuntime.StartupModeTray);
-                    settings = settings with
-                    {
-                        StartupMode = SteamLoaderRuntime.StartupModeTray,
-                        HideWindowsShellInConsoleMode = false,
-                        ConsoleModeDefaultApplied = true,
-                        RunOnWindowsSignInUserConfigured = true
-                    };
-                    SaveSettings(settings);
+                    HideWindowsShellInConsoleMode = false,
+                    HideWindowsShellDefaultOffApplied = true
+                };
+                SaveSettings(settings);
+                SteamStartupDiagnostics.Write("hide Windows shell in Console Mode set to its new default (off)");
+            }
+
+            var legacyXboxMode = IsLegacyXboxStartupMode(settings.StartupMode);
+            var legacyShellMode = IsLegacyShellStartupMode(settings.StartupMode) || _shellService.IsLegacyTfsShell();
+            if (legacyXboxMode || legacyShellMode)
+            {
+                // Xbox Mode and Shell Takeover were removed. Both meant "TFS as
+                // the console start", which Console Mode provides with Explorer
+                // as the Windows shell. Point Windows away from the removed
+                // Gaming Home package first, without leaving a running session.
+                if (legacyXboxMode)
+                {
+                    _legacyXboxModeCleanup.Run(leaveActiveSession: false);
                 }
 
+                var targetMode = string.Equals(
+                    NormalizeStartupMode(settings.StartupMode),
+                    SteamLoaderRuntime.StartupModeTray,
+                    StringComparison.Ordinal)
+                    ? SteamLoaderRuntime.StartupModeTray
+                    : SteamLoaderRuntime.StartupModeConsole;
+                var migratedMode = TryApplyStartupModeWithTrayFallback(targetMode);
+                if (migratedMode is null)
+                {
+                    // Keep the stored value so the next start retries; a failed
+                    // migration must never stop TFS from starting.
+                    return CreateSnapshot(settings);
+                }
+
+                SteamStartupDiagnostics.Write(
+                    $"removed startup mode (xbox={legacyXboxMode} shell={legacyShellMode}) migrated to {migratedMode}");
+                settings = settings with
+                {
+                    StartupMode = migratedMode,
+                    HideWindowsShellInConsoleMode = SteamLoaderRuntime.IsConsoleStartupMode(migratedMode) &&
+                        settings.HideWindowsShellInConsoleMode == true,
+                    ConsoleModeDefaultApplied = true,
+                    RunOnWindowsSignInUserConfigured = true
+                };
+                SaveSettings(settings);
                 return CreateSnapshot(settings);
             }
 
-            ApplyStartupMode(SteamLoaderRuntime.StartupModeShell);
+            if (settings.ConsoleModeDefaultApplied == true || settings.RunOnWindowsSignInUserConfigured == true)
+            {
+                RepairDisabledConsoleStartTask(settings);
+                return CreateSnapshot(settings);
+            }
+
+            var defaultMode = TryApplyStartupModeWithTrayFallback(SteamLoaderRuntime.StartupModeConsole);
+            if (defaultMode is null)
+            {
+                return CreateSnapshot(settings);
+            }
+
             settings = settings with
             {
-                StartupMode = SteamLoaderRuntime.StartupModeShell,
+                StartupMode = defaultMode,
                 ConsoleModeDefaultApplied = true,
-                HideWindowsShellInConsoleMode = true
+                HideWindowsShellInConsoleMode = false,
+                HideWindowsShellDefaultOffApplied = true
             };
             SaveSettings(settings);
 
@@ -106,19 +163,91 @@ public sealed class SteamLoaderSettingsService
         }
     }
 
+    /// <summary>
+    /// Older builds' autostart cleanup disabled TFS' own Console Mode sign-in
+    /// task, so Console Mode silently stopped starting. Re-enable it when it
+    /// belongs to this executable. A task of another TFS build (for example a
+    /// dev build next to the installed one) is left alone. Never throws.
+    /// </summary>
+    private void RepairDisabledConsoleStartTask(SteamLoaderSettingsData settings)
+    {
+        if (!SteamLoaderRuntime.IsConsoleStartupMode(ResolveStartupMode(settings)))
+        {
+            return;
+        }
+
+        try
+        {
+            if (!_consoleStartTask.IsDisabledForThisExecutable())
+            {
+                return;
+            }
+
+            _consoleStartTask.Register();
+            SteamStartupDiagnostics.Write("re-enabled the disabled Console Mode sign-in task");
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"disabled Console Mode sign-in task could not be repaired: {exception.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Applies a startup mode; if Console Mode's sign-in task cannot be created,
+    /// falls back to eTray so TFS still starts at sign-in. Never throws.
+    /// </summary>
+    private string? TryApplyStartupModeWithTrayFallback(string mode)
+    {
+        try
+        {
+            ApplyStartupMode(mode);
+            return mode;
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"startup mode {mode} could not be applied: {exception.Message}");
+        }
+
+        if (!string.Equals(mode, SteamLoaderRuntime.StartupModeTray, StringComparison.Ordinal))
+        {
+            try
+            {
+                ApplyStartupMode(SteamLoaderRuntime.StartupModeTray);
+                return SteamLoaderRuntime.StartupModeTray;
+            }
+            catch (Exception exception)
+            {
+                SteamStartupDiagnostics.Write($"eTray fallback could not be applied: {exception.Message}");
+            }
+        }
+
+        // Last line of defense: never leave Windows starting a removed shell mode.
+        try
+        {
+            if (_shellService.IsLegacyTfsShell())
+            {
+                _shellService.SetExplorerShell();
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
     public SteamLoaderGeneralSettingsSnapshot SetRunOnWindowsSignIn(bool enabled)
     {
         lock (_gate)
         {
-            var mode = enabled ? SteamLoaderRuntime.StartupModeShell : SteamLoaderRuntime.StartupModeTray;
+            var mode = enabled ? SteamLoaderRuntime.StartupModeConsole : SteamLoaderRuntime.StartupModeTray;
             ApplyStartupMode(mode);
 
             var settings = LoadSettings() with
             {
                 StartupMode = mode,
-                HideWindowsShellInConsoleMode = NormalizeStartupMode(mode) == SteamLoaderRuntime.StartupModeShell
-                    ? LoadSettings().HideWindowsShellInConsoleMode ?? true
-                    : false,
+                HideWindowsShellInConsoleMode = SteamLoaderRuntime.IsConsoleStartupMode(mode) &&
+                    LoadSettings().HideWindowsShellInConsoleMode == true,
                 ConsoleModeDefaultApplied = true,
                 RunOnWindowsSignInUserConfigured = true
             };
@@ -155,9 +284,11 @@ public sealed class SteamLoaderSettingsService
             var settings = existingSettings with
             {
                 StartupMode = normalizedMode,
-                HideWindowsShellInConsoleMode = normalizedMode == SteamLoaderRuntime.StartupModeShell
-                    ? existingSettings.HideWindowsShellInConsoleMode ?? true
-                    : false,
+                // Hiding is off by default. A switch from eTray starts with it
+                // off; staying in Console Mode keeps the user's own choice.
+                HideWindowsShellInConsoleMode = SteamLoaderRuntime.IsConsoleStartupMode(normalizedMode) &&
+                    SteamLoaderRuntime.IsConsoleStartupMode(previousMode) &&
+                    existingSettings.HideWindowsShellInConsoleMode == true,
                 ConsoleModeDefaultApplied = true,
                 RunOnWindowsSignInUserConfigured = true
             };
@@ -170,15 +301,6 @@ public sealed class SteamLoaderSettingsService
     private void ApplyStartupMode(string mode)
     {
         var normalizedMode = NormalizeStartupMode(mode);
-        if (normalizedMode == SteamLoaderRuntime.StartupModeXbox)
-        {
-            var support = _xboxModeService.GetSupportStatus();
-            if (!support.IsSupported)
-            {
-                throw new InvalidOperationException(support.Reason);
-            }
-        }
-
         using var modeMutex = new Mutex(false, StartupModeMutexName);
         var lockTaken = false;
         try
@@ -202,22 +324,17 @@ public sealed class SteamLoaderSettingsService
 
             switch (normalizedMode)
             {
-                case SteamLoaderRuntime.StartupModeShell:
-                    _xboxModeService.SetStartupEnabled(false);
-                    _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
-                    break;
                 case SteamLoaderRuntime.StartupModeTray:
-                    _xboxModeService.SetStartupEnabled(false);
+                    TryRemoveConsoleStartTask();
                     _shellService.SetExplorerShell();
                     _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, true);
                     break;
-                case SteamLoaderRuntime.StartupModeXbox:
-                    _shellService.SetExplorerShell();
-                    _xboxModeService.SetStartupEnabled(true);
-                    break;
                 default:
-                    _xboxModeService.SetStartupEnabled(false);
-                    _shellService.SetEnabled(_executablePath, _shellLaunchArguments, true);
+                    // Console Mode. Explorer first: if the sign-in task cannot be
+                    // created, the caller re-applies the previous mode and Windows
+                    // still boots to a working desktop in between.
+                    _shellService.SetExplorerShell();
+                    _consoleStartTask.Register();
                     break;
             }
 
@@ -234,14 +351,12 @@ public sealed class SteamLoaderSettingsService
 
     private void VerifyStartupMode(string mode)
     {
-        var shellEnabled = _shellService.IsEnabled(_executablePath, _shellLaunchArguments);
         var explorerEnabled = string.Equals(_shellService.GetShellCommand(), "explorer.exe", StringComparison.OrdinalIgnoreCase);
         var trayEnabled = _autostartService.IsEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments);
         var valid = mode switch
         {
-            SteamLoaderRuntime.StartupModeShell => shellEnabled && !trayEnabled && _xboxModeService.VerifyStartupEnabled(false),
-            SteamLoaderRuntime.StartupModeTray => explorerEnabled && trayEnabled && _xboxModeService.VerifyStartupEnabled(false),
-            SteamLoaderRuntime.StartupModeXbox => explorerEnabled && !trayEnabled && _xboxModeService.VerifyStartupEnabled(true),
+            SteamLoaderRuntime.StartupModeTray => explorerEnabled && trayEnabled,
+            SteamLoaderRuntime.StartupModeConsole => explorerEnabled && !trayEnabled && _consoleStartTask.IsRegistered(),
             _ => false
         };
 
@@ -251,16 +366,58 @@ public sealed class SteamLoaderSettingsService
         }
     }
 
+    private void TryRemoveConsoleStartTask()
+    {
+        try
+        {
+            _consoleStartTask.Unregister();
+        }
+        catch (Exception exception)
+        {
+            // Never block a switch to eTray on Task Scheduler:
+            // a leftover task only starts TFS as a plain tray launch, because
+            // Console Mode is no longer the saved mode.
+            SteamStartupDiagnostics.Write($"console start task could not be removed: {exception.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Uninstall: remove every startup hook that points at this TFS install
+    /// and give Windows back its own shell.
+    /// </summary>
+    public void RemoveStartupIntegration()
+    {
+        lock (_gate)
+        {
+            TryRemoveConsoleStartTask();
+
+            try
+            {
+                _autostartService.SetEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments, false);
+            }
+            catch (Exception exception)
+            {
+                SteamStartupDiagnostics.Write($"uninstall could not remove the TFS Run value: {exception.Message}");
+            }
+
+            try
+            {
+                _shellService.RestoreIfOwnedBy(_executablePath);
+            }
+            catch (Exception exception)
+            {
+                SteamStartupDiagnostics.Write($"uninstall could not restore the Windows shell: {exception.Message}");
+            }
+        }
+    }
+
     public SteamLoaderGeneralSettingsSnapshot SetHideWindowsShellInConsoleMode(bool enabled)
     {
         lock (_gate)
         {
             var settings = LoadSettings();
             var startupMode = ResolveStartupMode(settings);
-            var allowHideWindowsShell = string.Equals(
-                startupMode,
-                SteamLoaderRuntime.StartupModeShell,
-                StringComparison.OrdinalIgnoreCase);
+            var allowHideWindowsShell = SteamLoaderRuntime.IsConsoleStartupMode(startupMode);
 
             settings = settings with
             {
@@ -327,23 +484,6 @@ public sealed class SteamLoaderSettingsService
         return GetSnapshot();
     }
 
-    public string GetUpdateChannel()
-    {
-        return NormalizeUpdateChannel(LoadSettings().UpdateChannel);
-    }
-
-    public string SetUpdateChannel(string channel)
-    {
-        var normalizedChannel = NormalizeUpdateChannel(channel);
-        var settings = LoadSettings() with
-        {
-            UpdateChannel = normalizedChannel
-        };
-
-        SaveSettings(settings);
-        return normalizedChannel;
-    }
-
     public SteamLoaderGeneralSettingsSnapshot SetSplashScreenArtworkMode(string mode)
     {
         var settings = LoadSettings();
@@ -397,6 +537,55 @@ public sealed class SteamLoaderSettingsService
 
         SaveSettings(settings);
         return GetSnapshot();
+    }
+
+    /// <summary>
+    /// Game Bar controller shortcut automation (like Playhub): the Xbox
+    /// button does not open Game Bar in Big Picture, only in Xbox / Microsoft
+    /// Store games. On unless the user turned it off.
+    /// </summary>
+    public bool IsGameBarControllerAutomationEnabled()
+    {
+        return LoadSettings().GameBarControllerAutomation != false;
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetGameBarControllerAutomation(bool enabled)
+    {
+        lock (_gate)
+        {
+            var settings = LoadSettings() with { GameBarControllerAutomation = enabled };
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
+    }
+
+    public int GetNotificationScalePercent()
+    {
+        return NormalizeNotificationScalePercent(LoadSettings().NotificationScalePercent);
+    }
+
+    public SteamLoaderGeneralSettingsSnapshot SetNotificationScalePercent(int percent)
+    {
+        lock (_gate)
+        {
+            var settings = LoadSettings() with
+            {
+                NotificationScalePercent = NormalizeNotificationScalePercent(percent)
+            };
+
+            SaveSettings(settings);
+            return CreateSnapshot(settings);
+        }
+    }
+
+    /// <summary>
+    /// Clamps to 100–250 % and snaps to the 25 % steps the settings page offers.
+    /// </summary>
+    internal static int NormalizeNotificationScalePercent(int? percent)
+    {
+        var value = Math.Clamp(percent ?? DefaultNotificationScalePercent, MinimumNotificationScalePercent, MaximumNotificationScalePercent);
+        var snapped = (int)Math.Round(value / (double)NotificationScaleStepPercent, MidpointRounding.AwayFromZero) * NotificationScaleStepPercent;
+        return Math.Clamp(snapped, MinimumNotificationScalePercent, MaximumNotificationScalePercent);
     }
 
     public ControllerShortcutSettingsSnapshot GetControllerShortcutSettings()
@@ -631,6 +820,30 @@ public sealed class SteamLoaderSettingsService
         return GetSnapshot();
     }
 
+    /// <summary>True until the controller intro video was shown once (or skipped).</summary>
+    public bool IsIntroVideoPending()
+    {
+        return LoadSettings().IntroVideoSeen != true;
+    }
+
+    public void MarkIntroVideoSeen()
+    {
+        lock (_gate)
+        {
+            var settings = LoadSettings();
+            if (settings.IntroVideoSeen == true)
+            {
+                return;
+            }
+
+            SaveSettings(settings with
+            {
+                IntroVideoSeen = true,
+                IntroVideoSeenAtUtc = DateTimeOffset.UtcNow
+            });
+        }
+    }
+
     public bool ShouldHideWindowsShellInConsoleMode()
     {
         lock (_gate)
@@ -807,14 +1020,15 @@ public sealed class SteamLoaderSettingsService
 
     private static bool ShouldHideWindowsShellInConsoleMode(string startupMode, SteamLoaderSettingsData settings)
     {
-        return string.Equals(startupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase)
-            && settings.HideWindowsShellInConsoleMode != false;
+        // luis (2026-11-13): hiding the Windows shell is off unless the user
+        // turns it on; a missing value means off.
+        return SteamLoaderRuntime.IsConsoleStartupMode(startupMode)
+            && settings.HideWindowsShellInConsoleMode == true;
     }
 
     private SteamLoaderGeneralSettingsSnapshot CreateSnapshot(SteamLoaderSettingsData settings)
     {
         var startupMode = ResolveStartupMode(settings);
-        var xboxModeSupport = _xboxModeService.GetSupportStatus();
         var handheld = HandheldDeviceCatalog.Detect();
         return new SteamLoaderGeneralSettingsSnapshot(
             RunOnWindowsSignIn: true,
@@ -829,14 +1043,18 @@ public sealed class SteamLoaderSettingsService
             ProductVersion: GetProductVersion(),
             InstallPath: AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
             DeveloperDebugEnabled: settings.DeveloperDebugEnabled == true,
-            XboxModeSupported: xboxModeSupport.IsSupported,
-            XboxModeSupportReason: xboxModeSupport.Reason,
             HandheldPerformanceAvailable: HandheldDeviceCatalog.IsSupported(handheld),
             HandheldPerformanceTitle: handheld.DisplayName,
             OemSoftwareAvailable: HandheldDeviceCatalog.IsSupported(handheld) && handheld.OemSoftware.Supported,
             OemSoftwareTitle: handheld.OemSoftware.SoftwareName,
-            Plugins: BuildPluginStates(settings));
+            Plugins: BuildPluginStates(settings),
+            NotificationScalePercent: NormalizeNotificationScalePercent(settings.NotificationScalePercent),
+            GameBarControllerAutomation: settings.GameBarControllerAutomation != false,
+            WindowsXboxModeConflict: SteamLoaderRuntime.IsConsoleStartupMode(startupMode) && XboxModeDetector.IsEnabled());
     }
+
+    /// <summary>Reads Windows' own Xbox Mode; replaceable in tests.</summary>
+    internal WindowsXboxModeDetector XboxModeDetector { get; init; } = new();
 
     private static string NormalizeOptionalPath(string? path)
     {
@@ -845,11 +1063,6 @@ public sealed class SteamLoaderSettingsService
 
     private string ResolveStartupMode(SteamLoaderSettingsData settings)
     {
-        if (_shellService.IsEnabled(_executablePath, _shellLaunchArguments))
-        {
-            return SteamLoaderRuntime.StartupModeShell;
-        }
-
         if (_autostartService.IsEnabled(_executablePath, SteamLoaderRuntime.AutostartArguments))
         {
             return SteamLoaderRuntime.StartupModeTray;
@@ -860,28 +1073,36 @@ public sealed class SteamLoaderSettingsService
 
     private static string NormalizeStartupMode(string? mode)
     {
+        // Anything else, including the removed "shell" (Shell Takeover) and
+        // "xbox"/"external" (Xbox Mode) values, resolves to Console Mode.
         return mode?.Trim().ToLowerInvariant() switch
         {
-            SteamLoaderRuntime.StartupModeShell => SteamLoaderRuntime.StartupModeShell,
             SteamLoaderRuntime.StartupModeTray => SteamLoaderRuntime.StartupModeTray,
-            SteamLoaderRuntime.StartupModeXbox => SteamLoaderRuntime.StartupModeXbox,
-            "external" => SteamLoaderRuntime.StartupModeXbox,
-            _ => SteamLoaderRuntime.StartupModeShell
+            _ => SteamLoaderRuntime.StartupModeConsole
         };
+    }
+
+    public static bool IsSupportedStartupMode(string? mode)
+    {
+        var normalized = mode?.Trim().ToLowerInvariant();
+        return normalized is SteamLoaderRuntime.StartupModeTray
+            or SteamLoaderRuntime.StartupModeConsole;
+    }
+
+    private static bool IsLegacyXboxStartupMode(string? mode)
+    {
+        var normalized = mode?.Trim().ToLowerInvariant();
+        return normalized is "xbox" or "external";
+    }
+
+    private static bool IsLegacyShellStartupMode(string? mode)
+    {
+        return string.Equals(mode?.Trim(), SteamLoaderRuntime.LegacyStartupModeShell, StringComparison.OrdinalIgnoreCase);
     }
 
     private static int ClampWindowsShellStartDelay(int seconds)
     {
         return Math.Clamp(seconds, 0, MaximumWindowsShellStartDelaySeconds);
-    }
-
-    private static string NormalizeUpdateChannel(string? channel)
-    {
-        return channel?.Trim().ToLowerInvariant() switch
-        {
-            SteamLoaderRuntime.UpdateChannelBeta => SteamLoaderRuntime.UpdateChannelBeta,
-            _ => SteamLoaderRuntime.UpdateChannelStable
-        };
     }
 
     private static Dictionary<string, bool> NormalizePluginStates(Dictionary<string, bool>? savedStates)
@@ -983,19 +1204,29 @@ public sealed class SteamLoaderSettingsService
 
         public bool? HideWindowsShellInConsoleMode { get; init; }
 
-        public bool? DeveloperDebugEnabled { get; init; }
+        // Set once the old "hide by default" value was switched off (2026-11-13).
+        public bool? HideWindowsShellDefaultOffApplied { get; init; }
 
-        public string? UpdateChannel { get; init; }
+        public bool? DeveloperDebugEnabled { get; init; }
 
         public bool? FirstRunCompleted { get; init; }
 
         public DateTimeOffset? FirstRunCompletedAtUtc { get; init; }
+
+        // Controller intro video: shown once in Big Picture, then only on request.
+        public bool? IntroVideoSeen { get; init; }
+
+        public DateTimeOffset? IntroVideoSeenAtUtc { get; init; }
 
         public Dictionary<string, bool>? PluginEnabled { get; init; }
 
         public string[]? PluginOrder { get; init; }
 
         public int? WindowsShellStartDelaySeconds { get; init; }
+
+        public int? NotificationScalePercent { get; init; }
+
+        public bool? GameBarControllerAutomation { get; init; }
 
         public SteamLoaderSplashScreenSettingsData? SplashScreen { get; init; }
 

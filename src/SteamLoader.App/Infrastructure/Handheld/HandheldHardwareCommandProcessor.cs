@@ -52,6 +52,12 @@ internal sealed class HandheldHardwareCommandProcessor
         _lastNonce = command.Nonce;
         try
         {
+            if (string.Equals(command.Operation, "set-tdp", StringComparison.Ordinal))
+            {
+                ApplyTdp(command);
+                return;
+            }
+
             if (!string.Equals(command.DeviceId, "msi-claw-a8", StringComparison.Ordinal) ||
                 !string.Equals(command.ProductCode, "MS-1T8K", StringComparison.Ordinal))
             {
@@ -91,29 +97,7 @@ internal sealed class HandheldHardwareCommandProcessor
                 return;
             }
 
-            if (!string.Equals(command.Operation, "set-tdp", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException("The hardware operation is not supported by this device adapter.");
-            }
-
-            var sppt = command.SpptWatts > 0 ? command.SpptWatts : command.TdpWatts;
-            var fppt = command.FpptWatts > 0 ? command.FpptWatts : sppt;
-            var cpu = new MsiClawA8TdpController().Apply(command.TdpWatts, sppt, fppt);
-            var previousStatus = LoadStatus();
-            SaveStatus(new HandheldHardwareStatus(
-                command.Nonce,
-                true,
-                true,
-                command.TdpWatts,
-                cpu,
-                $"SPL {command.TdpWatts} W, SPPT {sppt} W and FPPT {fppt} W applied.",
-                DateTimeOffset.UtcNow,
-                command.Operation,
-                previousStatus.LightingApplied,
-                previousStatus.LightingMessage,
-                sppt,
-                fppt));
-            _log($"tdp-applied spl={command.TdpWatts} sppt={sppt} fppt={fppt} cpu={cpu}");
+            throw new InvalidOperationException("The hardware operation is not supported by this device adapter.");
         }
         catch (Exception exception)
         {
@@ -131,6 +115,36 @@ internal sealed class HandheldHardwareCommandProcessor
                 string.Equals(command.Operation, "set-lighting", StringComparison.Ordinal) ? exception.Message : previousStatus.LightingMessage));
             _log($"hardware-command-failed operation={command.Operation} watts={command.TdpWatts} type={exception.GetType().Name} message={exception.Message}");
         }
+    }
+
+    private void ApplyTdp(HandheldHardwareCommand command)
+    {
+        // The helper re-detects the device itself; the command only has to name the same device.
+        var device = HandheldDeviceCatalog.Detect();
+        if (!HandheldDeviceCatalog.SupportsTdp(device) || device.Tdp is null ||
+            !string.Equals(command.DeviceId, device.Id, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The TDP command does not match a detected AMD device with a known TDP range.");
+        }
+
+        var sppt = command.SpptWatts > 0 ? command.SpptWatts : command.TdpWatts;
+        var fppt = command.FpptWatts > 0 ? command.FpptWatts : sppt;
+        var cpu = new AmdTdpController().Apply(device.Tdp, command.TdpWatts, sppt, fppt);
+        var previousStatus = LoadStatus();
+        SaveStatus(new HandheldHardwareStatus(
+            command.Nonce,
+            true,
+            true,
+            command.TdpWatts,
+            cpu,
+            $"SPL {command.TdpWatts} W, SPPT {sppt} W and FPPT {fppt} W applied.",
+            DateTimeOffset.UtcNow,
+            command.Operation,
+            previousStatus.LightingApplied,
+            previousStatus.LightingMessage,
+            sppt,
+            fppt));
+        _log($"tdp-applied device={device.Id} spl={command.TdpWatts} sppt={sppt} fppt={fppt} cpu={cpu}");
     }
 
     private void SaveStatus(HandheldHardwareStatus status) => HandheldPerformanceService.WriteJsonAtomically(_statusPath, status);

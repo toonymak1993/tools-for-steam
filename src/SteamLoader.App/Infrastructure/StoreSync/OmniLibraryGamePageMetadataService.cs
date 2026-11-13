@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using SteamLoader.App.Infrastructure.Metadata;
 using SteamLoader.App.Models;
 
 namespace SteamLoader.App.Infrastructure.StoreSync;
@@ -46,6 +47,9 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly OmniLibraryAchievementProvider _achievementProvider;
+    private readonly IgnMetadataClient _ign;
+    private readonly MetadataTranslator _translator;
+    private const string IgnSourceLabel = "IGN";
     // Metadata is requested per visible title. Keep the fan-out bounded, but
     // allow several page refreshes to overlap so background work for a game
     // the user just left cannot delay the next game page.
@@ -77,6 +81,8 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(
                 "ToolsForSteam-OmniLibrary-Metadata/1.0");
         }
+        _ign = new IgnMetadataClient(_httpClient);
+        _translator = new MetadataTranslator(_httpClient);
         _achievementProvider = new OmniLibraryAchievementProvider(
             settingsStore,
             _httpClient);
@@ -94,22 +100,57 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             cancellationToken).ConfigureAwait(false);
     }
 
+    public Task<OmniLibraryGamePageMetadataSnapshot?> GetAsync(
+        uint shortcutAppId,
+        bool forceRefresh,
+        bool refreshOnOpen,
+        CancellationToken cancellationToken) =>
+        GetAsync(
+            shortcutAppId,
+            shortcutTitle: null,
+            forceRefresh,
+            refreshOnOpen,
+            cancellationToken);
+
+    /// <summary>
+    /// Game page metadata for any non-Steam shortcut. OmniLibrary games keep
+    /// their own store identity and achievement providers; every other
+    /// shortcut is identified by its Steam shortcut app ID and the title Steam
+    /// shows for it.
+    /// </summary>
     public async Task<OmniLibraryGamePageMetadataSnapshot?> GetAsync(
         uint shortcutAppId,
+        string? shortcutTitle,
         bool forceRefresh,
         bool refreshOnOpen,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        var gameDetail = _gameProvider(shortcutAppId);
-        if (gameDetail.Game is null ||
-            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
-            gameDetail.Game.SteamAppId != shortcutAppId)
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
         {
             return null;
         }
 
-        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game.Id);
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
+        var snapshot = await GetCoreAsync(
+                shortcutAppId,
+                gameDetail,
+                identity,
+                forceRefresh,
+                refreshOnOpen,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return ApplyUserEdits(snapshot, GetUserEdits(identity));
+    }
+
+    private async Task<OmniLibraryGamePageMetadataSnapshot> GetCoreAsync(
+        uint shortcutAppId,
+        UnifySteamGameDetailSnapshot gameDetail,
+        string identity,
+        bool forceRefresh,
+        bool refreshOnOpen,
+        CancellationToken cancellationToken)
+    {
         var now = DateTimeOffset.UtcNow;
         var entry = GetEntry(identity);
         var validIdentity = entry is not null &&
@@ -148,15 +189,14 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 cached: hadCachedEntry);
         }
 
-        var achievementFingerprint =
-            _achievementProvider.GetConfigurationFingerprint(gameDetail);
+        var achievementFingerprint = GetAchievementFingerprint(gameDetail);
         var needsRefresh = forceRefresh ||
                            entry is null ||
                            IsRefreshDue(
                                entry,
                                now,
                                achievementFingerprint,
-                               _achievementProvider.CanRefreshUserScoped(gameDetail));
+                               CanRefreshUserScopedAchievements(gameDetail));
         if (!needsRefresh)
         {
             TouchEntry(identity, now);
@@ -222,7 +262,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             MatchMode = manualSteamAppId.HasValue ? "manual" : "automatic",
             SourceMatchedAtUtc = manualSteamAppId.HasValue ? now : null,
             AchievementConfigurationFingerprint =
-                _achievementProvider.GetConfigurationFingerprint(gameDetail),
+                GetAchievementFingerprint(gameDetail),
             LastAccessedAtUtc = now,
             GameInfo = EmptyGameInfo(game.Title, manualSteamAppId),
             Achievements = StoreAchievementPlaceholder(gameDetail.StoreId),
@@ -232,16 +272,20 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         return entry;
     }
 
+    public Task<IReadOnlyList<OmniLibraryMetadataSearchResult>> SearchSteamMatchesAsync(
+        uint shortcutAppId,
+        string? query,
+        CancellationToken cancellationToken) =>
+        SearchSteamMatchesAsync(shortcutAppId, shortcutTitle: null, query, cancellationToken);
+
     public async Task<IReadOnlyList<OmniLibraryMetadataSearchResult>> SearchSteamMatchesAsync(
         uint shortcutAppId,
+        string? shortcutTitle,
         string? query,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        var gameDetail = _gameProvider(shortcutAppId);
-        if (gameDetail.Game is null ||
-            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
-            gameDetail.Game.SteamAppId != shortcutAppId)
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
         {
             return [];
         }
@@ -310,8 +354,15 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         }
     }
 
+    public Task<OmniLibraryGamePageMetadataSnapshot?> SetSteamMatchAsync(
+        uint shortcutAppId,
+        int steamAppId,
+        CancellationToken cancellationToken) =>
+        SetSteamMatchAsync(shortcutAppId, shortcutTitle: null, steamAppId, cancellationToken);
+
     public async Task<OmniLibraryGamePageMetadataSnapshot?> SetSteamMatchAsync(
         uint shortcutAppId,
+        string? shortcutTitle,
         int steamAppId,
         CancellationToken cancellationToken)
     {
@@ -323,41 +374,402 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 "A positive Steam app ID is required.");
         }
 
-        var gameDetail = _gameProvider(shortcutAppId);
-        if (gameDetail.Game is null ||
-            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
-            gameDetail.Game.SteamAppId != shortcutAppId)
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
         {
             return null;
         }
 
-        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game.Id);
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
         await AwaitActiveRefreshBeforeMatchChangeAsync(identity, cancellationToken)
             .ConfigureAwait(false);
         SaveSteamMatchOverride(identity, steamAppId);
-        return await GetAsync(shortcutAppId, forceRefresh: true, cancellationToken)
+        return await GetAsync(
+                shortcutAppId,
+                shortcutTitle,
+                forceRefresh: true,
+                refreshOnOpen: false,
+                cancellationToken)
             .ConfigureAwait(false);
     }
 
+    public Task<OmniLibraryGamePageMetadataSnapshot?> ClearSteamMatchAsync(
+        uint shortcutAppId,
+        CancellationToken cancellationToken) =>
+        ClearSteamMatchAsync(shortcutAppId, shortcutTitle: null, cancellationToken);
+
     public async Task<OmniLibraryGamePageMetadataSnapshot?> ClearSteamMatchAsync(
         uint shortcutAppId,
+        string? shortcutTitle,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        var gameDetail = _gameProvider(shortcutAppId);
-        if (gameDetail.Game is null ||
-            string.IsNullOrWhiteSpace(gameDetail.StoreId) ||
-            gameDetail.Game.SteamAppId != shortcutAppId)
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
         {
             return null;
         }
 
-        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game.Id);
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
         await AwaitActiveRefreshBeforeMatchChangeAsync(identity, cancellationToken)
             .ConfigureAwait(false);
         SaveSteamMatchOverride(identity, null);
-        return await GetAsync(shortcutAppId, forceRefresh: true, cancellationToken)
+        return await GetAsync(
+                shortcutAppId,
+                shortcutTitle,
+                forceRefresh: true,
+                refreshOnOpen: false,
+                cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Store id used for shortcuts that OmniLibrary does not manage (games
+    /// added by hand, Store Sync, Steam ROM Manager, UWPHook and so on).
+    /// </summary>
+    public const string ShortcutStoreId = "tfs-shortcut";
+
+    private const int MaxShortcutTitleLength = 200;
+
+    public static bool IsShortcutStore(string? storeId) =>
+        string.Equals(storeId, ShortcutStoreId, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// OmniLibrary keeps ownership of its own games. Any other non-Steam
+    /// shortcut (Steam gives those app IDs with the top bit set) becomes a
+    /// plain title-only game so Steam store matching can fill its page.
+    /// </summary>
+    private UnifySteamGameDetailSnapshot? ResolveGameDetail(
+        uint shortcutAppId,
+        string? shortcutTitle)
+    {
+        var gameDetail = _gameProvider(shortcutAppId);
+        if (gameDetail.Game is not null &&
+            !string.IsNullOrWhiteSpace(gameDetail.StoreId) &&
+            gameDetail.Game.SteamAppId == shortcutAppId)
+        {
+            return gameDetail;
+        }
+
+        var title = CleanShortcutTitle(shortcutTitle);
+        if (shortcutAppId < 0x80000000u || title.Length == 0)
+        {
+            return null;
+        }
+
+        return new UnifySteamGameDetailSnapshot(
+            0,
+            ShortcutStoreId,
+            new UnifySteamGameState(
+                shortcutAppId.ToString(CultureInfo.InvariantCulture),
+                title,
+                Installed: true,
+                CloudPlayable: false,
+                SyncedToSteam: true,
+                StatusText: string.Empty,
+                DetailText: string.Empty,
+                ImageUrl: string.Empty,
+                InstallPath: string.Empty,
+                ExecutablePath: string.Empty,
+                Version: string.Empty,
+                SteamAppId: shortcutAppId,
+                Download: new UnifySteamDownloadState(
+                    "idle",
+                    0,
+                    string.Empty,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0)));
+    }
+
+    internal static string CleanShortcutTitle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(Math.Min(value.Length, MaxShortcutTitleLength));
+        foreach (var character in value)
+        {
+            if (builder.Length >= MaxShortcutTitleLength)
+            {
+                break;
+            }
+            builder.Append(char.IsControl(character) ? ' ' : character);
+        }
+
+        return Regex.Replace(builder.ToString(), @"\s+", " ").Trim();
+    }
+
+    // Shortcuts outside OmniLibrary have no store account, so no achievement
+    // provider is consulted for them; their achievement section stays empty
+    // instead of showing someone else's Steam unlock list.
+    private string GetAchievementFingerprint(UnifySteamGameDetailSnapshot gameDetail) =>
+        IsShortcutStore(gameDetail.StoreId)
+            ? $"{ShortcutStoreId}:none"
+            : _achievementProvider.GetConfigurationFingerprint(gameDetail);
+
+    private bool CanRefreshUserScopedAchievements(UnifySteamGameDetailSnapshot gameDetail) =>
+        !IsShortcutStore(gameDetail.StoreId) &&
+        _achievementProvider.CanRefreshUserScoped(gameDetail);
+
+    private const int MaxDescriptionLength = 8000;
+    private const int MaxListItems = 8;
+    private const int MaxListItemLength = 120;
+    private const int MaxReleaseDateLength = 40;
+
+    /// <summary>
+    /// Editor view for one game: the page as shown (edits applied), the
+    /// automatic values underneath and the edits themselves.
+    /// </summary>
+    public async Task<GameMetadataEditorSnapshot?> GetEditorAsync(
+        uint shortcutAppId,
+        string? shortcutTitle,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
+        {
+            return null;
+        }
+
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
+        var automatic = await GetCoreAsync(
+                shortcutAppId,
+                gameDetail,
+                identity,
+                forceRefresh: false,
+                refreshOnOpen: false,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var edits = GetUserEdits(identity) ?? new GameMetadataEdits();
+        var ignSlug = GetIgnOverride(identity);
+        return new GameMetadataEditorSnapshot(
+            ApplyUserEdits(automatic, edits),
+            automatic.GameInfo,
+            edits,
+            ManagedByOmniLibrary: !IsShortcutStore(gameDetail.StoreId),
+            IgnPage: ignSlug is null ? string.Empty : IgnMetadataClient.PageBaseUrl + ignSlug);
+    }
+
+    /// <summary>
+    /// Picks an IGN page (address or slug) as the game's source; blank goes
+    /// back to automatic. Throws ArgumentException for anything that is not
+    /// an IGN game page.
+    /// </summary>
+    public async Task<GameMetadataEditorSnapshot?> SetIgnPageAsync(
+        uint shortcutAppId,
+        string? shortcutTitle,
+        string? page,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        string? slug = null;
+        if (!string.IsNullOrWhiteSpace(page))
+        {
+            slug = IgnMetadataClient.ParseSlug(page)
+                ?? throw new ArgumentException("Enter an IGN game page address, for example https://www.ign.com/games/hollow-knight.");
+        }
+
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
+        {
+            return null;
+        }
+
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
+        await AwaitActiveRefreshBeforeMatchChangeAsync(identity, cancellationToken)
+            .ConfigureAwait(false);
+        lock (_cacheGate)
+        {
+            var cache = LoadCacheLocked();
+            if (slug is null)
+            {
+                cache.IgnSlugOverrides.Remove(identity);
+            }
+            else
+            {
+                cache.IgnSlugOverrides[identity] = slug;
+            }
+            cache.Entries.Remove(identity);
+            SaveCacheLocked(cache);
+        }
+
+        return await GetEditorAsync(shortcutAppId, shortcutTitle, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private string? GetIgnOverride(string identity)
+    {
+        lock (_cacheGate)
+        {
+            return LoadCacheLocked().IgnSlugOverrides.TryGetValue(identity, out var slug)
+                ? slug
+                : null;
+        }
+    }
+
+    /// <summary>Saves hand-made game info; null clears every edit.</summary>
+    public async Task<GameMetadataEditorSnapshot?> SaveEditsAsync(
+        uint shortcutAppId,
+        string? shortcutTitle,
+        GameMetadataEdits? edits,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        if (ResolveGameDetail(shortcutAppId, shortcutTitle) is not { } gameDetail)
+        {
+            return null;
+        }
+
+        var identity = BuildIdentity(gameDetail.StoreId, gameDetail.Game!.Id);
+        var clean = CleanEdits(edits);
+        lock (_cacheGate)
+        {
+            var cache = LoadCacheLocked();
+            if (clean is null)
+            {
+                cache.UserEdits.Remove(identity);
+            }
+            else
+            {
+                cache.UserEdits[identity] = clean;
+            }
+
+            // A new revision makes every open game page re-apply the snapshot.
+            if (cache.Entries.TryGetValue(identity, out var entry))
+            {
+                entry.Revision = Interlocked.Increment(ref _revision);
+            }
+            SaveCacheLocked(cache);
+        }
+
+        return await GetEditorAsync(shortcutAppId, shortcutTitle, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private GameMetadataEdits? GetUserEdits(string identity)
+    {
+        lock (_cacheGate)
+        {
+            return LoadCacheLocked().UserEdits.TryGetValue(identity, out var edits)
+                ? edits
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// Trims and caps every field. Blank fields mean "automatic"; returns
+    /// null when nothing is left to keep.
+    /// </summary>
+    internal static GameMetadataEdits? CleanEdits(GameMetadataEdits? edits)
+    {
+        if (edits is null)
+        {
+            return null;
+        }
+
+        static string? Text(string? value, int maxLength)
+        {
+            var trimmed = value?.Trim();
+            if (string.IsNullOrEmpty(trimmed))
+            {
+                return null;
+            }
+            return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength].TrimEnd();
+        }
+
+        static IReadOnlyList<string>? List(IReadOnlyList<string>? values)
+        {
+            var items = (values ?? [])
+                .Select(value => CleanShortcutTitle(value))
+                .Select(value => value.Length <= MaxListItemLength ? value : value[..MaxListItemLength].TrimEnd())
+                .Where(value => value.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(MaxListItems)
+                .ToArray();
+            return items.Length > 0 ? items : null;
+        }
+
+        var clean = new GameMetadataEdits
+        {
+            Description = Text(edits.Description, MaxDescriptionLength),
+            Developers = List(edits.Developers),
+            Publishers = List(edits.Publishers),
+            Genres = List(edits.Genres),
+            ReleaseDate = Text(CleanShortcutTitle(edits.ReleaseDate), MaxReleaseDateLength),
+            Rating = edits.Rating is { } rating ? Math.Clamp(rating, 0, 100) : null,
+        };
+        return clean.Description is null &&
+               clean.Developers is null &&
+               clean.Publishers is null &&
+               clean.Genres is null &&
+               clean.ReleaseDate is null &&
+               clean.Rating is null
+            ? null
+            : clean;
+    }
+
+    internal static OmniLibraryGamePageMetadataSnapshot ApplyUserEdits(
+        OmniLibraryGamePageMetadataSnapshot snapshot,
+        GameMetadataEdits? edits)
+    {
+        if (edits is null)
+        {
+            return snapshot;
+        }
+
+        var info = snapshot.GameInfo;
+        var edited = new List<string>();
+        if (edits.Description is { } description)
+        {
+            var shortDescription = description.Length <= 300
+                ? description
+                : description[..300].TrimEnd() + "…";
+            info = info with { Description = description, ShortDescription = shortDescription };
+            edited.Add("description");
+        }
+        if (edits.Developers is { } developers)
+        {
+            info = info with { Developers = developers };
+            edited.Add("developers");
+        }
+        if (edits.Publishers is { } publishers)
+        {
+            info = info with { Publishers = publishers };
+            edited.Add("publishers");
+        }
+        if (edits.Genres is { } genres)
+        {
+            info = info with { Genres = genres };
+            edited.Add("genres");
+        }
+        if (edits.ReleaseDate is { } releaseDate)
+        {
+            info = info with { ReleaseDate = releaseDate };
+            edited.Add("releaseDate");
+        }
+        if (edits.Rating is { } rating)
+        {
+            info = info with { Rating = rating, RatingLabel = "Your rating" };
+            edited.Add("rating");
+        }
+
+        if (edited.Count == 0)
+        {
+            return snapshot;
+        }
+
+        // Hand-made info counts as real metadata even without a source match.
+        var status = snapshot.Status == "unmatched" ? "ready" : snapshot.Status;
+        return snapshot with
+        {
+            Status = status,
+            GameInfo = info,
+            EditedFields = edited,
+        };
     }
 
     public void Dispose()
@@ -421,8 +833,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         try
         {
             var now = DateTimeOffset.UtcNow;
-            var currentAchievementFingerprint =
-                _achievementProvider.GetConfigurationFingerprint(gameDetail);
+            var currentAchievementFingerprint = GetAchievementFingerprint(gameDetail);
             if (!forceRefresh &&
                 previous?.RetryAfterUtc is { } retryAfter &&
                 now < retryAfter &&
@@ -462,6 +873,10 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 sourceMatchedAtUtc = now;
             }
 
+            // A new (or lost) Steam match makes the cached game info stale at once.
+            var sourceChanged = previous is not null &&
+                                previous.SourceSteamAppId != sourceSteamAppId;
+            var translatedLanguage = previous?.TranslatedLanguage ?? string.Empty;
             var gameInfo = previous?.GameInfo ?? EmptyGameInfo(title, sourceSteamAppId);
             var activity = previous?.Activity ?? [];
             var community = previous?.Community ?? [];
@@ -478,8 +893,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             var achievementRetryAfterUtc = previous?.AchievementRetryAfterUtc;
             var achievementProviderState =
                 previous?.AchievementProviderState ?? string.Empty;
-            var achievementConfigurationFingerprint =
-                _achievementProvider.GetConfigurationFingerprint(gameDetail);
+            var achievementConfigurationFingerprint = GetAchievementFingerprint(gameDetail);
             var achievementConfigurationChanged =
                 !string.Equals(
                     previous?.AchievementConfigurationFingerprint,
@@ -499,6 +913,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     Title = title,
                     SourceSteamAppId = sourceSteamAppId,
                     MetadataSource = metadataSource,
+                    TranslatedLanguage = translatedLanguage,
                     MatchMode = manualSteamAppId.HasValue ? "manual" : "automatic",
                     SourceMatchedAtUtc = sourceMatchedAtUtc,
                     InfoRefreshedAtUtc = infoRefreshedAtUtc,
@@ -552,7 +967,43 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 PersistProgress();
             }
 
-            if (!manualSteamAppId.HasValue &&
+            var ignOverride = GetIgnOverride(identity);
+            if (ignOverride is not null)
+            {
+                // An IGN page picked by hand wins over Steam, Xbox and search.
+                if (forceRefresh ||
+                    !metadataSource.Equals(IgnSourceLabel, StringComparison.Ordinal) ||
+                    !infoRefreshedAtUtc.HasValue ||
+                    now - infoRefreshedAtUtc.Value >= GameInfoLifetime ||
+                    IsTranslationOutdated(translatedLanguage))
+                {
+                    try
+                    {
+                        var ign = await _ign.FetchAsync(ignOverride, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (ign is null)
+                        {
+                            failures.Add("IGN Game Info: The chosen IGN page was not found.");
+                        }
+                        else
+                        {
+                            (gameInfo, translatedLanguage) = await BuildIgnGameInfoAsync(
+                                ign,
+                                cancellationToken).ConfigureAwait(false);
+                            metadataSource = IgnSourceLabel;
+                            community = [];
+                            infoRefreshedAtUtc = now;
+                            refreshedAnySection = true;
+                            PersistProgress();
+                        }
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException)
+                    {
+                        failures.Add($"IGN Game Info: {FriendlyError(error)}");
+                    }
+                }
+            }
+            else if (!manualSteamAppId.HasValue &&
                 gameDetail.StoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
                 (forceRefresh ||
                  !metadataSource.Equals("Xbox", StringComparison.OrdinalIgnoreCase) ||
@@ -579,6 +1030,8 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             }
             else if (sourceSteamAppId.HasValue &&
                      (forceRefresh ||
+                      sourceChanged ||
+                      metadataSource.Equals(IgnSourceLabel, StringComparison.Ordinal) ||
                       !infoRefreshedAtUtc.HasValue ||
                       now - infoRefreshedAtUtc.Value >= GameInfoLifetime))
             {
@@ -600,6 +1053,39 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
                     failures.Add($"Game Info: {FriendlyError(error)}");
+                }
+            }
+            else if (!sourceSteamAppId.HasValue &&
+                     !gameDetail.StoreId.Equals("xbox-game-pass", StringComparison.OrdinalIgnoreCase) &&
+                     (forceRefresh ||
+                      sourceChanged ||
+                      !infoRefreshedAtUtc.HasValue ||
+                      now - infoRefreshedAtUtc.Value >= GameInfoLifetime ||
+                      (metadataSource.Equals(IgnSourceLabel, StringComparison.Ordinal) &&
+                       IsTranslationOutdated(translatedLanguage))))
+            {
+                // No Steam store page: IGN's public game page is the fallback.
+                try
+                {
+                    var ign = await _ign.FindAsync(
+                        IgnTitleVariants(title),
+                        cancellationToken).ConfigureAwait(false);
+                    // Without a matching page the last good info stays.
+                    if (ign is not null)
+                    {
+                        (gameInfo, translatedLanguage) = await BuildIgnGameInfoAsync(
+                            ign,
+                            cancellationToken).ConfigureAwait(false);
+                        metadataSource = IgnSourceLabel;
+                        community = [];
+                    }
+                    infoRefreshedAtUtc = now;
+                    refreshedAnySection = true;
+                    PersistProgress();
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    failures.Add($"IGN Game Info: {FriendlyError(error)}");
                 }
             }
 
@@ -624,8 +1110,8 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 }
             }
 
-            var hasUserScopedProvider =
-                _achievementProvider.CanRefreshUserScoped(gameDetail);
+            var isShortcut = IsShortcutStore(gameDetail.StoreId);
+            var hasUserScopedProvider = CanRefreshUserScopedAchievements(gameDetail);
             var definitionsDue =
                 forceRefresh ||
                 achievementConfigurationChanged ||
@@ -643,7 +1129,17 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 !achievementConfigurationChanged &&
                 achievementRetryAfterUtc.HasValue &&
                 now < achievementRetryAfterUtc.Value;
-            if (hasUserScopedProvider &&
+            if (isShortcut)
+            {
+                if (definitionsDue)
+                {
+                    achievements = StoreAchievementPlaceholder(gameDetail.StoreId);
+                    achievementDefinitionsRefreshedAtUtc = now;
+                    achievementLastError = string.Empty;
+                    achievementRetryAfterUtc = null;
+                }
+            }
+            else if (hasUserScopedProvider &&
                 (definitionsDue || progressDue) &&
                 !achievementBackoffActive)
             {
@@ -668,8 +1164,7 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                     }
                     achievementLastError = string.Empty;
                     achievementRetryAfterUtc = achievementResult.RetryAfterUtc;
-                    achievementConfigurationFingerprint =
-                        _achievementProvider.GetConfigurationFingerprint(gameDetail);
+                    achievementConfigurationFingerprint = GetAchievementFingerprint(gameDetail);
                     refreshedAnySection = true;
                     PersistProgress();
                 }
@@ -734,6 +1229,71 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         {
             _networkGate.Release();
         }
+    }
+
+    // IGN text needs a translation when the UI is not English and the cached
+    // text is not in the UI language yet (e.g. the last attempt failed).
+    private static bool IsTranslationOutdated(string translatedLanguage)
+    {
+        var target = MetadataTranslator.CurrentTargetLanguage();
+        return !target.Equals("en", StringComparison.OrdinalIgnoreCase) &&
+               !target.Equals(translatedLanguage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> IgnTitleVariants(string title) =>
+        new[]
+            {
+                title,
+                WindowsSuffixPattern.Replace(title, string.Empty).Trim(),
+                EditionSuffixPattern.Replace(title, string.Empty).Trim(),
+            }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// IGN writes English. The descriptions are translated into the Windows UI
+    /// language (Google, MyMemory as fallback); on failure the English text
+    /// stays and the translation is retried with the next refresh.
+    /// </summary>
+    private async Task<(OmniLibraryGameInfoMetadata GameInfo, string TranslatedLanguage)>
+        BuildIgnGameInfoAsync(IgnGameInfo ign, CancellationToken cancellationToken)
+    {
+        var description = ign.Description;
+        var shortDescription = ign.ShortDescription;
+        var translatedLanguage = string.Empty;
+        var target = MetadataTranslator.CurrentTargetLanguage();
+        if (!target.Equals("en", StringComparison.OrdinalIgnoreCase))
+        {
+            var translated = await _translator.TranslateAsync(description, target, cancellationToken)
+                .ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(translated))
+            {
+                description = translated;
+                translatedLanguage = target;
+                if (!string.IsNullOrWhiteSpace(shortDescription))
+                {
+                    shortDescription = shortDescription.Equals(ign.Description, StringComparison.Ordinal)
+                        ? translated
+                        : await _translator.TranslateAsync(shortDescription, target, cancellationToken)
+                              .ConfigureAwait(false) ?? shortDescription;
+                }
+            }
+        }
+
+        var info = new OmniLibraryGameInfoMetadata(
+            shortDescription,
+            description,
+            ign.Developers,
+            ign.Publishers,
+            ign.Genres,
+            [],
+            ign.ReleaseDate,
+            ign.Rating,
+            ign.Rating.HasValue ? "IGN" : string.Empty,
+            ign.ImageUrl,
+            ign.PageUrl,
+            []);
+        return (info, translatedLanguage);
     }
 
     private async Task<int?> ResolveSteamAppIdAsync(
@@ -1065,13 +1625,56 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         return (gameInfo, community);
     }
 
+    /// <summary>
+    /// Steam's news API mixes in external feeds in other scripts (for example
+    /// Russian gaming sites). Drop titles written mostly in Cyrillic or CJK
+    /// script unless the Windows UI uses such a language (CJK = Chinese,
+    /// Japanese, Korean).
+    /// </summary>
+    internal static bool IsReadableNewsTitle(string title, string uiLanguage)
+    {
+        int letters = 0, cyrillic = 0, cjk = 0;
+        foreach (var character in title)
+        {
+            if (!char.IsLetter(character))
+            {
+                continue;
+            }
+            letters++;
+            if (character is >= 'Ѐ' and <= 'ӿ')
+            {
+                cyrillic++;
+            }
+            else if (character is >= '぀' and <= 'ヿ' or >= '㐀' and <= '鿿' or >= '가' and <= '힯')
+            {
+                cjk++;
+            }
+        }
+
+        if (letters == 0)
+        {
+            return true;
+        }
+
+        // Game names stay Latin inside foreign titles, so a quarter of the
+        // letters in another script already marks a foreign-language article.
+        var language = uiLanguage.ToLowerInvariant();
+        if (cyrillic >= 3 && cyrillic * 4 > letters &&
+            language is not ("ru" or "uk" or "bg" or "be" or "sr" or "kk" or "mk"))
+        {
+            return false;
+        }
+
+        return !(cjk >= 2 && cjk * 4 > letters && language is not ("zh" or "ja" or "ko"));
+    }
+
     private async Task<List<OmniLibraryActivityMetadata>> FetchActivityAsync(
         int steamAppId,
         string fallbackImageUrl,
         CancellationToken cancellationToken)
     {
         var url =
-            $"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={steamAppId}&count=8&maxlength=700&format=json";
+            $"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={steamAppId}&count=20&maxlength=700&format=json";
         using var response = await _httpClient.GetAsync(url, cancellationToken)
             .ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
@@ -1121,8 +1724,10 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
                 publishedAt));
         }
 
+        var uiLanguage = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName;
         return items
             .Where(item => !string.IsNullOrWhiteSpace(item.Title))
+            .Where(item => IsReadableNewsTitle(item.Title, uiLanguage))
             .GroupBy(
                 item => $"{NormalizeTitle(item.Title)}|{item.PublishedAtUtc?.ToUnixTimeSeconds() ?? 0}",
                 StringComparer.Ordinal)
@@ -1479,6 +2084,16 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
             new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
         _cache.SteamAppIdOverrides ??=
             new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        _cache.IgnSlugOverrides = _cache.IgnSlugOverrides is null
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(
+                _cache.IgnSlugOverrides,
+                StringComparer.OrdinalIgnoreCase);
+        _cache.UserEdits = _cache.UserEdits is null
+            ? new Dictionary<string, GameMetadataEdits>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, GameMetadataEdits>(
+                _cache.UserEdits,
+                StringComparer.OrdinalIgnoreCase);
         if (_cache.Entries.Comparer != StringComparer.OrdinalIgnoreCase)
         {
             _cache.Entries = new Dictionary<string, CacheEntry>(
@@ -1673,6 +2288,17 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
     private static OmniLibraryAchievementMetadata StoreAchievementPlaceholder(string storeId)
     {
+        if (IsShortcutStore(storeId))
+        {
+            return new OmniLibraryAchievementMetadata(
+                string.Empty,
+                "none",
+                string.Empty,
+                0,
+                0,
+                []);
+        }
+
         var storeName = storeId switch
         {
             "xbox-game-pass" => "Xbox",
@@ -1912,6 +2538,15 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
 
         public Dictionary<string, int> SteamAppIdOverrides { get; set; } =
             new(StringComparer.OrdinalIgnoreCase);
+
+        // Hand-made game info. Kept apart from Entries so a refresh, a new
+        // Steam match or cache pruning never loses what the user typed.
+        public Dictionary<string, GameMetadataEdits> UserEdits { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        // IGN page (slug) the user picked by hand; wins over every other source.
+        public Dictionary<string, string> IgnSlugOverrides { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
     }
 
     private sealed record CacheEntry
@@ -1931,6 +2566,9 @@ public sealed partial class OmniLibraryGamePageMetadataService : IDisposable
         public string MetadataSource { get; init; } = string.Empty;
 
         public string MatchMode { get; init; } = "automatic";
+
+        /// <summary>Language the IGN description was translated into ("" = original).</summary>
+        public string TranslatedLanguage { get; init; } = string.Empty;
 
         public DateTimeOffset? SourceMatchedAtUtc { get; init; }
 

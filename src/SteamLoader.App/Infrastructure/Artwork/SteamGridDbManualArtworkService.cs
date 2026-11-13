@@ -305,6 +305,237 @@ public sealed class SteamGridDbManualArtworkService
             writtenPath);
     }
 
+    // -------------------------------------------------------------------
+    // Artwork page (/tfs/artworks): exact game match, filtered results, restore
+    // -------------------------------------------------------------------
+
+    internal static readonly IReadOnlyDictionary<string, (string Endpoint, string[] Styles, string[] Dimensions, string Mimes)> PickerSlots =
+        new Dictionary<string, (string, string[], string[], string)>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["grid_p"] = ("grids", ["alternate", "blurred", "white_logo", "material", "no_logo"], ["600x900", "342x482", "660x930", "512x512", "1024x1024"], "image/png,image/jpeg,image/webp"),
+            ["grid_l"] = ("grids", ["alternate", "blurred", "white_logo", "material", "no_logo"], ["920x430", "460x215"], "image/png,image/jpeg,image/webp"),
+            ["hero"] = ("heroes", ["alternate", "blurred", "material"], ["1920x620", "3840x1240", "1600x650"], "image/png,image/jpeg,image/webp"),
+            ["logo"] = ("logos", ["official", "white", "black", "custom"], [], "image/png,image/webp"),
+            ["icon"] = ("icons", ["official", "custom"], [], "image/png,image/vnd.microsoft.icon"),
+        };
+
+    public static bool TryGetSteamAssetType(string? assetType, out int steamAssetType)
+    {
+        steamAssetType = 0;
+        if (assetType is null || !ArtworkSlots.TryGetValue(assetType, out var slot))
+        {
+            return false;
+        }
+
+        steamAssetType = slot.SteamAssetType;
+        return true;
+    }
+
+    public bool IsApiKeyConfigured()
+    {
+        lock (_gate)
+        {
+            return !string.IsNullOrWhiteSpace(_settingsStore.Load().SteamGridDbApiKey);
+        }
+    }
+
+    /// <summary>The SteamGridDB game that belongs to a Steam app id (exact, no title guessing).</summary>
+    public async Task<ArtworkGameSearchResult?> FindGameBySteamAppIdAsync(uint steamAppId, CancellationToken cancellationToken)
+    {
+        if (steamAppId == 0)
+        {
+            return null;
+        }
+
+        ArtworkConfiguration configuration;
+        lock (_gate)
+        {
+            configuration = _settingsStore.Load();
+        }
+
+        try
+        {
+            using var httpClient = CreateApiClient(configuration);
+            using var response = await httpClient.GetAsync($"games/steam/{steamAppId}", cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var payload = await JsonSerializer.DeserializeAsync<SteamGridDbItemResponse<SteamGridDbGameMatch>>(stream, JsonOptions, cancellationToken);
+            return payload?.Data is { Id: > 0 } game && !string.IsNullOrWhiteSpace(game.Name)
+                ? new ArtworkGameSearchResult(game.Id, game.Name, game.Verified)
+                : null;
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or JsonException && !cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    internal static string BuildPickerAssetPath(int gameId, string assetType, ArtworkAssetFilter? filter, int page)
+    {
+        var slot = PickerSlots[assetType];
+        var styles = (filter?.Styles ?? [])
+            .Select(style => style.Trim().ToLowerInvariant())
+            .Where(style => slot.Styles.Contains(style, StringComparer.Ordinal))
+            .Distinct()
+            .ToArray();
+        var dimensions = (filter?.Dimensions ?? [])
+            .Select(dimension => dimension.Trim().ToLowerInvariant())
+            .Where(dimension => slot.Dimensions.Contains(dimension, StringComparer.Ordinal))
+            .Distinct()
+            .ToArray();
+        if (dimensions.Length == 0 && slot.Dimensions.Length > 0)
+        {
+            // Square covers stay opt-in; the default matches Steam's slot.
+            dimensions = assetType == "grid_p" ? ["600x900", "342x482", "660x930"] : slot.Dimensions;
+        }
+
+        var types = (filter?.Animation ?? "all").Trim().ToLowerInvariant() switch
+        {
+            "static" => "static",
+            "animated" => "animated",
+            _ => "static,animated",
+        };
+        var query = new List<string>
+        {
+            $"types={types}",
+            $"mimes={slot.Mimes}",
+            "epilepsy=false",
+            $"nsfw={(filter?.AllowNsfw == true ? "any" : "false")}",
+            $"humor={(filter?.AllowHumor == true ? "any" : "false")}",
+            $"page={Math.Max(0, page)}",
+        };
+        if (styles.Length > 0)
+        {
+            query.Insert(0, $"styles={string.Join(',', styles)}");
+        }
+
+        if (dimensions.Length > 0)
+        {
+            query.Insert(0, $"dimensions={string.Join(',', dimensions)}");
+        }
+
+        return $"{slot.Endpoint}/game/{gameId}?{string.Join('&', query)}";
+    }
+
+    public async Task<IReadOnlyList<ArtworkPickerAsset>> SearchPickerAssetsAsync(
+        int gameId,
+        string assetType,
+        ArtworkAssetFilter? filter,
+        int page,
+        CancellationToken cancellationToken)
+    {
+        if (gameId <= 0 || !PickerSlots.ContainsKey(assetType))
+        {
+            return [];
+        }
+
+        ArtworkConfiguration configuration;
+        lock (_gate)
+        {
+            configuration = _settingsStore.Load();
+        }
+
+        using var httpClient = CreateApiClient(configuration);
+        using var response = await httpClient.GetAsync(BuildPickerAssetPath(gameId, assetType, filter, page), cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            return [];
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var payload = await JsonSerializer.DeserializeAsync<SteamGridDbListResponse<SteamGridDbPickerAsset>>(stream, JsonOptions, cancellationToken);
+        return payload?.Data?
+            .Where(asset => !string.IsNullOrWhiteSpace(asset.Url))
+            .Select(asset => new ArtworkPickerAsset(
+                asset.Id?.ToString() ?? asset.Url,
+                "steamgriddb",
+                asset.Url,
+                string.IsNullOrWhiteSpace(asset.Thumb) ? asset.Url : asset.Thumb,
+                asset.Width,
+                asset.Height,
+                asset.Mime ?? string.Empty,
+                asset.Style ?? string.Empty,
+                IsAnimatedPreview(asset.Thumb),
+                asset.Author?.Name,
+                asset.Score ?? 0,
+                asset.Nsfw ?? false,
+                asset.Humor ?? false,
+                null))
+            .Take(configuration.ResultLimit)
+            .ToArray() ?? [];
+    }
+
+    /// <summary>Downloads an artwork source image (SteamGridDB, Steam CDN) for composing.</summary>
+    public async Task<byte[]?> DownloadImageAsync(string url, CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
+        {
+            return null;
+        }
+
+        using var httpClient = CreateAssetDownloadClient();
+        var downloaded = await DownloadAssetAsync(httpClient, uri, cancellationToken);
+        return downloaded?.Bytes is { Length: > 0 } bytes ? bytes : null;
+    }
+
+    /// <summary>Writes artwork TFS generated itself (Perfect Hero / Banner) like an applied asset.</summary>
+    public ArtworkApplyResult WriteGeneratedArtwork(long appId, string assetType, byte[] pngBytes, string message)
+    {
+        if (appId <= 0 || !ArtworkSlots.TryGetValue(assetType, out var slot) || pngBytes.Length == 0)
+        {
+            return CreateFailedResult(appId, assetType, "The generated artwork could not be saved.");
+        }
+
+        var writtenPath = TryWriteSteamGridFile(appId, slot, ".png", pngBytes);
+        return new ArtworkApplyResult(true, message, appId, slot.Id, slot.SteamAssetType, "png", "image/png", Convert.ToBase64String(pngBytes), writtenPath);
+    }
+
+    /// <summary>Removes artwork Tools for Steam wrote to Steam's grid folder for one slot.</summary>
+    public bool RemoveGridArtwork(long appId, string assetType)
+    {
+        if (appId <= 0 || !ArtworkSlots.TryGetValue(assetType, out var slot))
+        {
+            return false;
+        }
+
+        var gridDirectory = ResolveGridDirectory();
+        if (string.IsNullOrWhiteSpace(gridDirectory) || !Directory.Exists(gridDirectory))
+        {
+            return false;
+        }
+
+        try
+        {
+            RemoveSlotVariants(gridDirectory, slot.FileStemBuilder(appId));
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private sealed record SteamGridDbItemResponse<T>(bool Success, T? Data);
+
+    private sealed record SteamGridDbAuthor(string? Name);
+
+    private sealed record SteamGridDbPickerAsset(
+        int? Id,
+        string Url,
+        string? Thumb,
+        int? Width,
+        int? Height,
+        string? Mime,
+        string? Style,
+        int? Score,
+        bool? Nsfw,
+        bool? Humor,
+        SteamGridDbAuthor? Author);
+
     private HttpClient CreateApiClient(ArtworkConfiguration configuration)
     {
         var httpClient = new HttpClient

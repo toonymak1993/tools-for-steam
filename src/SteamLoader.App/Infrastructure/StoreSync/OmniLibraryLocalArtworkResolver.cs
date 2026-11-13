@@ -63,6 +63,111 @@ internal sealed class OmniLibraryLocalArtworkResolver
         return resolved;
     }
 
+    /// <summary>
+    /// Provider-owned files on this PC (ORBIT's local provider metadata):
+    /// explicit catalog file references, ROM sidecars and bounded install
+    /// artwork. These precede every network source.
+    /// </summary>
+    public IReadOnlyDictionary<OmniLibraryArtworkSlotKind, string> ResolveProviderLocal(
+        StoreSyncArtworkTarget target)
+    {
+        var resolved = new Dictionary<OmniLibraryArtworkSlotKind, string>();
+        RunBestEffort(() => AddExplicitLocalReference(
+            resolved,
+            OmniLibraryArtworkSlotKind.Portrait,
+            target.FallbackPortraitUrl));
+        RunBestEffort(() => AddExplicitLocalReference(
+            resolved,
+            OmniLibraryArtworkSlotKind.Hero,
+            target.FallbackHeroUrl));
+        RunBestEffort(() => AddExplicitLocalReference(
+            resolved,
+            OmniLibraryArtworkSlotKind.LibraryCapsule,
+            target.FallbackHeroUrl));
+        RunBestEffort(() => AddRomSidecarArtwork(resolved, target.RomPath));
+        RunBestEffort(() => AddInstallArtwork(
+            resolved,
+            target.LocalInstallPath,
+            target.LocalExecutablePath));
+        return resolved;
+    }
+
+    /// <summary>
+    /// Official Steam library files of an installed Steam copy with the same
+    /// canonical title (ORBIT's library match). Steam keeps them flat, below
+    /// the app folder, or below content-hashed subfolders; all are checked in
+    /// ORBIT's order, best first. Ambiguous titles never borrow artwork.
+    /// </summary>
+    public IReadOnlyDictionary<OmniLibraryArtworkSlotKind, IReadOnlyList<string>> ResolveSteamLibraryMatch(
+        StoreSyncArtworkTarget target)
+    {
+        var resolved = new Dictionary<OmniLibraryArtworkSlotKind, IReadOnlyList<string>>();
+        RunBestEffort(() =>
+        {
+            if (string.IsNullOrWhiteSpace(_steamRoot) || ResolveLocalSteamAppId(target) is not { } appId)
+            {
+                return;
+            }
+
+            foreach (var (slot, names) in SteamLibraryCacheNames)
+            {
+                var paths = SteamLibraryCachePaths(appId, names)
+                    .Where(path => TryResolveLocalReference(path, out _))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (paths.Length > 0)
+                {
+                    resolved[slot] = paths;
+                }
+            }
+        });
+        return resolved;
+    }
+
+    private static readonly (OmniLibraryArtworkSlotKind Slot, string[] Names)[] SteamLibraryCacheNames =
+    [
+        (OmniLibraryArtworkSlotKind.LibraryCapsule, ["header.jpg", "library_header.jpg"]),
+        (OmniLibraryArtworkSlotKind.Portrait, ["library_600x900_2x.jpg", "library_600x900.jpg", "library_capsule.jpg"]),
+        // The library hero is the purpose-built background; store-page
+        // backgrounds are only a later tier.
+        (OmniLibraryArtworkSlotKind.Hero, ["library_hero.jpg", "page_bg_generated_v6b.jpg"]),
+        (OmniLibraryArtworkSlotKind.Logo, ["logo.png", "library_logo.png", "logo_2x.png"]),
+        (OmniLibraryArtworkSlotKind.Icon, ["icon.jpg", "icon.png"]),
+    ];
+
+    private IEnumerable<string> SteamLibraryCachePaths(int appId, IReadOnlyList<string> names)
+    {
+        var cacheRoot = Path.Combine(_steamRoot, "appcache", "librarycache");
+        var appRoot = Path.Combine(cacheRoot, appId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        string[] hashedRoots = [];
+        if (Directory.Exists(appRoot))
+        {
+            try
+            {
+                hashedRoots = Directory.GetDirectories(appRoot);
+            }
+            catch
+            {
+            }
+        }
+
+        foreach (var name in names)
+        {
+            yield return Path.Combine(appRoot, name);
+        }
+        foreach (var root in hashedRoots)
+        {
+            foreach (var name in names)
+            {
+                yield return Path.Combine(root, name);
+            }
+        }
+        foreach (var name in names)
+        {
+            yield return Path.Combine(cacheRoot, $"{appId}_{name}");
+        }
+    }
+
     internal static bool TryResolveLocalReference(string? value, out string path)
     {
         path = string.Empty;
@@ -119,46 +224,21 @@ internal sealed class OmniLibraryLocalArtworkResolver
             return;
         }
 
-        var cacheRoot = Path.Combine(
-            _steamRoot,
-            "appcache",
-            "librarycache",
-            appId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        if (!Directory.Exists(cacheRoot))
+        foreach (var (slot, names) in SteamLibraryCacheNames)
         {
-            return;
+            if (resolved.ContainsKey(slot))
+            {
+                continue;
+            }
+            foreach (var path in SteamLibraryCachePaths(appId.Value, names))
+            {
+                if (TryResolveLocalReference(path, out var resolvedPath))
+                {
+                    resolved[slot] = resolvedPath;
+                    break;
+                }
+            }
         }
-
-        AddFirstExisting(
-            resolved,
-            OmniLibraryArtworkSlotKind.LibraryCapsule,
-            cacheRoot,
-            "library_capsule.jpg",
-            "header.jpg",
-            "library_header.jpg");
-        AddFirstExisting(
-            resolved,
-            OmniLibraryArtworkSlotKind.Portrait,
-            cacheRoot,
-            "library_600x900_2x.jpg",
-            "library_600x900.jpg");
-        AddFirstExisting(
-            resolved,
-            OmniLibraryArtworkSlotKind.Hero,
-            cacheRoot,
-            "library_hero.jpg");
-        AddFirstExisting(
-            resolved,
-            OmniLibraryArtworkSlotKind.Logo,
-            cacheRoot,
-            "logo_2x.png",
-            "logo.png");
-        AddFirstExisting(
-            resolved,
-            OmniLibraryArtworkSlotKind.Icon,
-            cacheRoot,
-            "icon.png",
-            "icon.jpg");
     }
 
     private int? ResolveLocalSteamAppId(StoreSyncArtworkTarget target)
@@ -513,28 +593,6 @@ internal sealed class OmniLibraryLocalArtworkResolver
         }
     }
 
-    private static void AddFirstExisting(
-        IDictionary<OmniLibraryArtworkSlotKind, string> resolved,
-        OmniLibraryArtworkSlotKind slot,
-        string directory,
-        params string[] fileNames)
-    {
-        if (resolved.ContainsKey(slot))
-        {
-            return;
-        }
-
-        foreach (var fileName in fileNames)
-        {
-            var path = Path.Combine(directory, fileName);
-            if (TryResolveLocalReference(path, out var resolvedPath))
-            {
-                resolved[slot] = resolvedPath;
-                return;
-            }
-        }
-    }
-
     private static void AddFirstExistingStem(
         IDictionary<OmniLibraryArtworkSlotKind, string> resolved,
         OmniLibraryArtworkSlotKind slot,
@@ -640,14 +698,8 @@ internal sealed class OmniLibraryLocalArtworkResolver
         }
     }
 
-    private static string NormalizeTitle(string? value)
-    {
-        var normalized = System.Text.RegularExpressions.Regex.Replace(
-            value?.Normalize(System.Text.NormalizationForm.FormKC).ToLowerInvariant() ?? string.Empty,
-            @"[^\p{L}\p{Nd}]+",
-            " ");
-        return System.Text.RegularExpressions.Regex.Replace(normalized, @"\s+", " ").Trim();
-    }
+    private static string NormalizeTitle(string? value) =>
+        OmniLibraryArtworkRules.CanonicalArtworkTitle(value);
 
     private static bool IsSupportedImage(string path) =>
         ImageExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);

@@ -5,7 +5,8 @@
 // controller hints and layouts remain untouched.
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const stateVersion = 28;
+  const stateVersion = 31;
+  const domQueryCacheMs = 100;
   const legacyPanelId = "steamtools-omnilibrary-metadata-panel";
   const legacyStyleId = "steamtools-omnilibrary-metadata-style";
   const achievementNoticeId =
@@ -132,6 +133,8 @@
   const state = {
     version: stateVersion,
     summary: null,
+    // TFS Metadata: game pages for every other non-Steam shortcut.
+    metadataEnabled: false,
     currentAppId: 0,
     lastOpenedAppId: 0,
     requestInFlight: false,
@@ -140,6 +143,7 @@
     timer: 0,
     mutationTimer: 0,
     metadataUiTimer: 0,
+    signInWatchTimer: 0,
     patchRetryTimer: 0,
     postPlayPollTimer: 0,
     postPlayInitialTimer: 0,
@@ -172,6 +176,8 @@
     patchedSectionsPrototype: null,
     renderedOverviewTargets: new WeakSet(),
     renderedSectionTargets: new WeakSet(),
+    domQueryGeneration: 0,
+    domQueryCache: new Map(),
     disposed: false,
     ensureActive: null,
     dispose: null,
@@ -247,12 +253,20 @@
       .toUpperCase();
   }
 
-  function isPluginEnabled() {
+  function isOmniLibraryEnabled() {
     return state.summary?.pluginEnabled === true;
+  }
+
+  // The surface runs when OmniLibrary or TFS Metadata is on.
+  function isPluginEnabled() {
+    return isOmniLibraryEnabled() || state.metadataEnabled === true;
   }
 
   function managedAppIds() {
     const ids = new Set();
+    if (!isOmniLibraryEnabled()) {
+      return ids;
+    }
     for (const store of state.summary?.stores || []) {
       if (store?.enabled !== true || store?.readyForLibraryTab !== true) {
         continue;
@@ -267,11 +281,85 @@
     return ids;
   }
 
-  function isManagedAppId(value) {
+  function isOmniLibraryAppId(value) {
     const appId = Number(value);
     return Number.isInteger(appId) &&
       appId >= 0x80000000 &&
       managedAppIds().has(appId);
+  }
+
+  // Title Steam shows for a non-Steam shortcut; the backend matches it to a
+  // Steam store page. Steam marks every shortcut app ID with the top bit.
+  function shortcutTitle(value) {
+    const appId = Number(value);
+    if (!Number.isInteger(appId) || appId < 0x80000000) {
+      return "";
+    }
+    try {
+      const overview = window.appStore?.GetAppOverviewByAppID?.(appId);
+      return String(overview?.display_name || "").trim().slice(0, 200);
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function isShortcutMetadataAppId(value) {
+    return state.metadataEnabled === true &&
+      !isOmniLibraryAppId(value) &&
+      shortcutTitle(value) !== "";
+  }
+
+  function isManagedAppId(value) {
+    return isOmniLibraryAppId(value) || isShortcutMetadataAppId(value);
+  }
+
+  // OmniLibrary games keep their own route (and with it OmniLibrary's
+  // achievement control); every other shortcut uses TFS Metadata.
+  function metadataGameUrl(appId, open = false) {
+    if (isOmniLibraryAppId(appId)) {
+      return `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}${
+        open ? "?open=true" : ""
+      }`;
+    }
+    const query = new URLSearchParams({ title: shortcutTitle(appId) });
+    if (open) {
+      query.set("open", "true");
+    }
+    return `${apiBase}api/metadata/games/${encodeURIComponent(appId)}?${query}`;
+  }
+
+  // A shortcut without a matched source keeps Steam's own non-Steam page
+  // instead of an empty Game Info layout.
+  function hasShortcutMetadata(snapshot) {
+    const info = snapshot?.gameInfo;
+    return Boolean(
+      info &&
+        (String(info.description || "").trim() ||
+          String(info.shortDescription || "").trim() ||
+          (info.developers || []).length ||
+          (info.publishers || []).length ||
+          String(info.releaseDate || "").trim()),
+    );
+  }
+
+  // Stores a fetched snapshot. Returns false when it must not be applied.
+  function acceptSnapshot(appId, snapshot) {
+    if (
+      Number(snapshot?.steamAppId || 0) !== appId ||
+      !isManagedAppId(appId)
+    ) {
+      return false;
+    }
+    state.lastFetchAtByApp.set(appId, Date.now());
+    if (isShortcutMetadataAppId(appId) && !hasShortcutMetadata(snapshot)) {
+      if (state.nativeSnapshots.delete(appId)) {
+        restoreOriginalState();
+      }
+      return false;
+    }
+    state.nativeSnapshots.set(appId, snapshot);
+    persistNativeSnapshot(snapshot);
+    return true;
   }
 
   function notificationAppId(notification) {
@@ -346,26 +434,17 @@
       return;
     }
     try {
-      const response = await fetch(
-        `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}`,
-        {
-          method: "POST",
-          cache: "no-store",
-        },
-      );
+      const response = await fetch(metadataGameUrl(appId), {
+        method: "POST",
+        cache: "no-store",
+      });
       if (!response.ok) {
         return;
       }
       const snapshot = await response.json();
-      if (
-        Number(snapshot?.steamAppId || 0) !== appId ||
-        !isManagedAppId(appId)
-      ) {
+      if (!acceptSnapshot(appId, snapshot)) {
         return;
       }
-      state.nativeSnapshots.set(appId, snapshot);
-      persistNativeSnapshot(snapshot);
-      state.lastFetchAtByApp.set(appId, Date.now());
       applyNativeSnapshot(snapshot);
       broadcastNativeSnapshot(snapshot);
       if (state.currentAppId === appId) {
@@ -560,7 +639,37 @@
     return candidates.sort((left, right) => right.score - left.score)[0]?.appId || 0;
   }
 
+  function invalidateDomQueries() {
+    state.domQueryGeneration += 1;
+  }
+
+  // Steam calls the patched overview getter and the focus handlers many times
+  // per frame, and each DOM answer below scans the whole page. Reuse an answer
+  // until the page changes, the user interacts, or a short age limit passes.
+  function memoizedDomQuery(key, compute) {
+    const now = Date.now();
+    const cached = state.domQueryCache.get(key);
+    if (
+      cached &&
+      cached.generation === state.domQueryGeneration &&
+      now - cached.at < domQueryCacheMs
+    ) {
+      return cached.value;
+    }
+    const value = compute();
+    state.domQueryCache.set(key, {
+      generation: state.domQueryGeneration,
+      at: now,
+      value,
+    });
+    return value;
+  }
+
   function hasNativeDetailTabs() {
+    return memoizedDomQuery("native-detail-tabs", detectNativeDetailTabs);
+  }
+
+  function detectNativeDetailTabs() {
     const labels = new Set(detailTabLabels.map(normalizeText));
     let found = 0;
     for (const element of document.querySelectorAll(
@@ -607,6 +716,10 @@
   }
 
   function renderedGameDetails() {
+    return memoizedDomQuery("rendered-game-details", readRenderedGameDetails);
+  }
+
+  function readRenderedGameDetails() {
     const tab = visibleDetailTab();
     let fiber = reactFiberForElement(tab);
     let overview = null;
@@ -846,12 +959,83 @@
 
   async function openMetadataUrl(url) {
     try {
-      await fetch(`${apiBase}api/unifystore/metadata/open`, {
+      const route = isOmniLibraryEnabled()
+        ? "api/unifystore/metadata/open"
+        : "api/metadata/open";
+      await fetch(`${apiBase}${route}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ value: url }),
       });
     } catch (_) {}
+  }
+
+  // Stores whose achievements need the user's own account, signed in through
+  // OmniLibrary's isolated window. Like ORBIT, the game page offers the
+  // sign-in right where the missing achievements are explained.
+  const achievementSignInStores = {
+    "xbox-game-pass": "Sign in to Xbox",
+    "epic-games": "Sign in to Epic Games",
+    "gog-galaxy": "Sign in to GOG",
+  };
+  const signInWatchIntervalMs = 5000;
+  const signInWatchMaxTicks = 36;
+
+  function achievementNeedsSignIn(snapshot) {
+    const status = String(snapshot?.achievements?.status || "").toLowerCase();
+    return status === "not-configured" || status === "not-connected";
+  }
+
+  function achievementSignInLabel(snapshot) {
+    if (!isOmniLibraryEnabled() || !achievementNeedsSignIn(snapshot)) {
+      return "";
+    }
+    const storeId = String(snapshot?.storeId || "").toLowerCase();
+    return achievementSignInStores[storeId] || "";
+  }
+
+  function stopSignInWatch() {
+    if (state.signInWatchTimer) {
+      window.clearInterval(state.signInWatchTimer);
+      state.signInWatchTimer = 0;
+    }
+  }
+
+  async function startAchievementSignIn(storeId) {
+    if (!achievementSignInStores[storeId.toLowerCase()]) {
+      return;
+    }
+    try {
+      const response = await fetch(`${apiBase}api/unifystore/stores/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: storeId }),
+      });
+      if (!response.ok) {
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+    // The sign-in window runs in its own process. Re-check this page for a
+    // bounded time so the achievements appear once the account is saved.
+    stopSignInWatch();
+    const appId = currentManagedAppId();
+    let ticks = 0;
+    state.signInWatchTimer = window.setInterval(() => {
+      ticks += 1;
+      const snapshot = state.nativeSnapshots.get(appId);
+      if (
+        state.disposed ||
+        ticks > signInWatchMaxTicks ||
+        currentManagedAppId() !== appId ||
+        (snapshot && !achievementNeedsSignIn(snapshot))
+      ) {
+        stopSignInWatch();
+        return;
+      }
+      void refreshCurrentMetadata(false);
+    }, signInWatchIntervalMs);
   }
 
   function createAchievementNoticeAction(label, onSelected) {
@@ -1012,6 +1196,14 @@
         void refreshCurrentMetadata(true);
       }),
     );
+    const signInLabel = achievementSignInLabel(snapshot);
+    if (signInLabel) {
+      actions.prepend(
+        createAchievementNoticeAction(signInLabel, () => {
+          void startAchievementSignIn(String(snapshot?.storeId || ""));
+        }),
+      );
+    }
     if (String(snapshot?.achievements?.provider || "").toLowerCase() === "retroachievements") {
       actions.append(
         createAchievementNoticeAction("Open RetroAchievements", () => {
@@ -1041,9 +1233,11 @@
       (achievements.items || []).length === 0 &&
       ["loading", "updating"].includes(achievementStatus);
     const loading = firstLoad || providerLoad;
+    // "none": a shortcut outside OmniLibrary without an achievement source.
     const unavailable =
       achievements &&
       (achievements.items || []).length === 0 &&
+      achievementStatus !== "none" &&
       !loading;
     const shouldShow =
       isPluginEnabled() &&
@@ -1728,6 +1922,23 @@
         );
         const date = Number(partnerEvent.postTime || 0);
         const gid = String(partnerEvent.AnnouncementGID);
+        // Steam's posted-announcement events (Steam client 2026-11) render
+        // only when BCanRender() is true and then read this ready-made preview
+        // (same fields Steam builds itself after LoadDetails()).
+        const preview = {
+          gid: partnerEvent.GID,
+          gidAnnouncement: gid,
+          unTimeLastMod: date,
+          appid: appId,
+          clanAccountID: 0,
+          eType: partnerEvent.type,
+          strCategory: partnerEvent.GetCategoryAsString(),
+          strTitle: partnerEvent.GetNameWithFallback(),
+          strSummary: partnerEvent.GetSummaryWithFallback(),
+          strSubTitle: "",
+          rtPostTime: date,
+          rgCapsuleImages: [],
+        };
         return {
           __steamToolsOmniNativeActivityEvent: true,
           gameid: String(appId),
@@ -1751,7 +1962,10 @@
           upvotes: 0,
           downvotes: 0,
           comment_count: 0,
+          preview,
           BIsValid: () => true,
+          BCanRender: () => true,
+          LoadDetails: async () => false,
           IsEventLoaded: () => true,
           GetEvent: async () => partnerEvent,
           ReloadEvent: async () => partnerEvent,
@@ -2570,7 +2784,10 @@
           const sections = original();
           const overview = args[0] || thisValue?.props?.overview;
           const appId = Number(overview?.appid || 0);
-          if (!isManagedAppId(appId)) {
+          if (
+            !isManagedAppId(appId) ||
+            (isShortcutMetadataAppId(appId) && !state.nativeSnapshots.has(appId))
+          ) {
             return sections;
           }
           // Steam's `nonsteam` section is a hard-coded explanation and never
@@ -2786,8 +3003,21 @@
     }, 500);
   }
 
+  async function refreshMetadataState() {
+    try {
+      const response = await fetch(`${apiBase}api/metadata/state`, {
+        cache: "no-store",
+      });
+      const payload = response.ok ? await response.json() : null;
+      state.metadataEnabled = payload?.enabled === true;
+    } catch (_) {
+      // Keep the last known value while the local API restarts.
+    }
+  }
+
   async function refreshSummary(force = false) {
     const shared = window.__steamLoaderOmniLibraryStateStore;
+    await refreshMetadataState();
     try {
       if (shared?.refresh) {
         state.summary = await shared.refresh(force);
@@ -2801,7 +3031,7 @@
         state.summary = await response.json();
       }
     } catch (_) {
-      if (!state.summary) {
+      if (!state.summary && !state.metadataEnabled) {
         deactivate();
       }
     }
@@ -2872,27 +3102,22 @@
     scheduleMetadataUiRender(0);
     try {
       const response = await fetch(
-        `${apiBase}api/unifystore/metadata/games/${encodeURIComponent(appId)}${
-          !force && openingGame ? "?open=true" : ""
-        }`,
+        metadataGameUrl(appId, !force && openingGame),
         {
           method: force ? "POST" : "GET",
           cache: "no-store",
         },
       );
       if (!response.ok) {
-        throw new Error(`OmniLibrary metadata failed (${response.status}).`);
+        throw new Error(`Game metadata failed (${response.status}).`);
       }
       const snapshot = await response.json();
-      if (
-        Number(snapshot?.steamAppId || 0) !== appId ||
-        !isManagedAppId(appId)
-      ) {
+      if (!acceptSnapshot(appId, snapshot)) {
+        if (Number(snapshot?.steamAppId || 0) === appId && snapshot?.refreshing) {
+          scheduleNextRefresh(snapshot);
+        }
         return;
       }
-      state.nativeSnapshots.set(appId, snapshot);
-      persistNativeSnapshot(snapshot);
-      state.lastFetchAtByApp.set(appId, Date.now());
       applyNativeSnapshot(snapshot);
       broadcastNativeSnapshot(snapshot);
       scheduleNextRefresh(snapshot);
@@ -2928,6 +3153,7 @@
       return;
     }
     state.observer = new MutationObserver((mutations) => {
+      invalidateDomQueries();
       if (
         mutations.some((mutation) =>
           Array.from(mutation.addedNodes || []).some((node) =>
@@ -2953,11 +3179,15 @@
       return;
     }
     state.detailsUiHandler = () => {
+      invalidateDomQueries();
       scheduleMetadataUiRender();
       const reapply = () => {
         if (state.disposed || !isPluginEnabled()) {
           return;
         }
+        // Focus and selection changes do not mutate the tree, so the cached
+        // page answers must not outlive the interaction that changed them.
+        invalidateDomQueries();
         const appId = currentManagedAppId() || Number(state.currentAppId || 0);
         const snapshot = state.nativeSnapshots.get(appId);
         if (snapshot) {
@@ -3004,6 +3234,7 @@
     uninstallNativePatches();
     uninstallPostPlaySync();
     uninstallDetailsUiTracking();
+    stopSignInWatch();
     state.currentAppId = 0;
     state.lastOpenedAppId = 0;
     removeAchievementNotice();
@@ -3050,12 +3281,9 @@
           const snapshot = event?.data?.snapshot;
           const appId = Number(snapshot?.steamAppId || 0);
           const applyReceivedSnapshot = () => {
-            if (!isPluginEnabled() || !isManagedAppId(appId)) {
+            if (!isPluginEnabled() || !acceptSnapshot(appId, snapshot)) {
               return;
             }
-            state.nativeSnapshots.set(appId, snapshot);
-            persistNativeSnapshot(snapshot);
-            state.lastFetchAtByApp.set(appId, Date.now());
             installNativePatches() || schedulePatchRetry();
             applyNativeSnapshot(snapshot);
           };

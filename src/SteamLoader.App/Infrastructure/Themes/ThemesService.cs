@@ -1047,7 +1047,15 @@ public sealed class ThemesService
             installedVersionMatches,
             statusText,
             BuildStoreImageUrl(previewImageId),
-            BuildStoreImageThumbnailUrl(previewImageId));
+            BuildStoreImageThumbnailUrl(previewImageId))
+        {
+            GalleryImageUrls = (theme.Images ?? [])
+                .Select(image => BuildStoreImageUrl(image?.Id))
+                .Where(url => url.Length > 0)
+                .Distinct(StringComparer.Ordinal)
+                .Take(10)
+                .ToList()
+        };
     }
 
     private static ThemesProfilesState BuildProfilesState(IReadOnlyList<CssLoaderThemeState> backendThemes)

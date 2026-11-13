@@ -6,6 +6,12 @@ public sealed class StoreSyncAutomationService
     private static readonly TimeSpan LoopInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan WatcherRefreshInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan WatcherDebounceInterval = TimeSpan.FromMilliseconds(1400);
+    // A watcher-triggered OmniLibrary check refreshes the store's catalog over
+    // the network (Epic runs a full Legendary refresh). Launcher folders change
+    // often, so a store is checked this way at most once per interval. Install
+    // state itself is tracked separately by the install-state coordinator, and
+    // the scheduled five-minute check still runs.
+    internal static readonly TimeSpan OmniLibraryWatchCheckInterval = TimeSpan.FromMinutes(2);
 
     // EA and Ubisoft Connect are represented inside OmniLibrary as Epic
     // delivery providers rather than as their own top-level stores, so a
@@ -37,15 +43,32 @@ public sealed class StoreSyncAutomationService
     private string _pendingWatcherTriggerSource = string.Empty;
     private string _pendingWatcherPath = string.Empty;
     private readonly HashSet<string> _pendingOmniLibraryStoreIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _lastOmniLibraryWatchCheckAtUtc =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Hands a watcher-triggered store check to the OmniLibrary scheduler, which
+    // runs it off this loop, coalesces it with the regular check and holds it
+    // while a game is running.
+    private readonly Action<string, string>? _requestOmniLibraryCheck;
+
+    // Hands a launcher folder change to the install-state coordinator. That
+    // check is local and cheap, so unlike the catalog check above it is not
+    // rate limited: an install or uninstall in another launcher shows up
+    // within seconds.
+    private readonly Action<string>? _requestInstallStateCheck;
 
     public StoreSyncAutomationService(
         StoreSyncService storeSyncService,
         Func<bool>? isStoreSyncEnabled = null,
-        Func<bool>? isOmniLibraryEnabled = null)
+        Func<bool>? isOmniLibraryEnabled = null,
+        Action<string, string>? requestOmniLibraryCheck = null,
+        Action<string>? requestInstallStateCheck = null)
     {
         _storeSyncService = storeSyncService;
         _isStoreSyncEnabled = isStoreSyncEnabled ?? (() => true);
         _isOmniLibraryEnabled = isOmniLibraryEnabled ?? (() => true);
+        _requestOmniLibraryCheck = requestOmniLibraryCheck;
+        _requestInstallStateCheck = requestInstallStateCheck;
     }
 
     internal static bool ShouldRunWatchers(bool storeSyncEnabled, bool omniLibraryEnabled) =>
@@ -131,10 +154,32 @@ public sealed class StoreSyncAutomationService
             return;
         }
 
+        var now = DateTimeOffset.UtcNow;
         foreach (var storeId in storeIds)
         {
             try
             {
+                _requestInstallStateCheck?.Invoke(storeId);
+            }
+            catch
+            {
+            }
+
+            _lastOmniLibraryWatchCheckAtUtc.TryGetValue(storeId, out var lastCheckAtUtc);
+            if (!ShouldRunOmniLibraryWatchCheck(lastCheckAtUtc, now))
+            {
+                continue;
+            }
+
+            _lastOmniLibraryWatchCheckAtUtc[storeId] = now;
+            try
+            {
+                if (_requestOmniLibraryCheck is not null)
+                {
+                    _requestOmniLibraryCheck(storeId, "watch");
+                    continue;
+                }
+
                 _storeSyncService.CheckUnifySteamStoreForChanges(storeId);
             }
             catch
@@ -142,6 +187,12 @@ public sealed class StoreSyncAutomationService
             }
         }
     }
+
+    internal static bool ShouldRunOmniLibraryWatchCheck(
+        DateTimeOffset lastCheckAtUtc,
+        DateTimeOffset now) =>
+        lastCheckAtUtc == default ||
+        now - lastCheckAtUtc >= OmniLibraryWatchCheckInterval;
 
     private void TryRunAutomaticSync(string triggerSource)
     {
@@ -198,6 +249,7 @@ public sealed class StoreSyncAutomationService
             _lastWatcherEventAtUtc = null;
         }
 
+        _storeSyncService.InvalidateAutomaticSyncState();
         if (omniLibraryStoreIds.Length > 0 && _isOmniLibraryEnabled())
         {
             TryCheckOmniLibraryStores(omniLibraryStoreIds);
@@ -344,7 +396,14 @@ public sealed class StoreSyncAutomationService
     {
         lock (_gate)
         {
-            _storeSyncService.InvalidateAutomaticSyncState();
+            // A copy or download raises thousands of events. Invalidating the
+            // sync state takes the store-sync lock, so do it once per burst;
+            // the flush below invalidates again before it acts.
+            if (!_lastWatcherEventAtUtc.HasValue)
+            {
+                _storeSyncService.InvalidateAutomaticSyncState();
+            }
+
             _pendingWatcherTriggerSource = string.IsNullOrWhiteSpace(triggerSource) ? "watch" : triggerSource;
             if (!string.IsNullOrWhiteSpace(changedPath))
             {

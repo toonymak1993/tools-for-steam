@@ -95,6 +95,43 @@ public sealed class DisplaySwitchService
         return GetModeSnapshot();
     }
 
+    /// <summary>
+    /// Every refresh rate the active display offers at its current resolution
+    /// (rounded, ascending), e.g. 60/120/165 on a gaming monitor.
+    /// </summary>
+    public (int Current, IReadOnlyList<int> Rates) GetRefreshRatesForCurrentResolution()
+    {
+        var context = ReadDisplayContext();
+        var current = context.CurrentMode;
+        if (current is null)
+        {
+            return (0, []);
+        }
+
+        var rates = context.Modes
+            .Where(mode => mode.Width == current.Width && mode.Height == current.Height && mode.RefreshRate >= 24)
+            .Select(mode => mode.RefreshRate)
+            .Append(current.RefreshRate)
+            .Distinct()
+            .Order()
+            .ToArray();
+        return (current.RefreshRate, rates);
+    }
+
+    /// <summary>Any refresh rate the display offers at the current resolution.</summary>
+    public DisplayModeSnapshot SetRefreshRate(int refreshRate)
+    {
+        var context = ReadDisplayContext();
+        var current = context.CurrentMode
+            ?? throw new InvalidOperationException("The current display mode could not be detected.");
+        var candidate = context.Modes
+            .Where(mode => mode.Width == current.Width && mode.Height == current.Height && mode.RefreshRate == refreshRate)
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException($"{refreshRate}Hz is not available at the current resolution.");
+        ApplyMode(context.Device, candidate);
+        return GetModeSnapshot();
+    }
+
     public DisplayModeSnapshot SetModePreset(string presetId, int refreshRate)
     {
         var preset = ResolutionPresets.FirstOrDefault(entry =>

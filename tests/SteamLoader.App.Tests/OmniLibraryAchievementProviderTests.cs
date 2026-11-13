@@ -66,6 +66,112 @@ public sealed class OmniLibraryAchievementProviderTests
     }
 
     [Fact]
+    public async Task XboxLive_PagesAchievements_AndReusesSessionUntilExpiry()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var settings = new StoreSyncSettingsStore(
+                Path.Combine(root, "store-sync.json"));
+            settings.Update(configuration =>
+            {
+                var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
+                xbox.Enabled = true;
+                xbox.AchievementsEnabled = true;
+                var provider = configuration.UnifySteam.GameData.Providers["xbox-live"];
+                provider.Enabled = true;
+                provider.SecondaryCredential = "microsoft-refresh-token";
+            });
+            var handler = new AchievementHttpHandler
+            {
+                PagedXboxLiveAchievements = true,
+                XstsNotAfter = DateTimeOffset.UtcNow.AddHours(4).ToString("O"),
+            };
+            using var client = new HttpClient(handler);
+            var provider = new OmniLibraryAchievementProvider(
+                settings,
+                client,
+                Path.Combine(root, "epic-user.json"));
+            var game = CreateGame("xbox-game-pass", storeTitleId: "1777860928");
+
+            var first = await provider.RefreshAsync(
+                game,
+                EmptyAchievements("Xbox Network"),
+                string.Empty,
+                refreshDefinitions: true,
+                refreshProgress: true,
+                CancellationToken.None);
+            var second = await provider.RefreshAsync(
+                game,
+                first.Metadata!,
+                first.ProviderState,
+                refreshDefinitions: false,
+                refreshProgress: true,
+                CancellationToken.None);
+
+            Assert.Equal("ready", first.Metadata?.Status);
+            Assert.Equal(2, first.Metadata?.TotalCount);
+            Assert.Equal(1, first.Metadata?.UnlockedCount);
+            Assert.Equal("ready", second.Metadata?.Status);
+            Assert.Single(
+                handler.Requests,
+                request => request.RequestUri!.Host.Equals(
+                    "login.microsoftonline.com",
+                    StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(
+                4,
+                handler.Requests.Count(request => request.RequestUri!.Host.Equals(
+                    "achievements.xboxlive.com",
+                    StringComparison.OrdinalIgnoreCase)));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void XboxLive_Fingerprint_IgnoresRefreshTokenRotation()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var settings = new StoreSyncSettingsStore(
+                Path.Combine(root, "store-sync.json"));
+            void SetToken(string token) => settings.Update(configuration =>
+            {
+                var xbox = configuration.UnifySteam.Stores["xbox-game-pass"];
+                xbox.Enabled = true;
+                xbox.AchievementsEnabled = true;
+                var provider = configuration.UnifySteam.GameData.Providers["xbox-live"];
+                provider.Enabled = true;
+                provider.SecondaryCredential = token;
+                provider.AccountId = string.IsNullOrEmpty(token) ? string.Empty : "281463901";
+            });
+            using var client = new HttpClient(new AchievementHttpHandler());
+            var provider = new OmniLibraryAchievementProvider(
+                settings,
+                client,
+                Path.Combine(root, "epic-user.json"));
+            var game = CreateGame("xbox-game-pass", storeTitleId: "1777860928");
+
+            SetToken("refresh-token-a");
+            var before = provider.GetConfigurationFingerprint(game);
+            SetToken("refresh-token-b");
+            var rotated = provider.GetConfigurationFingerprint(game);
+            SetToken(string.Empty);
+            var signedOut = provider.GetConfigurationFingerprint(game);
+
+            Assert.Equal(before, rotated);
+            Assert.NotEqual(before, signedOut);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Xbox_UsesCatalogTitleId_WithoutRequiringAccountLookup()
     {
         var root = CreateTemporaryDirectory();
@@ -522,6 +628,10 @@ public sealed class OmniLibraryAchievementProviderTests
 
         public bool XboxAchievementsNotFound { get; set; }
 
+        public bool PagedXboxLiveAchievements { get; set; }
+
+        public string XstsNotAfter { get; set; } = "2026-10-04T18:00:00Z";
+
         public List<HttpRequestMessage> Requests { get; } = [];
 
         protected override async Task<HttpResponseMessage> SendAsync(
@@ -561,10 +671,10 @@ public sealed class OmniLibraryAchievementProviderTests
                     StringComparison.OrdinalIgnoreCase))
             {
                 return Json(
-                    """
+                    $$"""
                     {
                       "Token": "xsts-token",
-                      "NotAfter": "2026-10-04T18:00:00Z",
+                      "NotAfter": "{{XstsNotAfter}}",
                       "DisplayClaims": {
                         "xui": [
                           { "uhs": "user-hash", "xid": "281463901", "gtg": "TestPlayer" }
@@ -577,6 +687,33 @@ public sealed class OmniLibraryAchievementProviderTests
                     "achievements.xboxlive.com",
                     StringComparison.OrdinalIgnoreCase))
             {
+                if (PagedXboxLiveAchievements &&
+                    !request.RequestUri.Query.Contains(
+                        "continuationToken=page-2",
+                        StringComparison.Ordinal))
+                {
+                    return Json(
+                        """
+                        {
+                          "achievements": [
+                            { "id": "page-1-achievement", "name": "Page One", "progressState": "Achieved" }
+                          ],
+                          "pagingInfo": { "continuationToken": "page-2" }
+                        }
+                        """);
+                }
+                if (PagedXboxLiveAchievements)
+                {
+                    return Json(
+                        """
+                        {
+                          "achievements": [
+                            { "id": "page-2-achievement", "name": "Page Two", "progressState": "NotStarted" }
+                          ],
+                          "pagingInfo": { "continuationToken": null }
+                        }
+                        """);
+                }
                 return Json(
                     """
                     {

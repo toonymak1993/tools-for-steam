@@ -26,10 +26,7 @@ public sealed class PluginStoreServiceTests
 
             Assert.Equal("Plugin Activator", snapshot.CatalogTitle);
             Assert.NotEmpty(snapshot.BuiltInPlugins);
-            Assert.Empty(snapshot.CommunityPlugins);
-            Assert.Equal(0, snapshot.CommunityCount);
-            Assert.Equal(0, snapshot.UpdateCount);
-            Assert.False(snapshot.CommunityCatalogAvailable);
+            Assert.Equal(snapshot.BuiltInPlugins.Count, snapshot.BuiltInCount);
             Assert.All(snapshot.BuiltInPlugins, plugin => Assert.True(plugin.IsBuiltIn));
             Assert.DoesNotContain(snapshot.BuiltInPlugins, plugin => plugin.Id == "third-party");
         }
@@ -107,8 +104,7 @@ public sealed class PluginStoreServiceTests
         return new PluginStoreService(
             new HttpClient(),
             settings,
-            Path.Combine(root, "plugin-store"),
-            enableCommunityCatalogBootstrap: false);
+            Path.Combine(root, "plugin-store"));
     }
 
     private static string CreateTempRoot()

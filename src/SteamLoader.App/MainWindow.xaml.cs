@@ -13,7 +13,7 @@ public partial class MainWindow : Window
 {
     private readonly DispatcherTimer _refreshTimer;
     private bool _allowClose;
-    private bool _shellBootstrapMode;
+    private bool _startupSplashMode;
     private bool _runtimeInitialized;
 
     public bool StartHiddenInTray { get; set; }
@@ -22,13 +22,13 @@ public partial class MainWindow : Window
 
     public TimeSpan PreviewSplashDuration { get; set; } = TimeSpan.FromSeconds(5);
 
-    public bool ShellBootstrapMode
+    public bool StartupSplashMode
     {
-        get => _shellBootstrapMode;
+        get => _startupSplashMode;
         set
         {
-            _shellBootstrapMode = value;
-            if (_shellBootstrapMode)
+            _startupSplashMode = value;
+            if (_startupSplashMode)
             {
                 ApplyStartupSplashChrome();
             }
@@ -62,7 +62,7 @@ public partial class MainWindow : Window
 
             await InitializeRuntimeAsync();
 
-            if (StartHiddenInTray && !ShellBootstrapMode)
+            if (StartHiddenInTray && !StartupSplashMode)
             {
                 _ = Dispatcher.BeginInvoke(HideToTray, DispatcherPriority.ApplicationIdle);
             }
@@ -247,7 +247,7 @@ public partial class MainWindow : Window
 
     private void RestoreManagerChromeIfNeeded()
     {
-        if (!ShellBootstrapMode)
+        if (!StartupSplashMode)
         {
             return;
         }
@@ -262,6 +262,6 @@ public partial class MainWindow : Window
         MinHeight = 620;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#10161F"));
-        ShellBootstrapMode = false;
+        StartupSplashMode = false;
     }
 }

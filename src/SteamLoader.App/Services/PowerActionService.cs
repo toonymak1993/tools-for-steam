@@ -10,23 +10,33 @@ public sealed class PowerActionService
     private readonly WindowsShellService _shellService;
     private readonly string _executablePath;
     private readonly string _backgroundArguments;
+    private readonly WindowsShellVisibilityService _shellVisibilityService;
+    private readonly ConsoleShellState _consoleShellState = new();
 
     public PowerActionService(
         SteamClientLaunchService steamClientLaunchService,
         WindowsShellService shellService,
         string executablePath,
-        string backgroundArguments)
+        string backgroundArguments,
+        WindowsShellVisibilityService? shellVisibilityService = null)
     {
         _steamClientLaunchService = steamClientLaunchService;
         _shellService = shellService;
         _executablePath = executablePath;
         _backgroundArguments = backgroundArguments;
+        _shellVisibilityService = shellVisibilityService ?? new WindowsShellVisibilityService();
     }
 
     public PowerActionResult StartWindowsDesktop()
     {
-        _shellService.StartWindowsShellIfNeeded();
-        return new PowerActionResult("Windows desktop is starting.");
+        // Explorer already runs behind Big Picture in Console Mode and in eTray:
+        // "desktop" means showing it, not starting it.
+        ConsoleDesktopSwitcher.SwitchToDesktop(
+            _shellService,
+            _shellVisibilityService,
+            _consoleShellState,
+            minimizeBigPicture: true);
+        return new PowerActionResult("Windows desktop is shown. Press the Guide button or open Big Picture to return.");
     }
 
     public PowerActionResult RestartSteam()

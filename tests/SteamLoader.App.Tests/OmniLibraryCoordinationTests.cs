@@ -82,6 +82,57 @@ public sealed class OmniLibraryCoordinationTests
     }
 
     [Fact]
+    public void RefreshScheduler_PausesWhileAGameRunsAndSettlesAfterwards()
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        Assert.True(OmniLibraryRefreshCoordinator.IsPausedForGame(true, now, DateTimeOffset.MinValue));
+        Assert.True(OmniLibraryRefreshCoordinator.IsPausedForGame(
+            false,
+            now,
+            now + OmniLibraryRefreshCoordinator.GameEndSettleDelay));
+        Assert.False(OmniLibraryRefreshCoordinator.IsPausedForGame(false, now, now));
+        Assert.Equal(
+            OmniLibraryRefreshCoordinator.GameActivityPollInterval,
+            OmniLibraryRefreshCoordinator.ComputePausedDelay(true, now, DateTimeOffset.MinValue));
+        Assert.Equal(
+            TimeSpan.FromSeconds(4),
+            OmniLibraryRefreshCoordinator.ComputePausedDelay(false, now, now.AddSeconds(4)));
+    }
+
+    [Fact]
+    public void RefreshScheduler_WakesForTheEarliestStoreWithinBounds()
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        Assert.Equal(
+            TimeSpan.FromSeconds(30),
+            OmniLibraryRefreshCoordinator.ComputeSchedulerDelay(
+                [now.AddMinutes(4), now.AddSeconds(30)],
+                now));
+        Assert.Equal(
+            TimeSpan.FromSeconds(2),
+            OmniLibraryRefreshCoordinator.ComputeSchedulerDelay([now.AddSeconds(-10)], now));
+        Assert.Equal(
+            OmniLibraryRefreshCoordinator.SchedulerWakeInterval,
+            OmniLibraryRefreshCoordinator.ComputeSchedulerDelay([], now));
+    }
+
+    [Fact]
+    public void GameSessionMarker_ExistsOnlyWhileALaunchHoldsIt()
+    {
+        var markerName = $@"Local\ToolsForSteamTestGameSession-{Guid.NewGuid():N}";
+
+        Assert.False(OmniLibraryGameActivity.IsGameSessionActive(markerName));
+        using (OmniLibraryGameActivity.EnterGameSession(markerName))
+        {
+            Assert.True(OmniLibraryGameActivity.IsGameSessionActive(markerName));
+        }
+
+        Assert.False(OmniLibraryGameActivity.IsGameSessionActive(markerName));
+    }
+
+    [Fact]
     public void InstallStateCoordinator_UsesFastChecksForRecentNativeHandoffs()
     {
         var now = DateTimeOffset.UtcNow;

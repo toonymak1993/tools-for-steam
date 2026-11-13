@@ -333,7 +333,7 @@
                                    Foreground="#F1F6FB"
                                    FontSize="42"
                                    FontWeight="Bold" />
-                        <TextBlock Text="Tools for Steam is installed and ready. Use Shell takeover, Tray app, or OmniConsole mode depending on whether Windows or another launcher should start TFS for you."
+                        <TextBlock Text="Tools for Steam is installed and ready. Use Console mode to start into Steam Big Picture, or eTray to keep the normal Windows desktop."
                                    Margin="0,14,0,0"
                                    Foreground="#AAB8C6"
                                    FontSize="17"

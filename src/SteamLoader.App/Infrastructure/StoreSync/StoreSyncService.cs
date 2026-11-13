@@ -248,6 +248,13 @@ public sealed class StoreSyncService
     private long _cachedUnifySteamSettingsRevision = long.MinValue;
     private long _cachedUnifySteamDownloadsRevision = long.MinValue;
     private DateTimeOffset _cachedUnifySteamStateExpiresAtUtc = DateTimeOffset.MinValue;
+    private long _cachedUnifySteamHealthRevision = long.MinValue;
+    private readonly Dictionary<string, OmniLibrarySyncHealthState> _omniLibrarySyncHealth =
+        new(StringComparer.OrdinalIgnoreCase);
+    private long _omniLibrarySyncHealthRevision;
+    private bool _omniLibraryBackgroundPaused;
+    private string _omniLibraryPauseReason = string.Empty;
+    private DateTimeOffset? _omniLibraryResumeAtUtc;
     private long _unifySteamStateRevision;
     // Tracks the last time TFS itself wrote shortcuts.vdf so we can detect Steam overwriting it.
     private DateTimeOffset _shortcutsFileLastOwnedWriteAtUtc = DateTimeOffset.MinValue;
@@ -423,6 +430,7 @@ public sealed class StoreSyncService
             if (_cachedUnifySteamState is not null &&
                 _cachedUnifySteamSettingsRevision == settingsRevision &&
                 _cachedUnifySteamDownloadsRevision == downloadsRevision &&
+                _cachedUnifySteamHealthRevision == _omniLibrarySyncHealthRevision &&
                 now < _cachedUnifySteamStateExpiresAtUtc)
             {
                 return _cachedUnifySteamState;
@@ -435,11 +443,14 @@ public sealed class StoreSyncService
             now = DateTimeOffset.UtcNow;
             settingsRevision = _settingsStore.GetRevision();
             downloadsRevision = UnifySteamDownloadStatusStore.GetRevision();
+            long healthRevision;
             lock (_gate)
             {
+                healthRevision = _omniLibrarySyncHealthRevision;
                 if (_cachedUnifySteamState is not null &&
                     _cachedUnifySteamSettingsRevision == settingsRevision &&
                     _cachedUnifySteamDownloadsRevision == downloadsRevision &&
+                    _cachedUnifySteamHealthRevision == healthRevision &&
                     now < _cachedUnifySteamStateExpiresAtUtc)
                 {
                     return _cachedUnifySteamState;
@@ -465,13 +476,15 @@ public sealed class StoreSyncService
                 }
             }
 
-            var snapshot = _unifySteamService.BuildSnapshot(configuration, []);
+            var snapshot = ApplyOmniLibrarySyncHealth(
+                _unifySteamService.BuildSnapshot(configuration, []));
             lock (_gate)
             {
                 snapshot = snapshot with
                 {
                     WatchersActive = _automationWatchersActive,
                     WatcherCount = _automationWatcherCount,
+                    Activity = BuildOmniLibraryActivityLocked(),
                 };
             }
             var activeLifecycle = UnifySteamDownloadStatusStore.GetAll().Values.Any(status =>
@@ -481,6 +494,7 @@ public sealed class StoreSyncService
             {
                 _cachedUnifySteamSettingsRevision = settingsRevision;
                 _cachedUnifySteamDownloadsRevision = downloadsRevision;
+                _cachedUnifySteamHealthRevision = healthRevision;
                 _cachedUnifySteamStateExpiresAtUtc = now.Add(
                     activeLifecycle
                         ? ActiveUnifySteamSnapshotCacheLifetime
@@ -1241,13 +1255,13 @@ public sealed class StoreSyncService
     {
         RecordOmniLibrarySyncHealth(
             storeId,
-            store =>
+            health => health with
             {
-                store.LastLocalCheckAtUtc = DateTimeOffset.UtcNow;
-                store.LastSyncTrigger = string.IsNullOrWhiteSpace(trigger)
+                LastLocalCheckAtUtc = DateTimeOffset.UtcNow,
+                Trigger = string.IsNullOrWhiteSpace(trigger)
                     ? "local"
-                    : trigger.Trim();
-                store.LastSyncDetail = detail?.Trim() ?? string.Empty;
+                    : trigger.Trim(),
+                Detail = detail?.Trim() ?? string.Empty,
             });
     }
 
@@ -1258,12 +1272,69 @@ public sealed class StoreSyncService
     {
         RecordOmniLibrarySyncHealth(
             storeId,
-            store =>
+            health => health with
             {
-                store.NextRemoteCheckAtUtc = nextCheckAtUtc;
-                store.LastSyncTrigger = trigger?.Trim() ?? string.Empty;
-                store.LastSyncDetail = "Remote catalog check scheduled.";
+                CheckRunning = false,
+                NextRemoteCheckAtUtc = nextCheckAtUtc,
+                Trigger = trigger?.Trim() ?? string.Empty,
+                Detail = "Remote catalog check scheduled.",
             });
+    }
+
+    internal void RecordOmniLibraryRemoteCheckStarted(string storeId, string trigger)
+    {
+        RecordOmniLibrarySyncHealth(
+            storeId,
+            health => health with
+            {
+                CheckRunning = true,
+                CheckStartedAtUtc = DateTimeOffset.UtcNow,
+                Trigger = string.IsNullOrWhiteSpace(trigger) ? "scheduled" : trigger.Trim(),
+            });
+    }
+
+    /// <summary>
+    /// The OmniLibrary scheduler reports whether it holds background work
+    /// back (a game is running, or Steam is settling after one).
+    /// </summary>
+    internal void SetOmniLibraryBackgroundPause(
+        bool paused,
+        string reason,
+        DateTimeOffset? resumeAtUtc)
+    {
+        lock (_gate)
+        {
+            var normalizedReason = paused ? reason?.Trim() ?? string.Empty : string.Empty;
+            var normalizedResumeAt = paused ? resumeAtUtc : null;
+            if (_omniLibraryBackgroundPaused == paused &&
+                _omniLibraryPauseReason == normalizedReason &&
+                _omniLibraryResumeAtUtc == normalizedResumeAt)
+            {
+                return;
+            }
+
+            _omniLibraryBackgroundPaused = paused;
+            _omniLibraryPauseReason = normalizedReason;
+            _omniLibraryResumeAtUtc = normalizedResumeAt;
+            // The cached settings snapshot is keyed on this revision.
+            _omniLibrarySyncHealthRevision++;
+        }
+    }
+
+    private OmniLibraryActivityState BuildOmniLibraryActivityLocked()
+    {
+        var shortcutSyncRunning =
+            _activeSyncTask is { IsCompleted: false } &&
+            _activeSyncIsOmniLibrary;
+        return new OmniLibraryActivityState(
+            _omniLibraryBackgroundPaused,
+            _omniLibraryPauseReason,
+            _omniLibraryResumeAtUtc,
+            shortcutSyncRunning,
+            shortcutSyncRunning ? _activeSyncOmniLibraryStoreId : string.Empty,
+            _pendingAllOmniLibraryStoreSync
+                ? 1
+                : _pendingOmniLibraryStoreSyncs.Count + _pendingOmniLibraryDeltas.Count);
     }
 
     internal void RecordOmniLibraryRemoteCheck(
@@ -1272,50 +1343,76 @@ public sealed class StoreSyncService
         string detail,
         DateTimeOffset nextCheckAtUtc)
     {
+        var now = DateTimeOffset.UtcNow;
         RecordOmniLibrarySyncHealth(
             storeId,
-            store =>
+            health => health with
             {
-                var now = DateTimeOffset.UtcNow;
-                store.LastRemoteCheckAtUtc = now;
-                if (succeeded)
-                {
-                    store.LastRemoteSuccessAtUtc = now;
-                }
-                store.NextRemoteCheckAtUtc = nextCheckAtUtc;
-                store.LastSyncTrigger = succeeded ? "remote-success" : "remote-retry";
-                store.LastSyncDetail = detail?.Trim() ?? string.Empty;
+                CheckRunning = false,
+                LastRemoteCheckAtUtc = now,
+                LastRemoteSuccessAtUtc = succeeded ? now : health.LastRemoteSuccessAtUtc,
+                NextRemoteCheckAtUtc = nextCheckAtUtc,
+                Trigger = succeeded ? "remote-success" : "remote-retry",
+                Detail = detail?.Trim() ?? string.Empty,
             });
     }
 
+    // Sync health (last local check, next remote check, retry detail) is
+    // display-only and changes on every scheduled check. Persisting it rewrote
+    // the whole store-sync file, catalogs included, and invalidated every
+    // cached OmniLibrary snapshot several times per store at each start. It
+    // now lives in memory and is laid over the state when that is built.
     private void RecordOmniLibrarySyncHealth(
         string storeId,
-        Action<UnifySteamStoreConfiguration> update)
+        Func<OmniLibrarySyncHealthState, OmniLibrarySyncHealthState> update)
     {
         if (!OmniLibraryStoreRegistry.TryGet(storeId, out _))
         {
             return;
         }
 
-        try
+        lock (_gate)
         {
-            _settingsStore.Update(configuration =>
+            _omniLibrarySyncHealth.TryGetValue(storeId, out var current);
+            _omniLibrarySyncHealth[storeId] =
+                update(current ?? OmniLibrarySyncHealthState.Empty);
+            _omniLibrarySyncHealthRevision++;
+        }
+    }
+
+    internal OmniLibrarySyncHealthState? GetOmniLibrarySyncHealth(string storeId)
+    {
+        lock (_gate)
+        {
+            return _omniLibrarySyncHealth.TryGetValue(storeId, out var health)
+                ? health
+                : null;
+        }
+    }
+
+    private UnifySteamSnapshot ApplyOmniLibrarySyncHealth(UnifySteamSnapshot snapshot)
+    {
+        Dictionary<string, OmniLibrarySyncHealthState> health;
+        lock (_gate)
+        {
+            if (_omniLibrarySyncHealth.Count == 0)
             {
-                if (configuration.UnifySteam.Stores.TryGetValue(storeId, out var store) &&
-                    store is not null)
-                {
-                    update(store);
-                }
-            });
+                return snapshot;
+            }
+
+            health = new Dictionary<string, OmniLibrarySyncHealthState>(
+                _omniLibrarySyncHealth,
+                StringComparer.OrdinalIgnoreCase);
         }
-        catch (Exception exception)
+
+        return snapshot with
         {
-            _journal.Append(
-                "warning",
-                "omnilibrary-health",
-                $"Could not persist sync health for {storeId}.",
-                exception.Message);
-        }
+            Stores = snapshot.Stores
+                .Select(store => health.TryGetValue(store.Id, out var storeHealth)
+                    ? store with { SyncHealth = storeHealth }
+                    : store)
+                .ToArray(),
+        };
     }
 
     public int QueueOmniLibraryLocalReconciliation(
@@ -3107,20 +3204,33 @@ public sealed class StoreSyncService
     public StoreSyncSnapshot SetOmniLibraryRomSystemSettings(
         string systemId,
         string? emulatorPathValue,
-        bool fullscreen)
+        bool fullscreen,
+        string? emulatorIdValue = null)
     {
         var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
         var emulatorPath = emulatorPathValue?.Trim() ?? string.Empty;
+        OmniLibraryEmulatorDescriptor? pathEmulator = null;
         if (!string.IsNullOrWhiteSpace(emulatorPath))
         {
             emulatorPath = Path.GetFullPath(emulatorPath);
-            if (!File.Exists(emulatorPath) ||
-                !Path.GetFileName(emulatorPath).Equals(
-                    system.EmulatorExecutableName,
-                    StringComparison.OrdinalIgnoreCase))
+            pathEmulator = OmniLibraryEmulatorCatalog.MatchExecutable(system, emulatorPath);
+            if (!File.Exists(emulatorPath) || pathEmulator is null)
             {
+                var names = OmniLibraryEmulatorCatalog.ForSystem(system)
+                    .Select(emulator => emulator.ExecutableNames[0]);
                 throw new InvalidOperationException(
-                    $"Select {system.EmulatorExecutableName} for {system.Title}.");
+                    $"Select {string.Join(" or ", names)} for {system.Title}.");
+            }
+        }
+
+        string? emulatorId = null;
+        if (emulatorIdValue is not null)
+        {
+            emulatorId = emulatorIdValue.Trim();
+            if (emulatorId.Length > 0 &&
+                !system.EmulatorIds.Contains(emulatorId, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"This emulator does not run {system.Title} games.");
             }
         }
 
@@ -3133,6 +3243,26 @@ public sealed class StoreSyncService
                     OmniLibraryRomSystemRegistry.StoreId);
                 store.RomSystems.TryGetValue(system.Id, out var settings);
                 settings ??= new OmniLibraryRomSystemConfiguration();
+                if (emulatorId is not null)
+                {
+                    // Choosing an emulator keeps an existing manual path only
+                    // when that path starts the chosen emulator (or the choice
+                    // is automatic).
+                    settings.EmulatorId = emulatorId;
+                    if (pathEmulator is null)
+                    {
+                        var previous = OmniLibraryEmulatorCatalog.MatchExecutable(system, settings.EmulatorPath);
+                        emulatorPath = emulatorId.Length == 0 ||
+                                       previous?.Id.Equals(emulatorId, StringComparison.OrdinalIgnoreCase) == true
+                            ? settings.EmulatorPath
+                            : string.Empty;
+                    }
+                }
+                else if (pathEmulator is not null)
+                {
+                    settings.EmulatorId = pathEmulator.Id;
+                }
+
                 settings.EmulatorPath = emulatorPath;
                 settings.Fullscreen = fullscreen;
                 store.RomSystems[system.Id] = settings;
@@ -3143,6 +3273,71 @@ public sealed class StoreSyncService
             });
             return BuildSnapshot(configuration);
         }
+    }
+
+    /// <summary>
+    /// Installs (or repairs) the emulator a system would use: the explicit
+    /// choice, otherwise the recommended one. Runs in the background; progress
+    /// is part of the snapshot.
+    /// </summary>
+    public StoreSyncSnapshot InstallOmniLibraryEmulator(string systemId, string? emulatorIdValue)
+    {
+        var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
+        var configuration = _settingsStore.Load();
+        var store = GetUnifySteamStoreConfiguration(configuration, OmniLibraryRomSystemRegistry.StoreId);
+        store.RomSystems.TryGetValue(system.Id, out var settings);
+        var emulatorId = emulatorIdValue?.Trim();
+        if (string.IsNullOrWhiteSpace(emulatorId))
+        {
+            var selection = OmniLibraryEmulatorDetector.Resolve(system, settings?.EmulatorId, settings?.EmulatorPath);
+            emulatorId = (selection.InstallCandidate ?? selection.Emulator ?? system.RecommendedEmulator)?.Id;
+        }
+
+        if (string.IsNullOrWhiteSpace(emulatorId))
+        {
+            throw new InvalidOperationException($"TFS has no emulator to install for {system.Title}.");
+        }
+
+        OmniLibraryEmulatorInstaller.Request(system.Id, emulatorId, automatic: false);
+        return BuildSnapshot(configuration);
+    }
+
+    public StoreSyncSnapshot SetOmniLibraryEmulationOptions(
+        bool autoInstallEmulators,
+        bool importOrbitRoms,
+        bool? importEmulatorLibraries = null)
+    {
+        bool importChanged;
+        StoreSyncConfiguration configuration;
+        lock (_gate)
+        {
+            var previous = GetUnifySteamStoreConfiguration(
+                _settingsStore.Load(),
+                OmniLibraryRomSystemRegistry.StoreId);
+            var previousOrbit = previous.ImportOrbitRoms;
+            var previousEmulatorLists = previous.ImportEmulatorLibraries;
+            var emulatorLists = importEmulatorLibraries ?? previousEmulatorLists;
+            configuration = _settingsStore.Update(latest =>
+            {
+                var store = GetUnifySteamStoreConfiguration(latest, OmniLibraryRomSystemRegistry.StoreId);
+                store.AutoInstallEmulators = autoInstallEmulators;
+                store.ImportOrbitRoms = importOrbitRoms;
+                store.ImportEmulatorLibraries = emulatorLists;
+            });
+            importChanged = previousOrbit != importOrbitRoms || previousEmulatorLists != emulatorLists;
+        }
+
+        var romStore = GetUnifySteamStoreConfiguration(configuration, OmniLibraryRomSystemRegistry.StoreId);
+        if (importChanged && romStore.Enabled)
+        {
+            _ = Task.Run(() => CheckUnifySteamStoreForChanges(OmniLibraryRomSystemRegistry.StoreId));
+        }
+        else if (autoInstallEmulators)
+        {
+            OmniLibraryRomLibrary.QueueAutomaticEmulatorInstalls(romStore);
+        }
+
+        return BuildSnapshot(configuration);
     }
 
     public StoreSyncSnapshot SetUnifySteamDownloadOptions(
@@ -3356,38 +3551,34 @@ public sealed class StoreSyncService
 
     public StoreSyncSnapshot StartUnifySteamLogin(string storeId)
     {
-        using var refreshLease = _unifyStoreRefreshGates.Enter(storeId);
-        try
+        // Starting a sign-in only records where the isolated session lives.
+        // It deliberately takes no store refresh gate and leaves the catalog
+        // alone: during first setup the initial preparation can hold that gate
+        // for minutes, and Sign In used to wait for it with no feedback and
+        // then overwrite the catalog that preparation had just written.
+        var configuration = _settingsStore.Load();
+        if (!StorefrontFeatureFlags.Enabled)
         {
-            var configuration = _settingsStore.Load();
-            if (!StorefrontFeatureFlags.Enabled)
-            {
-                return BuildSnapshot(configuration);
-            }
-
-            if (!GetUnifySteamStoreConfiguration(configuration, storeId).Enabled)
-            {
-                throw new InvalidOperationException("Enable this OmniLibrary store before signing in.");
-            }
-
-            _unifySteamService.StartLogin(configuration, storeId);
-            var source = GetUnifySteamStoreConfiguration(configuration, storeId);
-            var persisted = _settingsStore.Update(latest =>
-            {
-                var target = GetUnifySteamStoreConfiguration(latest, storeId);
-                if (!target.Enabled)
-                {
-                    return;
-                }
-                target.ToolPath = source.ToolPath;
-                target.AuthPath = source.AuthPath;
-                target.Cache = source.Cache;
-            });
-            return BuildSnapshot(persisted);
+            return BuildSnapshot(configuration);
         }
-        finally
+
+        if (!GetUnifySteamStoreConfiguration(configuration, storeId).Enabled)
         {
+            throw new InvalidOperationException("Enable this OmniLibrary store before signing in.");
         }
+
+        _unifySteamService.StartLogin(configuration, storeId);
+        var source = GetUnifySteamStoreConfiguration(configuration, storeId);
+        var persisted = _settingsStore.Update(latest =>
+        {
+            var target = GetUnifySteamStoreConfiguration(latest, storeId);
+            if (!target.Enabled)
+            {
+                return;
+            }
+            target.AuthPath = source.AuthPath;
+        });
+        return BuildSnapshot(persisted);
     }
 
     public StoreSyncSnapshot CompleteUnifySteamManualAuth(string storeId, string value)
@@ -3864,7 +4055,7 @@ public sealed class StoreSyncService
             })
             .ToList();
         var unifySteam = StorefrontFeatureFlags.Enabled
-            ? _unifySteamService.BuildSnapshot(configuration, stores)
+            ? ApplyOmniLibrarySyncHealth(_unifySteamService.BuildSnapshot(configuration, stores))
             : StorefrontFeatureFlags.BuildDisabledSnapshot();
 
         return new StoreSyncSnapshot(
@@ -3920,7 +4111,7 @@ public sealed class StoreSyncService
                     .ToArray()))
             .ToList();
         var unifySteam = StorefrontFeatureFlags.Enabled
-            ? _unifySteamService.BuildSnapshot(configuration, stores)
+            ? ApplyOmniLibrarySyncHealth(_unifySteamService.BuildSnapshot(configuration, stores))
             : StorefrontFeatureFlags.BuildDisabledSnapshot();
 
         return new StoreSyncSnapshot(
@@ -4161,7 +4352,11 @@ public sealed class StoreSyncService
         var targets = new Dictionary<string, StoreSyncWatchTarget>(StringComparer.OrdinalIgnoreCase);
         var profile = ResolveSteamProfile();
 
-        void addDirectoryTarget(string? path, string filter = "*", string storeId = "")
+        void addDirectoryTarget(
+            string? path,
+            string filter = "*",
+            string storeId = "",
+            bool includeSubdirectories = true)
         {
             var normalizedPath = NormalizePath(path);
             if (string.IsNullOrWhiteSpace(normalizedPath) || !Directory.Exists(normalizedPath))
@@ -4170,7 +4365,17 @@ public sealed class StoreSyncService
             }
 
             var key = $"{normalizedPath}|{filter}";
-            targets[key] = new StoreSyncWatchTarget(normalizedPath, filter, IncludeSubdirectories: true, StoreId: storeId);
+            if (targets.TryGetValue(key, out var existing) && existing.IncludeSubdirectories)
+            {
+                // Classic Store Sync may already need the full tree.
+                includeSubdirectories = true;
+            }
+
+            targets[key] = new StoreSyncWatchTarget(
+                normalizedPath,
+                filter,
+                IncludeSubdirectories: includeSubdirectories,
+                StoreId: storeId);
         }
 
         void addFileTarget(string? path, string storeId = "")
@@ -4207,6 +4412,11 @@ public sealed class StoreSyncService
             addDirectoryTarget(
                 OmniLibraryRomSystemRegistry.ResolveRootPath(
                     romLibrary.InstallPath));
+            if (romLibrary.ImportOrbitRoms &&
+                Directory.Exists(OmniLibraryRomSystemRegistry.OrbitRomRootPath))
+            {
+                addDirectoryTarget(OmniLibraryRomSystemRegistry.OrbitRomRootPath);
+            }
         }
 
         foreach (var definition in StoreDefinitions)
@@ -4232,6 +4442,13 @@ public sealed class StoreSyncService
                 continue;
             }
 
+            // Classic Store Sync scans executables inside game folders and needs
+            // the whole tree. OmniLibrary reads install state from manifests and
+            // its own install-state checks, so a library root only has to report
+            // games being added or removed. Watching the full tree for it fired
+            // on every file a running game, download or launcher log wrote.
+            var watchGameFolders = includeClassicStore;
+
             switch (definition.Id)
             {
                 case "epic-games":
@@ -4251,7 +4468,10 @@ public sealed class StoreSyncService
                     addDirectoryTarget(manifestDirectory, "*.item", definition.Id);
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4260,7 +4480,10 @@ public sealed class StoreSyncService
                 {
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4269,12 +4492,18 @@ public sealed class StoreSyncService
                 {
                     foreach (var root in GetXboxCandidateRoots().Distinct(StringComparer.OrdinalIgnoreCase))
                     {
-                        addDirectoryTarget(root, storeId: definition.Id);
+                        addDirectoryTarget(
+                            root,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4288,12 +4517,18 @@ public sealed class StoreSyncService
                     addFileTarget(settingsPath, definition.Id);
                     foreach (var root in GetUbisoftConnectCandidateRoots())
                     {
-                        addDirectoryTarget(root, storeId: definition.Id);
+                        addDirectoryTarget(
+                            root,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4302,12 +4537,18 @@ public sealed class StoreSyncService
                 {
                     foreach (var root in GetEaAppCandidateRoots())
                     {
-                        addDirectoryTarget(root, storeId: definition.Id);
+                        addDirectoryTarget(
+                            root,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4321,7 +4562,10 @@ public sealed class StoreSyncService
                     addFileTarget(configPath, definition.Id);
                     foreach (var extraRoot in NormalizeConfiguredScanRoots(storeConfiguration.AdditionalScanPaths))
                     {
-                        addDirectoryTarget(extraRoot, storeId: definition.Id);
+                        addDirectoryTarget(
+                            extraRoot,
+                            storeId: definition.Id,
+                            includeSubdirectories: watchGameFolders);
                     }
 
                     break;
@@ -4398,6 +4642,28 @@ public sealed class StoreSyncService
                 .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
                 Path.DirectorySeparatorChar;
             var fullPath = Path.GetFullPath(changedPath);
+            var orbitRoot = OmniLibraryRomSystemRegistry.OrbitRomRootPath
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            if (store.ImportOrbitRoms &&
+                !fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) &&
+                fullPath.StartsWith(orbitRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                // ORBIT's folders are named after ORBIT's system ids.
+                var orbitFolder = Path.GetRelativePath(orbitRoot, fullPath)
+                    .Split(
+                        [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                        StringSplitOptions.RemoveEmptyEntries)
+                    .FirstOrDefault();
+                if (OmniLibraryRomSystemRegistry.FindByOrbitFolder(orbitFolder) is not null)
+                {
+                    _ = Task.Run(() => CheckUnifySteamStoreForChanges(
+                        OmniLibraryRomSystemRegistry.StoreId));
+                }
+
+                return true;
+            }
+
             if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
             {
                 return false;
@@ -4770,9 +5036,11 @@ public sealed class StoreSyncService
         }
 
         // Older OmniLibrary builds did not always persist the current launch
-        // identity. Once one of those entries has been adopted, collapse any
-        // other recognizable OmniLibrary shortcut with the same canonical
-        // title as well. Unrelated user shortcuts are deliberately excluded.
+        // identity. Collapse such an identity-less entry into a recognizable
+        // OmniLibrary shortcut with the same canonical title. Two entries that
+        // each carry their own launch identity are different games (the same
+        // title on Epic and GOG, or on two emulator systems) and both stay.
+        // Unrelated user shortcuts are deliberately excluded.
         var alreadyQueuedIndices = result
             .Select(candidate => candidate.ExistingShortcut.Index)
             .ToHashSet();
@@ -4782,6 +5050,8 @@ public sealed class StoreSyncService
                      {
                          Entry = entry,
                          TitleKey = NormalizeUnifyTitleKey(entry.AppName),
+                         HasIdentity = !string.IsNullOrWhiteSpace(
+                             NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions)),
                      })
                      .Where(candidate => !string.IsNullOrWhiteSpace(candidate.TitleKey))
                      .GroupBy(candidate => candidate.TitleKey, StringComparer.OrdinalIgnoreCase)
@@ -4789,12 +5059,15 @@ public sealed class StoreSyncService
         {
             var canonical = group
                 .OrderBy(candidate => matchedManagedShortcutIndices.Contains(candidate.Entry.Index) ? 0 : 1)
+                .ThenBy(candidate => candidate.HasIdentity ? 0 : 1)
                 .ThenByDescending(candidate => candidate.Entry.IsManaged)
                 .ThenBy(candidate => candidate.Entry.Index)
                 .First();
 
             foreach (var duplicate in group.Where(candidate =>
                          candidate.Entry.Index != canonical.Entry.Index &&
+                         !candidate.HasIdentity &&
+                         !matchedManagedShortcutIndices.Contains(candidate.Entry.Index) &&
                          !alreadyQueuedIndices.Contains(candidate.Entry.Index)))
             {
                 result.Add(new StoreSyncCleanupCandidate(
@@ -4818,6 +5091,15 @@ public sealed class StoreSyncService
         (entry.IsManaged &&
          entry.ManagedStoreId.Equals(UnifySteamStoreId, StringComparison.OrdinalIgnoreCase)) ||
         !string.IsNullOrWhiteSpace(NormalizeOmniLibraryLaunchIdentity(entry.LaunchOptions));
+
+    // The durable OmniLibrary identity is the `<store>:<game>` launch target.
+    // Older builds wrote other launch arguments, but every one of them named
+    // "unifysteam"; nothing else in a foreign shortcut does.
+    private static bool IsRecognizableOmniLibraryShortcut(ExistingShortcutEntry entry) =>
+        IsOmniLibraryShortcutCandidate(entry) ||
+        (entry.LaunchOptions ?? string.Empty).Contains(
+            "unifysteam",
+            StringComparison.OrdinalIgnoreCase);
 
     private static bool TryResolveCleanupOmniLibraryGameIdentity(
         StoreSyncCleanupCandidate candidate,
@@ -9394,6 +9676,77 @@ public sealed class StoreSyncService
     const errors = [];
     let attemptedCount = 0;
 
+    // OmniLibrary owns exactly one Steam shortcut per launch identity
+    // ("--unifysteam-launch <store>:<game>"). Steam's live list is the truth:
+    // a failed earlier attempt or an unwritten shortcuts.vdf must never lead
+    // to a second AddShortcut for an identity Steam already has.
+    const launchIdentity = (launchOptions) => {
+      const match = /^\s*--unifysteam-launch\s+"?([^"\s]+)"?/i.exec(toText(launchOptions));
+      return match ? match[1].trim().toLowerCase() : "";
+    };
+    let liveShortcutsByIdentity = null;
+    const loadLiveShortcuts = async () => {
+      if (liveShortcutsByIdentity) {
+        return liveShortcutsByIdentity;
+      }
+      liveShortcutsByIdentity = new Map();
+      if (typeof apps.GetAllShortcuts !== "function") {
+        return liveShortcutsByIdentity;
+      }
+      try {
+        const shortcuts = await apps.GetAllShortcuts();
+        for (const shortcut of Array.isArray(shortcuts) ? shortcuts : []) {
+          const data = shortcut?.data ?? shortcut;
+          const appId = Number(shortcut?.appid ?? data?.appid) >>> 0;
+          const identity = launchIdentity(data?.strLaunchOptions ?? data?.launchOptions);
+          if (!appId || !identity) {
+            continue;
+          }
+          const appIds = liveShortcutsByIdentity.get(identity) ?? [];
+          appIds.push(appId);
+          liveShortcutsByIdentity.set(identity, appIds);
+        }
+      } catch {
+      }
+      return liveShortcutsByIdentity;
+    };
+    const rememberLiveShortcut = (identity, appId) => {
+      if (!identity || !liveShortcutsByIdentity) {
+        return;
+      }
+      const appIds = liveShortcutsByIdentity.get(identity) ?? [];
+      if (!appIds.includes(appId)) {
+        appIds.push(appId);
+      }
+      liveShortcutsByIdentity.set(identity, appIds);
+    };
+    const findLiveShortcut = async (identity, excludedAppId = 0) => {
+      if (!identity) {
+        return 0;
+      }
+      const appIds = (await loadLiveShortcuts()).get(identity) ?? [];
+      return appIds.find((appId) => appId !== excludedAppId) ?? 0;
+    };
+    const removeLiveDuplicates = async (identity, keptAppId) => {
+      if (!identity || !keptAppId) {
+        return;
+      }
+      const appIds = (await loadLiveShortcuts()).get(identity) ?? [];
+      for (const appId of appIds) {
+        if (appId === keptAppId) {
+          continue;
+        }
+        try {
+          await invoke("RemoveShortcut", appId);
+          removedDuplicateAppIds.add(appId);
+        } catch {
+          // Not fatal: the shortcuts.vdf duplicate cleanup removes it later.
+        }
+      }
+      liveShortcutsByIdentity.set(identity, [keptAppId]);
+    };
+    const removedDuplicateAppIds = new Set();
+
     const applyShortcutFields = async (appId, operation) => {
       await invoke("SetShortcutName", appId, operation.name);
       await invoke("SetShortcutExe", appId, operation.executablePath);
@@ -9430,19 +9783,28 @@ public sealed class StoreSyncService
     for (const operation of plan.createOperations ?? []) {
       attemptedCount += 1;
       try {
-        const createdAppId = Number(await invoke(
-          "AddShortcut",
-          operation.name,
-          operation.executablePath,
-          toText(operation.launchOptions),
-          operation.startDirectory));
-        if (!Number.isFinite(createdAppId) || createdAppId <= 0) {
-          throw new Error("Steam returned an invalid shortcut id.");
+        const identity = launchIdentity(operation.launchOptions);
+        let liveAppId = await findLiveShortcut(identity);
+        if (!liveAppId) {
+          const createdAppId = Number(await invoke(
+            "AddShortcut",
+            operation.name,
+            operation.executablePath,
+            toText(operation.launchOptions),
+            operation.startDirectory));
+          if (!Number.isFinite(createdAppId) || createdAppId <= 0) {
+            throw new Error("Steam returned an invalid shortcut id.");
+          }
+
+          liveAppId = createdAppId >>> 0;
+          rememberLiveShortcut(identity, liveAppId);
         }
 
-        const liveAppId = createdAppId >>> 0;
-        await applyShortcutFields(liveAppId, operation);
+        // Report the id before the remaining fields: if one of them fails,
+        // a retry must reuse this shortcut instead of adding another one.
         appIdsByTitleId[operation.titleId] = liveAppId;
+        await applyShortcutFields(liveAppId, operation);
+        await removeLiveDuplicates(identity, liveAppId);
       } catch (error) {
         errors.push(`Create ${operation.titleId}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -9466,6 +9828,21 @@ public sealed class StoreSyncService
           }
         }
 
+        const identity = launchIdentity(operation.launchOptions);
+        let replacesOriginal = false;
+        if (!appliedToExistingShortcut) {
+          // A shortcut Steam already holds for this identity is reused; a
+          // forced split never reuses the shared original it splits from.
+          const existingAppId = await findLiveShortcut(
+            identity,
+            operation.forceCreate ? originalAppId : 0);
+          if (existingAppId && await tryApplyToShortcut(existingAppId, operation)) {
+            liveAppId = existingAppId;
+            appliedToExistingShortcut = true;
+            replacesOriginal = true;
+          }
+        }
+
         if (!appliedToExistingShortcut) {
           const createdAppId = Number(await invoke(
             "AddShortcut",
@@ -9478,14 +9855,19 @@ public sealed class StoreSyncService
           }
 
           liveAppId = createdAppId >>> 0;
+          rememberLiveShortcut(identity, liveAppId);
+          // Report the id before the remaining fields so a retry reuses it.
+          appIdsByTitleId[operation.titleId] = liveAppId;
           await applyShortcutFields(liveAppId, operation);
+          replacesOriginal = true;
+        }
 
-          if (originalAppId && originalAppId !== liveAppId) {
-            await invoke("RemoveShortcut", originalAppId);
-          }
+        if (replacesOriginal && originalAppId && originalAppId !== liveAppId) {
+          await invoke("RemoveShortcut", originalAppId);
         }
 
         appIdsByTitleId[operation.titleId] = liveAppId;
+        await removeLiveDuplicates(identity, liveAppId);
       } catch (error) {
         errors.push(`Refresh ${operation.titleId}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -9493,6 +9875,9 @@ public sealed class StoreSyncService
 
     for (const operation of plan.removeOperations ?? []) {
       attemptedCount += 1;
+      if (removedDuplicateAppIds.has(operation.appId >>> 0)) {
+        continue;
+      }
       try {
         await invoke("RemoveShortcut", operation.appId >>> 0);
       } catch (error) {
@@ -10795,22 +11180,19 @@ public sealed class StoreSyncService
 
         if (existingShortcut is null)
         {
-            var titleMatches = existingEntries
-                .Where(entry => TitleMatches(entry, normalizedRawTitle, normalizedEffectiveTitle))
-                .ToArray();
-
-            // Prefer a single recognizable legacy OmniLibrary entry. If no
-            // ownership markers survived an old installation, a unique title
-            // match across Steam's non-Steam shortcuts is still safe to adopt:
-            // ambiguity is rejected instead of guessing between two games.
-            var legacyMatches = titleMatches
-                .Where(IsOmniLibraryShortcutCandidate)
+            // Only a shortcut that carries one of OmniLibrary's own marks can be
+            // taken over by title. A user's own shortcut, or one created by
+            // another tool, is foreign even when its title matches: OmniLibrary
+            // creates its own entry beside it and never rewrites it. Two marked
+            // candidates are ambiguous and are never guessed between.
+            var legacyMatches = existingEntries
+                .Where(entry =>
+                    TitleMatches(entry, normalizedRawTitle, normalizedEffectiveTitle) &&
+                    IsRecognizableOmniLibraryShortcut(entry))
                 .ToArray();
             existingShortcut = legacyMatches.Length == 1
                 ? legacyMatches[0]
-                : titleMatches.Length == 1
-                    ? titleMatches[0]
-                    : null;
+                : null;
         }
 
         return existingShortcut is not null;

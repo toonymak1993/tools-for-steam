@@ -114,11 +114,13 @@ public sealed class ReleaseUpdateServiceTests
         var portableAsset = CreateNonPublicInstance(
             assetType!,
             "ToolsForSteam-portable-win-x64.zip",
-            "https://example.invalid/portable.zip");
+            "https://example.invalid/portable.zip",
+            null);
         var installerAsset = CreateNonPublicInstance(
             assetType!,
             "ToolsForSteamSetup.exe",
-            "https://example.invalid/setup.exe");
+            "https://example.invalid/setup.exe",
+            null);
         var portableOnlyAssets = Array.CreateInstance(assetType!, 1);
         portableOnlyAssets.SetValue(portableAsset, 0);
         var mixedAssets = Array.CreateInstance(assetType!, 2);
@@ -153,37 +155,132 @@ public sealed class ReleaseUpdateServiceTests
             assetType!.GetProperty("Name")?.GetValue(matchedAsset));
     }
 
+    // A fixed point inside the current version line (see VersionLineStartUtc).
+    private static readonly DateTimeOffset ReleaseNow = new(2026, 12, 1, 12, 0, 0, TimeSpan.Zero);
+
     [Fact]
-    public void SelectRelease_StableIgnoresPrerelease_WhenStableExists()
+    public void SelectLatestStableRelease_IgnoresPrereleases()
     {
-        var method = typeof(ReleaseUpdateService).GetMethod("SelectRelease", BindingFlags.NonPublic | BindingFlags.Static);
-        Assert.NotNull(method);
+        var stableRelease = CreateRelease("v0.2.1", prerelease: false, publishedAtUtc: ReleaseNow.AddDays(-1));
+        var prerelease = CreateRelease("v0.2.2-beta.1", prerelease: true, publishedAtUtc: ReleaseNow);
 
-        var stableRelease = CreateRelease("v0.3.4", prerelease: false, publishedAtUtc: DateTimeOffset.UtcNow.AddDays(-1));
-        var prerelease = CreateRelease("v0.3.5-beta.1", prerelease: true, publishedAtUtc: DateTimeOffset.UtcNow);
-        var releases = CreateReleaseArray(prerelease, stableRelease);
-
-        var selected = method!.Invoke(null, [releases, "stable"]);
-        var tagName = selected?.GetType().GetProperty("TagName")?.GetValue(selected);
-
-        Assert.Equal("v0.3.4", tagName);
+        Assert.Equal("v0.2.1", SelectLatestStableTag(prerelease, stableRelease));
     }
 
     [Fact]
-    public void SelectRelease_BetaPrefersHighestPrerelease()
+    public void SelectLatestStableRelease_IgnoresBetaTagWithoutPrereleaseFlag()
     {
-        var method = typeof(ReleaseUpdateService).GetMethod("SelectRelease", BindingFlags.NonPublic | BindingFlags.Static);
+        // Mirrors the published v0.3.9-beta.1, which lacks GitHub's prerelease flag.
+        var mislabeledBeta = CreateRelease("v0.2.2-beta.1", prerelease: false, publishedAtUtc: ReleaseNow);
+        var stableRelease = CreateRelease("v0.2.1", prerelease: false, publishedAtUtc: ReleaseNow.AddDays(-1));
+
+        Assert.Equal("v0.2.1", SelectLatestStableTag(mislabeledBeta, stableRelease));
+    }
+
+    [Fact]
+    public void SelectLatestStableRelease_PrefersHighestVersionOverPublishDate()
+    {
+        var older = CreateRelease("v0.2.10", prerelease: false, publishedAtUtc: ReleaseNow.AddDays(-5));
+        var newerDateLowerVersion = CreateRelease("v0.2.9", prerelease: false, publishedAtUtc: ReleaseNow);
+
+        Assert.Equal("v0.2.10", SelectLatestStableTag(newerDateLowerVersion, older));
+    }
+
+    [Fact]
+    public void SelectLatestStableRelease_SkipsNewerReleaseWithoutInstaller()
+    {
+        var withoutInstaller = CreateRelease("v0.3.0", prerelease: false, publishedAtUtc: ReleaseNow, withInstaller: false);
+        var installable = CreateRelease("v0.2.1", prerelease: false, publishedAtUtc: ReleaseNow.AddDays(-1));
+
+        Assert.Equal("v0.2.1", SelectLatestStableTag(withoutInstaller, installable));
+    }
+
+    [Fact]
+    public void SelectLatestStableRelease_IgnoresReleasesOfTheRetiredVersionLine()
+    {
+        // v0.4.0 was published before the version restart at 0.2.0 and must
+        // never be offered to a 0.2.x install although its number is higher.
+        var retired = CreateRelease("v0.4.0", prerelease: false, publishedAtUtc: new DateTimeOffset(2026, 10, 6, 0, 0, 0, TimeSpan.Zero));
+        var current = CreateRelease("v0.2.0", prerelease: false, publishedAtUtc: ReleaseNow);
+
+        Assert.Equal("v0.2.0", SelectLatestStableTag(retired, current));
+    }
+
+    [Fact]
+    public void SelectLatestStableRelease_ThrowsWhenOnlyPrereleasesExist()
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod("SelectLatestStableRelease", BindingFlags.NonPublic | BindingFlags.Static);
         Assert.NotNull(method);
 
-        var prerelease1 = CreateRelease("v0.3.4-beta.2", prerelease: true, publishedAtUtc: DateTimeOffset.UtcNow.AddDays(-2));
-        var prerelease2 = CreateRelease("v0.3.4-beta.10", prerelease: true, publishedAtUtc: DateTimeOffset.UtcNow.AddDays(-1));
-        var stableRelease = CreateRelease("v0.3.4", prerelease: false, publishedAtUtc: DateTimeOffset.UtcNow);
-        var releases = CreateReleaseArray(prerelease1, stableRelease, prerelease2);
+        var releases = CreateReleaseArray(CreateRelease("v0.2.1-beta.1", prerelease: true, publishedAtUtc: ReleaseNow));
 
-        var selected = method!.Invoke(null, [releases, "beta"]);
-        var tagName = selected?.GetType().GetProperty("TagName")?.GetValue(selected);
+        var exception = Assert.Throws<TargetInvocationException>(() => method!.Invoke(null, [releases]));
+        Assert.IsType<InvalidOperationException>(exception.InnerException);
+    }
 
-        Assert.Equal("v0.3.4-beta.10", tagName);
+    [Fact]
+    public void SelectLatestStableRelease_ThrowsWhenOnlyRetiredReleasesExist()
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod("SelectLatestStableRelease", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var releases = CreateReleaseArray(
+            CreateRelease("v0.4.0", prerelease: false, publishedAtUtc: new DateTimeOffset(2026, 10, 6, 0, 0, 0, TimeSpan.Zero)));
+
+        var exception = Assert.Throws<TargetInvocationException>(() => method!.Invoke(null, [releases]));
+        Assert.IsType<InvalidOperationException>(exception.InnerException);
+    }
+
+    [Theory]
+    [InlineData("0.4.1", "0.4.1-beta.1", true)]
+    [InlineData("0.4.0", "0.4.1-beta.1", false)]
+    [InlineData("0.4.0", "0.4.0", false)]
+    [InlineData("0.3.10", "0.3.9", true)]
+    public void IsNewerVersion_NeverDowngradesOrReinstalls(string latest, string current, bool expected)
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod("IsNewerVersion", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        Assert.Equal(expected, method!.Invoke(null, [latest, current]));
+    }
+
+    [Fact]
+    public void ValidatePackageDigest_AcceptsMatchingAndRejectsWrongChecksum()
+    {
+        var root = CreateTempRoot();
+
+        try
+        {
+            var method = typeof(ReleaseUpdateService).GetMethod("ValidatePackageDigest", BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.NotNull(method);
+
+            var packagePath = Path.Combine(root, "ToolsForSteamSetup.exe");
+            var bytes = new byte[] { 1, 2, 3, 4 };
+            File.WriteAllBytes(packagePath, bytes);
+            var digest = "sha256:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
+
+            method!.Invoke(null, [packagePath, digest]);
+            method.Invoke(null, [packagePath, null]);
+            Assert.True(File.Exists(packagePath));
+
+            var exception = Assert.Throws<TargetInvocationException>(() =>
+                method.Invoke(null, [packagePath, "sha256:" + new string('0', 64)]));
+            Assert.IsType<InvalidOperationException>(exception.InnerException);
+            Assert.False(File.Exists(packagePath));
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    private static string? SelectLatestStableTag(params object[] releases)
+    {
+        var method = typeof(ReleaseUpdateService).GetMethod("SelectLatestStableRelease", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var selected = method!.Invoke(null, [CreateReleaseArray(releases)]);
+        return selected?.GetType().GetProperty("TagName")?.GetValue(selected) as string;
     }
 
     private static string CreateTempRoot()
@@ -193,7 +290,11 @@ public sealed class ReleaseUpdateServiceTests
         return root;
     }
 
-    private static object CreateRelease(string tagName, bool prerelease, DateTimeOffset publishedAtUtc)
+    private static object CreateRelease(
+        string tagName,
+        bool prerelease,
+        DateTimeOffset publishedAtUtc,
+        bool withInstaller = true)
     {
         var serviceType = typeof(ReleaseUpdateService);
         var releaseType = serviceType.GetNestedType("GithubRelease", BindingFlags.NonPublic);
@@ -204,8 +305,9 @@ public sealed class ReleaseUpdateServiceTests
 
         var installerAsset = CreateNonPublicInstance(
             assetType!,
-            "ToolsForSteamSetup.exe",
-            $"https://example.invalid/{tagName}/setup.exe");
+            withInstaller ? "ToolsForSteamSetup.exe" : "notes.txt",
+            $"https://example.invalid/{tagName}/setup.exe",
+            null);
         var assets = Array.CreateInstance(assetType!, 1);
         assets.SetValue(installerAsset, 0);
 

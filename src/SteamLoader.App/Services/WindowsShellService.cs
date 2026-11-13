@@ -28,31 +28,16 @@ public sealed class WindowsShellService
             : appStateKeyPath;
     }
 
-    public bool IsEnabled(string executablePath, string arguments)
+    /// <summary>
+    /// True while the per-user shell value still starts a TFS build as the
+    /// removed Shell Takeover (any install path).
+    /// </summary>
+    public bool IsLegacyTfsShell()
     {
-        var desiredCommand = BuildCommand(executablePath, arguments);
         var currentShell = GetShellCommand();
-        return string.Equals(currentShell, desiredCommand, StringComparison.OrdinalIgnoreCase);
-    }
-
-    public void SetEnabled(string executablePath, string arguments, bool enabled)
-    {
-        var desiredCommand = BuildCommand(executablePath, arguments);
-        if (enabled)
-        {
-            var currentShell = GetShellCommand();
-            if (!string.IsNullOrWhiteSpace(currentShell) &&
-                !string.Equals(currentShell, desiredCommand, StringComparison.OrdinalIgnoreCase))
-            {
-                using var stateKey = Registry.CurrentUser.CreateSubKey(_appStateKeyPath);
-                stateKey?.SetValue(PreviousShellValueName, currentShell, RegistryValueKind.String);
-            }
-
-            SetShellCommand(desiredCommand);
-            return;
-        }
-
-        SetShellCommand(GetFallbackShellCommand());
+        return currentShell.Contains(SteamLoaderRuntime.LegacyShellBootstrapArgument, StringComparison.OrdinalIgnoreCase) &&
+            (currentShell.Contains("ToolsForSteam.exe", StringComparison.OrdinalIgnoreCase) ||
+             currentShell.Contains("SteamLoader.exe", StringComparison.OrdinalIgnoreCase));
     }
 
     public void SetExplorerShell()
@@ -60,26 +45,27 @@ public sealed class WindowsShellService
         SetShellCommand(DefaultShellCommand);
     }
 
-    public void PrepareCurrentSession(string executablePath, string arguments)
+    /// <summary>
+    /// Gives Windows its shell back when the per-user shell value still starts
+    /// this TFS executable (any arguments). Used on uninstall.
+    /// </summary>
+    public bool RestoreIfOwnedBy(string executablePath)
     {
-        var desiredCommand = BuildCommand(executablePath, arguments);
+        var currentShell = GetShellCommand();
+        if (string.IsNullOrWhiteSpace(executablePath) ||
+            currentShell.IndexOf(executablePath, StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            return false;
+        }
+
         var fallbackShell = GetFallbackShellCommand();
-
-        try
-        {
-            SetShellCommand(fallbackShell);
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            SetShellCommand(desiredCommand);
-        }
-        catch
-        {
-        }
+        var executableName = Path.GetFileName(executablePath);
+        SetShellCommand(
+            !string.IsNullOrWhiteSpace(executableName) &&
+            fallbackShell.IndexOf(executableName, StringComparison.OrdinalIgnoreCase) >= 0
+                ? DefaultShellCommand
+                : fallbackShell);
+        return true;
     }
 
     public void StartWindowsShellIfNeeded()
@@ -150,12 +136,5 @@ public sealed class WindowsShellService
             FileName = "explorer.exe",
             UseShellExecute = true,
         })?.Dispose();
-    }
-
-    private static string BuildCommand(string executablePath, string arguments)
-    {
-        return string.IsNullOrWhiteSpace(arguments)
-            ? $"\"{executablePath}\""
-            : $"\"{executablePath}\" {arguments}";
     }
 }

@@ -243,14 +243,9 @@ internal static class ManagedRetroAchievementsHasher
     }
 
     private static int ResolveSystemId(string? platformId) =>
-        platformId?.Trim().ToLowerInvariant() switch
-        {
-            "nintendo-64" => 2,
-            "game-boy-advance" => 5,
-            "gamecube" => 16,
-            "psp" => 41,
-            _ => 0,
-        };
+        OmniLibraryRomSystemRegistry.TryGet(platformId, out var system)
+            ? system.RetroAchievementsConsoleId
+            : 0;
 
     private static async Task CopyToWithLimitAsync(
         Stream source,

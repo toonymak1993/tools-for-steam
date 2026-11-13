@@ -114,25 +114,52 @@ public sealed class SteamLoaderBackgroundHost
         var steamLoaderSettingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
-            new XboxModeService(),
             Environment.ProcessPath
                 ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path."),
-            SteamLoaderRuntime.ShellLaunchArguments,
+            SteamLoaderRuntime.LegacyShellLaunchArguments,
             Path.Combine(dataDirectory, "tfs.json"));
         steamLoaderSettingsService.EnsureDefaultConsoleModeEnabled();
         await using var curtainService = new CurtainService(
             new CurtainSettingsStore(Path.Combine(dataDirectory, "curtain.json")),
             steamInstallationService,
-            () => steamLoaderSettingsService.IsPluginEnabled("curtain"));
+            () => steamLoaderSettingsService.IsPluginEnabled("curtain"),
+            windowHandle =>
+            {
+                processWindowService.ActivateWindow($"0x{windowHandle.ToInt64():X}");
+                return true;
+            });
         var pluginStoreService = new PluginStoreService(
             httpClient,
             steamLoaderSettingsService,
             Path.Combine(dataDirectory, "plugin-store"));
-        var pluginFullTrustRuntime = new PluginFullTrustRuntime(pluginStoreService, devToolsClient);
+        var omniLibraryRefreshCoordinator = new OmniLibraryRefreshCoordinator(
+            storeSyncService,
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
+            message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
+                message));
+        var omniLibraryInstallStateCoordinator = new OmniLibraryInstallStateCoordinator(
+            storeSyncSettingsStore,
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
+            (storeId, gameIds) =>
+            {
+                if (steamLoaderSettingsService.IsPluginEnabled("omnilibrary"))
+                {
+                    storeSyncService.QueueOmniLibraryLocalReconciliation(
+                        storeId,
+                        "omnilibrary-install-state",
+                        gameIds);
+                }
+            },
+            message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "omnilibrary-install-state.log"),
+                message));
         var storeSyncAutomationService = new StoreSyncAutomationService(
             storeSyncService,
             () => steamLoaderSettingsService.IsPluginEnabled("store-sync"),
-            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"));
+            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
+            omniLibraryRefreshCoordinator.RequestCheck,
+            omniLibraryInstallStateCoordinator.RequestCheck);
         var frontendComponentService = new SteamFrontendComponentService(devToolsClient);
         var shellVisibilityService = new WindowsShellVisibilityService();
         var shellGuardService = new ConsoleModeShellGuardService(
@@ -151,7 +178,8 @@ public sealed class SteamLoaderBackgroundHost
             steamClientLaunchService,
             shellService,
             executablePath,
-            SteamLoaderRuntime.BackgroundArgument);
+            SteamLoaderRuntime.BackgroundArgument,
+            shellVisibilityService);
         var gamepadHelperTaskService = new GamepadHelperScheduledTaskService(
             executablePath,
             AppContext.BaseDirectory);
@@ -192,24 +220,98 @@ public sealed class SteamLoaderBackgroundHost
             devToolsClient,
             liveUpdateHub,
             Path.Combine(dataDirectory, "external-game-quick-access.log"));
-        var sharedScript = EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js");
+        var sharedScript = string.Join(
+            Environment.NewLine,
+            EmbeddedAssetReader.ReadText("Assets/quickaccess-shell.js"),
+            // TFS Curtain's launch hook and editor route live next to
+            // SteamClient and Steam's React in the shared context.
+            EmbeddedAssetReader.ReadText("Assets/curtain-core.js"),
+            // TFS Trailers: game page trailer player and its settings route.
+            EmbeddedAssetReader.ReadText("Assets/trailer-core.js"),
+            // HowLongToBeat row on the game page (patches Steam's app route).
+            EmbeddedAssetReader.ReadText("Assets/hltb-core.js"),
+            // OmniLibrary download row on the game page, right below Play
+            // (after hltb-core so it wraps outermost and sits above HLTB).
+            EmbeddedAssetReader.ReadText("Assets/download-core.js"),
+            // TFS Overture: game page theme music and its settings route.
+            EmbeddedAssetReader.ReadText("Assets/overture-core.js"),
+            // TFS Metadata: per-game metadata editor route (/tfs/metadata/:appId).
+            EmbeddedAssetReader.ReadText("Assets/metadata-editor.js"),
+            // TFS Artworks page (/tfs/artworks/:appId).
+            EmbeddedAssetReader.ReadText("Assets/artwork-picker.js"),
+            // TFS section in Steam's own Performance tab (core.qam.patchTab).
+            EmbeddedAssetReader.ReadText("Assets/perf-tab.js"),
+            // TFS Popups: hands Steam's toasts to the TFS overlay (settings: Quick Access plugin).
+            // It also retires the removed notification-scale.js / menu-scale.js.
+            EmbeddedAssetReader.ReadText("Assets/popups-core.js"),
+            // Controller intro video (/tfs/intro): once after installation, replay from Settings.
+            EmbeddedAssetReader.ReadText("Assets/intro-video.js"));
         var popupScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
+            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"),
-            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"));
+            // Window bridge: Steam keyboard for every text field + core.css (tfs-core).
+            EmbeddedAssetReader.ReadText("Assets/window-bridge.js"));
         var themeSurfaceScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
+            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-tab-topology.js"),
             EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
             EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-metadata-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/curtain-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/artwork-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/plugin-store-overlay.js"),
-            EmbeddedAssetReader.ReadText("Assets/store-overlay.js"));
+            EmbeddedAssetReader.ReadText("Assets/store-overlay.js"),
+            EmbeddedAssetReader.ReadText("Assets/window-bridge.js"));
+        var frontendBundles = new FrontendBundleRegistry(ApiBaseUri, apiSessionToken);
+        var sharedBundle = frontendBundles.AddScript(
+            "shared",
+            "__steamLoaderSharedScriptVersion",
+            sharedScript);
+        var popupBundle = frontendBundles.AddScript(
+            "quickaccess",
+            "__steamLoaderPopupScriptVersion",
+            popupScript);
+        var themeSurfaceBundle = frontendBundles.AddScript(
+            "surfaces",
+            "__steamLoaderThemeSurfaceScriptVersion",
+            themeSurfaceScript);
+        // Steam's menu popups only get theming (and the curtain, which owns
+        // its own window handling); everything else runs in Big Picture.
+        var menuSurfaceBundle = frontendBundles.AddScript(
+            "surfaces-menu",
+            "__steamLoaderMenuSurfaceScriptVersion",
+            string.Join(
+                Environment.NewLine,
+                EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
+                EmbeddedAssetReader.ReadText("Assets/curtain-surface.js"),
+                // These three retire themselves outside Big Picture; loading
+                // them here stops copies an older build left in menu windows.
+                EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
+                EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),
+                EmbeddedAssetReader.ReadText("Assets/store-overlay.js"),
+                EmbeddedAssetReader.ReadText("Assets/window-bridge.js")));
+        var coreBundle = frontendBundles.AddModule(
+            "tfs-core",
+            "__tfsCoreVersion",
+            EmbeddedAssetReader.ReadText("Assets/tfs-core.mjs"));
+        var storeBundle = frontendBundles.AddModule(
+            "tfs-store",
+            "__tfsStoreVersion",
+            EmbeddedAssetReader.ReadText("Assets/tfs-store.mjs"));
+        // CSS Loader Theme Store pages (DeckThemes previews), also on tfs-core.
+        var themesStoreBundle = frontendBundles.AddModule(
+            "tfs-themes-store",
+            "__tfsThemesStoreVersion",
+            EmbeddedAssetReader.ReadText("Assets/tfs-themes-store.mjs"));
+        // Discord Web as a Big Picture page (Steam BrowserView), also on tfs-core.
+        var discordBundle = frontendBundles.AddModule(
+            "tfs-discord",
+            "__tfsDiscordVersion",
+            EmbeddedAssetReader.ReadText("Assets/tfs-discord.mjs"));
 
         var appStartService = new AppStartService(
             Path.Combine(dataDirectory, "app-start.json"),
@@ -232,6 +334,12 @@ public sealed class SteamLoaderBackgroundHost
             () => steamLoaderSettingsService.IsPluginEnabled("smart-home"),
             discordService,
             () => steamLoaderSettingsService.IsPluginEnabled("discord"));
+        // Xbox button: no Game Bar over Big Picture, Game Bar in Xbox / MS Store games.
+        using var gameBarControllerAutomation = new GameBarControllerAutomationService(
+            steamLoaderSettingsService.IsGameBarControllerAutomationEnabled,
+            () => SteamBigPictureForegroundDetector.FindGamepadUiWindows().Count > 0,
+            Path.Combine(dataDirectory, "gamebar-controller-original.json"),
+            message => AppendDiagnosticLog(Path.Combine(dataDirectory, "gamebar-controller.log"), message));
         using var hidMenuButtonMonitor = new HidMenuButtonMonitor();
         hidMenuButtonMonitor.ReportObserved += handheldPerformanceService.ObserveOemInput;
         var controllerShortcutService = new ControllerShortcutService(
@@ -257,6 +365,12 @@ public sealed class SteamLoaderBackgroundHost
             openInGameQuickAccessAsync: () =>
                 devToolsClient.TryOpenInGameOverlayAsync(quickAccess: true, cancellationToken));
 
+        // TFS Popups: overlay + shell-mode volume indicator (Windows calls back on changes only).
+        using var popupService = new Infrastructure.Popups.PopupService(
+            dataDirectory,
+            () => steamLoaderSettingsService.IsPluginEnabled("popups"),
+            steamLoaderSettingsService.GetNotificationScalePercent);
+        _ = Task.Run(popupService.Start, cancellationToken);
         await using var apiServer = new SteamLoaderApiServer(
             audioOutputDeviceService,
             displaySwitchService,
@@ -284,7 +398,6 @@ public sealed class SteamLoaderBackgroundHost
             devToolsClient,
             smartHomeService,
             discordService,
-            pluginFullTrustRuntime,
             externalGameQuickAccessService,
             () => ControllerShortcutService.ReadPressedButtonIds(
                 ControllerShortcutService.ReadConnectedControllerButtonMasks()
@@ -297,22 +410,58 @@ public sealed class SteamLoaderBackgroundHost
             apiSessionToken,
             _hostState,
             liveUpdateHub,
-            requestShutdown);
+            requestShutdown)
+        {
+            FrontendBundles = frontendBundles,
+            Trailers = new Infrastructure.Trailers.TrailerService(
+                httpClient,
+                new Infrastructure.Trailers.TrailerSettingsStore(Path.Combine(dataDirectory, "trailers.json"))),
+            Overture = new Infrastructure.Overture.OvertureService(
+                new Infrastructure.Overture.OvertureSettingsStore(Path.Combine(dataDirectory, "overture.json")),
+                Path.Combine(dataDirectory, "overture")),
+            ArtworkPicker = new ArtworkPickerService(
+                artworkService,
+                new SteamOfficialArtworkService(httpClient),
+                httpClient,
+                Path.Combine(dataDirectory, "artwork-matches.json")),
+            PerfTab = new Infrastructure.PerfTab.PerfTabService(
+                performanceService,
+                displaySwitchService,
+                handheldPerformanceService,
+                dataDirectory),
+            QuickSettings = new Infrastructure.PerfTab.QuickSettingsService(
+                audioOutputDeviceService,
+                displaySwitchService,
+                hdrDisplayService),
+            Popups = popupService,
+            DiscordWeb = new DiscordWebBridge(
+                devToolsClient,
+                message => AppendDiagnosticLog(Path.Combine(dataDirectory, "discord-web.log"), message))
+        };
 
         var injector = new QuickAccessShellInjector(
             devToolsClient,
-            ApiBaseUri,
-            apiSessionToken,
+            frontendBundles,
             steamClientLaunchService,
-            sharedScript,
-            popupScript,
-            themeSurfaceScript,
-            _hostState);
+            sharedBundle,
+            popupBundle,
+            themeSurfaceBundle,
+            coreBundle,
+            _hostState,
+            message => AppendDiagnosticLog(
+                Path.Combine(dataDirectory, "frontend-loader.log"),
+                message),
+            menuSurfaceBundle,
+            storeBundle,
+            [themesStoreBundle, discordBundle]);
 
         await apiServer.StartAsync(cancellationToken);
         _ = themesService.StartBackendOnStartupAsync();
         using var shellGuardCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var shellGuardTask = shellGuardService.RunAsync(shellGuardCts.Token);
+        var xboxModeConflictTask = new XboxModeConflictNotifier(
+            steamLoaderSettingsService,
+            liveUpdateHub).RunAsync(shellGuardCts.Token);
         using var autoSisirCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var autoSisirTask = autoSisirService.RunAsync(autoSisirCts.Token);
         using var storeSyncAutomationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -330,12 +479,6 @@ public sealed class SteamLoaderBackgroundHost
         using var handheldProfileCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var handheldProfileTask = handheldProfileCoordinator.RunAsync(handheldProfileCts.Token);
         using var omniLibraryRefreshCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var omniLibraryRefreshCoordinator = new OmniLibraryRefreshCoordinator(
-            storeSyncService,
-            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
-            message => AppendDiagnosticLog(
-                Path.Combine(dataDirectory, "omnilibrary-refresh.log"),
-                message));
         var omniLibraryRefreshTask = omniLibraryRefreshCoordinator.RunAsync(
             omniLibraryRefreshCts.Token);
         using var omniLibraryDownloadPowerCts =
@@ -348,22 +491,6 @@ public sealed class SteamLoaderBackgroundHost
                 omniLibraryDownloadPowerCts.Token);
         using var omniLibraryInstallStateCts =
             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var omniLibraryInstallStateCoordinator = new OmniLibraryInstallStateCoordinator(
-            storeSyncSettingsStore,
-            () => steamLoaderSettingsService.IsPluginEnabled("omnilibrary"),
-            (storeId, gameIds) =>
-            {
-                if (steamLoaderSettingsService.IsPluginEnabled("omnilibrary"))
-                {
-                    storeSyncService.QueueOmniLibraryLocalReconciliation(
-                        storeId,
-                        "omnilibrary-install-state",
-                        gameIds);
-                }
-            },
-            message => AppendDiagnosticLog(
-                Path.Combine(dataDirectory, "omnilibrary-install-state.log"),
-                message));
         var omniLibraryInstallStateTask = omniLibraryInstallStateCoordinator.RunAsync(
             omniLibraryInstallStateCts.Token);
 
@@ -471,6 +598,14 @@ public sealed class SteamLoaderBackgroundHost
             try
             {
                 await shellGuardTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            try
+            {
+                await xboxModeConflictTask;
             }
             catch (OperationCanceledException)
             {

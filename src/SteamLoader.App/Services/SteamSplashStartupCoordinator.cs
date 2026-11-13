@@ -5,18 +5,33 @@ internal sealed class SteamSplashStartupCoordinator
     private const int RequiredStableForegroundObservations = 2;
     private const int RequiredStableUiObservationsWithHostSignal = 2;
     private const int RequiredStableUiObservationsWithoutHostSignal = 4;
+    private const int RequiredStableBlockingUiObservations = 2;
     private const int MaximumAutomaticFocusAttempts = 3;
     private static readonly TimeSpan FailedStateDesktopFallbackDelay = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan UserWaitExtension = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan HostUnavailableDesktopFallbackDelay = TimeSpan.FromSeconds(60);
+
+    // Recovery choices appear only when Steam is slower than usual AND has not
+    // shown a new startup signal for this long. A slow but progressing start
+    // never sees "Steam is taking longer than usual".
+    private static readonly TimeSpan ProgressStallWindow = TimeSpan.FromSeconds(30);
+
+    // Progress also moves the automatic desktop fallback, but never beyond
+    // this absolute limit.
+    private static readonly TimeSpan StalledSafetyWindow = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan MaximumSplashDuration = TimeSpan.FromMinutes(15);
 
     private readonly SteamStartupTimingPolicy _timing;
     private readonly DateTimeOffset _startedAt;
     private DateTimeOffset? _failedAt;
     private DateTimeOffset? _hostUnavailableAt;
     private DateTimeOffset? _waitExtendedUntil;
+    private DateTimeOffset _lastProgressAt;
+    private int _lastProgressLevel;
     private int _stableForegroundCount;
     private int _stableUiCount;
     private int _stableHostSignalCount;
+    private int _stableBlockingUiCount;
     private int _automaticFocusAttempts;
 
     public SteamSplashStartupCoordinator(
@@ -25,6 +40,7 @@ internal sealed class SteamSplashStartupCoordinator
     {
         _timing = timing;
         _startedAt = startedAt;
+        _lastProgressAt = startedAt;
     }
 
     public SteamSplashDecision Observe(
@@ -61,6 +77,14 @@ internal sealed class SteamSplashStartupCoordinator
         _stableHostSignalCount = hostSteamSignalReady && uiVisible
             ? _stableHostSignalCount + 1
             : 0;
+        _stableBlockingUiCount = blockingUiState && runtime.Windows.HasLikelyGamepadWindow
+            ? _stableBlockingUiCount + 1
+            : 0;
+
+        var updateProtected = runtime.UpdateInProgress ||
+            startupStage == SteamClientStartupStage.Updating ||
+            uiState == SteamUiState.Updating;
+        TrackProgress(now, runtime, uiVisible, hostSteamSignalReady, updateProtected);
 
         var uiStable =
             _stableHostSignalCount >= RequiredStableUiObservationsWithHostSignal ||
@@ -74,6 +98,34 @@ internal sealed class SteamSplashStartupCoordinator
                 "Steam is ready in the foreground.");
         }
 
+        if (uiStable && _automaticFocusAttempts >= MaximumAutomaticFocusAttempts)
+        {
+            // Big Picture is up but Windows did not hand it the foreground.
+            // The splash must not keep covering a ready Steam: step aside so
+            // Big Picture is the top window.
+            return new SteamSplashDecision(
+                SteamSplashNextAction.CompleteWithSteam,
+                ShowRecoveryActions: false,
+                CanRestartSteam: false,
+                "Steam Big Picture is ready; handing over without confirmed foreground.");
+        }
+
+        if (_stableBlockingUiCount >= RequiredStableBlockingUiObservations)
+        {
+            // Sign-in, offline or error screens in Big Picture need the user.
+            // Show them instead of covering them with the splash.
+            return new SteamSplashDecision(
+                SteamSplashNextAction.CompleteWithSteam,
+                ShowRecoveryActions: false,
+                CanRestartSteam: false,
+                uiState switch
+                {
+                    SteamUiState.Login => "Steam Big Picture is waiting for sign-in; handing over to Steam.",
+                    SteamUiState.Offline => "Steam Big Picture shows an offline/network screen; handing over to Steam.",
+                    _ => "Steam Big Picture shows an error screen; handing over to Steam."
+                });
+        }
+
         if (runtime.GameOrOverlayRunning || startupStage == SteamClientStartupStage.Protected)
         {
             return new SteamSplashDecision(
@@ -83,16 +135,14 @@ internal sealed class SteamSplashStartupCoordinator
                 "Active Steam game or download protected from startup recovery.");
         }
 
-        var updateProtected = runtime.UpdateInProgress ||
-            startupStage == SteamClientStartupStage.Updating ||
-            uiState == SteamUiState.Updating;
         var elapsed = now - _startedAt;
-        var recoveryActionsDue = elapsed >= _timing.ShowRecoveryActionsAfter;
+        var stalled = now - _lastProgressAt >= ProgressStallWindow;
+        var recoveryActionsDue = elapsed >= _timing.ShowRecoveryActionsAfter && stalled;
+        var safetyDeadline = _waitExtendedUntil ?? ResolveSafetyDeadline();
 
         if (blockingUiState && startupStage != SteamClientStartupStage.Failed)
         {
-            var blockingUiDeadline = _waitExtendedUntil ?? _startedAt + _timing.SplashSafetyTimeout;
-            if (now >= blockingUiDeadline)
+            if (now >= safetyDeadline)
             {
                 return new SteamSplashDecision(
                     SteamSplashNextAction.CompleteWithDesktop,
@@ -136,7 +186,7 @@ internal sealed class SteamSplashStartupCoordinator
 
         _failedAt = null;
 
-        if (_hostUnavailableAt.HasValue && now - _hostUnavailableAt.Value >= TimeSpan.FromSeconds(30))
+        if (_hostUnavailableAt.HasValue && now - _hostUnavailableAt.Value >= HostUnavailableDesktopFallbackDelay)
         {
             return new SteamSplashDecision(
                 SteamSplashNextAction.CompleteWithDesktop,
@@ -145,8 +195,7 @@ internal sealed class SteamSplashStartupCoordinator
                 "The background service is unavailable.");
         }
 
-        var effectiveSafetyDeadline = _waitExtendedUntil ?? _startedAt + _timing.SplashSafetyTimeout;
-        if (now >= effectiveSafetyDeadline)
+        if (now >= safetyDeadline)
         {
             return new SteamSplashDecision(
                 SteamSplashNextAction.CompleteWithDesktop,
@@ -157,17 +206,9 @@ internal sealed class SteamSplashStartupCoordinator
 
         if (runtime.Windows.HasVisibleSteamWindow &&
             uiState != SteamUiState.Desktop &&
-            !runtime.Windows.IsSteamForeground)
+            !runtime.Windows.IsSteamForeground &&
+            _automaticFocusAttempts < MaximumAutomaticFocusAttempts)
         {
-            if (recoveryActionsDue || _automaticFocusAttempts >= MaximumAutomaticFocusAttempts)
-            {
-                return new SteamSplashDecision(
-                    SteamSplashNextAction.Wait,
-                    ShowRecoveryActions: true,
-                    CanRestartSteam: !updateProtected,
-                    "Steam is visible, but Windows did not keep it in the foreground.");
-            }
-
             _automaticFocusAttempts++;
             return new SteamSplashDecision(
                 SteamSplashNextAction.FocusSteam,
@@ -184,13 +225,52 @@ internal sealed class SteamSplashStartupCoordinator
                 ? "Steam update/download activity detected; automatic restart is paused."
                 : startupStage == SteamClientStartupStage.Recovering
                     ? "Steam is completing its single controlled recovery."
-                    : "Waiting for Steam Gamepad UI.");
+                    : runtime.Windows.HasVisibleSteamWindow && !runtime.Windows.IsSteamForeground
+                        ? "Steam is visible, but Windows did not keep it in the foreground."
+                        : "Waiting for Steam Gamepad UI.");
     }
 
     public void ExtendWait(DateTimeOffset now)
     {
         _waitExtendedUntil = now + UserWaitExtension;
         _failedAt = null;
+        _lastProgressAt = now;
+    }
+
+    /// <summary>
+    /// Every new startup signal (steam.exe, web helper, a visible window, the
+    /// host's Steam connection, Big Picture) counts as progress. An active
+    /// Steam update counts as progress the whole time it runs. A signal that
+    /// disappears (Steam restarting itself) and comes back counts again.
+    /// </summary>
+    private void TrackProgress(
+        DateTimeOffset now,
+        SteamRuntimeObservation runtime,
+        bool uiVisible,
+        bool hostSteamSignalReady,
+        bool updateProtected)
+    {
+        var level =
+            (runtime.SteamRunning ? 1 : 0) +
+            (runtime.WebHelperRunning ? 1 : 0) +
+            (runtime.Windows.HasVisibleSteamWindow ? 1 : 0) +
+            (hostSteamSignalReady ? 1 : 0) +
+            (uiVisible ? 1 : 0);
+        if (level > _lastProgressLevel || updateProtected)
+        {
+            _lastProgressAt = now;
+        }
+
+        _lastProgressLevel = level;
+    }
+
+    private DateTimeOffset ResolveSafetyDeadline()
+    {
+        var timeoutDeadline = _startedAt + _timing.SplashSafetyTimeout;
+        var progressDeadline = _lastProgressAt + StalledSafetyWindow;
+        var absoluteDeadline = _startedAt + MaximumSplashDuration;
+        var deadline = progressDeadline > timeoutDeadline ? progressDeadline : timeoutDeadline;
+        return deadline < absoluteDeadline ? deadline : absoluteDeadline;
     }
 }
 

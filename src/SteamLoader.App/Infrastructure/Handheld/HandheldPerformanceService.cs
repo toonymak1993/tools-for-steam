@@ -69,12 +69,15 @@ public sealed class HandheldPerformanceService
             var status = LoadStatus();
             var pawnIoInstalled = IsPawnIoInstalled();
             var pawnIoReady = pawnIoInstalled && status.PawnIoReady;
-            var supported = HandheldDeviceCatalog.IsSupported(device);
+            var supported = HandheldDeviceCatalog.SupportsTdp(device);
+            var vendorApps = HandheldVendorAppDetector.FindRunning();
             var statusText = !supported
                 ? $"Unsupported device ({device.Manufacturer} {device.ProductCode})."
                 : !pawnIoInstalled
                     ? "PawnIO 2.1 or newer is required before TDP control can be enabled."
-                    : status.Message;
+                    : vendorApps.Count > 0
+                        ? $"{string.Join(", ", vendorApps)} is running and may override the TDP."
+                        : status.Message;
             var globalAcWatts = ResolveSettingsTdp(settings, "ac");
             var globalBatteryWatts = ResolveSettingsTdp(settings, "battery");
             var globalWatts = ResolveSettingsTdp(settings, _powerState.PowerSource);
@@ -125,10 +128,10 @@ public sealed class HandheldPerformanceService
                 pawnIoInstalled,
                 pawnIoReady,
                 device.MinimumTdpWatts,
-                device.MaximumTdpWatts,
+                MaximumTdp(device, _powerState.PowerSource),
                 selectedWatts,
-                ResolveSppt(selectedWatts),
-                ResolveFppt(selectedWatts),
+                ResolveSppt(device, selectedWatts, _powerState.PowerSource),
+                ResolveFppt(device, selectedWatts, _powerState.PowerSource),
                 status.AppliedTdpWatts,
                 status.AppliedSpptWatts,
                 status.AppliedFpptWatts,
@@ -175,7 +178,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            var device = RequireSupportedDevice();
+            var device = RequireOemDevice();
             if (!device.OemSoftware.Supported)
             {
                 throw new InvalidOperationException("OEM software control is not supported by this device.");
@@ -195,7 +198,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            _systemControls.SetVibrationStrength(RequireSupportedDevice(), strengthPercent);
+            _systemControls.SetVibrationStrength(RequireOemDevice(), strengthPercent);
             _uiHapticVibrationStrength = strengthPercent;
             return GetSnapshot();
         }
@@ -205,7 +208,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            _systemControls.SetUiHapticsEnabled(RequireSupportedDevice(), enabled);
+            _systemControls.SetUiHapticsEnabled(RequireOemDevice(), enabled);
             _uiHapticsEnabled = enabled;
             return GetSnapshot();
         }
@@ -245,7 +248,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            _systemControls.StartButtonCapture(RequireSupportedDevice(), buttonId);
+            _systemControls.StartButtonCapture(RequireOemDevice(), buttonId);
             return GetSnapshot();
         }
     }
@@ -254,7 +257,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            _systemControls.CancelButtonCapture(RequireSupportedDevice());
+            _systemControls.CancelButtonCapture(RequireOemDevice());
             return GetSnapshot();
         }
     }
@@ -266,7 +269,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            _systemControls.SetButtonBinding(RequireSupportedDevice(), buttonId, actionId, customShortcut);
+            _systemControls.SetButtonBinding(RequireOemDevice(), buttonId, actionId, customShortcut);
             return GetSnapshot();
         }
     }
@@ -281,7 +284,7 @@ public sealed class HandheldPerformanceService
     {
         lock (_sync)
         {
-            var device = RequireSupportedDevice();
+            var device = RequireOemDevice();
             if (!device.Lighting.Supported)
             {
                 throw new InvalidOperationException("RGB lighting is not supported by this device.");
@@ -319,11 +322,15 @@ public sealed class HandheldPerformanceService
                 throw new InvalidOperationException("PawnIO 2.1 or newer is not installed.");
             }
 
-            var clamped = Math.Clamp(watts, device.MinimumTdpWatts, device.MaximumTdpWatts);
+            var clamped = ClampTdp(device, watts, _powerState.PowerSource);
             var matchingMode = device.Modes.FirstOrDefault(mode => mode.Watts == clamped);
-            if (_currentGame is null)
+            // Like the Steam Deck: changes go into the running game's profile only when
+            // that game uses its own profile; otherwise they change the global value.
+            if (_currentGame is null || FindCurrentGameProfile(device) is null)
             {
                 SaveGlobalPowerProfile(device, _powerState.PowerSource, clamped, matchingMode?.Id ?? "custom");
+                _lastAutomaticTargetKey = _currentGame?.Key ?? string.Empty;
+                _lastAutomaticTdpWatts = clamped;
             }
             else
             {
@@ -356,10 +363,11 @@ public sealed class HandheldPerformanceService
                 throw new InvalidOperationException("PawnIO 2.1 or newer is not installed.");
             }
 
-            var clamped = Math.Clamp(watts, device.MinimumTdpWatts, device.MaximumTdpWatts);
             var normalizedPowerSource = NormalizePowerSource(powerSource, _powerState.PowerSource);
+            var clamped = ClampTdp(device, watts, normalizedPowerSource);
             SaveGlobalPowerProfile(device, normalizedPowerSource, clamped, ResolveModeId(device, clamped));
-            if (_currentGame is null && string.Equals(normalizedPowerSource, _powerState.PowerSource, StringComparison.Ordinal))
+            if ((_currentGame is null || FindCurrentGameProfile(device) is null) &&
+                string.Equals(normalizedPowerSource, _powerState.PowerSource, StringComparison.Ordinal))
             {
                 WriteCommand(device, clamped);
                 _lastAutomaticTargetKey = string.Empty;
@@ -384,8 +392,8 @@ public sealed class HandheldPerformanceService
             var profile = settings.Profiles?.FirstOrDefault(candidate =>
                 string.Equals(candidate.Key, key, StringComparison.OrdinalIgnoreCase))
                 ?? throw new InvalidOperationException("The selected game profile no longer exists.");
-            var clamped = Math.Clamp(watts, device.MinimumTdpWatts, device.MaximumTdpWatts);
             var normalizedPowerSource = NormalizePowerSource(powerSource, _powerState.PowerSource);
+            var clamped = ClampTdp(device, watts, normalizedPowerSource);
             var updated = SetProfilePowerTdp(profile, normalizedPowerSource, clamped) with
             {
                 UpdatedAt = DateTimeOffset.UtcNow
@@ -420,6 +428,7 @@ public sealed class HandheldPerformanceService
             SaveProfileSettings(settings);
             _lastAutomaticTargetKey = string.Empty;
             _lastAutomaticTdpWatts = 0;
+            NotifyActiveProfile(enabled ? FindCurrentGameProfile(device) : null);
             return GetSnapshot();
         }
     }
@@ -465,8 +474,278 @@ public sealed class HandheldPerformanceService
                 .ToArray();
             SaveProfileSettings(settings with { Profiles = profiles });
             _lastAutomaticTargetKey = string.Empty;
+            if (string.Equals(_activeProfileKey, key, StringComparison.OrdinalIgnoreCase))
+            {
+                NotifyActiveProfile(null);
+            }
+
             return GetSnapshot();
         }
+    }
+
+    /// <summary>Raised when the game profile in effect changes (null = global values).</summary>
+    public event Action<HandheldGameTdpProfile?>? ActiveGameProfileChanged;
+
+    private string _activeProfileKey = string.Empty;
+    private GameProfileExtras? _activeProfileExtras;
+
+    private void NotifyActiveProfile(HandheldGameTdpProfile? profile, bool force = false)
+    {
+        var key = profile?.Key ?? string.Empty;
+        if (!force &&
+            string.Equals(key, _activeProfileKey, StringComparison.OrdinalIgnoreCase) &&
+            Equals(profile?.Extras, _activeProfileExtras))
+        {
+            return;
+        }
+
+        _activeProfileKey = key;
+        _activeProfileExtras = profile?.Extras;
+        try
+        {
+            ActiveGameProfileChanged?.Invoke(profile);
+        }
+        catch
+        {
+            // A failing listener must not stop TDP handling.
+        }
+    }
+
+    public HandheldGameTdpProfile? GetProfile(string key)
+    {
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            return LoadProfileSettings(device).Profiles?.FirstOrDefault(profile =>
+                string.Equals(profile.Key, key, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>How long the elevated helper may take before "no answer" is reported.</summary>
+    internal static readonly TimeSpan HelperAnswerTimeout = TimeSpan.FromSeconds(8);
+
+    /// <summary>Compares the last TDP command with the elevated helper's answer.</summary>
+    public HandheldTdpConfirmation GetTdpConfirmation()
+    {
+        lock (_sync)
+        {
+            return ResolveTdpConfirmation(LoadCommand(), LoadStatus(), DateTimeOffset.UtcNow);
+        }
+    }
+
+    internal static HandheldTdpConfirmation ResolveTdpConfirmation(
+        HandheldHardwareCommand? command,
+        HandheldHardwareStatus status,
+        DateTimeOffset now)
+    {
+        var tdpCommand = command is not null && string.Equals(command.Operation, "set-tdp", StringComparison.Ordinal)
+            ? command
+            : null;
+        if (tdpCommand is not null && status.Nonce < tdpCommand.Nonce)
+        {
+            var sentAt = DateTimeOffset.FromUnixTimeMilliseconds(tdpCommand.Nonce);
+            return now - sentAt > HelperAnswerTimeout
+                ? new HandheldTdpConfirmation("no-helper", tdpCommand.TdpWatts, tdpCommand.SpptWatts, tdpCommand.FpptWatts, string.Empty,
+                    "The elevated hardware helper did not answer.", sentAt)
+                : new HandheldTdpConfirmation("pending", tdpCommand.TdpWatts, tdpCommand.SpptWatts, tdpCommand.FpptWatts, string.Empty,
+                    string.Empty, sentAt);
+        }
+
+        if (string.Equals(status.Operation, "set-tdp", StringComparison.Ordinal) && status.Nonce > 0 && !status.Success)
+        {
+            return new HandheldTdpConfirmation("failed", tdpCommand?.TdpWatts ?? 0, 0, 0, string.Empty, status.Message, status.UpdatedAt);
+        }
+
+        return status.AppliedTdpWatts > 0
+            ? new HandheldTdpConfirmation("confirmed", status.AppliedTdpWatts, status.AppliedSpptWatts, status.AppliedFpptWatts,
+                status.CpuCodeName, status.Message, status.UpdatedAt)
+            : new HandheldTdpConfirmation("none", 0, 0, 0, string.Empty, string.Empty, null);
+    }
+
+    private HandheldHardwareCommand? LoadCommand()
+    {
+        try
+        {
+            return File.Exists(_commandPath)
+                ? JsonSerializer.Deserialize<HandheldHardwareCommand>(File.ReadAllText(_commandPath), JsonOptions)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Used by the game monitor: hand-added apps count as "games" for their profile.</summary>
+    public bool HasProfile(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return false;
+        }
+
+        lock (_sync)
+        {
+            return HandheldDeviceCatalog.SupportsTdp(_device) &&
+                (LoadProfileSettings(_device).Profiles?.Any(profile =>
+                    string.Equals(profile.Key, key, StringComparison.OrdinalIgnoreCase)) ?? false);
+        }
+    }
+
+    /// <summary>
+    /// "Add profile": creates a profile for a game or app the user picked, starting from the
+    /// global TDP values. Profiles are only ever created this way or with "use per-game profile".
+    /// </summary>
+    public HandheldGameTdpProfile CreateProfile(string key, string appId, string title, string executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            throw new ArgumentException("No game or app was selected.");
+        }
+
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            var settings = LoadProfileSettings(device);
+            var existing = settings.Profiles?.FirstOrDefault(profile =>
+                string.Equals(profile.Key, key, StringComparison.OrdinalIgnoreCase));
+            if (existing is not null)
+            {
+                return existing;
+            }
+
+            var global = LoadSettings(device);
+            var profile = new HandheldGameTdpProfile(
+                key.Trim(),
+                appId ?? string.Empty,
+                string.IsNullOrWhiteSpace(title) ? Path.GetFileNameWithoutExtension(executablePath ?? string.Empty) : title.Trim(),
+                executablePath ?? string.Empty,
+                ResolveSettingsTdp(global, _powerState.PowerSource),
+                DateTimeOffset.UtcNow,
+                ResolveSettingsTdp(global, "ac"),
+                ResolveSettingsTdp(global, "battery"));
+            SaveProfileSettings(settings with { Profiles = (settings.Profiles ?? []).Append(profile).ToArray() });
+            if (_currentGame is not null && string.Equals(_currentGame.Key, profile.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                _lastAutomaticTargetKey = string.Empty;
+                NotifyActiveProfile(profile);
+            }
+
+            return profile;
+        }
+    }
+
+    /// <summary>The running game's profile while it is in effect, else null.</summary>
+    public HandheldGameTdpProfile? GetActiveProfile()
+    {
+        lock (_sync)
+        {
+            return string.IsNullOrEmpty(_activeProfileKey) || !HandheldDeviceCatalog.SupportsTdp(_device)
+                ? null
+                : GetProfile(_activeProfileKey);
+        }
+    }
+
+    /// <summary>
+    /// Saves a profile edited on its settings page. When it belongs to the running game,
+    /// the new TDP and settings take effect at once.
+    /// </summary>
+    public HandheldPerformanceSnapshot UpdateProfile(string key, int acWatts, int batteryWatts, GameProfileExtras? extras)
+    {
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            var settings = LoadProfileSettings(device);
+            var profile = settings.Profiles?.FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, key, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidOperationException("The selected game profile no longer exists.");
+            var ac = ClampTdp(device, acWatts, "ac");
+            var battery = ClampTdp(device, batteryWatts, "battery");
+            var normalizedExtras = NormalizeExtras(extras);
+            var updated = profile with
+            {
+                TdpWatts = string.Equals(_powerState.PowerSource, "battery", StringComparison.Ordinal) ? battery : ac,
+                AcTdpWatts = ac,
+                BatteryTdpWatts = battery,
+                Extras = normalizedExtras,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            SaveProfileSettings(settings with
+            {
+                Profiles = (settings.Profiles ?? [])
+                    .Where(candidate => !string.Equals(candidate.Key, key, StringComparison.OrdinalIgnoreCase))
+                    .Append(updated)
+                    .ToArray()
+            });
+
+            if (string.Equals(_activeProfileKey, key, StringComparison.OrdinalIgnoreCase))
+            {
+                var watts = ResolveProfileTdp(updated, _powerState.PowerSource);
+                if (IsPawnIoInstalled())
+                {
+                    WriteCommand(device, watts);
+                }
+
+                _lastAutomaticTargetKey = key;
+                _lastAutomaticTdpWatts = watts;
+                NotifyActiveProfile(updated);
+            }
+
+            return GetSnapshot();
+        }
+    }
+
+    /// <summary>Stores one extra value in the running game's profile (used while "use per-game profile" is on).</summary>
+    public bool TryUpdateActiveProfileExtras(Func<GameProfileExtras, GameProfileExtras> change)
+    {
+        lock (_sync)
+        {
+            if (string.IsNullOrEmpty(_activeProfileKey) || !HandheldDeviceCatalog.SupportsTdp(_device))
+            {
+                return false;
+            }
+
+            var settings = LoadProfileSettings(_device);
+            var profile = settings.Profiles?.FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, _activeProfileKey, StringComparison.OrdinalIgnoreCase));
+            if (profile is null)
+            {
+                return false;
+            }
+
+            var updated = profile with
+            {
+                Extras = NormalizeExtras(change(profile.Extras ?? new GameProfileExtras())),
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            SaveProfileSettings(settings with
+            {
+                Profiles = (settings.Profiles ?? [])
+                    .Where(candidate => !string.Equals(candidate.Key, profile.Key, StringComparison.OrdinalIgnoreCase))
+                    .Append(updated)
+                    .ToArray()
+            });
+            // The caller already applied the value; only remember the new extras.
+            _activeProfileExtras = updated.Extras;
+            return true;
+        }
+    }
+
+    internal static GameProfileExtras? NormalizeExtras(GameProfileExtras? extras)
+    {
+        if (extras is null)
+        {
+            return null;
+        }
+
+        var powerMode = extras.PowerMode?.Trim().ToLowerInvariant();
+        var normalized = new GameProfileExtras(
+            extras.FrameLimit is null ? null : Math.Clamp(extras.FrameLimit.Value, 0, 500),
+            extras.RefreshRate is null or <= 0 ? null : Math.Clamp(extras.RefreshRate.Value, 24, 500),
+            extras.RtssLevel is null ? null : Math.Clamp(extras.RtssLevel.Value, 0, 10),
+            powerMode is "efficiency" or "balanced" or "performance" ? powerMode : null,
+            extras.CpuBoost);
+        return normalized.IsEmpty ? null : normalized;
     }
 
     internal HandheldAutomaticProfileResult? ApplyAutomaticProfile(HandheldRunningGame game)
@@ -476,14 +755,15 @@ public sealed class HandheldPerformanceService
             var device = RequireSupportedDevice();
             _currentGame = game;
             var profileSettings = LoadProfileSettings(device);
-            if (!profileSettings.AutoProfilesEnabled || !IsPawnIoInstalled())
+            var profile = profileSettings.Profiles?.FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, game.Key, StringComparison.OrdinalIgnoreCase));
+            // Frame limit, refresh rate, RTSS etc. follow the profile even without PawnIO.
+            NotifyActiveProfile(profileSettings.AutoProfilesEnabled ? profile : null);
+            if (!profileSettings.AutoProfilesEnabled || !IsPawnIoInstalled() || !HasUserTdpChoice(profileSettings))
             {
                 _lastAutomaticTargetKey = string.Empty;
                 return null;
             }
-
-            var profile = profileSettings.Profiles?.FirstOrDefault(candidate =>
-                string.Equals(candidate.Key, game.Key, StringComparison.OrdinalIgnoreCase));
             var watts = profile is null
                 ? ResolveSettingsTdp(LoadSettings(device), _powerState.PowerSource)
                 : ResolveProfileTdp(profile, _powerState.PowerSource);
@@ -514,12 +794,14 @@ public sealed class HandheldPerformanceService
             }
 
             _currentGame = null;
+            NotifyActiveProfile(null);
             var device = RequireSupportedDevice();
             var profileSettings = LoadProfileSettings(device);
             var settings = LoadSettings(device);
             var globalWatts = ResolveSettingsTdp(settings, _powerState.PowerSource);
             var shouldRestore = profileSettings.AutoProfilesEnabled &&
                 IsPawnIoInstalled() &&
+                HasUserTdpChoice(profileSettings) &&
                 (_lastAutomaticTdpWatts != globalWatts || !string.IsNullOrEmpty(_lastAutomaticTargetKey));
             _lastAutomaticTargetKey = string.Empty;
             _lastAutomaticTdpWatts = 0;
@@ -551,7 +833,7 @@ public sealed class HandheldPerformanceService
 
             var device = RequireSupportedDevice();
             var profileSettings = LoadProfileSettings(device);
-            if (!profileSettings.AutoProfilesEnabled || !IsPawnIoInstalled())
+            if (!profileSettings.AutoProfilesEnabled || !IsPawnIoInstalled() || !HasUserTdpChoice(profileSettings))
             {
                 return null;
             }
@@ -629,7 +911,17 @@ public sealed class HandheldPerformanceService
         }
     }
 
+    /// <summary>TDP and game-profile features: any device with a known AMD TDP range.</summary>
     private HandheldDeviceProfile RequireSupportedDevice()
+    {
+        var device = _device;
+        return HandheldDeviceCatalog.SupportsTdp(device)
+            ? device
+            : throw new InvalidOperationException("No AMD processor with a known TDP range was detected.");
+    }
+
+    /// <summary>OEM buttons, RGB and vibration: only fully supported handhelds.</summary>
+    private HandheldDeviceProfile RequireOemDevice()
     {
         var device = _device;
         return HandheldDeviceCatalog.IsSupported(device)
@@ -637,9 +929,18 @@ public sealed class HandheldPerformanceService
             : throw new InvalidOperationException("No supported handheld was detected.");
     }
 
+    /// <summary>
+    /// TFS leaves the processor's own limits alone until the user picked a TDP once
+    /// (global setting or a game profile). Without that, automatic profiles write nothing.
+    /// </summary>
+    private bool HasUserTdpChoice(HandheldPerformanceProfileSettings profileSettings)
+        => File.Exists(_settingsPath) || (profileSettings.Profiles?.Count ?? 0) > 0;
+
     private void WriteCommand(HandheldDeviceProfile device, int watts)
     {
-        WritePowerLimitsCommand(device, watts, ResolveSppt(watts), ResolveFppt(watts));
+        var source = _powerState.PowerSource;
+        watts = ClampTdp(device, watts, source);
+        WritePowerLimitsCommand(device, watts, ResolveSppt(device, watts, source), ResolveFppt(device, watts, source));
     }
 
     private void WritePowerLimitsCommand(HandheldDeviceProfile device, int splWatts, int spptWatts, int fpptWatts)
@@ -662,13 +963,13 @@ public sealed class HandheldPerformanceService
             if (File.Exists(_settingsPath))
             {
                 var loaded = JsonSerializer.Deserialize<HandheldPerformanceSettings>(File.ReadAllText(_settingsPath), JsonOptions);
-                if (loaded is not null && HandheldDeviceCatalog.IsSupported(device))
+                if (loaded is not null && HandheldDeviceCatalog.SupportsTdp(device))
                 {
                     return loaded with
                     {
                         TdpWatts = ClampTdp(device, loaded.TdpWatts),
-                        AcTdpWatts = loaded.AcTdpWatts is null ? null : ClampTdp(device, loaded.AcTdpWatts.Value),
-                        BatteryTdpWatts = loaded.BatteryTdpWatts is null ? null : ClampTdp(device, loaded.BatteryTdpWatts.Value)
+                        AcTdpWatts = loaded.AcTdpWatts is null ? null : ClampTdp(device, loaded.AcTdpWatts.Value, "ac"),
+                        BatteryTdpWatts = ClampTdp(device, loaded.BatteryTdpWatts ?? loaded.TdpWatts, "battery")
                     };
                 }
             }
@@ -677,7 +978,9 @@ public sealed class HandheldPerformanceService
         {
         }
 
-        return new HandheldPerformanceSettings();
+        return device.Tdp is null
+            ? new HandheldPerformanceSettings()
+            : new HandheldPerformanceSettings(device.Tdp.DefaultWatts, ResolveModeId(device, device.Tdp.DefaultWatts));
     }
 
     private HandheldPerformanceProfileSettings LoadProfileSettings(HandheldDeviceProfile device)
@@ -696,8 +999,8 @@ public sealed class HandheldPerformanceService
                         .Select(profile => profile with
                         {
                             TdpWatts = ClampTdp(device, profile.TdpWatts),
-                            AcTdpWatts = profile.AcTdpWatts is null ? null : ClampTdp(device, profile.AcTdpWatts.Value),
-                            BatteryTdpWatts = profile.BatteryTdpWatts is null ? null : ClampTdp(device, profile.BatteryTdpWatts.Value)
+                            AcTdpWatts = profile.AcTdpWatts is null ? null : ClampTdp(device, profile.AcTdpWatts.Value, "ac"),
+                            BatteryTdpWatts = ClampTdp(device, profile.BatteryTdpWatts ?? profile.TdpWatts, "battery")
                         })
                         .GroupBy(profile => profile.Key, StringComparer.OrdinalIgnoreCase)
                         .Select(group => group.OrderByDescending(profile => profile.UpdatedAt).First())
@@ -811,12 +1114,76 @@ public sealed class HandheldPerformanceService
                 ? "ac"
                 : fallback;
 
-    private static int ClampTdp(HandheldDeviceProfile device, int watts) =>
-        Math.Clamp(watts, device.MinimumTdpWatts, device.MaximumTdpWatts);
+    private static int MaximumTdp(HandheldDeviceProfile device, string powerSource) =>
+        device.Tdp?.MaximumFor(powerSource) ?? device.MaximumTdpWatts;
 
-    private static int ResolveSppt(int splWatts) => Math.Min(40, splWatts + 5);
+    private static int ClampTdp(HandheldDeviceProfile device, int watts, string powerSource = "ac") =>
+        Math.Clamp(watts, device.MinimumTdpWatts, Math.Max(device.MinimumTdpWatts, MaximumTdp(device, powerSource)));
 
-    private static int ResolveFppt(int splWatts) => Math.Min(48, splWatts + 13);
+    private static int ResolveSppt(HandheldDeviceProfile device, int splWatts, string powerSource = "ac")
+        => device.Tdp?.ResolveSppt(splWatts, powerSource) ?? splWatts;
+
+    private static int ResolveFppt(HandheldDeviceProfile device, int splWatts, string powerSource = "ac")
+        => device.Tdp?.ResolveFppt(splWatts, powerSource) ?? splWatts;
+
+    private HandheldGameTdpProfile? FindCurrentGameProfile(HandheldDeviceProfile device)
+        => _currentGame is null
+            ? null
+            : LoadProfileSettings(device).Profiles?.FirstOrDefault(profile =>
+                string.Equals(profile.Key, _currentGame.Key, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Steam Deck's "use per-game profile": on copies the current values into a profile for
+    /// the running game; off deletes that profile and goes back to the global values.
+    /// </summary>
+    public HandheldPerformanceSnapshot SetCurrentGameProfileEnabled(bool enabled)
+    {
+        lock (_sync)
+        {
+            var device = RequireSupportedDevice();
+            var game = _currentGame ?? throw new InvalidOperationException("No game is running.");
+            var settings = LoadProfileSettings(device);
+            var existing = FindCurrentGameProfile(device);
+            if (enabled && existing is null)
+            {
+                var global = LoadSettings(device);
+                SaveProfileSettings(settings with
+                {
+                    Profiles = (settings.Profiles ?? []).Append(new HandheldGameTdpProfile(
+                        game.Key,
+                        game.AppId,
+                        game.Title,
+                        game.ExecutablePath,
+                        ResolveSettingsTdp(global, _powerState.PowerSource),
+                        DateTimeOffset.UtcNow,
+                        ResolveSettingsTdp(global, "ac"),
+                        ResolveSettingsTdp(global, "battery"))).ToArray()
+                });
+                _lastAutomaticTargetKey = game.Key;
+                NotifyActiveProfile(FindCurrentGameProfile(device));
+            }
+            else if (!enabled && existing is not null)
+            {
+                SaveProfileSettings(settings with
+                {
+                    Profiles = (settings.Profiles ?? [])
+                        .Where(profile => !string.Equals(profile.Key, game.Key, StringComparison.OrdinalIgnoreCase))
+                        .ToArray()
+                });
+                var globalWatts = ResolveSettingsTdp(LoadSettings(device), _powerState.PowerSource);
+                if (IsPawnIoInstalled() && HasUserTdpChoice(LoadProfileSettings(device)))
+                {
+                    WriteCommand(device, globalWatts);
+                }
+
+                _lastAutomaticTargetKey = game.Key;
+                _lastAutomaticTdpWatts = globalWatts;
+                NotifyActiveProfile(null);
+            }
+
+            return GetSnapshot();
+        }
+    }
 
     private static string ResolveModeId(HandheldDeviceProfile device, int watts) =>
         device.Modes.FirstOrDefault(mode => mode.Watts == watts)?.Id ?? "custom";

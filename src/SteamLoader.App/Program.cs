@@ -20,14 +20,30 @@ public static class Program
     {
         _installerMutex = new Mutex(false, SteamLoaderRuntime.InstallerMutexName);
 
+        var legacyShellLaunch = args.Any(argument =>
+            string.Equals(argument, SteamLoaderRuntime.LegacyShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+        var consoleStartRequested = args.Any(argument =>
+            string.Equals(argument, SteamLoaderRuntime.ConsoleStartArgument, StringComparison.OrdinalIgnoreCase));
+        if (legacyShellLaunch || consoleStartRequested)
+        {
+            // First line of every sign-in start, before anything that can fail,
+            // so a start that dies early still leaves a trace.
+            SteamStartupDiagnostics.Write($"sign-in start args=\"{string.Join(' ', args)}\"");
+        }
+
+        if (legacyShellLaunch)
+        {
+            // Shell Takeover was removed, but an old Winlogon "Shell" value still
+            // made Windows start TFS instead of Explorer. Give the user the
+            // desktop first; the settings below migrate to Console Mode and
+            // put Explorer back as the shell for the next sign-in.
+            SteamStartupDiagnostics.Write("legacy Shell Takeover launch; starting Windows Explorer and migrating to Console Mode");
+            new WindowsShellService().StartWindowsShellIfNeeded();
+        }
+
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RestoreXboxModeArgument, StringComparison.OrdinalIgnoreCase)))
         {
             return RestoreXboxMode();
-        }
-
-        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.CheckXboxModeSupportArgument, StringComparison.OrdinalIgnoreCase)))
-        {
-            return CheckXboxModeSupport();
         }
 
         if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.PrepareHandheldOemArgument, StringComparison.OrdinalIgnoreCase)))
@@ -265,6 +281,11 @@ public static class Program
             return ConfigureStartupMode(startupModeArgument[SteamLoaderRuntime.SetStartupModeArgumentPrefix.Length..]);
         }
 
+        if (args.Any(argument => string.Equals(argument, SteamLoaderRuntime.RemoveStartupIntegrationArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RemoveStartupIntegration();
+        }
+
         using var appMutex = new Mutex(true, SteamLoaderRuntime.AppMutexName, out var ownsAppMutex);
         if (!ownsAppMutex)
         {
@@ -272,8 +293,10 @@ public static class Program
             return 0;
         }
 
-        var shellBootstrapRequested = args.Any(argument =>
-            string.Equals(argument, SteamLoaderRuntime.ShellBootstrapArgument, StringComparison.OrdinalIgnoreCase));
+        if (consoleStartRequested)
+        {
+            InstallConsoleStartSafetyNet();
+        }
 
         var executablePath =
             Environment.ProcessPath
@@ -287,27 +310,46 @@ public static class Program
         var settingsService = new SteamLoaderSettingsService(
             autostartService,
             shellService,
-            new XboxModeService(),
             executablePath,
-            SteamLoaderRuntime.ShellLaunchArguments,
+            SteamLoaderRuntime.LegacyShellLaunchArguments,
             Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
         var settingsSnapshot = settingsService.EnsureDefaultConsoleModeEnabled();
-        var shellBootstrapMode = SteamLoaderRuntime.ShouldUseShellBootstrap(
-            shellBootstrapRequested,
+        var consoleStartMode = SteamLoaderRuntime.ShouldUseConsoleStart(
+            consoleStartRequested,
             settingsSnapshot.StartupMode);
-        var xboxBootstrapMode = args.Any(argument =>
-            string.Equals(argument, SteamLoaderRuntime.XboxBootstrapArgument, StringComparison.OrdinalIgnoreCase));
-        var xboxHostedSplash = args.Any(argument =>
-            string.Equals(argument, SteamLoaderRuntime.XboxHostedSplashArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleBootstrapMode = shellBootstrapMode || xboxBootstrapMode;
+        var consoleBootstrapMode = consoleStartMode;
         SteamStartupDiagnostics.Write(
-            $"main startup mode={settingsSnapshot.StartupMode} shellBootstrap={shellBootstrapMode} " +
-            $"xboxBootstrap={xboxBootstrapMode} disabledConflictingAutostarts={disabledStartupEntries}");
+            $"main startup mode={settingsSnapshot.StartupMode} consoleStart={consoleStartMode} " +
+            $"legacyShellLaunch={legacyShellLaunch} disabledConflictingAutostarts={disabledStartupEntries}");
+        if (consoleStartRequested && !consoleStartMode)
+        {
+            // A sign-in task from an earlier Console Mode: start like eTray and
+            // keep the desktop visible. Switching modes removes that task.
+            SteamStartupDiagnostics.Write(
+                $"console start task fired outside Console Mode (mode={settingsSnapshot.StartupMode}); starting without the console cover");
+        }
 
-        // Resolve Steam early and, in console/shell startup, launch Big Picture as
-        // the very first action - before shell setup, settings and the launcher
-        // sync - so its (slow, on handhelds) cold start begins immediately and
-        // everything else happens while Steam is already loading.
+        ConsoleStartChromeCover? consoleChromeCover = null;
+        if (consoleStartMode)
+        {
+            EnsureNormalProcessPriority();
+            // Explorer starts right next to TFS here. Keep its taskbar off the
+            // splash from the very first frame it exists.
+            consoleChromeCover = new ConsoleStartChromeCover(new WindowsShellVisibilityService());
+            consoleChromeCover.Start();
+        }
+
+        if (consoleBootstrapMode)
+        {
+            // A desktop request from an earlier session must not keep the
+            // taskbar over this console start.
+            new ConsoleShellState().ClearDesktopRequest();
+        }
+
+        // Resolve Steam early and, in a console start, launch Big Picture as the
+        // very first action - before settings and the launcher sync - so its
+        // (slow, on handhelds) cold start begins immediately and everything
+        // else happens while Steam is already loading.
         var steamInstallationService = new SteamInstallationService(
             new SteamInstallPathSettingsStore(Path.Combine(AppContext.BaseDirectory, "data", "steam-install-path.json")),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Steam"));
@@ -337,24 +379,17 @@ public static class Program
             }
         }
 
-        if (shellBootstrapMode)
-        {
-            var bootstrapShellService = new WindowsShellService();
-            bootstrapShellService.PrepareCurrentSession(executablePath, SteamLoaderRuntime.ShellLaunchArguments);
-        }
-
-        var runStartupSync = shellBootstrapMode || xboxBootstrapMode || args.Any(argument =>
+        var runStartupSync = consoleBootstrapMode || args.Any(argument =>
             string.Equals(argument, SteamLoaderRuntime.StartupSyncArgument, StringComparison.OrdinalIgnoreCase));
-        var consoleStartupMode = SteamLoaderRuntime.ShouldShowStartupSplash(
-            consoleBootstrapMode,
-            xboxHostedSplash);
+        // A normal tray/manager/debug launch never opens a splash.
+        var consoleStartupMode = consoleBootstrapMode;
 
         var startHiddenInTray = true;
 
         var processManager = new SteamLoaderProcessManager(
             new Uri("http://127.0.0.1:47652/"),
             SteamLoaderRuntime.BackgroundArgument);
-        if (shellBootstrapMode && !settingsSnapshot.FirstRunCompleted)
+        if (consoleBootstrapMode && !settingsSnapshot.FirstRunCompleted)
         {
             settingsService.CompleteFirstRunSetup();
         }
@@ -362,11 +397,6 @@ public static class Program
         if (startHiddenInTray && !runStartupSync)
         {
             SteamClientLaunchService.RequestSteamStartForTools(steamInstallationService);
-        }
-
-        if (shellBootstrapMode && !runStartupSync)
-        {
-            shellService.StartWindowsShellIfNeeded();
         }
 
         var releaseUpdateService = new ReleaseUpdateService();
@@ -380,10 +410,9 @@ public static class Program
             releaseUpdateService,
             supportBundleService,
             steamInstallationService,
-            SteamLoaderRuntime.ShellLaunchArguments,
-            shellBootstrapMode,
             consoleStartupMode,
-            runStartupSync);
+            runStartupSync,
+            consoleChromeCover);
 
         var application = new System.Windows.Application
         {
@@ -394,7 +423,7 @@ public static class Program
         {
             DataContext = viewModel,
             StartHiddenInTray = startHiddenInTray,
-            ShellBootstrapMode = consoleStartupMode
+            StartupSplashMode = consoleStartupMode
         };
 
         using var trayIconController = new TrayIconController(application, window, viewModel);
@@ -404,6 +433,18 @@ public static class Program
         {
             if (viewModel.ShowStartupSplash)
             {
+                // Console Mode: Explorer is drawing the desktop right now. Cover
+                // it at once with the splash background while the covers load.
+                if (consoleChromeCover is not null)
+                {
+                    var startCover = CreateConsoleStartCover();
+                    startCover.Show();
+                    consoleChromeCover.AttachCoverWindow(
+                        application.Dispatcher,
+                        new System.Windows.Interop.WindowInteropHelper(startCover).Handle);
+                    window.ContentRendered += (_, _) => startCover.Close();
+                }
+
                 // Wait for game covers to be ready before showing the window so
                 // the mosaic appears immediately without a pop-in effect.
                 // Falls back gracefully after 2.5 s if covers are unavailable.
@@ -411,6 +452,9 @@ public static class Program
                     await viewModel.AwaitSplashCoversAsync();
 
                 window.Show();
+                consoleChromeCover?.AttachCoverWindow(
+                    application.Dispatcher,
+                    new System.Windows.Interop.WindowInteropHelper(window).Handle);
                 return;
             }
 
@@ -419,6 +463,107 @@ public static class Program
 
         application.MainWindow = window;
         return application.Run();
+    }
+
+    private static int _consoleStartSafetyNetInstalled;
+
+    private static void InstallConsoleStartSafetyNet()
+    {
+        if (Interlocked.Exchange(ref _consoleStartSafetyNetInstalled, 1) == 1)
+        {
+            return;
+        }
+
+        // Console Mode keeps Explorer running, so a crash already ends on the
+        // desktop. Only the taskbar the start cover hid has to come back.
+        AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+        {
+            try
+            {
+                SteamStartupDiagnostics.Write(
+                    $"console start crashed; showing the Windows taskbar again: {eventArgs.ExceptionObject}");
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                new WindowsShellVisibilityService().RestoreShellChrome();
+            }
+            catch
+            {
+            }
+        };
+    }
+
+    private static Window CreateConsoleStartCover()
+    {
+        // Same color as the splash background, so the hand-over is invisible.
+        return new Window
+        {
+            Title = SteamLoaderRuntime.ProductName,
+            WindowStyle = WindowStyle.None,
+            ResizeMode = ResizeMode.NoResize,
+            WindowState = WindowState.Maximized,
+            ShowInTaskbar = false,
+            ShowActivated = true,
+            Topmost = true,
+            Background = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0x08, 0x10, 0x19))
+        };
+    }
+
+    private static void EnsureNormalProcessPriority()
+    {
+        // Sign-in tasks can start below normal priority, and Steam and games
+        // started by TFS inherit that class. The task asks for normal already;
+        // this also covers a task edited by hand.
+        try
+        {
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            if (process.PriorityClass is System.Diagnostics.ProcessPriorityClass.BelowNormal
+                or System.Diagnostics.ProcessPriorityClass.Idle)
+            {
+                process.PriorityClass = System.Diagnostics.ProcessPriorityClass.Normal;
+                SteamStartupDiagnostics.Write("console start raised TFS to normal priority");
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static int RemoveStartupIntegration()
+    {
+        try
+        {
+            var executablePath =
+                Environment.ProcessPath
+                ?? throw new InvalidOperationException("Unable to resolve the Tools for Steam executable path.");
+            var autostartService = new WindowsAutostartService(
+                SteamLoaderRuntime.AutostartValueName,
+                "SteamLoader",
+                "SteamTools");
+            var settingsService = new SteamLoaderSettingsService(
+                autostartService,
+                new WindowsShellService(),
+                executablePath,
+                SteamLoaderRuntime.LegacyShellLaunchArguments,
+                Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
+            settingsService.RemoveStartupIntegration();
+            new WindowsShellVisibilityService().RestoreShellChrome();
+            var consoleShellState = new ConsoleShellState();
+            consoleShellState.ClearDesktopRequest();
+            consoleShellState.ClearStartCoverOwner();
+            SteamStartupDiagnostics.Write("startup integration removed for uninstall");
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception.Message);
+            return 1;
+        }
     }
 
     private static int RunSplashPreview(string[] args)
@@ -439,7 +584,7 @@ public static class Program
             autostartService,
             shellService,
             executablePath,
-            SteamLoaderRuntime.ShellLaunchArguments,
+            SteamLoaderRuntime.LegacyShellLaunchArguments,
             Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
         var releaseUpdateService = new ReleaseUpdateService();
         var supportBundleService = new SupportBundleService(shellService);
@@ -454,8 +599,6 @@ public static class Program
             releaseUpdateService,
             supportBundleService,
             previewSteamInstallationService,
-            SteamLoaderRuntime.ShellLaunchArguments,
-            false,
             false,
             false);
 
@@ -473,7 +616,7 @@ public static class Program
             PreviewSplashMode = true,
             PreviewSplashDuration = duration,
             StartHiddenInTray = false,
-            ShellBootstrapMode = true
+            StartupSplashMode = true
         };
 
         application.MainWindow = window;
@@ -544,6 +687,12 @@ public static class Program
 
     private static int ConfigureStartupMode(string mode)
     {
+        if (!SteamLoaderSettingsService.IsSupportedStartupMode(mode))
+        {
+            Console.Error.WriteLine($"Unsupported startup mode '{mode}'. Use console, shell or tray.");
+            return 2;
+        }
+
         try
         {
             var executablePath =
@@ -557,9 +706,8 @@ public static class Program
             var settingsService = new SteamLoaderSettingsService(
                 autostartService,
                 shellService,
-                new XboxModeService(),
                 executablePath,
-                SteamLoaderRuntime.ShellLaunchArguments,
+                SteamLoaderRuntime.LegacyShellLaunchArguments,
                 Path.Combine(AppContext.BaseDirectory, "data", "tfs.json"));
 
             settingsService.SetStartupMode(mode);
@@ -576,7 +724,7 @@ public static class Program
     {
         try
         {
-            new XboxModeService().RestoreOnUninstall();
+            new LegacyXboxModeCleanup().Run(leaveActiveSession: true);
             return 0;
         }
         catch (Exception exception)
@@ -584,13 +732,6 @@ public static class Program
             Console.Error.WriteLine(exception.Message);
             return 1;
         }
-    }
-
-    private static int CheckXboxModeSupport()
-    {
-        var support = new XboxModeService().GetSupportStatus();
-        Console.WriteLine(support.Reason);
-        return support.IsSupported ? 0 : 1;
     }
 
     private static int RunGamepadHelper()

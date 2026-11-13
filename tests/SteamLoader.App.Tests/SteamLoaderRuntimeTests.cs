@@ -6,65 +6,47 @@ namespace SteamLoader.App.Tests;
 public sealed class SteamLoaderRuntimeTests
 {
     [Fact]
-    public void ShouldUseShellBootstrap_ReturnsTrue_WhenRequestedInShellMode()
+    public void ShouldUseConsoleStart_ReturnsTrue_WhenRequestedInConsoleMode()
     {
-        Assert.True(SteamLoaderRuntime.ShouldUseShellBootstrap(
-            shellBootstrapRequested: true,
-            startupMode: SteamLoaderRuntime.StartupModeShell));
+        Assert.True(SteamLoaderRuntime.ShouldUseConsoleStart(
+            consoleStartRequested: true,
+            startupMode: SteamLoaderRuntime.StartupModeConsole));
     }
 
     [Theory]
+    [InlineData(SteamLoaderRuntime.LegacyStartupModeShell)]
     [InlineData(SteamLoaderRuntime.StartupModeTray)]
-    [InlineData(SteamLoaderRuntime.StartupModeExternal)]
-    public void ShouldUseShellBootstrap_ReturnsFalse_ForNonShellModes(string startupMode)
+    [InlineData(null)]
+    public void ShouldUseConsoleStart_IgnoresALeftoverSignInTaskOutsideConsoleMode(string? startupMode)
     {
-        Assert.False(SteamLoaderRuntime.ShouldUseShellBootstrap(
-            shellBootstrapRequested: true,
+        Assert.False(SteamLoaderRuntime.ShouldUseConsoleStart(
+            consoleStartRequested: true,
             startupMode: startupMode));
     }
 
     [Fact]
-    public void ShouldUseShellBootstrap_ReturnsFalse_WhenBootstrapWasNotRequested()
+    public void ShouldUseConsoleStart_ReturnsFalse_ForANormalLaunchInConsoleMode()
     {
-        Assert.False(SteamLoaderRuntime.ShouldUseShellBootstrap(
-            shellBootstrapRequested: false,
-            startupMode: SteamLoaderRuntime.StartupModeShell));
+        Assert.False(SteamLoaderRuntime.ShouldUseConsoleStart(
+            consoleStartRequested: false,
+            startupMode: SteamLoaderRuntime.StartupModeConsole));
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void ShouldStartShellHandOffMonitor_ReturnsTrue_InShellMode_RegardlessOfSplash(
-        bool startupSplashVisible)
+    [InlineData(SteamLoaderRuntime.StartupModeConsole, true)]
+    [InlineData("CONSOLE", true)]
+    [InlineData(SteamLoaderRuntime.LegacyStartupModeShell, false)]
+    [InlineData(SteamLoaderRuntime.StartupModeTray, false)]
+    [InlineData(null, false)]
+    public void IsConsoleStartupMode_OnlyCoversConsoleMode(string? startupMode, bool expected)
     {
-        Assert.True(SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
-            shellBootstrapMode: true,
-            startupSplashVisible: startupSplashVisible));
+        Assert.Equal(expected, SteamLoaderRuntime.IsConsoleStartupMode(startupMode));
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void ShouldStartShellHandOffMonitor_FollowsSplash_OutsideShellMode(
-        bool startupSplashVisible)
+    [Fact]
+    public void ConsoleLaunchArguments_MarkTheConsoleStartAndNeverTheLegacyShellBootstrap()
     {
-        Assert.Equal(startupSplashVisible, SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
-            shellBootstrapMode: false,
-            startupSplashVisible: startupSplashVisible));
-    }
-
-    [Theory]
-    [InlineData(true, false, true)]
-    [InlineData(true, true, false)]
-    [InlineData(false, false, false)]
-    [InlineData(false, true, false)]
-    public void ShouldShowStartupSplash_RequiresAnUnhostedConsoleBootstrap(
-        bool consoleBootstrapMode,
-        bool xboxHostedSplash,
-        bool expected)
-    {
-        Assert.Equal(expected, SteamLoaderRuntime.ShouldShowStartupSplash(
-            consoleBootstrapMode,
-            xboxHostedSplash));
+        Assert.Contains(SteamLoaderRuntime.ConsoleStartArgument, SteamLoaderRuntime.ConsoleLaunchArguments);
+        Assert.DoesNotContain(SteamLoaderRuntime.LegacyShellBootstrapArgument, SteamLoaderRuntime.ConsoleLaunchArguments);
     }
 }

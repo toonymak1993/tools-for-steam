@@ -11,6 +11,10 @@ public sealed class SteamClientLaunchService
     private const string SteamStartupMutexName = @"Local\ToolsForSteam.SteamStartup";
     private static readonly TimeSpan ActionCooldown = TimeSpan.FromSeconds(20);
 
+    // steam.exe briefly exits and relaunches itself when it applies an update.
+    // A Steam that is gone longer than this was closed by the user or crashed.
+    private static readonly TimeSpan SteamSelfRestartGrace = TimeSpan.FromSeconds(45);
+
     private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(18);
     private static readonly TimeSpan ForceKillTimeout = TimeSpan.FromSeconds(8);
 
@@ -167,6 +171,16 @@ public sealed class SteamClientLaunchService
     private int _recoveryAttempts;
     private int _launchAttempts;
     private bool _steamUiWasVisible;
+    // Once TFS was attached to Steam in this run, Steam belongs to the user:
+    // if it goes away, TFS never starts or restarts it, it only waits.
+    private bool _steamSessionAttached;
+    private bool _waitingForSteamToReturn;
+    private bool _steamReturnedAfterClose;
+    // steam.exe was seen in this run before DevTools came up. If it disappears
+    // afterwards, TFS waits instead of launching it again.
+    private bool _steamSeenRunning;
+    private DateTimeOffset? _steamClosedDuringStartupAt;
+    private bool _steamClosedDuringStartup;
     private bool _historyOutcomeRecorded;
     private string _lastProtectedRecoveryMessage = string.Empty;
 
@@ -183,10 +197,13 @@ public sealed class SteamClientLaunchService
             steamInstallationService.ResolveSteamRootPath());
         var timing = _historyStore.GetTimingPolicy(isHandheld);
         _startupGracePeriod = timing.StartupGracePeriod;
+        // A cold Steam start can expose DevTools long before Big Picture is
+        // drawn (shader cache, library load, sign-in). Only a much longer
+        // invisible phase justifies the one automatic restart.
         _invisibleUiGracePeriod = TimeSpan.FromSeconds(Math.Clamp(
-            timing.StartupGracePeriod.TotalSeconds * 0.75,
-            30,
-            90));
+            timing.StartupGracePeriod.TotalSeconds,
+            60,
+            180));
         SteamStartupDiagnostics.Write(
             $"startup timing grace={_startupGracePeriod.TotalSeconds:F0}s " +
             $"invisibleUi={_invisibleUiGracePeriod.TotalSeconds:F0}s adaptive={timing.IsAdaptive}");
@@ -264,7 +281,20 @@ public sealed class SteamClientLaunchService
         var launchAttemptInFlight = _firstUnavailableAt.HasValue;
         if (await IsDebugEndpointAvailableAsync(cancellationToken))
         {
-            if (IsSteamUiVisible())
+            if (_waitingForSteamToReturn)
+            {
+                _waitingForSteamToReturn = false;
+                _steamClosedDuringStartup = false;
+                _steamReturnedAfterClose = true;
+                _firstUnavailableAt = null;
+                _firstInvisibleUiAt = null;
+                _launchAttempts = 0;
+                _recoveryAttempts = 0;
+                SteamStartupDiagnostics.Write("Steam is back with its DevTools endpoint; reconnecting without touching Steam");
+            }
+
+            _steamSessionAttached = true;
+            if (SteamUiVisibleProbe())
             {
                 _steamUiWasVisible = true;
                 _firstInvisibleUiAt = null;
@@ -294,6 +324,17 @@ public sealed class SteamClientLaunchService
                     true,
                     "Steam DevTools endpoint is ready.",
                     SteamClientStartupStage.Ready);
+            }
+
+            if (_steamReturnedAfterClose)
+            {
+                // The user started Steam again. Attach as soon as DevTools is
+                // up and wait for Big Picture; never push the Gamepad UI or
+                // restart a Steam the user started.
+                _firstUnavailableAt = null;
+                return new SteamClientLaunchState(
+                    true,
+                    "Steam is running again. Tools for Steam reconnects when Big Picture is available.");
             }
 
             _firstUnavailableAt = null;
@@ -372,6 +413,23 @@ public sealed class SteamClientLaunchService
         }
 
         _firstInvisibleUiAt = null;
+
+        if (_steamSessionAttached)
+        {
+            return WaitForSteamToReturn();
+        }
+
+        var steamRunning = SteamRunningProbe();
+        if (steamRunning)
+        {
+            _steamSeenRunning = true;
+            _steamClosedDuringStartupAt = null;
+        }
+        else if (_launchAttempts > 0 || _steamSeenRunning)
+        {
+            return HandleSteamClosedDuringStartup(now);
+        }
+
         _firstUnavailableAt ??= now;
 
         if (now - _lastActionAt < ActionCooldown)
@@ -391,53 +449,11 @@ public sealed class SteamClientLaunchService
                 SteamClientStartupStage.Failed);
         }
 
-        if (!IsSteamRunning())
+        if (!steamRunning)
         {
-            if (_launchAttempts > 0)
-            {
-                if (_recoveryAttempts >= MaxAutomaticRecoveryAttempts)
-                {
-                    RecordStartupOutcome(
-                        SteamStartupOutcome.Failed,
-                        "steam.exe exited again after its automatic relaunch.");
-                    return new SteamClientLaunchState(
-                        false,
-                        "steam.exe exited again after the one permitted automatic relaunch. " +
-                        "Automatic recovery is stopped to prevent a launch loop.",
-                        SteamClientStartupStage.Failed);
-                }
-
-                if (TryGetProtectedRecoveryState(now, out var protectedMissingProcessState))
-                {
-                    return protectedMissingProcessState;
-                }
-
-                if (!TryBeginAutomaticRecovery(now, out var missingProcessGuardMessage))
-                {
-                    RecordStartupOutcome(SteamStartupOutcome.Failed, missingProcessGuardMessage);
-                    return new SteamClientLaunchState(
-                        false,
-                        missingProcessGuardMessage,
-                        SteamClientStartupStage.Failed);
-                }
-
-                _recoveryAttempts++;
-                ForceKillSteamProcesses();
-                LaunchSteam(steamExePath);
-                _launchAttempts++;
-                _lastActionAt = now;
-                _firstUnavailableAt = now;
-                SteamStartupDiagnostics.Write(
-                    "steam.exe did not remain running; performed the one permitted clean relaunch");
-                return new SteamClientLaunchState(
-                    false,
-                    "Steam closed during startup. All remaining Steam processes were stopped and Steam is relaunching once.",
-                    SteamClientStartupStage.Recovering);
-            }
-
-            // Fresh boot: start once. If steam.exe immediately exits, the branch
-            // above consumes the guarded recovery budget instead of launching it
-            // every time the injector polls.
+            // Fresh boot: Steam was never seen in this run, start it once. If
+            // steam.exe goes away later, HandleSteamClosedDuringStartup waits
+            // for it instead of launching it again.
             LaunchSteam(steamExePath);
             _launchAttempts = 1;
             _lastActionAt = now;
@@ -511,6 +527,71 @@ public sealed class SteamClientLaunchService
             false,
             "Steam looked stuck. Its process tree was stopped and Steam is restarting once with the required Gamepad UI arguments.",
             SteamClientStartupStage.Recovering);
+    }
+
+    /// <summary>
+    /// Steam was attached in this run and its DevTools endpoint is gone: the
+    /// user closed Steam (or Steam restarts itself). Starting, restarting or
+    /// killing Steam is off the table from here on; TFS keeps polling and
+    /// reconnects when Steam comes back.
+    /// </summary>
+    private SteamClientLaunchState WaitForSteamToReturn()
+    {
+        if (!_waitingForSteamToReturn)
+        {
+            _waitingForSteamToReturn = true;
+            SteamStartupDiagnostics.Write(
+                "Steam closed after Tools for Steam was attached; waiting for Steam without starting it");
+        }
+
+        _steamReturnedAfterClose = false;
+        _steamUiWasVisible = false;
+        _firstUnavailableAt = null;
+        _launchAttempts = 0;
+        var steamRunning = SteamRunningProbe();
+        return new SteamClientLaunchState(
+            false,
+            steamRunning
+                ? "Steam is running without the Tools for Steam connection. Tools for Steam does not restart Steam on its own and reconnects when Steam provides it."
+                : "Steam was closed. Tools for Steam does not start it again and reconnects when Steam and Big Picture are back.",
+            // During the console start a closed Steam needs the user: the
+            // splash hands over to the desktop instead of waiting for Steam.
+            _steamClosedDuringStartup && !steamRunning
+                ? SteamClientStartupStage.Failed
+                : SteamClientStartupStage.Starting);
+    }
+
+    /// <summary>
+    /// steam.exe was running (or started by TFS) in this run, then went away
+    /// before DevTools came up. Steam restarts itself when it applies an
+    /// update, so TFS first waits. If Steam stays away, the user closed it or
+    /// it crashed: TFS never starts, restarts or kills it on its own from then
+    /// on and reconnects when Steam is back.
+    /// </summary>
+    private SteamClientLaunchState HandleSteamClosedDuringStartup(DateTimeOffset now)
+    {
+        if (!_steamClosedDuringStartupAt.HasValue)
+        {
+            _steamClosedDuringStartupAt = now;
+            SteamStartupDiagnostics.Write(
+                "steam.exe exited during startup; waiting for Steam to restart on its own");
+        }
+
+        if (now - _steamClosedDuringStartupAt.Value < SteamSelfRestartGrace)
+        {
+            return new SteamClientLaunchState(
+                false,
+                "Steam closed during startup. Waiting for Steam to restart on its own, for example after an update.");
+        }
+
+        _steamSessionAttached = true;
+        _steamClosedDuringStartup = true;
+        SteamStartupDiagnostics.Write(
+            "Steam did not restart on its own after closing during startup; it is not started again automatically");
+        RecordStartupOutcome(
+            SteamStartupOutcome.Failed,
+            "Steam closed during startup and did not restart on its own.");
+        return WaitForSteamToReturn();
     }
 
     private bool TryGetProtectedRecoveryState(
@@ -913,8 +994,18 @@ public sealed class SteamClientLaunchService
 
     private string? ResolveSteamExecutablePath()
     {
-        return _steamInstallationService.ResolveSteamExecutablePath();
+        return SteamExecutableProbe is not null
+            ? SteamExecutableProbe()
+            : _steamInstallationService.ResolveSteamExecutablePath();
     }
+
+    // Test seams for EnsureDevToolsReadyAsync. Tests must never see the real
+    // Steam process, window or executable: a wrong decision would start Steam.
+    internal Func<bool> SteamRunningProbe { get; init; } = IsSteamRunning;
+
+    internal Func<bool> SteamUiVisibleProbe { get; init; } = IsSteamUiVisible;
+
+    internal Func<string?>? SteamExecutableProbe { get; init; }
 
     private static bool IsSteamRunning()
     {

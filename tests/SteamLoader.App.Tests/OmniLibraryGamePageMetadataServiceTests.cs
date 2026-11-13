@@ -136,10 +136,14 @@ public sealed class OmniLibraryGamePageMetadataServiceTests
             Assert.Equal("unmatched", snapshot.Status);
             Assert.Null(snapshot.SourceSteamAppId);
             Assert.Empty(snapshot.Activity);
-            Assert.Equal(2, handler.CallCount);
+            // Two Steam searches, then only the IGN fallback (no page found).
+            Assert.Equal(2, handler.RequestUris.Count(uri => uri.AbsoluteUri.Contains("storesearch")));
             Assert.All(
                 handler.RequestUris,
-                uri => Assert.Contains("storesearch", uri.AbsoluteUri));
+                uri => Assert.True(
+                    uri.AbsoluteUri.Contains("storesearch") ||
+                    uri.AbsoluteUri.StartsWith("https://www.ign.com/games/", StringComparison.Ordinal),
+                    uri.AbsoluteUri));
         }
         finally
         {
@@ -447,6 +451,375 @@ public sealed class OmniLibraryGamePageMetadataServiceTests
         }
     }
 
+    [Fact]
+    public async Task GetAsync_PlainShortcutWithTitle_UsesSteamMatchWithoutAchievementProvider()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler();
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+            const uint plainShortcut = 0x9def5678;
+
+            var first = await service.GetAsync(
+                plainShortcut,
+                "  Example Game 2\t",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+            var callsAfterFirstLoad = handler.CallCount;
+            var second = await service.GetAsync(
+                plainShortcut,
+                "Example Game 2",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+
+            Assert.NotNull(first);
+            Assert.Equal(OmniLibraryGamePageMetadataService.ShortcutStoreId, first.StoreId);
+            Assert.Equal(plainShortcut, first.SteamAppId);
+            Assert.Equal("Example Game 2", first.Title);
+            Assert.Equal(990080, first.SourceSteamAppId);
+            Assert.Equal("Test Studio", Assert.Single(first.GameInfo.Developers));
+            Assert.Equal("none", first.Achievements.Status);
+            Assert.Empty(first.Achievements.Items);
+            Assert.DoesNotContain(
+                handler.RequestUris,
+                uri => uri.AbsoluteUri.Contains("/stats/", StringComparison.OrdinalIgnoreCase));
+            Assert.NotNull(second);
+            Assert.Equal(first.Revision, second.Revision);
+            Assert.Equal(callsAfterFirstLoad, handler.CallCount);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_ShortcutWithoutTitleOrSteamAppId_ReturnsNull()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler();
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var untitled = await service.GetAsync(
+                0x9def5678,
+                "   ",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+            var steamApp = await service.GetAsync(
+                440,
+                "Team Fortress 2",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+
+            Assert.Null(untitled);
+            Assert.Null(steamApp);
+            Assert.Equal(0, handler.CallCount);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_OmniLibraryGame_KeepsOmniLibraryIdentityWhenTitleIsPassed()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler();
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var snapshot = await service.GetAsync(
+                ShortcutAppId,
+                "Some Other Title",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+
+            Assert.NotNull(snapshot);
+            Assert.Equal("epic-games", snapshot.StoreId);
+            Assert.Equal("example-game", snapshot.GameId);
+            Assert.Equal("Epic Games", snapshot.Achievements.Provider);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveEditsAsync_EditsWinOverSourceAndSurviveRestartUntilReset()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler();
+            using var httpClient = new HttpClient(handler);
+            const uint plainShortcut = 0x9def5678;
+            long revisionBefore;
+            using (var service = CreateService(root, httpClient))
+            {
+                var before = await service.GetAsync(
+                    plainShortcut,
+                    "Example Game 2",
+                    forceRefresh: false,
+                    refreshOnOpen: false,
+                    CancellationToken.None);
+                revisionBefore = before!.Revision;
+
+                var saved = await service.SaveEditsAsync(
+                    plainShortcut,
+                    "Example Game 2",
+                    new GameMetadataEdits
+                    {
+                        Description = "  My own words.  ",
+                        Developers = ["Indie Team", " ", "indie team"],
+                        Rating = 140,
+                    },
+                    CancellationToken.None);
+
+                Assert.NotNull(saved);
+                Assert.Equal("My own words.", saved.Metadata.GameInfo.Description);
+                Assert.Equal("Indie Team", Assert.Single(saved.Metadata.GameInfo.Developers));
+                Assert.Equal(100, saved.Metadata.GameInfo.Rating);
+                Assert.Equal("Test Publisher", Assert.Single(saved.Metadata.GameInfo.Publishers));
+                Assert.Equal("Test Studio", Assert.Single(saved.Automatic.Developers));
+                Assert.Contains("description", saved.Metadata.EditedFields);
+                Assert.False(saved.ManagedByOmniLibrary);
+                Assert.NotEqual(revisionBefore, saved.Metadata.Revision);
+            }
+
+            using (var restarted = CreateService(root, httpClient))
+            {
+                var page = await restarted.GetAsync(
+                    plainShortcut,
+                    "Example Game 2",
+                    forceRefresh: false,
+                    refreshOnOpen: false,
+                    CancellationToken.None);
+                Assert.Equal("My own words.", page!.GameInfo.Description);
+
+                var reset = await restarted.SaveEditsAsync(
+                    plainShortcut,
+                    "Example Game 2",
+                    edits: null,
+                    CancellationToken.None);
+                Assert.Equal("A reliable cached description.", reset!.Metadata.GameInfo.Description);
+                Assert.Empty(reset.Metadata.EditedFields);
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ApplyUserEdits_UnmatchedShortcutWithEditsBecomesReady()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler
+            {
+                SearchJson = """{"total":0,"items":[]}""",
+            };
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var saved = await service.SaveEditsAsync(
+                0x9def5678,
+                "Homebrew Thing",
+                new GameMetadataEdits { ReleaseDate = "2024" },
+                CancellationToken.None);
+
+            Assert.NotNull(saved);
+            Assert.Null(saved.Metadata.SourceSteamAppId);
+            Assert.Equal("ready", saved.Metadata.Status);
+            Assert.Equal("2024", saved.Metadata.GameInfo.ReleaseDate);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    internal static string IgnPage(string name) =>
+        """
+        <html><body><script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"page":{"type":"Game","name":"__NAME__",
+          "metadata":{"names":{"name":"__NAME__"},"descriptions":{"short":"A short IGN summary.","long":"A long IGN description."}},
+          "genreNames":["Action","Platformer"],
+          "producers":{"name":"Little Studio","slug":"little-studio"},
+          "publishers":[{"name":"Little Studio"},{"name":"Big Publisher"}],
+          "releaseDate":"Feb 24, 2017",
+          "primaryReview":{"score":9.4},
+          "primaryImage":{"url":"https://assets-prd.ignimgs.com/hero.png"}}}}}
+        </script></body></html>
+        """.Replace("__NAME__", name, StringComparison.Ordinal);
+
+    [Fact]
+    public async Task GetAsync_ShortcutWithoutSteamMatch_FallsBackToMatchingIgnPage()
+    {
+        var root = CreateTemporaryDirectory();
+        var culture = System.Globalization.CultureInfo.CurrentUICulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentUICulture = new System.Globalization.CultureInfo("de-DE");
+            var handler = new MetadataHttpHandler
+            {
+                SearchJson = """{"total":0,"items":[]}""",
+                IgnHtml = IgnPage("Hollow Knight"),
+                IgnSlug = "hollow-knight",
+                TranslateJson = """[[["Eine lange IGN-Beschreibung.","A long IGN description.",null,null,10]],null,"en"]""",
+            };
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var snapshot = await service.GetAsync(
+                0x9def5678,
+                "Hollow Knight™",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+
+            Assert.NotNull(snapshot);
+            Assert.Equal("ready", snapshot.Status);
+            Assert.Equal("IGN", snapshot.SourceLabel);
+            Assert.Null(snapshot.SourceSteamAppId);
+            Assert.Equal("Eine lange IGN-Beschreibung.", snapshot.GameInfo.Description);
+            Assert.Equal("Little Studio", Assert.Single(snapshot.GameInfo.Developers));
+            Assert.Equal(["Little Studio", "Big Publisher"], snapshot.GameInfo.Publishers);
+            Assert.Equal(94, snapshot.GameInfo.Rating);
+            Assert.Equal("https://www.ign.com/games/hollow-knight", snapshot.GameInfo.StoreUrl);
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentUICulture = culture;
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SetIgnPageAsync_ChosenPageWinsOverSteamUntilCleared()
+    {
+        var root = CreateTemporaryDirectory();
+        var culture = System.Globalization.CultureInfo.CurrentUICulture;
+        try
+        {
+            System.Globalization.CultureInfo.CurrentUICulture = new System.Globalization.CultureInfo("en-US");
+            var handler = new MetadataHttpHandler
+            {
+                IgnHtml = IgnPage("Some Other Name"),
+                IgnSlug = "some-other-name",
+            };
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+            const uint plainShortcut = 0x9def5678;
+
+            await Assert.ThrowsAsync<ArgumentException>(() => service.SetIgnPageAsync(
+                plainShortcut,
+                "Example Game 2",
+                "https://example.com/games/x",
+                CancellationToken.None));
+
+            var chosen = await service.SetIgnPageAsync(
+                plainShortcut,
+                "Example Game 2",
+                "https://www.ign.com/games/some-other-name",
+                CancellationToken.None);
+
+            Assert.NotNull(chosen);
+            Assert.Equal("https://www.ign.com/games/some-other-name", chosen.IgnPage);
+            Assert.Equal("IGN", chosen.Metadata.SourceLabel);
+            Assert.Equal("A long IGN description.", chosen.Metadata.GameInfo.Description);
+
+            var cleared = await service.SetIgnPageAsync(
+                plainShortcut,
+                "Example Game 2",
+                " ",
+                CancellationToken.None);
+
+            Assert.Empty(cleared!.IgnPage);
+            Assert.Equal("A reliable cached description.", cleared.Metadata.GameInfo.Description);
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentUICulture = culture;
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetAsync_IgnPageForAnotherGame_IsNotUsed()
+    {
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var handler = new MetadataHttpHandler
+            {
+                SearchJson = """{"total":0,"items":[]}""",
+                IgnHtml = IgnPage("Hollow Knight: Silksong"),
+                IgnSlug = "hollow-knight",
+            };
+            using var httpClient = new HttpClient(handler);
+            using var service = CreateService(root, httpClient);
+
+            var snapshot = await service.GetAsync(
+                0x9def5678,
+                "Hollow Knight",
+                forceRefresh: false,
+                refreshOnOpen: false,
+                CancellationToken.None);
+
+            Assert.NotNull(snapshot);
+            Assert.Equal("unmatched", snapshot.Status);
+            Assert.Empty(snapshot.GameInfo.Description);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CleanEdits_BlankFieldsMeanAutomatic()
+    {
+        Assert.Null(OmniLibraryGamePageMetadataService.CleanEdits(new GameMetadataEdits
+        {
+            Description = "   ",
+            Developers = ["", "  "],
+            ReleaseDate = "\t",
+        }));
+        var clean = OmniLibraryGamePageMetadataService.CleanEdits(new GameMetadataEdits
+        {
+            Genres = Enumerable.Range(0, 20).Select(index => $"Genre {index}").ToArray(),
+            Description = new string('d', 9000),
+        });
+        Assert.NotNull(clean);
+        Assert.Equal(8, clean.Genres!.Count);
+        Assert.Equal(8000, clean.Description!.Length);
+    }
+
+    [Fact]
+    public void CleanShortcutTitle_StripsControlCharactersAndCapsLength()
+    {
+        Assert.Equal("A B", OmniLibraryGamePageMetadataService.CleanShortcutTitle(" A\u0000\r\nB "));
+        Assert.Equal(200, OmniLibraryGamePageMetadataService.CleanShortcutTitle(new string('x', 500)).Length);
+        Assert.Equal(string.Empty, OmniLibraryGamePageMetadataService.CleanShortcutTitle(null));
+    }
+
     private const uint ShortcutAppId = 0x8abc1234;
 
     private static OmniLibraryGamePageMetadataService CreateService(
@@ -510,6 +883,12 @@ public sealed class OmniLibraryGamePageMetadataServiceTests
 
         public string RequiredSearchTerm { get; set; } = string.Empty;
 
+        public string? IgnHtml { get; set; }
+
+        public string IgnSlug { get; set; } = string.Empty;
+
+        public string? TranslateJson { get; set; }
+
         public List<Uri> RequestUris { get; } = [];
 
         protected override Task<HttpResponseMessage> SendAsync(
@@ -519,6 +898,21 @@ public sealed class OmniLibraryGamePageMetadataServiceTests
             CallCount++;
             RequestUris.Add(request.RequestUri!);
             var uri = request.RequestUri!.AbsoluteUri;
+            if (uri.StartsWith("https://www.ign.com/games/", StringComparison.OrdinalIgnoreCase))
+            {
+                return IgnHtml is { } ignHtml &&
+                       uri.EndsWith("/" + IgnSlug, StringComparison.OrdinalIgnoreCase)
+                    ? Html(ignHtml)
+                    : Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            }
+
+            if (uri.StartsWith("https://translate.googleapis.com/", StringComparison.OrdinalIgnoreCase))
+            {
+                return TranslateJson is { } translateJson
+                    ? Json(translateJson)
+                    : Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+            }
+
             if (uri.Contains("storesearch", StringComparison.OrdinalIgnoreCase))
             {
                 if (!string.IsNullOrWhiteSpace(RequiredSearchTerm) &&

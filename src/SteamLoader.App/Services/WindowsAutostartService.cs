@@ -76,9 +76,18 @@ public sealed class WindowsAutostartService
             }
         }
 
-        removedCount += DisableSteamScheduledAutostartTasks(diagnosticLog);
+        if (DisableScheduledTasks)
+        {
+            removedCount += DisableSteamScheduledAutostartTasks(diagnosticLog);
+        }
+
         return removedCount;
     }
+
+    /// <summary>
+    /// Tests turn this off so they never disable real Task Scheduler tasks.
+    /// </summary>
+    internal bool DisableScheduledTasks { get; init; } = true;
 
     private static int DisableSteamScheduledAutostartTasks(Action<string>? diagnosticLog)
     {
@@ -94,6 +103,19 @@ function Test-IsConflictingStartupTask {
   $hasLogonTrigger = @($Task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count -gt 0
   if (-not $hasLogonTrigger) {
     return $false
+  }
+
+  # Tools for Steam's own tasks start Console Mode and the gamepad helper.
+  # Disabling them silently switched Console Mode off at the next sign-in.
+  if ($Task.TaskPath -eq '\ToolsForSteam\' -or $Task.TaskName -like 'Tools for Steam Console Start*') {
+    return $false
+  }
+  foreach ($action in $Task.Actions) {
+    $ownArguments = [string]$action.Arguments
+    if (([string]$action.Execute) -match $tfsExePattern -and
+        $ownArguments -match '(^|\s)--(console-start|gamepad-helper)(\s|$)') {
+      return $false
+    }
   }
 
   if ($Task.TaskName -like '*Steam*Big Picture*' -or $Task.Description -like '*Steam*Big Picture*') {

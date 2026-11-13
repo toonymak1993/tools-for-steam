@@ -23,7 +23,7 @@ test("Settings exposes the staged System > Driver Game Ready workflow", () => {
     popupSource,
     /id:\s*"system"[\s\S]*title:\s*"System"[\s\S]*pageId === "system"/,
   );
-  assert.match(popupSource, /createSectionHeader\(3,\s*"Driver"/);
+  assert.match(popupSource, /createSectionHeader\(2,\s*"Driver"/);
   assert.match(popupSource, /"Check for Game Ready Update"/);
   assert.match(popupSource, /"Install Game Ready Driver"/);
 });
@@ -34,7 +34,7 @@ test("NVIDIA-only driver controls stay hidden on AMD and Intel systems", () => {
     /const nvidiaGpuDetected = gpuUpdate\?\.nvidiaGpuDetected === true/,
   );
   assert.match(popupSource, /if \(nvidiaGpuDetected\) \{[\s\S]*slots\.push/);
-  assert.match(popupSource, /\.\.\.\(nvidiaGpuDetected[\s\S]*createSectionHeader\(3,\s*"Driver"/);
+  assert.match(popupSource, /\.\.\.\(nvidiaGpuDetected[\s\S]*createSectionHeader\(2,\s*"Driver"/);
   assert.match(serviceSource, /Win32_VideoController/);
   assert.match(serviceSource, /VEN_10DE/);
   assert.match(

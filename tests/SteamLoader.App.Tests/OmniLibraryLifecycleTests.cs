@@ -107,7 +107,7 @@ public sealed class OmniLibraryLifecycleTests
             var store = new UnifySteamStoreConfiguration
             {
                 Enabled = true,
-                InstallPath = root,
+                InstallPath = root, ImportOrbitRoms = false, ImportEmulatorLibraries = false,
             };
             var romPath = Path.Combine(root, "PSP", "Lumines (USA).iso");
             OmniLibraryRomSystemRegistry.EnsureFolderStructure(root);
@@ -161,11 +161,16 @@ public sealed class OmniLibraryLifecycleTests
     }
 
     [Fact]
-    public void RomRegistry_ExposesTheFourInitialSystemsWithStableEmulators()
+    public void RomRegistry_KeepsTheFirstFourSystemsAndAddsOrbitsSystems()
     {
-        Assert.Equal(
-            ["psp", "gamecube", "game-boy-advance", "nintendo-64"],
-            OmniLibraryRomSystemRegistry.Supported.Select(system => system.Id));
+        var supported = OmniLibraryRomSystemRegistry.Supported.Select(system => system.Id).ToArray();
+        Assert.Contains("psp", supported);
+        Assert.Contains("gamecube", supported);
+        Assert.Contains("game-boy-advance", supported);
+        Assert.Contains("nintendo-64", supported);
+        Assert.Contains("switch", supported);
+        Assert.Contains("playstation-2", supported);
+        Assert.True(supported.Length >= 35);
 
         Assert.Equal(
             "mGBA.exe",
@@ -174,13 +179,17 @@ public sealed class OmniLibraryLifecycleTests
             "Dolphin.exe",
             OmniLibraryRomSystemRegistry.GetRequired("gamecube").EmulatorExecutableName);
         Assert.Equal(
-            "ares.exe",
+            "Project64.exe",
             OmniLibraryRomSystemRegistry.GetRequired("nintendo-64").EmulatorExecutableName);
+        Assert.Contains("ares", OmniLibraryRomSystemRegistry.GetRequired("nintendo-64").EmulatorIds);
         Assert.Equal(
             "PPSSPPWindows64.exe",
             OmniLibraryRomSystemRegistry.GetRequired("psp").EmulatorExecutableName);
+        foreach (var system in OmniLibraryRomSystemRegistry.Supported)
+        {
+            Assert.NotEmpty(OmniLibraryEmulatorCatalog.ForSystem(system));
+        }
     }
-
     [Theory]
     [InlineData(
         "God of War - Ghost of Sparta (Europe, Australia) (En,Fr,De,Es,It).iso",
@@ -214,7 +223,7 @@ public sealed class OmniLibraryLifecycleTests
             var store = new UnifySteamStoreConfiguration
             {
                 Enabled = true,
-                InstallPath = root,
+                InstallPath = root, ImportOrbitRoms = false, ImportEmulatorLibraries = false,
             };
             OmniLibraryRomSystemRegistry.EnsureFolderStructure(root);
             var romPath = Path.Combine(root, folder, fileName);
@@ -279,29 +288,36 @@ public sealed class OmniLibraryLifecycleTests
     }
 
     [Theory]
-    [InlineData("gamecube", "--batch", "--exec")]
-    [InlineData("game-boy-advance", "-f", null)]
-    [InlineData("nintendo-64", "--system", "--fullscreen")]
-    public void RomLaunch_UsesSystemSpecificFullscreenArguments(
-        string systemId,
-        string expectedArgument,
+    [InlineData("dolphin", "--batch", "--exec")]
+    [InlineData("mgba", "-f", null)]
+    [InlineData("ares", "--system", "--fullscreen")]
+    [InlineData("cemu", "-f", "-g")]
+    [InlineData("pcsx2", "-fullscreen", "--")]
+    [InlineData("rpcs3", "--no-gui", "--fullscreen")]
+    [InlineData("project64", null, null)]
+    public void RomLaunch_UsesEmulatorSpecificFullscreenArguments(
+        string emulatorId,
+        string? expectedArgument,
         string? secondExpectedArgument)
     {
         var romPath = Path.Combine(Path.GetTempPath(), "ROMs", "game.rom");
 
-        var arguments = UnifySteamLauncher.BuildRomLaunchArguments(
-            systemId,
+        var arguments = OmniLibraryEmulatorCatalog.BuildLaunchArguments(
+            emulatorId,
             romPath,
+            corePath: null,
             fullscreen: true);
 
-        Assert.Contains(expectedArgument, arguments);
+        if (expectedArgument is not null)
+        {
+            Assert.Contains(expectedArgument, arguments);
+        }
         if (secondExpectedArgument is not null)
         {
             Assert.Contains(secondExpectedArgument, arguments);
         }
         Assert.Equal(Path.GetFullPath(romPath), arguments[^1]);
     }
-
     [Fact]
     public void Registry_GogUsesTheSameManagedStoreContractsAsEpic()
     {

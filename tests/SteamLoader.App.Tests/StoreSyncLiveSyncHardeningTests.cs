@@ -825,6 +825,101 @@ public sealed class StoreSyncLiveSyncHardeningTests
     }
 
     [Fact]
+    public void TryFindExistingShortcut_NeverAdoptsForeignShortcutWithSameTitle()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var storeGameEntryType = serviceType.GetNestedType("StoreGameEntry", BindingFlags.NonPublic);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod("TryFindExistingShortcut", BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(storeGameEntryType);
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(method);
+
+        var game = CreateNonPublicInstance(
+            storeGameEntryType!,
+            "unifysteam",
+            "epic-games:hades",
+            "Hades",
+            @"C:\ToolsForSteam\ToolsForSteam.exe",
+            @"C:\ToolsForSteam",
+            "--unifysteam-launch epic-games:hades");
+        // A user's own shortcut, pointing at the game itself, with the same title.
+        var entries = Array.CreateInstance(existingShortcutEntryType!, 1);
+        entries.SetValue(
+            CreateNonPublicInstance(
+                existingShortcutEntryType!,
+                0,
+                7070u,
+                "Hades",
+                @"D:\Games\Hades\Hades.exe",
+                @"D:\Games\Hades",
+                string.Empty,
+                false,
+                string.Empty,
+                string.Empty,
+                new Dictionary<string, object?>()),
+            0);
+
+        var arguments = new object?[] { entries, game, null, "Hades", null };
+        var matched = (bool?)method!.Invoke(null, arguments);
+
+        Assert.False(matched);
+        Assert.Null(arguments[4]);
+    }
+
+    [Fact]
+    public void DuplicateCleanup_KeepsSameTitleGamesWithTheirOwnIdentity()
+    {
+        var serviceType = typeof(StoreSyncService);
+        var existingShortcutEntryType = serviceType.GetNestedType("ExistingShortcutEntry", BindingFlags.NonPublic);
+        var analysisItemType = serviceType.GetNestedType("StoreSyncAnalysisItem", BindingFlags.NonPublic);
+        var method = serviceType.GetMethod(
+            "BuildDuplicateOmniLibraryCleanupCandidates",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(existingShortcutEntryType);
+        Assert.NotNull(analysisItemType);
+        Assert.NotNull(method);
+
+        object CreateEntry(int index, uint appId, string launchOptions, bool managed) =>
+            CreateNonPublicInstance(
+                existingShortcutEntryType!,
+                index,
+                appId,
+                "Hades",
+                @"C:\ToolsForSteam\ToolsForSteam.exe",
+                @"C:\ToolsForSteam",
+                launchOptions,
+                managed,
+                managed ? "unifysteam" : string.Empty,
+                string.Empty,
+                new Dictionary<string, object?>());
+
+        var entries = Array.CreateInstance(existingShortcutEntryType!, 3);
+        entries.SetValue(CreateEntry(0, 8001u, "--unifysteam-launch epic-games:hades", true), 0);
+        entries.SetValue(CreateEntry(1, 8002u, "--unifysteam-launch gog-galaxy:1234", true), 1);
+        // An entry from an old build that never stored its launch identity.
+        entries.SetValue(CreateEntry(2, 8003u, string.Empty, true), 2);
+
+        var candidates = (System.Collections.IEnumerable)method!.Invoke(
+            null,
+            [entries, Array.CreateInstance(analysisItemType!, 0), new HashSet<int>()])!;
+        var removedAppIds = candidates
+            .Cast<object>()
+            .Select(candidate =>
+            {
+                var shortcut = candidate.GetType().GetProperty("ExistingShortcut")!.GetValue(candidate)!;
+                return (uint)shortcut.GetType().GetProperty("AppId")!.GetValue(shortcut)!;
+            })
+            .ToArray();
+
+        // Epic and GOG are two different games; only the identity-less
+        // leftover is collapsed.
+        Assert.Equal([8003u], removedAppIds);
+    }
+
+    [Fact]
     public void TryFindExistingShortcut_DoesNotGuessBetweenAmbiguousLegacyTitles()
     {
         var serviceType = typeof(StoreSyncService);

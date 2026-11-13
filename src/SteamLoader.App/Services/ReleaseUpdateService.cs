@@ -12,10 +12,16 @@ namespace SteamLoader.App.Services;
 public sealed class ReleaseUpdateService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private static readonly Uri LatestStableReleaseUri = new(
-        $"https://api.github.com/repos/{SteamLoaderRuntime.ReleaseRepository}/releases/latest");
+    // The release list (not /releases/latest) is queried on purpose: some
+    // older beta tags were published without GitHub's prerelease flag, so the
+    // stable filter also has to look at the tag itself.
     private static readonly Uri ReleasesUri = new(
-        $"https://api.github.com/repos/{SteamLoaderRuntime.ReleaseRepository}/releases?per_page=20");
+        $"https://api.github.com/repos/{SteamLoaderRuntime.ReleaseRepository}/releases?per_page=30");
+
+    // Versioning restarted at 0.2.0 on this date. Releases of the retired
+    // 0.3/0.4 line stay on GitHub but carry higher numbers, so anything
+    // published before the restart is never offered as an update.
+    internal static readonly DateTimeOffset VersionLineStartUtc = new(2026, 11, 11, 0, 0, 0, TimeSpan.Zero);
 
     private readonly HttpClient _httpClient;
 
@@ -28,37 +34,29 @@ public sealed class ReleaseUpdateService
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("ToolsForSteam-Updater/1.0");
     }
 
-    public Task<UpdateCheckSnapshot> CheckAsync(CancellationToken cancellationToken = default)
-    {
-        return CheckAsync(SteamLoaderRuntime.UpdateChannelStable, cancellationToken);
-    }
-
-    public async Task<UpdateCheckSnapshot> CheckAsync(
-        string channel,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Looks up the newest stable Tools for Steam release. There is no beta
+    /// channel: prereleases are never offered and a newer local build is never
+    /// downgraded.
+    /// </summary>
+    public async Task<UpdateCheckSnapshot> CheckAsync(CancellationToken cancellationToken = default)
     {
         var currentVersion = GetCurrentVersion();
-        var normalizedChannel = NormalizeUpdateChannel(channel);
 
         try
         {
-            var release = await GetPreferredReleaseAsync(normalizedChannel, cancellationToken);
+            var release = await GetLatestStableReleaseAsync(cancellationToken);
             var latestVersion = NormalizeVersion(release.TagName);
             var asset = FindUpdateAsset(release);
             var updateAvailable = IsNewerVersion(latestVersion, currentVersion);
-            var releaseKind = release.Prerelease ? "preview" : "release";
-            var channelLabel = GetChannelLabel(normalizedChannel);
 
             var message = updateAvailable
                 ? asset is null
-                    ? $"The latest {channelLabel} {releaseKind} is {latestVersion}, but no Windows package was attached."
-                    : $"The latest {channelLabel} {releaseKind} is {latestVersion}."
-                : normalizedChannel == SteamLoaderRuntime.UpdateChannelBeta && !release.Prerelease
-                    ? $"No GitHub preview is published right now. Tools for Steam is following the latest stable release ({currentVersion})."
-                    : $"You are already on the latest {channelLabel} {releaseKind} ({currentVersion}).";
+                    ? $"The latest release is {latestVersion}, but no Windows package was attached."
+                    : $"Version {latestVersion} is available."
+                : $"You are on the latest release ({currentVersion}).";
 
             return BuildSnapshot(
-                normalizedChannel,
                 currentVersion,
                 release,
                 asset,
@@ -67,50 +65,43 @@ public sealed class ReleaseUpdateService
         }
         catch (Exception exception)
         {
-            return BuildFailureSnapshot(currentVersion, normalizedChannel, $"Update check failed: {exception.Message}");
+            return BuildFailureSnapshot(currentVersion, $"Update check failed: {exception.Message}");
         }
     }
 
-    public Task<UpdateCheckSnapshot> BeginInstallLatestAsync(
-        string installDirectory,
-        string executablePath,
-        IEnumerable<int> processIdsToWaitFor,
-        CancellationToken cancellationToken = default)
-    {
-        return BeginInstallLatestAsync(
-            SteamLoaderRuntime.UpdateChannelStable,
-            installDirectory,
-            executablePath,
-            processIdsToWaitFor,
-            progressCallback: null,
-            cancellationToken);
-    }
-
     public async Task<UpdateCheckSnapshot> BeginInstallLatestAsync(
-        string channel,
         string installDirectory,
         string executablePath,
         IEnumerable<int> processIdsToWaitFor,
         Func<UpdateCheckSnapshot, Task>? progressCallback = null,
         CancellationToken cancellationToken = default)
     {
-        var normalizedChannel = NormalizeUpdateChannel(channel);
         var currentVersion = GetCurrentVersion();
         var workDirectory = string.Empty;
 
         try
         {
-            var release = await GetPreferredReleaseAsync(normalizedChannel, cancellationToken);
+            var release = await GetLatestStableReleaseAsync(cancellationToken);
             var latestVersion = NormalizeVersion(release.TagName);
             var asset = FindUpdateAsset(release)
-                ?? throw new InvalidOperationException("The selected GitHub release does not contain a Tools for Steam Windows package.");
+                ?? throw new InvalidOperationException("The latest GitHub release does not contain a Tools for Steam Windows package.");
+            if (!IsNewerVersion(latestVersion, currentVersion))
+            {
+                // Never reinstall or downgrade, whoever asked for the install.
+                return BuildSnapshot(
+                    currentVersion,
+                    release,
+                    asset,
+                    updateAvailable: false,
+                    message: $"You are on the latest release ({currentVersion}).");
+            }
+
             var baseSnapshot = BuildSnapshot(
-                normalizedChannel,
                 currentVersion,
                 release,
                 asset,
                 updateAvailable: true,
-                message: $"Preparing {latestVersion} from the {GetChannelLabel(normalizedChannel)} channel.");
+                message: $"Preparing {latestVersion}.");
 
             await ReportInstallProgressAsync(
                 progressCallback,
@@ -118,7 +109,7 @@ public sealed class ReleaseUpdateService
                     baseSnapshot,
                     "preparing",
                     5,
-                    $"Preparing {latestVersion} from the {GetChannelLabel(normalizedChannel)} channel."));
+                    $"Preparing {latestVersion}."));
 
             workDirectory = Path.Combine(Path.GetTempPath(), $"ToolsForSteam-Update-{Guid.NewGuid():N}");
             Directory.CreateDirectory(workDirectory);
@@ -153,6 +144,7 @@ public sealed class ReleaseUpdateService
                     84,
                     $"Validating {asset.Name}..."));
             ValidateDownloadedPackage(packagePath, isInstallerAsset);
+            ValidatePackageDigest(packagePath, asset.Digest);
 
             var scriptPath = Path.Combine(workDirectory, "apply-update.ps1");
             await ReportInstallProgressAsync(
@@ -192,14 +184,13 @@ public sealed class ReleaseUpdateService
             }
 
             return BuildSnapshot(
-                normalizedChannel,
                 currentVersion,
                 release,
                 asset,
                 updateAvailable: true,
                 message: isInstallerAsset
-                    ? $"Installing {latestVersion} from the {GetChannelLabel(normalizedChannel)} channel. Tools for Steam will restart after setup finishes."
-                    : $"Applying {latestVersion} from the {GetChannelLabel(normalizedChannel)} channel. Tools for Steam will restart after the files are replaced.")
+                    ? $"Installing {latestVersion}. Tools for Steam will restart after setup finishes."
+                    : $"Applying {latestVersion}. Tools for Steam will restart after the files are replaced.")
                 with
                 {
                     InstallInProgress = true,
@@ -214,28 +205,12 @@ public sealed class ReleaseUpdateService
         }
     }
 
-    private async Task<GithubRelease> GetPreferredReleaseAsync(string channel, CancellationToken cancellationToken)
+    private async Task<GithubRelease> GetLatestStableReleaseAsync(CancellationToken cancellationToken)
     {
-        if (string.Equals(channel, SteamLoaderRuntime.UpdateChannelStable, StringComparison.OrdinalIgnoreCase))
-        {
-            return await RetryUpdateNetworkOperationAsync(
-                () => GetReleaseAsync(LatestStableReleaseUri, cancellationToken),
-                cancellationToken);
-        }
-
         var releases = await RetryUpdateNetworkOperationAsync(
             () => GetReleasesAsync(cancellationToken),
             cancellationToken);
-        return SelectRelease(releases, channel);
-    }
-
-    private async Task<GithubRelease> GetReleaseAsync(Uri uri, CancellationToken cancellationToken)
-    {
-        using var response = await _httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        await EnsureGithubResponseSuccessAsync(response, cancellationToken);
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        return await JsonSerializer.DeserializeAsync<GithubRelease>(stream, JsonOptions, cancellationToken)
-            ?? throw new InvalidOperationException("GitHub returned an empty release response.");
+        return SelectLatestStableRelease(releases);
     }
 
     private async Task<IReadOnlyList<GithubRelease>> GetReleasesAsync(CancellationToken cancellationToken)
@@ -284,26 +259,35 @@ public sealed class ReleaseUpdateService
         response.EnsureSuccessStatusCode();
     }
 
-    private static GithubRelease SelectRelease(IReadOnlyList<GithubRelease> releases, string channel)
+    private static GithubRelease SelectLatestStableRelease(IReadOnlyList<GithubRelease> releases)
     {
-        var publishedReleases = releases
-            .Where(release => !release.Draft)
+        var stableReleases = releases
+            .Where(IsStableRelease)
             .ToArray();
 
-        if (publishedReleases.Length == 0)
-        {
-            throw new InvalidOperationException("No published GitHub releases are available.");
-        }
-
-        if (string.Equals(channel, SteamLoaderRuntime.UpdateChannelBeta, StringComparison.OrdinalIgnoreCase))
-        {
-            return SelectHighestRelease(publishedReleases.Where(release => release.Prerelease))
-                ?? SelectHighestRelease(publishedReleases.Where(release => !release.Prerelease))
-                ?? throw new InvalidOperationException("No compatible GitHub release is available.");
-        }
-
-        return SelectHighestRelease(publishedReleases.Where(release => !release.Prerelease))
+        // Prefer the newest stable release that ships the installer; a newer
+        // one without a package is only reported when nothing installable exists.
+        return SelectHighestRelease(stableReleases.Where(release => FindUpdateAsset(release) is not null))
+            ?? SelectHighestRelease(stableReleases)
             ?? throw new InvalidOperationException("No stable GitHub release is available.");
+    }
+
+    private static bool IsStableRelease(GithubRelease release)
+    {
+        if (release.Draft || release.Prerelease)
+        {
+            return false;
+        }
+
+        if (release.PublishedAt is not { } publishedAt || publishedAt < VersionLineStartUtc)
+        {
+            return false;
+        }
+
+        // A tag such as v0.3.9-beta.1 is a preview even when GitHub's
+        // prerelease flag was forgotten.
+        var version = ParseSemanticVersion(release.TagName);
+        return version is not null && version.PrereleaseIdentifiers.Length == 0;
     }
 
     private static GithubRelease? SelectHighestRelease(IEnumerable<GithubRelease> releases)
@@ -454,6 +438,34 @@ public sealed class ReleaseUpdateService
         }
     }
 
+    /// <summary>
+    /// Checks the download against the SHA-256 digest GitHub reports for the
+    /// asset ("sha256:&lt;hex&gt;"). Older assets carry no digest; they keep the
+    /// structural check only.
+    /// </summary>
+    private static void ValidatePackageDigest(string destinationPath, string? digest)
+    {
+        const string Sha256Prefix = "sha256:";
+        if (string.IsNullOrWhiteSpace(digest) ||
+            !digest.StartsWith(Sha256Prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var expectedHash = digest[Sha256Prefix.Length..].Trim();
+        string actualHash;
+        using (var stream = File.OpenRead(destinationPath))
+        {
+            actualHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
+        }
+
+        if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+        {
+            File.Delete(destinationPath);
+            throw new InvalidOperationException("The downloaded update does not match the published checksum.");
+        }
+    }
+
     private static void ValidateZipPackage(string destinationPath)
     {
         try
@@ -472,7 +484,6 @@ public sealed class ReleaseUpdateService
     }
 
     private static UpdateCheckSnapshot BuildSnapshot(
-        string channel,
         string currentVersion,
         GithubRelease release,
         GithubReleaseAsset? asset,
@@ -488,8 +499,6 @@ public sealed class ReleaseUpdateService
             ReleaseUrl: release.HtmlUrl,
             AssetName: asset?.Name,
             PublishedAtUtc: release.PublishedAt,
-            Channel: channel,
-            IsPrerelease: release.Prerelease,
             ReleaseName: string.IsNullOrWhiteSpace(release.Name) ? null : release.Name.Trim(),
             CheckedAtUtc: DateTimeOffset.UtcNow,
             InstallInProgress: false,
@@ -499,7 +508,6 @@ public sealed class ReleaseUpdateService
 
     private static UpdateCheckSnapshot BuildFailureSnapshot(
         string currentVersion,
-        string channel,
         string message)
     {
         return new UpdateCheckSnapshot(
@@ -511,8 +519,6 @@ public sealed class ReleaseUpdateService
             ReleaseUrl: null,
             AssetName: null,
             PublishedAtUtc: null,
-            Channel: channel,
-            IsPrerelease: false,
             ReleaseName: null,
             CheckedAtUtc: DateTimeOffset.UtcNow,
             InstallInProgress: false,
@@ -743,22 +749,6 @@ Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction SilentlyCon
             : version;
     }
 
-    private static string NormalizeUpdateChannel(string? channel)
-    {
-        return channel?.Trim().ToLowerInvariant() switch
-        {
-            SteamLoaderRuntime.UpdateChannelBeta => SteamLoaderRuntime.UpdateChannelBeta,
-            _ => SteamLoaderRuntime.UpdateChannelStable
-        };
-    }
-
-    private static string GetChannelLabel(string channel)
-    {
-        return string.Equals(channel, SteamLoaderRuntime.UpdateChannelBeta, StringComparison.OrdinalIgnoreCase)
-            ? "beta"
-            : "stable";
-    }
-
     private static bool IsNewerVersion(string latestVersion, string currentVersion)
     {
         var latest = ParseSemanticVersion(latestVersion);
@@ -901,5 +891,7 @@ Remove-Item -LiteralPath $workDirectory -Recurse -Force -ErrorAction SilentlyCon
         [property: JsonPropertyName("name")]
         string Name,
         [property: JsonPropertyName("browser_download_url")]
-        string BrowserDownloadUrl);
+        string BrowserDownloadUrl,
+        [property: JsonPropertyName("digest")]
+        string? Digest = null);
 }

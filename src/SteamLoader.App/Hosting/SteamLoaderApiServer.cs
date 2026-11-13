@@ -30,6 +30,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan UpdateSnapshotCacheDuration = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan AutomaticUpdateStartupDelay = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan AutomaticUpdateCheckInterval = TimeSpan.FromHours(4);
+    private static readonly TimeSpan AutomaticUpdateIdlePollInterval = TimeSpan.FromMinutes(2);
     private readonly IAudioOutputDeviceService _audioOutputDeviceService;
     private readonly DisplaySwitchService _displaySwitchService;
     private readonly ProcessWindowService _processWindowService;
@@ -56,7 +59,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private readonly SteamDevToolsClient _devToolsClient;
     private readonly SmartHomeService _smartHomeService;
     private readonly DiscordService _discordService;
-    private readonly PluginFullTrustRuntime _pluginFullTrustRuntime;
     private readonly ExternalGameQuickAccessService _externalGameQuickAccessService;
     private readonly Func<IReadOnlyList<string>> _pressedControllerButtonsProvider;
     private readonly SteamLoaderHostState _hostState;
@@ -79,6 +81,8 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private UpdateCheckSnapshot? _cachedUpdateSnapshot;
     private Task? _activeUpdateInstallTask;
     private Task? _acceptLoopTask;
+    private Task? _automaticUpdateLoopTask;
+    private CancellationTokenSource? _automaticUpdateCts;
     private bool _unifyStoreOverlayOpen;
     private bool _storeOverlayOpen;
 
@@ -109,7 +113,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         SteamDevToolsClient devToolsClient,
         SmartHomeService smartHomeService,
         DiscordService discordService,
-        PluginFullTrustRuntime pluginFullTrustRuntime,
         ExternalGameQuickAccessService externalGameQuickAccessService,
         Func<IReadOnlyList<string>> pressedControllerButtonsProvider,
         Uri baseUri,
@@ -144,7 +147,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         _devToolsClient = devToolsClient;
         _smartHomeService = smartHomeService;
         _discordService = discordService;
-        _pluginFullTrustRuntime = pluginFullTrustRuntime;
         _externalGameQuickAccessService = externalGameQuickAccessService;
         _pressedControllerButtonsProvider = pressedControllerButtonsProvider;
         _apiSessionToken = apiSessionToken;
@@ -158,10 +160,37 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     public Uri BaseUri { get; }
 
+    /// <summary>Frontend bundles served under <c>/frontend/</c> for the Decky-style loader.</summary>
+    public FrontendBundleRegistry? FrontendBundles { get; init; }
+
+    /// <summary>TFS Trailers backend, served under <c>/api/trailers/</c>.</summary>
+    public Infrastructure.Trailers.TrailerService? Trailers { get; init; }
+
+    /// <summary>TFS Overture backend (game page theme music), served under <c>/api/overture/</c>.</summary>
+    public Infrastructure.Overture.OvertureService? Overture { get; init; }
+
+    /// <summary>TFS Artworks page backend, served under <c>/api/artwork/picker/</c>.</summary>
+    public Infrastructure.Artwork.ArtworkPickerService? ArtworkPicker { get; init; }
+
+    /// <summary>TFS section in Steam's Performance tab, served under <c>/api/perf-tab/</c>.</summary>
+    public Infrastructure.PerfTab.PerfTabService? PerfTab { get; init; }
+
+    /// <summary>TFS rows in Steam's Quick Settings tab, served under <c>/api/quick-settings/</c>.</summary>
+    public Infrastructure.PerfTab.QuickSettingsService? QuickSettings { get; init; }
+
+    /// <summary>TFS Popups backend, served under <c>/api/popups/</c>.</summary>
+    public Infrastructure.Popups.PopupService? Popups { get; init; }
+
+    /// <summary>Discord Web input bridge, served under <c>/api/discord/web/</c>.</summary>
+    public DiscordWebBridge? DiscordWeb { get; init; }
+
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
         _acceptLoopTask = Task.Run(() => AcceptLoopAsync(cancellationToken), cancellationToken);
+        _automaticUpdateCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var automaticUpdateToken = _automaticUpdateCts.Token;
+        _automaticUpdateLoopTask = Task.Run(() => AutomaticUpdateLoopAsync(automaticUpdateToken));
         return Task.CompletedTask;
     }
 
@@ -176,12 +205,24 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         {
             await _acceptLoopTask;
         }
+
+        if (_automaticUpdateCts is not null)
+        {
+            _automaticUpdateCts.Cancel();
+            if (_automaticUpdateLoopTask is not null)
+            {
+                await _automaticUpdateLoopTask;
+            }
+
+            _automaticUpdateCts.Dispose();
+            _automaticUpdateCts = null;
+            _automaticUpdateLoopTask = null;
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
-        await _pluginFullTrustRuntime.DisposeAsync();
         _listener.Close();
     }
 
@@ -266,6 +307,33 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     HttpStatusCode.NotFound,
                     new { message = "OmniLibrary is disabled in this build." },
                     cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                FrontendBundleRegistry.TryParseRequestPath(request.Url?.AbsolutePath, out var frontendFileName))
+            {
+                if (FrontendBundles?.TryGet(frontendFileName, out var frontendBundle) != true)
+                {
+                    await WriteTextAsync(response, HttpStatusCode.NotFound, "Unknown frontend bundle.", cancellationToken);
+                    return;
+                }
+
+                // The URL carries the content hash, so a matching request can be
+                // cached for good; anything else must revalidate.
+                var cacheControl = string.Equals(
+                    request.QueryString["v"],
+                    frontendBundle!.Version,
+                    StringComparison.OrdinalIgnoreCase)
+                    ? "public, max-age=31536000, immutable"
+                    : "no-cache";
+                await WriteBytesAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    Encoding.UTF8.GetBytes(frontendBundle.Body),
+                    "text/javascript; charset=utf-8",
+                    cancellationToken,
+                    cacheControl);
                 return;
             }
 
@@ -387,6 +455,55 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            if (await TrailerApiEndpoints.TryHandleAsync(request, response, Trailers, cancellationToken))
+            {
+                return;
+            }
+
+            if (await OvertureApiEndpoints.TryHandleAsync(request, response, Overture, cancellationToken))
+            {
+                return;
+            }
+
+            if (await IntroVideoApiEndpoints.TryHandleAsync(request, response, _steamLoaderSettingsService, cancellationToken))
+            {
+                return;
+            }
+
+            if (await GameMetadataApiEndpoints.TryHandleAsync(
+                    request,
+                    response,
+                    _omniLibraryMetadataService,
+                    cancellationToken))
+            {
+                return;
+            }
+
+            if (await ArtworkPickerApiEndpoints.TryHandleAsync(request, response, ArtworkPicker, cancellationToken))
+            {
+                return;
+            }
+
+            if (await PerfTabApiEndpoints.TryHandleAsync(request, response, PerfTab, cancellationToken))
+            {
+                return;
+            }
+
+            if (await PerfTabApiEndpoints.TryHandleQuickSettingsAsync(request, response, QuickSettings, cancellationToken))
+            {
+                return;
+            }
+
+            if (await PopupApiEndpoints.TryHandleAsync(request, response, Popups, cancellationToken))
+            {
+                return;
+            }
+
+            if (await DiscordWebApiEndpoints.TryHandleAsync(request, response, DiscordWeb, cancellationToken))
+            {
+                return;
+            }
+
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/curtain/state")
             {
@@ -440,10 +557,30 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     return;
                 }
 
+                // Play on an OmniLibrary game that is not installed starts
+                // nothing (downloads run from the game page Download row), so
+                // there is no launch to cover.
+                if (IsUninstalledOmniLibraryShortcut(payload.AppId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.Conflict,
+                        new CurtainLaunchResult(
+                            false,
+                            "This OmniLibrary game is not installed.",
+                            _curtainService.GetSnapshot()),
+                        cancellationToken);
+                    return;
+                }
+
+                // The launch must not die with the request: Steam's frontend
+                // fires it and moves on.
                 var result = await _curtainService.ShowAsync(
                     payload.AppId,
                     payload.Title,
-                    cancellationToken);
+                    payload.Reason,
+                    payload.BigPicture ?? true,
+                    CancellationToken.None);
                 await WriteJsonAsync(
                     response,
                     result.Shown ? HttpStatusCode.OK : HttpStatusCode.Conflict,
@@ -453,13 +590,142 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             }
 
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/curtain/dismiss")
+                request.Url?.AbsolutePath == "/api/curtain/confirm")
             {
+                var payload = await JsonSerializer.DeserializeAsync<CurtainAppRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
                 await WriteJsonAsync(
                     response,
                     HttpStatusCode.OK,
-                    await _curtainService.DismissAsync(),
+                    _curtainService.Confirm(payload?.AppId ?? 0),
                     cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/curtain/dismiss")
+            {
+                CurtainDismissRequest? payload = null;
+                if (request.HasEntityBody)
+                {
+                    try
+                    {
+                        payload = await JsonSerializer.DeserializeAsync<CurtainDismissRequest>(
+                            request.InputStream,
+                            JsonOptions,
+                            cancellationToken);
+                    }
+                    catch (JsonException)
+                    {
+                        payload = null;
+                    }
+                }
+
+                await WriteJsonAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    await _curtainService.DismissAsync(payload?.Reason),
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/curtain/settings")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<CurtainGlobalUpdate>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Curtain settings are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, _curtainService.SaveGlobal(payload), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/curtain/game")
+            {
+                if (!uint.TryParse(request.QueryString["appId"], out var curtainAppId) || curtainAppId == 0)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Steam app id is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                await WriteJsonAsync(response, HttpStatusCode.OK, _curtainService.GetGame(curtainAppId), cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                (request.Url?.AbsolutePath == "/api/curtain/game" ||
+                 request.Url?.AbsolutePath == "/api/curtain/game/reset"))
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SaveCurtainGameRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+                if (payload is null || payload.AppId == 0)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A Steam app id is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var details = request.Url.AbsolutePath.EndsWith("/reset", StringComparison.Ordinal)
+                    ? _curtainService.ResetGame(payload.AppId)
+                    : _curtainService.SaveGame(payload.AppId, payload.Settings ?? new CurtainGameSettings(), payload.Enabled);
+                await WriteJsonAsync(response, HttpStatusCode.OK, details, cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/curtain/image")
+            {
+                _ = uint.TryParse(request.QueryString["appId"], out var imageAppId);
+                var curtainImagePath = _curtainService.ResolveImagePath(
+                    imageAppId,
+                    request.QueryString["kind"] ?? "background",
+                    request.QueryString["source"]);
+                if (string.IsNullOrWhiteSpace(curtainImagePath) || !File.Exists(curtainImagePath))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.NotFound,
+                        new { message = "No curtain image is available." },
+                        cancellationToken);
+                    return;
+                }
+
+                // The URL carries a content version (v=), so the image may be cached.
+                await WriteFileAsync(
+                    response,
+                    curtainImagePath,
+                    Path.GetExtension(curtainImagePath).ToLowerInvariant() switch
+                    {
+                        ".png" => "image/png",
+                        ".webp" => "image/webp",
+                        ".gif" => "image/gif",
+                        ".bmp" => "image/bmp",
+                        _ => "image/jpeg"
+                    },
+                    cancellationToken,
+                    string.IsNullOrEmpty(request.QueryString["v"]) ? "no-cache, no-store" : "private, max-age=86400");
                 return;
             }
 
@@ -1841,305 +2107,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
-            if (request.Url?.AbsolutePath.StartsWith("/api/plugin-sdk/", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                await WriteTextAsync(
-                    response,
-                    HttpStatusCode.NotFound,
-                    "The public plugin runtime is not available.",
-                    cancellationToken);
-                return;
-            }
-
-            if (TryParsePluginSdkPath(request.Url?.AbsolutePath, out var sdkPluginId, out var sdkPath))
-            {
-                if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "state")
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.GetPluginSdkState(sdkPluginId),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath.StartsWith("capabilities/", StringComparison.OrdinalIgnoreCase))
-                {
-                    var capability = sdkPath["capabilities/".Length..].Trim('/');
-                    if (capability.Length == 0 || capability.Contains('/'))
-                    {
-                        await WriteJsonAsync(
-                            response,
-                            HttpStatusCode.BadRequest,
-                            new { message = "A valid SDK capability is required." },
-                            cancellationToken);
-                        return;
-                    }
-
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkCapabilityRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        await ExecutePluginSdkCapabilityAsync(
-                            sdkPluginId,
-                            capability,
-                            payload,
-                            cancellationToken),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "settings")
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.GetPluginSdkSettings(sdkPluginId),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "settings")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<JsonElement>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.SetPluginSdkSettings(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "secrets")
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.GetPluginSdkSecrets(sdkPluginId),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    TryParsePluginSdkSecretPath(sdkPath, out var sdkSecretKey, out var clearSecret) &&
-                    clearSecret)
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.ClearPluginSdkSecret(sdkPluginId, sdkSecretKey),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    TryParsePluginSdkSecretPath(sdkPath, out sdkSecretKey, out clearSecret) &&
-                    !clearSecret)
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<SetTextValueRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    if (payload is null)
-                    {
-                        await WriteJsonAsync(
-                            response,
-                            HttpStatusCode.BadRequest,
-                            new { message = "A secret value is required." },
-                            cancellationToken);
-                        return;
-                    }
-
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.SetPluginSdkSecret(sdkPluginId, sdkSecretKey, payload.Value),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "network/request")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkNetworkRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        await _pluginStoreService.SendPluginSdkNetworkRequestAsync(
-                            sdkPluginId,
-                            payload,
-                            cancellationToken),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/list")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileListRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.ListPluginSdkFiles(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/stat")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.GetPluginSdkFileInfo(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/read")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileReadRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.ReadPluginSdkFile(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/write")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileWriteRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.WritePluginSdkFile(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/directory")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.CreatePluginSdkDirectory(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/delete")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFilePathRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.DeletePluginSdkFile(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/move")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileTransferRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.MovePluginSdkFile(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "files/copy")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkFileTransferRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.CopyPluginSdkFile(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "notifications/show")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkNotificationRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.CreatePluginSdkNotification(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-
-                if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                    sdkPath == "logs/write")
-                {
-                    var payload = await JsonSerializer.DeserializeAsync<PluginSdkLogRequest>(
-                        request.InputStream,
-                        JsonOptions,
-                        cancellationToken);
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.OK,
-                        _pluginStoreService.WritePluginSdkLog(sdkPluginId, payload),
-                        cancellationToken);
-                    return;
-                }
-            }
-
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/autostart")
             {
@@ -2182,6 +2149,18 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         response,
                         HttpStatusCode.BadRequest,
                         new { message = "A startup mode is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                if (!SteamLoaderSettingsService.IsSupportedStartupMode(payload.Mode))
+                {
+                    // Xbox Mode was removed; an overlay script from an older
+                    // build may still offer it until Steam restarts.
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Tools for Steam supports Console Mode and eTray startup only. Shell Takeover and Xbox Mode were removed." },
                         cancellationToken);
                     return;
                 }
@@ -2243,6 +2222,34 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 }
 
                 var settingsSnapshot = _steamLoaderSettingsService.SetDeveloperDebugEnabled(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/gamebar-automation")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetBooleanValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A boolean value is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetGameBarControllerAutomation(payload.Value);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -2395,6 +2402,9 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             if (request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/overlay/input-state")
             {
+                // Only the Overlay recorder polls this: keep the shortcut
+                // pollers quiet while it listens.
+                ControllerShortcutCaptureGate.MarkActive();
                 var pressedButtons = _pressedControllerButtonsProvider();
                 await WriteJsonAsync(
                     response,
@@ -2567,6 +2577,36 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 return;
             }
 
+            // TFS Popups size (Quick Access plugin "TFS Popups"), kept as the
+            // general notification size setting.
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/settings/notification-scale")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetIntegerValueRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A notification size in percent is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var settingsSnapshot = _steamLoaderSettingsService.SetNotificationScalePercent(payload.Value);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    settingsSnapshot,
+                    "settings.state",
+                    cancellationToken);
+                return;
+            }
+
             if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 request.Url?.AbsolutePath == "/api/settings/plugins/enabled")
             {
@@ -2673,35 +2713,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken),
-                    cancellationToken);
-                return;
-            }
-
-            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/updates/channel")
-            {
-                var payload = await JsonSerializer.DeserializeAsync<SetUpdateChannelRequest>(
-                    request.InputStream,
-                    JsonOptions,
-                    cancellationToken);
-
-                if (payload is null || string.IsNullOrWhiteSpace(payload.Channel))
-                {
-                    await WriteJsonAsync(
-                        response,
-                        HttpStatusCode.BadRequest,
-                        new { message = "An update channel is required." },
-                        cancellationToken);
-                    return;
-                }
-
-                var normalizedChannel = _steamLoaderSettingsService.SetUpdateChannel(payload.Channel);
-                InvalidateUpdateSnapshotCache();
-
-                await WriteJsonAsync(
-                    response,
-                    HttpStatusCode.OK,
-                    await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken, normalizedChannel),
                     cancellationToken);
                 return;
             }
@@ -2849,28 +2860,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     response,
                     HttpStatusCode.OK,
                     _autoSisirService.ToggleWatchedTitle(payload.Value),
-                    cancellationToken);
-                return;
-            }
-
-            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/display/internal")
-            {
-                await WriteJsonAsync(
-                    response,
-                    HttpStatusCode.OK,
-                    _displaySwitchService.SwitchToInternalDisplay(),
-                    cancellationToken);
-                return;
-            }
-
-            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
-                request.Url?.AbsolutePath == "/api/display/external")
-            {
-                await WriteJsonAsync(
-                    response,
-                    HttpStatusCode.OK,
-                    _displaySwitchService.SwitchToExternalDisplay(),
                     cancellationToken);
                 return;
             }
@@ -4165,7 +4154,69 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 var storeSyncSnapshot = _storeSyncService.SetOmniLibraryRomSystemSettings(
                     payload.SystemId,
                     payload.EmulatorPath,
-                    payload.Fullscreen);
+                    payload.Fullscreen,
+                    payload.EmulatorId);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/rom-system/install-emulator")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<InstallRomEmulatorRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null || string.IsNullOrWhiteSpace(payload.SystemId))
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "A ROM system ID is required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.InstallOmniLibraryEmulator(
+                    payload.SystemId,
+                    payload.EmulatorId);
+                await WriteJsonAndPublishAsync(
+                    response,
+                    HttpStatusCode.OK,
+                    storeSyncSnapshot,
+                    "store-sync.state",
+                    cancellationToken);
+                return;
+            }
+
+            if (request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                request.Url?.AbsolutePath == "/api/unifystore/emulation/options")
+            {
+                var payload = await JsonSerializer.DeserializeAsync<SetEmulationOptionsRequest>(
+                    request.InputStream,
+                    JsonOptions,
+                    cancellationToken);
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        response,
+                        HttpStatusCode.BadRequest,
+                        new { message = "Emulation options are required." },
+                        cancellationToken);
+                    return;
+                }
+
+                var storeSyncSnapshot = _storeSyncService.SetOmniLibraryEmulationOptions(
+                    payload.AutoInstallEmulators,
+                    payload.ImportOrbitRoms,
+                    payload.ImportEmulatorLibraries);
                 await WriteJsonAndPublishAsync(
                     response,
                     HttpStatusCode.OK,
@@ -5952,17 +6003,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     return steamRequire;
   }
 
-  const steamRequire = getSteamRequire();
-  if (!steamRequire) {
-    return {
-      success: false,
-      message: "Steam webpack runtime is not available."
-    };
-  }
+  void getSteamRequire;
 
-  const gamepadStore = steamRequire(61236)?.oy;
+  // Steam's window store is a stable global. The old hard-coded webpack
+  // module id (61236) vanished with a Steam client update.
+  const gamepadStore = window.SteamUIStore?.m_WindowStore || window.SteamUIStore?.WindowStore;
   const windowInstance =
-    gamepadStore?.ActiveWindowInstance ||
     gamepadStore?.GamepadUIMainWindowInstance ||
     gamepadStore?.MainWindowInstance;
   const keyboardManager = windowInstance?.VirtualKeyboardManager;
@@ -6032,9 +6078,14 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 evaluation.Value);
         }
 
+        // The script reports its own outcome; a missing keyboard manager is a
+        // failure, not "requested" (that hid the breakage after a Steam update).
+        var opened = evaluation.Value is JsonElement { ValueKind: JsonValueKind.Object } details &&
+            details.TryGetProperty("success", out var successElement) &&
+            successElement.ValueKind == JsonValueKind.True;
         return new SteamKeyboardOpenResult(
-            true,
-            "Steam virtual keyboard requested.",
+            opened,
+            opened ? "Steam virtual keyboard requested." : "Steam's virtual keyboard is not available.",
             evaluation.Value);
     }
 
@@ -6205,6 +6256,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return;
         }
 
+        if (string.Equals(path, "/api/metadata/state", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(response, HttpStatusCode.OK, new { enabled = false }, cancellationToken);
+            return;
+        }
+
         if (string.Equals(path, "/api/hltb/game", StringComparison.OrdinalIgnoreCase))
         {
             var settings = new HltbSettingsState(false, false, false, false, false, false, 0);
@@ -6305,6 +6362,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             if (_omniLibraryLoginProcesses.TryGetValue(descriptor.Id, out var existing) &&
                 !existing.HasExited)
             {
+                OmniLibraryLoginRuntime.TryActivate(existing);
                 return snapshot;
             }
 
@@ -6364,12 +6422,15 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return false;
         }
 
-        var snapshot = _storeSyncService.GetSnapshot();
+        // The cached OmniLibrary state is enough to validate an action. The full
+        // Store Sync snapshot rescanned every store folder and shortcuts.vdf
+        // under the service lock on each Play or Download press.
+        var snapshot = _storeSyncService.GetUnifySteamState();
         var storeState = snapshot.UnifySteam.Stores
             .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
         if (storeState is null || !storeState.Enabled)
         {
-            message = "Enable this OmniLibrary store before downloading its games.";
+            message = "Enable this OmniLibrary store before launching its games.";
             return false;
         }
 
@@ -6417,7 +6478,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                     WorkingDirectory = Path.GetDirectoryName(xboxHostPath) ?? AppContext.BaseDirectory,
                     UseShellExecute = false,
                     CreateNoWindow = true,
-                });
+                })?.Dispose();
                 message = $"Starting {gameState.Title} through the Xbox launch host.";
                 return true;
             }
@@ -6447,7 +6508,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         };
         startInfo.ArgumentList.Add("--unifysteam-launch");
         startInfo.ArgumentList.Add($"{normalizedStoreId}:{normalizedGameId}");
-        Process.Start(startInfo);
+        Process.Start(startInfo)?.Dispose();
 
         message = normalizedStoreId.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) && !gameState.Installed
             ? "Opening the GOG Galaxy game page. Install the game there, then refresh OmniLibrary."
@@ -6477,13 +6538,16 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return false;
         }
 
-        var snapshot = _storeSyncService.GetSnapshot();
+        // The cached OmniLibrary state is enough to validate an action. The full
+        // Store Sync snapshot rescanned every store folder and shortcuts.vdf
+        // under the service lock on each Play or Download press.
+        var snapshot = _storeSyncService.GetUnifySteamState();
         var storeState = snapshot.UnifySteam.Stores
             .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
         if (storeState is null ||
             (!storeState.Enabled && !allowDisabledExistingDownload))
         {
-            message = "Enable this OmniLibrary store before launching its games.";
+            message = "Enable this OmniLibrary store before downloading its games.";
             return false;
         }
 
@@ -6638,7 +6702,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return false;
         }
 
-        var store = _storeSyncService.GetSnapshot().UnifySteam.Stores
+        var store = _storeSyncService.GetUnifySteamState().UnifySteam.Stores
             .FirstOrDefault(candidate =>
                 candidate.Id.Equals(
                     normalizedStoreId,
@@ -6748,7 +6812,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return false;
         }
 
-        var snapshot = _storeSyncService.GetSnapshot();
+        // The cached OmniLibrary state is enough to validate an action. The full
+        // Store Sync snapshot rescanned every store folder and shortcuts.vdf
+        // under the service lock on each Play or Download press.
+        var snapshot = _storeSyncService.GetUnifySteamState();
         var storeState = snapshot.UnifySteam.Stores
             .FirstOrDefault(store => string.Equals(store.Id, normalizedStoreId, StringComparison.OrdinalIgnoreCase));
         if (storeState is null || !storeState.Enabled)
@@ -6853,6 +6920,27 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 $"Opening {gameState.Title} in the Xbox app. Finish the uninstall there; OmniLibrary will detect the removal.",
         };
         return true;
+    }
+
+    // True for an OmniLibrary shortcut whose game is neither installed nor
+    // cloud playable: Steam's Play button starts nothing for it.
+    private bool IsUninstalledOmniLibraryShortcut(uint appId)
+    {
+        if (appId < 0x80000000u)
+        {
+            return false;
+        }
+
+        try
+        {
+            var detail = _storeSyncService.GetUnifySteamGame(appId);
+            return detail.Game is { Installed: false, CloudPlayable: false } &&
+                !string.Equals(detail.StoreId, "rom-library", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private bool TryControlUnifyStoreDownload(
@@ -7047,11 +7135,14 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             ["/api/audio"] = "audio",
             ["/api/app-start"] = "app-start",
             ["/api/auto-sisr"] = "auto-sisr",
-            ["/api/display"] = "display",
             ["/api/discord"] = "discord",
             ["/api/performance"] = "performance",
             ["/api/processes"] = "processes",
             ["/api/curtain"] = "curtain",
+            ["/api/trailers"] = "trailers",
+            ["/api/popups"] = "popups",
+            ["/api/overture"] = "overture",
+            ["/api/metadata"] = "metadata",
             ["/api/artwork"] = "artwork",
             ["/api/hltb"] = "hltb",
             ["/api/smart-home"] = "smart-home",
@@ -7080,7 +7171,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         return false;
     }
 
-    private static bool TryNormalizeMetadataUrl(string? value, out string normalizedUrl)
+    internal static bool TryNormalizeMetadataUrl(string? value, out string normalizedUrl)
     {
         normalizedUrl = string.Empty;
         if (!Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var uri) ||
@@ -7121,556 +7212,10 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         return true;
     }
 
-    private async Task<object> ExecutePluginSdkCapabilityAsync(
-        string pluginId,
-        string capability,
-        PluginSdkCapabilityRequest? request,
-        CancellationToken cancellationToken)
-    {
-        if (request is null || string.IsNullOrWhiteSpace(request.Operation))
-        {
-            throw new InvalidOperationException("An SDK capability operation is required.");
-        }
-
-        var normalizedCapability = capability.Trim().ToLowerInvariant();
-        var permission = normalizedCapability switch
-        {
-            "audio" => "native.audio",
-            "processes" => "native.processes",
-            "display" => "native.display",
-            "themes" => "native.themes",
-            "artwork" => "native.artwork",
-            "app-start" => "native.app-start",
-            "store-sync" => "native.store-sync",
-            "automation" => "native.automation",
-            "performance" => "native.performance",
-            "power" => "native.power",
-            "system" or "filesystem" or "steam" => "native.full-trust",
-            _ => throw new InvalidOperationException($"Unknown native SDK capability ({normalizedCapability}).")
-        };
-        _pluginStoreService.EnsurePluginSdkPermission(pluginId, permission);
-
-        var operation = request.Operation.Trim().ToLowerInvariant();
-        return normalizedCapability switch
-        {
-            "audio" => await ExecutePluginSdkAudioAsync(operation, request.Arguments, cancellationToken),
-            "processes" => ExecutePluginSdkProcesses(operation, request.Arguments),
-            "display" => ExecutePluginSdkDisplay(operation, request.Arguments),
-            "themes" => await ExecutePluginSdkThemesAsync(operation, request.Arguments),
-            "artwork" => await ExecutePluginSdkArtworkAsync(operation, request.Arguments, cancellationToken),
-            "app-start" => ExecutePluginSdkAppStart(operation, request.Arguments),
-            "store-sync" => await ExecutePluginSdkStoreSyncAsync(operation, request.Arguments, cancellationToken),
-            "automation" => ExecutePluginSdkAutomation(operation, request.Arguments),
-            "performance" => ExecutePluginSdkPerformance(operation, request.Arguments),
-            "power" => ExecutePluginSdkPower(operation, request.Arguments),
-            "system" => await _pluginFullTrustRuntime.ExecuteSystemAsync(pluginId, operation, request.Arguments, cancellationToken),
-            "filesystem" => await _pluginFullTrustRuntime.ExecuteFileSystemAsync(pluginId, operation, request.Arguments, cancellationToken),
-            "steam" => await _pluginFullTrustRuntime.ExecuteSteamAsync(pluginId, operation, request.Arguments, cancellationToken),
-            _ => throw new InvalidOperationException($"Unknown native SDK capability ({normalizedCapability}).")
-        };
-    }
-
-    private object ExecutePluginSdkPerformance(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => _performanceService.GetSnapshot(),
-            "setoverlaylevel" => _performanceService.SetOverlayLevel(GetCapabilityInt32(arguments, "level")),
-            "toggleautotarget" => _performanceService.ToggleAutoTarget(),
-            "setsettingvalue" => _performanceService.SetSettingValue(
-                GetCapabilityString(arguments, "key"),
-                GetCapabilityInt32(arguments, "value")),
-            "startoverlay" => _performanceService.StartOverlay(),
-            "stopoverlay" => _performanceService.StopOverlay(),
-            "prepareelevatedhelper" => _performanceService.PrepareElevatedHelper(),
-            _ => throw new InvalidOperationException($"Unknown native performance operation ({operation}).")
-        };
-    }
-
-    private object ExecutePluginSdkPower(string operation, JsonElement? arguments)
-    {
-        if (operation == "getstate")
-        {
-            return new
-            {
-                actions = new[]
-                {
-                    new { id = "startWindowsDesktop", title = "Start Windows Desktop", disruptive = false },
-                    new { id = "restartSteam", title = "Restart Steam", disruptive = true },
-                    new { id = "sleepWindows", title = "Sleep Windows", disruptive = true },
-                    new { id = "restartWindows", title = "Restart Windows", disruptive = true },
-                    new { id = "shutdownWindows", title = "Shut Down Windows", disruptive = true }
-                },
-                confirmationRequired = true
-            };
-        }
-
-        if (!GetCapabilityBoolean(arguments, "confirmed", false))
-        {
-            throw new InvalidOperationException("Native power actions require confirmed: true after an explicit user confirmation.");
-        }
-
-        return operation switch
-        {
-            "startwindowsdesktop" => _powerActionService.StartWindowsDesktop(),
-            "restartsteam" => _powerActionService.RestartSteam(),
-            "sleepwindows" => _powerActionService.SleepWindows(),
-            "restartwindows" => _powerActionService.RestartWindows(),
-            "shutdownwindows" => _powerActionService.ShutDownWindows(),
-            _ => throw new InvalidOperationException($"Unknown native power operation ({operation}).")
-        };
-    }
-
-    private async Task<object> ExecutePluginSdkAudioAsync(
-        string operation,
-        JsonElement? arguments,
-        CancellationToken cancellationToken)
-    {
-        if (operation == "getstate")
-        {
-            return await GetAudioDashboardSnapshotAsync(cancellationToken);
-        }
-
-        await StaThread.RunAsync(
-            () =>
-            {
-                switch (operation)
-                {
-                    case "setdefaultplayback":
-                        _audioOutputDeviceService.SetDefaultPlaybackDevice(GetCapabilityString(arguments, "deviceId"));
-                        break;
-                    case "setdefaultcapture":
-                        _audioOutputDeviceService.SetDefaultCaptureDevice(GetCapabilityString(arguments, "deviceId"));
-                        break;
-                    case "setplaybackvolume":
-                        _audioOutputDeviceService.SetDefaultPlaybackVolume(GetCapabilityDouble(arguments, "volume"));
-                        break;
-                    case "setcapturevolume":
-                        _audioOutputDeviceService.SetDefaultCaptureVolume(GetCapabilityDouble(arguments, "volume"));
-                        break;
-                    case "adjustplaybackvolume":
-                        _audioOutputDeviceService.AdjustDefaultPlaybackVolume(GetCapabilityDouble(arguments, "delta"));
-                        break;
-                    case "adjustcapturevolume":
-                        _audioOutputDeviceService.AdjustDefaultCaptureVolume(GetCapabilityDouble(arguments, "delta"));
-                        break;
-                    case "toggleplaybackmute":
-                        _audioOutputDeviceService.ToggleDefaultPlaybackMute();
-                        break;
-                    case "togglecapturemute":
-                        _audioOutputDeviceService.ToggleDefaultCaptureMute();
-                        break;
-                    case "setmixervolume":
-                        _audioOutputDeviceService.SetMixerSessionVolume(
-                            GetCapabilityString(arguments, "sessionId"),
-                            GetCapabilityDouble(arguments, "volume"));
-                        break;
-                    case "togglemixermute":
-                        _audioOutputDeviceService.ToggleMixerSessionMute(GetCapabilityString(arguments, "sessionId"));
-                        break;
-                    default:
-                        throw new InvalidOperationException($"Unknown native audio operation ({operation}).");
-                }
-
-                return true;
-            },
-            cancellationToken);
-
-        var snapshot = await GetAudioDashboardSnapshotAsync(cancellationToken);
-        _liveUpdateHub.Publish("audio.dashboard", snapshot);
-        return snapshot;
-    }
-
-    private object ExecutePluginSdkProcesses(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => _processWindowService.GetSnapshot(),
-            "activate" => _processWindowService.ActivateWindow(GetCapabilityString(arguments, "handle")),
-            _ => throw new InvalidOperationException($"Unknown native processes operation ({operation}).")
-        };
-    }
-
-    private object ExecutePluginSdkDisplay(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => _displaySwitchService.GetModeSnapshot(),
-            "switchinternal" => _displaySwitchService.SwitchToInternalDisplay(),
-            "switchexternal" => _displaySwitchService.SwitchToExternalDisplay(),
-            "setresolution" => _displaySwitchService.SetResolutionPreset(
-                GetCapabilityString(arguments, "presetId")),
-            "setrefreshrate" => _displaySwitchService.SetRefreshRatePreset(
-                GetCapabilityInt32(arguments, "refreshRate")),
-            _ => throw new InvalidOperationException($"Unknown native display operation ({operation}).")
-        };
-    }
-
-    private async Task<object> ExecutePluginSdkThemesAsync(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => await _themesService.GetSnapshotAsync(),
-            "refreshcatalog" => await _themesService.RefreshCatalogAsync(),
-            "getstorecatalog" => await _themesService.GetStoreCatalogAsync(
-                GetCapabilityOptionalString(arguments, "search"),
-                GetCapabilityOptionalString(arguments, "filter"),
-                GetCapabilityOptionalString(arguments, "order"),
-                GetCapabilityInt32(arguments, "page", 1),
-                GetCapabilityInt32(arguments, "perPage", 12)),
-            "getstoretheme" => await _themesService.GetStoreThemeAsync(
-                GetCapabilityString(arguments, "storeThemeId")),
-            "installstoretheme" => await _themesService.InstallStoreThemeAsync(
-                GetCapabilityString(arguments, "storeThemeId")),
-            "setenabled" => await _themesService.SetThemeEnabledAsync(
-                GetCapabilityString(arguments, "themeId"),
-                GetCapabilityBoolean(arguments, "enabled")),
-            "toggleoption" => await _themesService.ToggleThemeOptionAsync(
-                GetCapabilityString(arguments, "themeId"),
-                GetCapabilityString(arguments, "optionId")),
-            "setchoice" => await _themesService.SetThemeChoiceAsync(
-                GetCapabilityString(arguments, "themeId"),
-                GetCapabilityString(arguments, "optionId"),
-                GetCapabilityString(arguments, "choiceId")),
-            "adjustrange" => await _themesService.AdjustThemeRangeAsync(
-                GetCapabilityString(arguments, "themeId"),
-                GetCapabilityString(arguments, "optionId"),
-                GetCapabilityInt32(arguments, "delta")),
-            "resetrange" => await _themesService.ResetThemeRangeAsync(
-                GetCapabilityString(arguments, "themeId"),
-                GetCapabilityString(arguments, "optionId")),
-            "createprofile" => await _themesService.CreateProfileAsync(
-                GetCapabilityString(arguments, "title")),
-            "applyprofile" => await _themesService.ApplyProfileAsync(
-                GetCapabilityString(arguments, "profileId")),
-            "updateprofile" => await _themesService.UpdateProfileAsync(
-                GetCapabilityString(arguments, "profileId")),
-            "removeprofile" => await _themesService.RemoveProfileAsync(
-                GetCapabilityString(arguments, "profileId")),
-            "setwatchenabled" => await _themesService.SetWatchEnabledAsync(
-                GetCapabilityBoolean(arguments, "enabled")),
-            _ => throw new InvalidOperationException($"Unknown native themes operation ({operation}).")
-        };
-    }
-
-    private async Task<object> ExecutePluginSdkArtworkAsync(
-        string operation,
-        JsonElement? arguments,
-        CancellationToken cancellationToken)
-    {
-        return operation switch
-        {
-            "getstate" => _artworkService.GetSnapshot(),
-            "searchgames" => await _artworkService.SearchGamesAsync(
-                GetCapabilityString(arguments, "term"),
-                cancellationToken),
-            "searchassets" => await _artworkService.SearchAssetsAsync(
-                GetCapabilityInt32(arguments, "gameId"),
-                GetCapabilityString(arguments, "assetType"),
-                GetCapabilityInt32(arguments, "page", 0),
-                cancellationToken),
-            "apply" => await _artworkService.ApplyAssetAsync(
-                GetCapabilityInt64(arguments, "appId"),
-                GetCapabilityString(arguments, "assetType"),
-                GetCapabilityString(arguments, "assetUrl"),
-                cancellationToken),
-            "togglesetting" => _artworkService.ToggleSetting(
-                GetCapabilityString(arguments, "key")),
-            "setresultlimit" => _artworkService.SetResultLimit(
-                GetCapabilityInt32(arguments, "value")),
-            _ => throw new InvalidOperationException($"Unknown native artwork operation ({operation}).")
-        };
-    }
-
-    private object ExecutePluginSdkAppStart(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => _appStartService.GetSnapshot(),
-            "getcatalog" => _appStartService.GetCatalog(),
-            "refreshcatalog" => _appStartService.RefreshCatalog(),
-            "add" => _appStartService.AddShortcut(GetCapabilityString(arguments, "appId")),
-            "remove" => _appStartService.RemoveShortcut(GetCapabilityString(arguments, "shortcutId")),
-            "togglefavorite" => _appStartService.ToggleFavorite(GetCapabilityString(arguments, "shortcutId")),
-            "launch" => _appStartService.LaunchShortcut(GetCapabilityString(arguments, "shortcutId")),
-            _ => throw new InvalidOperationException($"Unknown native app-start operation ({operation}).")
-        };
-    }
-
-    private async Task<object> ExecutePluginSdkStoreSyncAsync(
-        string operation,
-        JsonElement? arguments,
-        CancellationToken cancellationToken)
-    {
-        object result = operation switch
-        {
-            "getstate" => _storeSyncService.GetSnapshot(),
-            "gettitles" => string.IsNullOrWhiteSpace(GetCapabilityOptionalString(arguments, "storeId"))
-                ? _storeSyncService.GetDetectedTitles()
-                : _storeSyncService.GetDetectedTitlesByStore(GetCapabilityString(arguments, "storeId")),
-            "getartworkpreview" => await _storeSyncService.GetArtworkPreviewAsync(
-                GetCapabilityString(arguments, "titleId"),
-                cancellationToken),
-            "togglesetting" => _storeSyncService.ToggleSetting(GetCapabilityString(arguments, "key")),
-            "setstoreenabled" => _storeSyncService.SetStoreEnabled(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityBoolean(arguments, "enabled")),
-            "setstorepath" => _storeSyncService.SetStoreScanPath(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityString(arguments, "path")),
-            "clearstorepath" => _storeSyncService.ClearStoreScanPath(
-                GetCapabilityString(arguments, "storeId")),
-            "setadditionalpaths" => _storeSyncService.SetStoreAdditionalScanPaths(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityStringArray(arguments, "paths")),
-            "settitleoverride" => _storeSyncService.SetTitleOverride(
-                GetCapabilityString(arguments, "titleId"),
-                GetCapabilityOptionalString(arguments, "titleOverride") ?? string.Empty,
-                GetCapabilityOptionalString(arguments, "artworkTitleOverride") ?? string.Empty,
-                GetCapabilityBoolean(arguments, "excluded", false)),
-            "cleartitleoverride" => _storeSyncService.ClearTitleOverride(
-                GetCapabilityString(arguments, "titleId")),
-            "sync" => _storeSyncService.RunSync(),
-            "refreshstorefront" => _storeSyncService.RefreshUnifySteam(
-                GetCapabilityOptionalString(arguments, "storeId")),
-            "setstorefrontenabled" => _storeSyncService.SetUnifySteamStoreEnabled(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityBoolean(arguments, "enabled")),
-            "startstorefrontlogin" => StartUnifySteamLogin(
-                GetCapabilityString(arguments, "storeId")),
-            "completestorefrontauth" => _storeSyncService.CompleteUnifySteamManualAuth(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityString(arguments, "value")),
-            "launchstorefrontgame" => TryStartUnifyStoreLaunch(
-                GetCapabilityString(arguments, "storeId"),
-                GetCapabilityString(arguments, "gameId"),
-                out var launchMessage)
-                    ? new { success = true, message = launchMessage }
-                    : new { success = false, message = launchMessage },
-            _ => throw new InvalidOperationException($"Unknown native store-sync operation ({operation}).")
-        };
-
-        if (result is StoreSyncSnapshot snapshot && operation != "getstate")
-        {
-            _liveUpdateHub.Publish("store-sync.state", snapshot);
-        }
-        return result;
-    }
-
-    private object ExecutePluginSdkAutomation(string operation, JsonElement? arguments)
-    {
-        return operation switch
-        {
-            "getstate" => _autoSisirService.GetSnapshot(),
-            "togglesetting" => _autoSisirService.ToggleSetting(
-                GetCapabilityString(arguments, "key")),
-            "setexecutablepath" => _autoSisirService.SetExecutablePath(
-                GetCapabilityString(arguments, "path")),
-            "resetexecutablepath" => _autoSisirService.ResetExecutablePath(),
-            "togglewatchedtitle" => _autoSisirService.ToggleWatchedTitle(
-                GetCapabilityString(arguments, "titleId")),
-            _ => throw new InvalidOperationException($"Unknown native automation operation ({operation}).")
-        };
-    }
-
-    private static JsonElement GetCapabilityArguments(JsonElement? arguments)
-    {
-        if (arguments is null || arguments.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
-        {
-            return default;
-        }
-        if (arguments.Value.ValueKind != JsonValueKind.Object)
-        {
-            throw new InvalidOperationException("SDK capability arguments must be a JSON object.");
-        }
-        return arguments.Value;
-    }
-
-    private static string GetCapabilityString(JsonElement? arguments, string name)
-    {
-        var value = GetCapabilityOptionalString(arguments, name);
-        return string.IsNullOrWhiteSpace(value)
-            ? throw new InvalidOperationException($"SDK capability argument '{name}' is required.")
-            : value;
-    }
-
-    private static string? GetCapabilityOptionalString(JsonElement? arguments, string name)
-    {
-        var value = GetCapabilityArguments(arguments);
-        return value.ValueKind == JsonValueKind.Object &&
-               value.TryGetProperty(name, out var property) &&
-               property.ValueKind == JsonValueKind.String
-            ? property.GetString()?.Trim()
-            : null;
-    }
-
-    private static double GetCapabilityDouble(JsonElement? arguments, string name)
-    {
-        var value = GetCapabilityArguments(arguments);
-        if (value.ValueKind != JsonValueKind.Object ||
-            !value.TryGetProperty(name, out var property) ||
-            !property.TryGetDouble(out var result) ||
-            double.IsNaN(result) ||
-            double.IsInfinity(result))
-        {
-            throw new InvalidOperationException($"SDK capability argument '{name}' must be a number.");
-        }
-        return result;
-    }
-
-    private static int GetCapabilityInt32(JsonElement? arguments, string name, int? defaultValue = null)
-    {
-        var value = GetCapabilityArguments(arguments);
-        if (value.ValueKind == JsonValueKind.Object &&
-            value.TryGetProperty(name, out var property) &&
-            property.TryGetInt32(out var result))
-        {
-            return result;
-        }
-        return defaultValue ?? throw new InvalidOperationException(
-            $"SDK capability argument '{name}' must be an integer.");
-    }
-
-    private static long GetCapabilityInt64(JsonElement? arguments, string name)
-    {
-        var value = GetCapabilityArguments(arguments);
-        if (value.ValueKind == JsonValueKind.Object &&
-            value.TryGetProperty(name, out var property) &&
-            property.TryGetInt64(out var result))
-        {
-            return result;
-        }
-        throw new InvalidOperationException($"SDK capability argument '{name}' must be an integer.");
-    }
-
-    private static bool GetCapabilityBoolean(JsonElement? arguments, string name, bool? defaultValue = null)
-    {
-        var value = GetCapabilityArguments(arguments);
-        if (value.ValueKind == JsonValueKind.Object && value.TryGetProperty(name, out var property))
-        {
-            if (property.ValueKind == JsonValueKind.True)
-            {
-                return true;
-            }
-            if (property.ValueKind == JsonValueKind.False)
-            {
-                return false;
-            }
-        }
-        return defaultValue ?? throw new InvalidOperationException(
-            $"SDK capability argument '{name}' must be a boolean.");
-    }
-
-    private static IReadOnlyList<string> GetCapabilityStringArray(JsonElement? arguments, string name)
-    {
-        var value = GetCapabilityArguments(arguments);
-        if (value.ValueKind != JsonValueKind.Object ||
-            !value.TryGetProperty(name, out var property) ||
-            property.ValueKind != JsonValueKind.Array)
-        {
-            throw new InvalidOperationException($"SDK capability argument '{name}' must be an array of strings.");
-        }
-
-        return property.EnumerateArray()
-            .Where(entry => entry.ValueKind == JsonValueKind.String)
-            .Select(entry => entry.GetString()?.Trim() ?? string.Empty)
-            .Where(entry => entry.Length > 0)
-            .ToArray();
-    }
-
-    private static bool TryParsePluginSdkPath(string? path, out string pluginId, out string sdkPath)
-    {
-        pluginId = string.Empty;
-        sdkPath = string.Empty;
-
-        const string prefix = "/api/plugin-sdk/plugins/";
-        if (string.IsNullOrWhiteSpace(path) ||
-            !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var remainder = path[prefix.Length..].Trim('/');
-        if (remainder.Length == 0)
-        {
-            return false;
-        }
-
-        var separatorIndex = remainder.IndexOf('/');
-        pluginId = Uri.UnescapeDataString(separatorIndex < 0
-            ? remainder
-            : remainder[..separatorIndex]);
-        sdkPath = separatorIndex < 0
-            ? string.Empty
-            : remainder[(separatorIndex + 1)..].Trim('/').ToLowerInvariant();
-        return !string.IsNullOrWhiteSpace(pluginId);
-    }
-
-    private static bool TryParseCommunityPluginFilePath(
-        string? path,
-        out string pluginId,
-        out string relativePath)
-    {
-        pluginId = string.Empty;
-        relativePath = string.Empty;
-
-        const string prefix = "/api/plugin-store/community/";
-        const string filesSegment = "/files/";
-        if (string.IsNullOrWhiteSpace(path) ||
-            !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var remainder = path[prefix.Length..];
-        var filesSegmentIndex = remainder.IndexOf(filesSegment, StringComparison.OrdinalIgnoreCase);
-        if (filesSegmentIndex <= 0)
-        {
-            return false;
-        }
-
-        pluginId = Uri.UnescapeDataString(remainder[..filesSegmentIndex]);
-        relativePath = Uri.UnescapeDataString(remainder[(filesSegmentIndex + filesSegment.Length)..]);
-        return !string.IsNullOrWhiteSpace(pluginId) && !string.IsNullOrWhiteSpace(relativePath);
-    }
-
-    private static bool TryParsePluginSdkSecretPath(
-        string sdkPath,
-        out string secretKey,
-        out bool clear)
-    {
-        secretKey = string.Empty;
-        clear = false;
-
-        const string prefix = "secrets/";
-        if (!sdkPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var remainder = sdkPath[prefix.Length..].Trim('/');
-        if (remainder.EndsWith("/clear", StringComparison.OrdinalIgnoreCase))
-        {
-            clear = true;
-            remainder = remainder[..^"/clear".Length].Trim('/');
-        }
-
-        if (remainder.Length == 0 || remainder.Contains('/'))
-        {
-            return false;
-        }
-
-        secretKey = Uri.UnescapeDataString(remainder);
-        return !string.IsNullOrWhiteSpace(secretKey);
-    }
-
     private async Task<UpdateCheckSnapshot> GetUpdateSnapshotAsync(
         bool forceRefresh,
-        CancellationToken cancellationToken,
-        string? overrideChannel = null)
+        CancellationToken cancellationToken)
     {
-        var channel = NormalizeUpdateChannel(overrideChannel ?? _steamLoaderSettingsService.GetUpdateChannel());
-
         await _updateSnapshotGate.WaitAsync(cancellationToken);
         try
         {
@@ -7681,7 +7226,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
             if (!forceRefresh &&
                 _cachedUpdateSnapshot is not null &&
-                string.Equals(_cachedUpdateSnapshot.Channel, channel, StringComparison.OrdinalIgnoreCase) &&
                 DateTimeOffset.UtcNow - _cachedUpdateSnapshot.CheckedAtUtc <= UpdateSnapshotCacheDuration)
             {
                 return _cachedUpdateSnapshot;
@@ -7692,13 +7236,15 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             _updateSnapshotGate.Release();
         }
 
-        var snapshot = await _releaseUpdateService.CheckAsync(channel, cancellationToken);
-        await CacheUpdateSnapshotAsync(snapshot, cancellationToken);
-        return snapshot;
+        var snapshot = await _releaseUpdateService.CheckAsync(cancellationToken);
+        return await CacheUpdateSnapshotAsync(snapshot, cancellationToken);
     }
 
-    private async Task CacheUpdateSnapshotAsync(UpdateCheckSnapshot snapshot, CancellationToken cancellationToken)
+    private async Task<UpdateCheckSnapshot> CacheUpdateSnapshotAsync(
+        UpdateCheckSnapshot snapshot,
+        CancellationToken cancellationToken)
     {
+        snapshot = snapshot with { AutomaticInstall = AutomaticUpdatesEnabled };
         await _updateSnapshotGate.WaitAsync(cancellationToken);
         try
         {
@@ -7710,11 +7256,71 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         }
 
         _liveUpdateHub.Publish("updates.state", snapshot);
+        return snapshot;
     }
 
-    private void InvalidateUpdateSnapshotCache()
+    private static bool AutomaticUpdatesEnabled =>
+        AutomaticUpdatePolicy.IsInstalledBuild(AppContext.BaseDirectory);
+
+    /// <summary>
+    /// Keeps an installed TFS on the newest stable release without any user
+    /// action: checks GitHub a few minutes after start and then every few
+    /// hours, and installs only while no game is running. A development build
+    /// never updates itself.
+    /// </summary>
+    private async Task AutomaticUpdateLoopAsync(CancellationToken cancellationToken)
     {
-        _cachedUpdateSnapshot = null;
+        if (!AutomaticUpdatesEnabled)
+        {
+            return;
+        }
+
+        var attemptPath = Path.Combine(AppContext.BaseDirectory, "data", AutomaticUpdatePolicy.AttemptFileName);
+        try
+        {
+            await Task.Delay(AutomaticUpdateStartupDelay, cancellationToken);
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var nextCheckAt = DateTimeOffset.UtcNow + AutomaticUpdateCheckInterval;
+                var snapshot = await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken);
+                if (AutomaticUpdatePolicy.ShouldInstall(
+                        snapshot,
+                        AutomaticUpdatePolicy.ReadAttempt(attemptPath),
+                        DateTimeOffset.UtcNow))
+                {
+                    // Wait for a quiet moment; the GitHub answer stays valid
+                    // until the next regular check.
+                    while (AutomaticUpdatePolicy.IsUserBusy() && DateTimeOffset.UtcNow < nextCheckAt)
+                    {
+                        await Task.Delay(AutomaticUpdateIdlePollInterval, cancellationToken);
+                    }
+
+                    var executablePath = Environment.ProcessPath;
+                    if (!AutomaticUpdatePolicy.IsUserBusy() && !string.IsNullOrWhiteSpace(executablePath))
+                    {
+                        AutomaticUpdatePolicy.WriteAttempt(
+                            attemptPath,
+                            new AutomaticUpdateAttempt(snapshot.LatestVersion!, DateTimeOffset.UtcNow));
+                        await BeginBackgroundUpdateInstallAsync(executablePath, cancellationToken);
+                    }
+                }
+
+                var remaining = nextCheckAt - DateTimeOffset.UtcNow;
+                if (remaining > TimeSpan.Zero)
+                {
+                    await Task.Delay(remaining, cancellationToken);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            // The automatic path must never take the host down; the manual
+            // update button keeps working.
+            Debug.WriteLine($"Automatic update loop stopped: {exception}");
+        }
     }
 
     private async Task<UpdateCheckSnapshot> BeginBackgroundUpdateInstallAsync(
@@ -7734,8 +7340,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             return await GetUpdateSnapshotAsync(forceRefresh: false, cancellationToken);
         }
 
-        var channel = _steamLoaderSettingsService.GetUpdateChannel();
-        var basisSnapshot = await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken, channel);
+        var basisSnapshot = await GetUpdateSnapshotAsync(forceRefresh: true, cancellationToken);
         if (!basisSnapshot.UpdateAvailable || !basisSnapshot.CanInstall)
         {
             return basisSnapshot;
@@ -7749,7 +7354,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             InstallState = "starting",
             InstallProgressPercent = 0
         };
-        await CacheUpdateSnapshotAsync(pendingSnapshot, cancellationToken);
+        pendingSnapshot = await CacheUpdateSnapshotAsync(pendingSnapshot, cancellationToken);
 
         Task installTask;
         lock (_updateInstallGate)
@@ -7764,7 +7369,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                 try
                 {
                     var finalSnapshot = await _releaseUpdateService.BeginInstallLatestAsync(
-                        channel,
                         AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
                         executablePath,
                         GetUpdateProcessIdsToWaitFor(executablePath),
@@ -7772,8 +7376,12 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
                         CancellationToken.None);
 
                     await CacheUpdateSnapshotAsync(finalSnapshot, CancellationToken.None);
-                    await Task.Delay(500);
-                    _requestShutdown();
+                    if (finalSnapshot.InstallInProgress)
+                    {
+                        // The handoff script waits for this process to exit.
+                        await Task.Delay(500);
+                        _requestShutdown();
+                    }
                 }
                 catch (Exception exception)
                 {
@@ -7801,15 +7409,6 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
         }
 
         return pendingSnapshot;
-    }
-
-    private static string NormalizeUpdateChannel(string? channel)
-    {
-        return channel?.Trim().ToLowerInvariant() switch
-        {
-            SteamLoaderRuntime.UpdateChannelBeta => SteamLoaderRuntime.UpdateChannelBeta,
-            _ => SteamLoaderRuntime.UpdateChannelStable
-        };
     }
 
     private static IReadOnlyList<int> GetUpdateProcessIdsToWaitFor(string executablePath)
@@ -7931,13 +7530,18 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
 
     private sealed record SetOemButtonBindingRequest(string ButtonId, string ActionId, string CustomShortcut);
 
-    private sealed record SetUpdateChannelRequest(string Channel);
 
     private sealed record ApplyArtworkRequest(long AppId, string AssetType, string Url);
 
     private sealed record SetCurtainGameEnabledRequest(uint AppId, bool Enabled);
 
-    private sealed record ShowCurtainRequest(uint AppId, string? Title);
+    private sealed record ShowCurtainRequest(uint AppId, string? Title, string? Reason = null, bool? BigPicture = null);
+
+    private sealed record CurtainAppRequest(uint AppId);
+
+    private sealed record CurtainDismissRequest(string? Reason);
+
+    private sealed record SaveCurtainGameRequest(uint AppId, CurtainGameSettings? Settings, bool? Enabled);
 
     private sealed record SetStartupModeRequest(string Mode);
 
@@ -8004,7 +7608,17 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
     private sealed record SetRomSystemSettingsRequest(
         string SystemId,
         string? EmulatorPath,
-        bool Fullscreen);
+        bool Fullscreen,
+        string? EmulatorId = null);
+
+    private sealed record InstallRomEmulatorRequest(
+        string SystemId,
+        string? EmulatorId);
+
+    private sealed record SetEmulationOptionsRequest(
+        bool AutoInstallEmulators,
+        bool ImportOrbitRoms,
+        bool? ImportEmulatorLibraries = null);
 
     private sealed record SetStoreDownloadOptionsRequest(
         string StoreId,

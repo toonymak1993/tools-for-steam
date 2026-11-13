@@ -40,6 +40,13 @@ internal sealed class UnifySteamService
     private static readonly Dictionary<string, (int MissingCount, DateTimeOffset FirstMissingAtUtc)>
         XboxPendingUninstallMisses = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan XboxInstalledCacheLifetime = TimeSpan.FromSeconds(30);
+    // Every registered Store app has a manifest under the AppModel repository,
+    // usually well over a hundred packages, and only a few are Xbox games.
+    // Install-state checks run every two seconds during a transfer, so each
+    // manifest is parsed once per package version instead of on every scan.
+    private static readonly object XboxAppxManifestCacheGate = new();
+    private static readonly Dictionary<string, XboxAppxManifestCacheEntry> XboxAppxManifestCache =
+        new(StringComparer.OrdinalIgnoreCase);
     private static DateTimeOffset XboxLastCompletedDownloadObservedUtc = DateTimeOffset.MinValue;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -568,6 +575,11 @@ internal sealed class UnifySteamService
             GogGalaxyLaunchEnabled =
                 definition.Id.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase) &&
                 storeConfiguration.PreferGogGalaxyForLaunch,
+            AutoInstallEmulators = isRomLibrary && storeConfiguration.AutoInstallEmulators,
+            ImportOrbitRoms = isRomLibrary && storeConfiguration.ImportOrbitRoms,
+            ImportEmulatorLibraries = isRomLibrary && storeConfiguration.ImportEmulatorLibraries,
+            OrbitRomsAvailable = isRomLibrary && Directory.Exists(OmniLibraryRomSystemRegistry.OrbitRomRootPath),
+            EmulatorFolderPath = isRomLibrary ? OmniLibraryEmulatorDetector.ManagedRoot : string.Empty,
             AchievementsEnabled = ResolveGameDataProvider(configuration, definition.Id)?.Enabled == true,
             AchievementProviderConfigured = IsGameDataProviderConfigured(
                 configuration,
@@ -613,11 +625,19 @@ internal sealed class UnifySteamService
                     (system.Id.Equals("psp", StringComparison.OrdinalIgnoreCase)
                         ? storeConfiguration.ToolPath
                         : string.Empty);
-                var resolvedPath = ResolveRomEmulatorExecutable(system.Id, configuredPath);
+                var selection = OmniLibraryEmulatorDetector.Resolve(
+                    system,
+                    settings?.EmulatorId,
+                    configuredPath);
+                var resolvedPath = selection.ExecutablePath;
+                var shownEmulator = selection.Emulator ?? selection.InstallCandidate ?? system.RecommendedEmulator;
+                var installStatus = selection.InstallCandidate is { } candidate
+                    ? OmniLibraryEmulatorInstaller.GetStatus(candidate.Id)
+                    : OmniLibraryEmulatorInstallStatus.Idle;
                 return new OmniLibraryRomSystemState(
                     system.Id,
                     system.Title,
-                    system.EmulatorTitle,
+                    shownEmulator?.Title ?? system.EmulatorTitle,
                     games.Count(game => game.PlatformId.Equals(
                         system.Id,
                         StringComparison.OrdinalIgnoreCase)),
@@ -633,10 +653,27 @@ internal sealed class UnifySteamService
                         .ToArray())
                 {
                     EmulatorPath = resolvedPath.Length > 0 ? resolvedPath : configuredPath,
-                    ExecutableName = system.EmulatorExecutableName,
+                    ExecutableName = shownEmulator?.ExecutableNames.FirstOrDefault() ?? system.EmulatorExecutableName,
                     FolderPath = Path.Combine(root, system.FolderName),
-                    EmulatorDetected = resolvedPath.Length > 0,
+                    EmulatorDetected = selection.Ready,
                     Fullscreen = settings?.Fullscreen ?? true,
+                    EmulatorId = selection.Emulator?.Id ?? string.Empty,
+                    SelectedEmulatorId = settings?.EmulatorId ?? string.Empty,
+                    InstallEmulatorId = selection.InstallCandidate?.Id ?? string.Empty,
+                    InstallEmulatorTitle = selection.InstallCandidate?.Title ?? string.Empty,
+                    CanInstallEmulator = selection.InstallCandidate?.CanInstall == true,
+                    InstallState = installStatus.State,
+                    InstallProgressPercent = installStatus.ProgressPercent,
+                    InstallMessage = installStatus.Message,
+                    FirmwareRequired = shownEmulator?.NeedsFirmware(system.Id) == true,
+                    Experimental = shownEmulator?.Experimental == true,
+                    Emulators = OmniLibraryEmulatorCatalog.ForSystem(system)
+                        .Select(emulator => new OmniLibraryRomEmulatorOption(
+                            emulator.Id,
+                            emulator.Title,
+                            OmniLibraryEmulatorDetector.Locate(emulator).Length > 0,
+                            emulator.CanInstall))
+                        .ToArray(),
                 };
             })
             .ToArray();
@@ -1379,69 +1416,11 @@ internal sealed class UnifySteamService
 
     internal static string ResolveRomEmulatorExecutable(
         string systemId,
-        string? configuredPath)
-    {
-        var system = OmniLibraryRomSystemRegistry.GetRequired(systemId);
-        var candidates = new List<string>();
-        if (!string.IsNullOrWhiteSpace(configuredPath))
-        {
-            candidates.Add(configuredPath.Trim());
-        }
-
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        candidates.Add(Path.Combine(
-            localAppData,
-            "Programs",
-            system.EmulatorTitle,
-            system.EmulatorExecutableName));
-        candidates.Add(Path.Combine(localAppData, system.EmulatorTitle, system.EmulatorExecutableName));
-        candidates.Add(Path.Combine(programFiles, system.EmulatorTitle, system.EmulatorExecutableName));
-        candidates.Add(Path.Combine(
-            AppContext.BaseDirectory,
-            "tools",
-            system.Id,
-            system.EmulatorExecutableName));
-
-        if (system.Id.Equals("gamecube", StringComparison.OrdinalIgnoreCase))
-        {
-            candidates.Add(Path.Combine(programFiles, "Dolphin Emulator", system.EmulatorExecutableName));
-        }
-
-        foreach (var candidate in candidates)
-        {
-            try
-            {
-                var fullPath = Path.GetFullPath(candidate);
-                if (File.Exists(fullPath))
-                {
-                    return fullPath;
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        try
-        {
-            var pathDirectories = (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
-                .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            foreach (var directory in pathDirectories)
-            {
-                var candidate = Path.Combine(directory.Trim('"'), system.EmulatorExecutableName);
-                if (File.Exists(candidate))
-                {
-                    return Path.GetFullPath(candidate);
-                }
-            }
-        }
-        catch
-        {
-        }
-
-        return string.Empty;
-    }
+        string? configuredPath) =>
+        OmniLibraryEmulatorDetector.Resolve(
+            OmniLibraryRomSystemRegistry.GetRequired(systemId),
+            null,
+            configuredPath).ExecutablePath;
 
     private static UnifySteamDownloadState ToDownloadState(
         string storeId,
@@ -1476,6 +1455,7 @@ internal sealed class UnifySteamService
             {
                 case OmniLibraryRomSystemRegistry.StoreId:
                     OmniLibraryRomLibrary.Refresh(storeConfiguration);
+                    OmniLibraryRomLibrary.QueueAutomaticEmulatorInstalls(storeConfiguration);
                     break;
                 case "epic-games":
                     RefreshEpicStore(definition, storeConfiguration, quiet);
@@ -3027,7 +3007,7 @@ internal sealed class UnifySteamService
                 return LoadXboxInstalledGames(forceRefresh: true);
             }
 
-            return LoadXboxInstalledGamesForReconciliation(store.Cache.Games);
+            return LoadXboxInstalledGamesForReconciliation(store.Cache.Games, store.InstallPath);
         }
         catch
         {
@@ -3038,9 +3018,12 @@ internal sealed class UnifySteamService
 
     internal static Dictionary<string, UnifySteamGameCacheEntry>
         LoadXboxInstalledGamesForReconciliation(
-            IEnumerable<UnifySteamGameCacheEntry> catalogGames)
+            IEnumerable<UnifySteamGameCacheEntry> catalogGames,
+            string? preferredInstallPath = null)
     {
-        var installed = LoadXboxInstalledGames(forceRefresh: true);
+        // Same roots as the catalog refresh, so a game in the configured
+        // Xbox folder is never cleared here and re-added by the refresh.
+        var installed = LoadXboxInstalledGames(preferredInstallPath, forceRefresh: true);
         foreach (var catalogGame in catalogGames.Where(game =>
                      game is not null && !string.IsNullOrWhiteSpace(game.Id)))
         {
@@ -3074,7 +3057,8 @@ internal sealed class UnifySteamService
                 return;
             }
 
-            foreach (var packageFullName in packagesKey.GetSubKeyNames())
+            var packageFullNames = packagesKey.GetSubKeyNames();
+            foreach (var packageFullName in packageFullNames)
             {
                 try
                 {
@@ -3083,7 +3067,7 @@ internal sealed class UnifySteamService
                     var registryDisplayName = packageKey?.GetValue("DisplayName") as string;
                     if (string.IsNullOrWhiteSpace(packageRoot) ||
                         !Directory.Exists(packageRoot) ||
-                        !TryParseXboxAppxManifest(
+                        !TryGetRegisteredXboxAppxGame(
                             packageFullName,
                             packageRoot,
                             registryDisplayName,
@@ -3104,9 +3088,76 @@ internal sealed class UnifySteamService
                     // registered legacy Xbox games.
                 }
             }
+
+            PruneXboxAppxManifestCache(packageFullNames);
         }
         catch
         {
+        }
+    }
+
+    private static bool TryGetRegisteredXboxAppxGame(
+        string packageFullName,
+        string packageRoot,
+        string? registryDisplayName,
+        out UnifySteamGameCacheEntry game)
+    {
+        game = default!;
+        var manifestWriteTimeUtc = File.GetLastWriteTimeUtc(
+            Path.Combine(packageRoot, "AppxManifest.xml"));
+        lock (XboxAppxManifestCacheGate)
+        {
+            if (XboxAppxManifestCache.TryGetValue(packageFullName, out var cached) &&
+                cached.ManifestWriteTimeUtc == manifestWriteTimeUtc &&
+                string.Equals(cached.PackageRoot, packageRoot, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(cached.RegistryDisplayName, registryDisplayName, StringComparison.Ordinal))
+            {
+                if (cached.Game is null)
+                {
+                    return false;
+                }
+
+                game = CloneXboxInstalledGame(cached.Game);
+                return true;
+            }
+        }
+
+        var parsed = TryParseXboxAppxManifest(
+            packageFullName,
+            packageRoot,
+            registryDisplayName,
+            out var candidate)
+            ? candidate
+            : null;
+        lock (XboxAppxManifestCacheGate)
+        {
+            XboxAppxManifestCache[packageFullName] = new XboxAppxManifestCacheEntry(
+                packageRoot,
+                registryDisplayName,
+                manifestWriteTimeUtc,
+                parsed is null ? null : CloneXboxInstalledGame(parsed));
+        }
+
+        if (parsed is null)
+        {
+            return false;
+        }
+
+        game = parsed;
+        return true;
+    }
+
+    private static void PruneXboxAppxManifestCache(IReadOnlyCollection<string> registeredPackageFullNames)
+    {
+        var registered = registeredPackageFullNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        lock (XboxAppxManifestCacheGate)
+        {
+            foreach (var packageFullName in XboxAppxManifestCache.Keys
+                         .Where(packageFullName => !registered.Contains(packageFullName))
+                         .ToArray())
+            {
+                XboxAppxManifestCache.Remove(packageFullName);
+            }
         }
     }
 
@@ -3525,44 +3576,54 @@ internal sealed class UnifySteamService
     {
         return games.ToDictionary(
             pair => pair.Key,
-            pair => new UnifySteamGameCacheEntry
-            {
-                Id = pair.Value.Id,
-                Title = pair.Value.Title,
-                Installed = pair.Value.Installed,
-                CloudPlayable = pair.Value.CloudPlayable,
-                InstallPath = pair.Value.InstallPath,
-                ExecutablePath = pair.Value.ExecutablePath,
-                Version = pair.Value.Version,
-                DeliveryProvider = pair.Value.DeliveryProvider,
-                ThirdPartyManagedApp = pair.Value.ThirdPartyManagedApp,
-                PartnerLinkType = pair.Value.PartnerLinkType,
-                PartnerLinkId = pair.Value.PartnerLinkId,
-                ProviderGameId = pair.Value.ProviderGameId,
-                StoreTitleId = pair.Value.StoreTitleId,
-                StoreNamespace = pair.Value.StoreNamespace,
-                RegistryPath = pair.Value.RegistryPath,
-                RegistryValueName = pair.Value.RegistryValueName,
-                ProcessNames = pair.Value.ProcessNames,
-                HasInstallableAsset = pair.Value.HasInstallableAsset,
-                RequiresAccountLink = pair.Value.RequiresAccountLink,
-                RequiresExternalLauncher = pair.Value.RequiresExternalLauncher,
-                RequiresEpicLauncherBridge =
-                    pair.Value.RequiresEpicLauncherBridge,
-                SupportsCloudSaves = pair.Value.SupportsCloudSaves,
-                IsPreloaded = pair.Value.IsPreloaded,
-                LatestVersion = pair.Value.LatestVersion,
-                PreparationSignature = pair.Value.PreparationSignature,
-                ImageUrl = pair.Value.ImageUrl,
-                HeroImageUrl = pair.Value.HeroImageUrl,
-                SteamAppId = pair.Value.SteamAppId,
-            },
+            pair => CloneXboxInstalledGame(pair.Value),
             StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static UnifySteamGameCacheEntry CloneXboxInstalledGame(UnifySteamGameCacheEntry game)
+    {
+        return new UnifySteamGameCacheEntry
+        {
+            Id = game.Id,
+            Title = game.Title,
+            Installed = game.Installed,
+            CloudPlayable = game.CloudPlayable,
+            InstallPath = game.InstallPath,
+            ExecutablePath = game.ExecutablePath,
+            Version = game.Version,
+            DeliveryProvider = game.DeliveryProvider,
+            ThirdPartyManagedApp = game.ThirdPartyManagedApp,
+            PartnerLinkType = game.PartnerLinkType,
+            PartnerLinkId = game.PartnerLinkId,
+            ProviderGameId = game.ProviderGameId,
+            StoreTitleId = game.StoreTitleId,
+            StoreNamespace = game.StoreNamespace,
+            RegistryPath = game.RegistryPath,
+            RegistryValueName = game.RegistryValueName,
+            ProcessNames = game.ProcessNames,
+            HasInstallableAsset = game.HasInstallableAsset,
+            RequiresAccountLink = game.RequiresAccountLink,
+            RequiresExternalLauncher = game.RequiresExternalLauncher,
+            RequiresEpicLauncherBridge = game.RequiresEpicLauncherBridge,
+            SupportsCloudSaves = game.SupportsCloudSaves,
+            IsPreloaded = game.IsPreloaded,
+            LatestVersion = game.LatestVersion,
+            PreparationSignature = game.PreparationSignature,
+            ImageUrl = game.ImageUrl,
+            HeroImageUrl = game.HeroImageUrl,
+            SteamAppId = game.SteamAppId,
+        };
     }
 
     private sealed record XboxInstalledCacheState(
         DateTimeOffset CreatedAtUtc,
         Dictionary<string, UnifySteamGameCacheEntry> Games);
+
+    private sealed record XboxAppxManifestCacheEntry(
+        string PackageRoot,
+        string? RegistryDisplayName,
+        DateTime ManifestWriteTimeUtc,
+        UnifySteamGameCacheEntry? Game);
 
     private sealed record XboxCatalogCandidate(
         UnifySteamGameCacheEntry Game,
@@ -3620,11 +3681,26 @@ internal sealed class UnifySteamService
 
     internal static Dictionary<string, UnifySteamGameCacheEntry> LoadEpicLauncherInstalledGames()
     {
-        var installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
-        var manifestPath = GetEpicLauncherInstalledManifestPath();
+        TryReadEpicLauncherInstalledGames(
+            GetEpicLauncherInstalledManifestPath(),
+            out var installed);
+        return installed;
+    }
+
+    /// <summary>
+    /// Reads the Epic Games Launcher install list. Returns false when the file
+    /// exists but cannot be read or parsed, so callers that mark games
+    /// uninstalled can skip that pass. Entries whose folder was deleted from
+    /// a present drive are left out: the launcher does not notice that itself.
+    /// </summary>
+    internal static bool TryReadEpicLauncherInstalledGames(
+        string manifestPath,
+        out Dictionary<string, UnifySteamGameCacheEntry> installed)
+    {
+        installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(manifestPath))
         {
-            return installed;
+            return true;
         }
 
         try
@@ -3633,7 +3709,7 @@ internal sealed class UnifySteamService
             if (!document.RootElement.TryGetProperty("InstallationList", out var installationList) ||
                 installationList.ValueKind != JsonValueKind.Array)
             {
-                return installed;
+                return false;
             }
 
             foreach (var item in installationList.EnumerateArray())
@@ -3649,6 +3725,11 @@ internal sealed class UnifySteamService
                 }
 
                 var installLocation = GetJsonString(item, "InstallLocation");
+                if (ProviderInstallStateTracker.IsMissingFromAvailableVolume(installLocation))
+                {
+                    continue;
+                }
+
                 var launchExecutable = GetJsonString(item, "LaunchExecutable");
                 var executablePath = ResolveExecutablePath(installLocation, launchExecutable);
                 installed[appName] = new UnifySteamGameCacheEntry
@@ -3663,9 +3744,121 @@ internal sealed class UnifySteamService
         }
         catch
         {
+            installed.Clear();
+            return false;
         }
 
-        return installed;
+        return true;
+    }
+
+    /// <summary>
+    /// Reads the install records of OmniLibrary's own Legendary helper
+    /// directly from its installed.json (the data behind
+    /// <c>legendary list-installed</c>), without starting a process. Returns
+    /// false when the file exists but cannot be read.
+    /// </summary>
+    internal static bool TryReadLegendaryInstalledGames(
+        string installedJsonPath,
+        out Dictionary<string, UnifySteamGameCacheEntry> installed)
+    {
+        installed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(installedJsonPath))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(installedJsonPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                var item = property.Value;
+                if (item.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var appName = FirstNonEmpty(GetJsonString(item, "app_name"), property.Name);
+                var isPreloaded = string.Equals(
+                    GetJsonString(item, "is_preloaded"),
+                    "true",
+                    StringComparison.OrdinalIgnoreCase);
+                var installPath = GetJsonString(item, "install_path");
+                if (string.IsNullOrWhiteSpace(appName) ||
+                    string.Equals(GetJsonString(item, "is_dlc"), "true", StringComparison.OrdinalIgnoreCase) ||
+                    ProviderInstallStateTracker.IsMissingFromAvailableVolume(installPath))
+                {
+                    continue;
+                }
+
+                installed[appName] = new UnifySteamGameCacheEntry
+                {
+                    Id = appName,
+                    Title = FirstNonEmpty(GetJsonString(item, "title"), appName),
+                    Installed = !isPreloaded,
+                    IsPreloaded = isPreloaded,
+                    InstallPath = installPath,
+                    ExecutablePath = ResolveInstalledExecutablePath(item),
+                    Version = GetJsonString(item, "version"),
+                };
+            }
+        }
+        catch
+        {
+            installed.Clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    internal static string LegendaryInstalledJsonPath =>
+        Path.Combine(ManagedLegendaryHelper.ConfigDirectory, "installed.json");
+
+    /// <summary>
+    /// True when Legendary still has an install record for the game but its
+    /// folder is gone from a present drive (deleted outside OmniLibrary).
+    /// </summary>
+    internal static bool IsLegendaryRecordWithDeletedFolder(
+        string installedJsonPath,
+        string appName)
+    {
+        if (string.IsNullOrWhiteSpace(appName) || !File.Exists(installedJsonPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(installedJsonPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                var recordAppName = FirstNonEmpty(
+                    GetJsonString(property.Value, "app_name"),
+                    property.Name);
+                if (string.Equals(recordAppName, appName.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    var installPath = GetJsonString(property.Value, "install_path");
+                    return !string.IsNullOrWhiteSpace(installPath) &&
+                           ProviderInstallStateTracker.IsMissingFromAvailableVolume(installPath);
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
     }
 
     private static string GetEpicLauncherInstalledManifestPath()
@@ -3819,7 +4012,12 @@ internal sealed class UnifySteamService
         foreach (var item in document.RootElement.EnumerateArray())
         {
             var appName = GetJsonString(item, "app_name");
-            if (string.IsNullOrWhiteSpace(appName))
+            if (string.IsNullOrWhiteSpace(appName) ||
+                // Legendary keeps its record when the folder is deleted by
+                // hand; the local install-state pass treats that as removed,
+                // so the catalog refresh must not bring it back.
+                ProviderInstallStateTracker.IsMissingFromAvailableVolume(
+                    GetJsonString(item, "install_path")))
             {
                 continue;
             }
@@ -4155,7 +4353,37 @@ internal sealed class UnifySteamService
         LoadEpicInstalledGamesForReconciliation(
             IEnumerable<UnifySteamGameCacheEntry> catalogGames)
     {
-        var installed = LoadEpicLauncherInstalledGames();
+        return LoadEpicInstalledGamesForReconciliation(
+            catalogGames,
+            LegendaryInstalledJsonPath,
+            GetEpicLauncherInstalledManifestPath());
+    }
+
+    /// <summary>
+    /// Local Epic install evidence from every place a game can come from:
+    /// OmniLibrary's own Legendary downloads, the Epic Games Launcher, and
+    /// Epic entitlements delivered by EA app, Ubisoft Connect or Battle.net.
+    /// Throws when an install list is unreadable so the pass clears nothing.
+    /// </summary>
+    internal static Dictionary<string, UnifySteamGameCacheEntry>
+        LoadEpicInstalledGamesForReconciliation(
+            IEnumerable<UnifySteamGameCacheEntry> catalogGames,
+            string legendaryInstalledJsonPath,
+            string launcherInstalledPath)
+    {
+        if (!TryReadLegendaryInstalledGames(legendaryInstalledJsonPath, out var installed))
+        {
+            throw new IOException("Legendary install list is not readable right now.");
+        }
+
+        if (!TryReadEpicLauncherInstalledGames(launcherInstalledPath, out var launcherInstalled))
+        {
+            throw new IOException("Epic Games Launcher install list is not readable right now.");
+        }
+
+        // Same precedence as the catalog refresh: OmniLibrary's own
+        // Legendary record first, the Epic Games Launcher as fallback.
+        installed = MergeEpicInstalledGames(installed, launcherInstalled);
         foreach (var game in catalogGames.Where(game =>
                      game is not null &&
                      game.RequiresExternalLauncher &&

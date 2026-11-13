@@ -23,7 +23,9 @@ internal sealed class SteamStartupHistoryStore
 
     public SteamStartupTimingPolicy GetTimingPolicy(bool isHandheld)
     {
-        var defaultGrace = isHandheld ? TimeSpan.FromSeconds(150) : TimeSpan.FromSeconds(30);
+        // A cold start right after Windows sign-in is much slower than a warm
+        // restart: disk, shader cache and the library compete with Explorer.
+        var defaultGrace = isHandheld ? TimeSpan.FromSeconds(150) : TimeSpan.FromSeconds(75);
         var successes = ReadEntries()
             .Where(entry => entry.Outcome == SteamStartupOutcome.Ready && entry.DurationSeconds >= 3)
             .OrderBy(entry => entry.DurationSeconds)
@@ -38,8 +40,8 @@ internal sealed class SteamStartupHistoryStore
         var percentileIndex = (int)Math.Ceiling((successes.Length - 1) * 0.8);
         var observedP80 = successes[Math.Clamp(percentileIndex, 0, successes.Length - 1)];
         var adaptiveSeconds = observedP80.TotalSeconds * 1.6 + 8;
-        var minimum = isHandheld ? 75 : 25;
-        var maximum = isHandheld ? 210 : 90;
+        var minimum = isHandheld ? 90 : 45;
+        var maximum = isHandheld ? 240 : 150;
         var grace = TimeSpan.FromSeconds(Math.Clamp(adaptiveSeconds, minimum, maximum));
         return SteamStartupTimingPolicy.FromGracePeriod(grace, isAdaptive: true);
     }
@@ -169,13 +171,15 @@ internal sealed record SteamStartupTimingPolicy(
 {
     public static SteamStartupTimingPolicy FromGracePeriod(TimeSpan gracePeriod, bool isAdaptive)
     {
+        // The splash only offers recovery once Steam is clearly slower than
+        // usual; it additionally waits while Steam still makes progress.
         var actionsAfter = TimeSpan.FromSeconds(Math.Clamp(
-            gracePeriod.TotalSeconds * 0.65,
-            20,
-            90));
+            gracePeriod.TotalSeconds,
+            45,
+            180));
         var safetyTimeout = TimeSpan.FromSeconds(Math.Clamp(
-            gracePeriod.TotalSeconds * 2.2 + 60,
-            180,
+            gracePeriod.TotalSeconds * 3 + 60,
+            300,
             600));
         return new SteamStartupTimingPolicy(
             gracePeriod,

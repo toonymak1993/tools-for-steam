@@ -78,7 +78,23 @@ public sealed record HandheldGameTdpProfile(
     int TdpWatts,
     DateTimeOffset UpdatedAt,
     int? AcTdpWatts = null,
-    int? BatteryTdpWatts = null);
+    int? BatteryTdpWatts = null,
+    GameProfileExtras? Extras = null);
+
+/// <summary>
+/// Everything else a game profile can set, like the Steam Deck's per-game profile.
+/// Null means "use the global value". PowerMode: efficiency, balanced or performance.
+/// </summary>
+public sealed record GameProfileExtras(
+    int? FrameLimit = null,
+    int? RefreshRate = null,
+    int? RtssLevel = null,
+    string? PowerMode = null,
+    bool? CpuBoost = null)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsEmpty => FrameLimit is null && RefreshRate is null && RtssLevel is null && PowerMode is null && CpuBoost is null;
+}
 
 public sealed record HandheldPerformanceTelemetry(
     string PowerSource,
@@ -116,6 +132,20 @@ internal sealed record HandheldHardwareCommand(
     HandheldLightingSettings? Lighting = null,
     int SpptWatts = 0,
     int FpptWatts = 0);
+
+/// <summary>
+/// Did the handheld take the last TDP? State: "none" (nothing sent yet), "pending" (sent,
+/// waiting for the elevated helper), "confirmed" (the SMU accepted SPL/SPPT/FPPT),
+/// "failed" (the SMU or helper refused, Message says why), "no-helper" (nobody answered).
+/// </summary>
+public sealed record HandheldTdpConfirmation(
+    string State,
+    int SplWatts,
+    int SpptWatts,
+    int FpptWatts,
+    string Chip,
+    string Message,
+    DateTimeOffset? At);
 
 internal sealed record HandheldHardwareStatus(
     long Nonce = 0,

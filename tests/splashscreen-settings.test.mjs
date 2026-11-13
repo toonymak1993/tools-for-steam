@@ -9,10 +9,6 @@ const popup = fs.readFileSync(
   path.join(root, "src", "SteamLoader.App", "Assets", "quickaccess-popup.js"),
   "utf8",
 );
-const xboxHost = fs.readFileSync(
-  path.join(root, "src", "ToolsForSteam.XboxHost", "Program.cs"),
-  "utf8",
-);
 
 test("splash settings expose one dynamic or custom artwork choice", () => {
   assert.match(popup, /Dynamic Library Artwork/);
@@ -24,9 +20,15 @@ test("splash settings expose one dynamic or custom artwork choice", () => {
   assert.doesNotMatch(popup, /api\/settings\/splash\/(?:enabled|show-text|wallpaper|icon)/);
 });
 
-test("Xbox Mode reads the same artwork mode and custom image path", () => {
-  assert.match(xboxHost, /GetString\(splash, "artworkMode"\)/);
-  assert.match(xboxHost, /GetString\(splash, "customImagePath"\)/);
-  assert.match(xboxHost, /StartupSplashArtworkMode\.Custom/);
-  assert.doesNotMatch(xboxHost, /settings\.Enabled|settings\.ShowText|settings\.IconPath/);
+test("splash settings describe the Console Mode start without the removed Xbox Mode", () => {
+  assert.match(popup, /The splashscreen covers the Console Mode start until Steam is ready\./);
+  assert.doesNotMatch(popup, /Xbox Mode/);
+});
+
+test("startup settings offer only Console Mode and eTray (Shell Takeover was removed)", () => {
+  assert.doesNotMatch(popup, /Shell Takeover/);
+  assert.doesNotMatch(popup, /setStartupMode\("shell"\)/);
+  assert.doesNotMatch(popup, /windows-shell-start-delay/);
+  assert.match(popup, /setStartupMode\("console"\)/);
+  assert.match(popup, /setStartupMode\("tray"\)/);
 });

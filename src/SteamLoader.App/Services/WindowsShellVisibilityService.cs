@@ -9,14 +9,29 @@ public sealed class WindowsShellVisibilityService
 
     private readonly object _gate = new();
     private readonly HashSet<nint> _hiddenHandles = [];
+    private readonly ConsoleShellState _state;
 
+    public WindowsShellVisibilityService()
+        : this(new ConsoleShellState())
+    {
+    }
+
+    internal WindowsShellVisibilityService(ConsoleShellState state)
+    {
+        _state = state;
+    }
+
+    /// <summary>
+    /// True while this process hid the taskbar, or while another TFS process
+    /// (possibly one that crashed) left the shared "hidden" marker behind.
+    /// </summary>
     public bool IsHidden
     {
         get
         {
             lock (_gate)
             {
-                return _hiddenHandles.Count > 0;
+                return _hiddenHandles.Count > 0 || _state.IsChromeMarkedHidden();
             }
         }
     }
@@ -32,6 +47,9 @@ public sealed class WindowsShellVisibilityService
                     continue;
                 }
 
+                // Mark first: if this process dies right after hiding, the
+                // next TFS process still knows the taskbar needs to come back.
+                _state.MarkChromeHidden(true);
                 ShowWindow(handle, SwHide);
                 _hiddenHandles.Add(handle);
             }
@@ -51,6 +69,7 @@ public sealed class WindowsShellVisibilityService
             }
 
             _hiddenHandles.Clear();
+            _state.MarkChromeHidden(false);
         }
     }
 

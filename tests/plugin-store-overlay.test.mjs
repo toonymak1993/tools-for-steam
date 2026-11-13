@@ -2,53 +2,55 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const overlayUrl = new URL("../src/SteamLoader.App/Assets/plugin-store-overlay.js", import.meta.url);
+const popupUrl = new URL("../src/SteamLoader.App/Assets/quickaccess-popup.js", import.meta.url);
+const backgroundHostUrl = new URL("../src/SteamLoader.App/Hosting/SteamLoaderBackgroundHost.cs", import.meta.url);
 
-test("plugin activator is a simple included-plugin list", async () => {
-  const source = await readFile(overlayUrl, "utf8");
+test("plugin activator opens inside the wide Quick Access workspace", async () => {
+  const source = await readFile(popupUrl, "utf8");
 
-  assert.match(source, /Plugin Activator/);
-  assert.match(source, /snapshot\?\.builtInPlugins/);
-  assert.match(source, /plugin\?\.images\?\.\[0\]\?\.url/);
-  assert.match(source, /plugin\?\.description/);
-  assert.match(source, /role", "switch"/);
-  assert.match(source, /Activate/);
-  assert.match(source, /Deactivate/);
-  assert.match(source, /api\/settings\/plugins\/enabled/);
+  assert.match(source, /id: "plugins",[\s\S]*?title: "Plugin Activator"/);
+  assert.match(
+    source,
+    /key: "plugins"[\s\S]*?const targetRoute = \{ screen: "page", pluginId: "settings", pageId: "plugins" \}[\s\S]*?setRoute\(targetRoute\)/,
+  );
+  assert.match(source, /panelClassName: "steamloader-panel-plugin-activator"/);
+  assert.doesNotMatch(source, /function openPluginStoreOverlay\(/);
+  assert.doesNotMatch(source, /api\/plugin-activator\/overlay\/open/);
 });
 
-test("plugin activator has no catalog or community actions", async () => {
-  const source = await readFile(overlayUrl, "utf8");
+test("integrated plugin activator uses visual two-column toggle cards", async () => {
+  const source = await readFile(popupUrl, "utf8");
 
-  assert.doesNotMatch(source, /communityPlugins/);
-  assert.doesNotMatch(source, /plugins\/install/);
-  assert.doesNotMatch(source, /plugins\/uninstall/);
-  assert.doesNotMatch(source, /plugins\/update/);
-  assert.doesNotMatch(source, /plugin-store\/refresh/);
-  assert.doesNotMatch(source, /Search plugins/);
+  assert.match(source, /getPluginActivatorImageUrl\(plugin\.id\)/);
+  assert.match(source, /api\/plugin-activator\/images\//);
+  assert.match(source, /makeSettingToggleSlot\([\s\S]*?"tfs-plugin"[\s\S]*?layout: "feature"/);
+  assert.match(source, /slotKey: `plugin-activator-\$\{plugin\.id\}`/);
+  assert.match(source, /badge: canDisable \? \(active \? "Active" : "Inactive"\) : "Required"/);
+  assert.match(source, /footerLabel: isSaving[\s\S]*?"Deactivate"[\s\S]*?"Activate"[\s\S]*?"Always active"/);
+  assert.match(
+    source,
+    /\.steamloader-panel-plugin-activator[\s\S]*?steamloader-plugin-activator-card\[data-slot-layout="feature"\][\s\S]*?height: 100%;/,
+  );
 });
 
-test("plugin activator keeps controller navigation and safe host selection", async () => {
-  const source = await readFile(overlayUrl, "utf8");
+test("plugin activation keeps safe controller navigation and live state", async () => {
+  const source = await readFile(popupUrl, "utf8");
 
-  assert.match(source, /function isQuickAccessSurface\(\)/);
-  assert.match(source, /document\.visibilityState !== "hidden"/);
-  assert.match(source, /!isQuickAccessSurface\(\)/);
-  assert.match(source, /ArrowUp: "up"/);
-  assert.match(source, /GamepadA: "a"/);
-  assert.match(source, /GamepadB: "b"/);
-  assert.match(source, /normalized === "b"/);
-  assert.match(source, /void closeOverlay\(\)/);
-  assert.match(source, /scrollIntoView\(\{ block: "nearest"/);
+  assert.match(source, /fallbackSlotKey: "header-action:plugins"/);
+  assert.match(source, /\{ button: "A", label: "Activate \/ Deactivate" \}/);
+  assert.match(source, /\{ button: "B", label: "Back" \}/);
+  assert.match(source, /state\.generalSettings\.pluginToggleBusyId = pluginId/);
+  assert.match(source, /"api\/settings\/plugins\/enabled"/);
+  assert.match(source, /topics\.add\("plugin-store\.state"\)/);
 });
 
-test("plugin activator preserves the cross-surface overlay bridge", async () => {
-  const source = await readFile(overlayUrl, "utf8");
+test("the retired full-screen plugin activator is no longer injected", async () => {
+  const source = await readFile(backgroundHostUrl, "utf8");
+  const popupScript = source.match(/var popupScript = string\.Join\([\s\S]*?\);/)?.[0];
+  const themeSurfaceScript = source.match(/var themeSurfaceScript = string\.Join\([\s\S]*?;\r?\n\r?\n        var appStartService/)?.[0];
 
-  assert.match(source, /source: "plugin-store"/);
-  assert.match(source, /api\/plugin-activator\/overlay\/state/);
-  assert.match(source, /api\/plugin-activator\/overlay\/input\?after=/);
-  assert.match(source, /stopAnnouncements\(false\)/);
-  assert.match(source, /if \(announceClosed && wasAnnouncing\) announceOverlay\(false\)/);
-  assert.match(source, /Date\.now\(\) \+ 360/);
+  assert.ok(popupScript);
+  assert.ok(themeSurfaceScript);
+  assert.doesNotMatch(popupScript, /plugin-store-overlay\.js/);
+  assert.doesNotMatch(themeSurfaceScript, /plugin-store-overlay\.js/);
 });

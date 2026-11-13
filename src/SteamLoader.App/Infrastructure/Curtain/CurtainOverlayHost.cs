@@ -16,6 +16,11 @@ using Rectangle = System.Windows.Shapes.Rectangle;
 
 namespace SteamLoader.App.Infrastructure.Curtain;
 
+/// <summary>
+/// Classic TFS Curtain: a non-activating topmost window over the whole
+/// monitor. Used when Big Picture is not available (desktop Steam) or when the
+/// user picks Classic. It draws the same per-game look as the Modern curtain.
+/// </summary>
 internal sealed class CurtainOverlayHost
 {
     private const int GwlExStyle = -20;
@@ -27,18 +32,17 @@ internal sealed class CurtainOverlayHost
 
     private readonly Window _window;
     private readonly Dispatcher _dispatcher;
+    private readonly Rectangle _blackout;
     private int _closing;
 
-    private CurtainOverlayHost(Window window)
+    private CurtainOverlayHost(Window window, Rectangle blackout)
     {
         _window = window;
+        _blackout = blackout;
         _dispatcher = window.Dispatcher;
     }
 
-    public static Task<CurtainOverlayHost> ShowAsync(
-        string title,
-        string backgroundPath,
-        string logoPath)
+    public static Task<CurtainOverlayHost> ShowAsync(CurtainVisual visual)
     {
         var completion = new TaskCompletionSource<CurtainOverlayHost>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -46,8 +50,8 @@ internal sealed class CurtainOverlayHost
         {
             try
             {
-                var window = BuildWindow(title, backgroundPath, logoPath);
-                var host = new CurtainOverlayHost(window);
+                var window = BuildWindow(visual, out var blackout);
+                var host = new CurtainOverlayHost(window, blackout);
                 window.Closed += (_, _) => Dispatcher.CurrentDispatcher.BeginInvokeShutdown(
                     DispatcherPriority.Background);
                 window.Show();
@@ -68,6 +72,24 @@ internal sealed class CurtainOverlayHost
         return completion.Task;
     }
 
+    /// <summary>Fades the artwork to black before the game takes over.</summary>
+    public Task FadeToBlackAsync(TimeSpan duration)
+    {
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _dispatcher.BeginInvoke(() =>
+        {
+            var fade = new DoubleAnimation(_blackout.Opacity, 1, duration) { FillBehavior = FillBehavior.HoldEnd };
+            fade.Completed += (_, _) => completion.TrySetResult();
+            _blackout.BeginAnimation(UIElement.OpacityProperty, fade);
+        });
+        return completion.Task;
+    }
+
     public Task CloseAsync(bool animate)
     {
         if (Interlocked.Exchange(ref _closing, 1) != 0)
@@ -85,7 +107,7 @@ internal sealed class CurtainOverlayHost
                 return;
             }
 
-            var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(420))
+            var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(320))
             {
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut },
                 FillBehavior = FillBehavior.Stop
@@ -100,7 +122,7 @@ internal sealed class CurtainOverlayHost
         return completion.Task;
     }
 
-    private static Window BuildWindow(string title, string backgroundPath, string logoPath)
+    private static Window BuildWindow(CurtainVisual visual, out Rectangle blackout)
     {
         var steamWindow = Services.SteamBigPictureForegroundDetector.Capture().PreferredWindowHandle;
         var screen = steamWindow != IntPtr.Zero
@@ -110,172 +132,161 @@ internal sealed class CurtainOverlayHost
 
         var root = new Grid
         {
-            Background = new SolidColorBrush(Color.FromRgb(5, 10, 17)),
+            Background = Brushes.Black,
             ClipToBounds = true
         };
 
-        if (TryCreateImage(backgroundPath, out var background))
+        if (TryLoadBitmap(visual.BackgroundPath, out var backgroundBitmap))
         {
-            background.Stretch = Stretch.UniformToFill;
-            background.Opacity = 0.82;
-            background.RenderTransformOrigin = new Point(0.5, 0.5);
-            var scale = new ScaleTransform(1, 1);
-            background.RenderTransform = scale;
-            var zoom = new DoubleAnimation(1, 1.045, TimeSpan.FromSeconds(18))
+            var brush = new ImageBrush(backgroundBitmap)
             {
-                AutoReverse = true,
-                RepeatBehavior = RepeatBehavior.Forever,
-                EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+                Stretch = Stretch.UniformToFill,
+                AlignmentX = visual.BackgroundX < 0.34 ? AlignmentX.Left : visual.BackgroundX > 0.66 ? AlignmentX.Right : AlignmentX.Center,
+                AlignmentY = visual.BackgroundY < 0.34 ? AlignmentY.Top : visual.BackgroundY > 0.66 ? AlignmentY.Bottom : AlignmentY.Center
             };
-            scale.BeginAnimation(ScaleTransform.ScaleXProperty, zoom);
-            scale.BeginAnimation(ScaleTransform.ScaleYProperty, zoom);
+            var background = new Rectangle
+            {
+                Fill = brush,
+                Opacity = visual.BackgroundOpacity,
+                RenderTransformOrigin = new Point(visual.BackgroundX, visual.BackgroundY)
+            };
+            var scale = new ScaleTransform(visual.BackgroundScale, visual.BackgroundScale);
+            background.RenderTransform = scale;
+            if (visual.BackgroundZoom)
+            {
+                var zoom = new DoubleAnimation(visual.BackgroundScale, visual.BackgroundScale * 1.045, TimeSpan.FromSeconds(18))
+                {
+                    AutoReverse = true,
+                    RepeatBehavior = RepeatBehavior.Forever,
+                    EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+                };
+                scale.BeginAnimation(ScaleTransform.ScaleXProperty, zoom);
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, zoom);
+            }
+
             root.Children.Add(background);
         }
 
-        root.Children.Add(new Rectangle
+        var vignette = new RadialGradientBrush
         {
-            Fill = new LinearGradientBrush(
-                Color.FromArgb(34, 3, 9, 16),
-                Color.FromArgb(178, 5, 11, 19),
-                new Point(0.5, 0),
-                new Point(0.5, 1))
-        });
-
-        var vignette = new Rectangle();
-        var vignetteBrush = new RadialGradientBrush
-        {
-            Center = new Point(0.5, 0.44),
-            GradientOrigin = new Point(0.5, 0.44),
-            RadiusX = 0.72,
-            RadiusY = 0.78
+            Center = new Point(0.5, 0.5),
+            GradientOrigin = new Point(0.5, 0.5),
+            RadiusX = 0.75,
+            RadiusY = 0.8
         };
-        vignetteBrush.GradientStops.Add(new GradientStop(Color.FromArgb(0, 4, 10, 18), 0));
-        vignetteBrush.GradientStops.Add(new GradientStop(Color.FromArgb(145, 3, 7, 13), 1));
-        vignette.Fill = vignetteBrush;
-        root.Children.Add(vignette);
+        vignette.GradientStops.Add(new GradientStop(Color.FromArgb(0, 0, 0, 0), 0.55));
+        vignette.GradientStops.Add(new GradientStop(Color.FromArgb(150, 0, 0, 0), 1));
+        root.Children.Add(new Rectangle { Fill = vignette });
 
-        var layout = new Grid { Margin = new Thickness(54, 42, 54, 42) };
-        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-        var brand = new StackPanel { Orientation = Orientation.Horizontal };
-        brand.Children.Add(new Border
-        {
-            Width = 42,
-            Height = 42,
-            CornerRadius = new CornerRadius(12),
-            Background = new SolidColorBrush(Color.FromRgb(91, 205, 245)),
-            Child = new TextBlock
-            {
-                Text = "TFS",
-                Foreground = new SolidColorBrush(Color.FromRgb(7, 26, 39)),
-                FontSize = 14,
-                FontWeight = FontWeights.Black,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            }
-        });
-        brand.Children.Add(new TextBlock
-        {
-            Text = "TFS CURTAIN",
-            Margin = new Thickness(16, 0, 0, 0),
-            Foreground = new SolidColorBrush(Color.FromRgb(122, 216, 250)),
-            FontSize = 18,
-            FontWeight = FontWeights.Bold,
-            VerticalAlignment = VerticalAlignment.Center
-        });
-        Grid.SetRow(brand, 0);
-        layout.Children.Add(brand);
-
+        var stage = new Canvas();
+        root.Children.Add(stage);
         FrameworkElement centerpiece;
-        if (TryCreateImage(logoPath, out var logo))
+        if (TryLoadBitmap(visual.LogoPath, out var logoBitmap))
         {
-            logo.Stretch = Stretch.Uniform;
-            logo.MaxWidth = 760;
-            logo.MaxHeight = 300;
-            logo.HorizontalAlignment = HorizontalAlignment.Center;
-            logo.VerticalAlignment = VerticalAlignment.Center;
-            logo.Effect = new System.Windows.Media.Effects.DropShadowEffect
+            centerpiece = new System.Windows.Controls.Image
             {
-                BlurRadius = 28,
-                Opacity = 0.75,
-                ShadowDepth = 4,
-                Color = Colors.Black
+                Source = logoBitmap,
+                Stretch = Stretch.Uniform,
+                Width = bounds.Width * visual.LogoWidth,
+                MaxHeight = bounds.Height * 0.45
             };
-            centerpiece = logo;
         }
         else
         {
             centerpiece = new TextBlock
             {
-                Text = string.IsNullOrWhiteSpace(title) ? "Starting game" : title,
-                MaxWidth = 1080,
+                Text = string.IsNullOrWhiteSpace(visual.Title) ? "Starting game" : visual.Title,
+                MaxWidth = bounds.Width * 0.8,
                 Foreground = Brushes.White,
                 FontSize = 54,
                 FontWeight = FontWeights.Black,
                 TextAlignment = TextAlignment.Center,
-                TextWrapping = TextWrapping.Wrap,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center,
-                Effect = new System.Windows.Media.Effects.DropShadowEffect
-                {
-                    BlurRadius = 24,
-                    Opacity = 0.75,
-                    ShadowDepth = 4,
-                    Color = Colors.Black
-                }
+                TextWrapping = TextWrapping.Wrap
             };
         }
-        Grid.SetRow(centerpiece, 1);
-        layout.Children.Add(centerpiece);
 
-        var statusContent = new StackPanel
+        if (visual.LogoShadow)
         {
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Orientation = Orientation.Horizontal
+            centerpiece.Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                BlurRadius = 28,
+                Opacity = 0.8,
+                ShadowDepth = 4,
+                Color = Colors.Black
+            };
+        }
+
+        if (visual.LogoZoom)
+        {
+            var logoScale = new ScaleTransform(1, 1);
+            centerpiece.RenderTransformOrigin = new Point(0.5, 0.5);
+            centerpiece.RenderTransform = logoScale;
+            var pulse = new DoubleAnimation(1, 1.06, TimeSpan.FromSeconds(6))
+            {
+                AutoReverse = true,
+                RepeatBehavior = RepeatBehavior.Forever,
+                EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+            };
+            logoScale.BeginAnimation(ScaleTransform.ScaleXProperty, pulse);
+            logoScale.BeginAnimation(ScaleTransform.ScaleYProperty, pulse);
+        }
+
+        // Logo position is its centre in percent of the screen, like the Modern curtain.
+        centerpiece.SizeChanged += (_, _) =>
+        {
+            Canvas.SetLeft(centerpiece, stage.ActualWidth * visual.LogoX - centerpiece.ActualWidth / 2);
+            Canvas.SetTop(centerpiece, stage.ActualHeight * visual.LogoY - centerpiece.ActualHeight / 2);
         };
-        statusContent.Children.Add(new Ellipse
+        stage.SizeChanged += (_, _) =>
         {
-            Width = 9,
-            Height = 9,
-            Margin = new Thickness(0, 0, 12, 0),
-            Fill = new SolidColorBrush(Color.FromRgb(94, 230, 168))
-        });
-        statusContent.Children.Add(new TextBlock
-        {
-            Text = "PREPARING GAME",
-            Foreground = new SolidColorBrush(Color.FromRgb(220, 230, 239)),
-            FontSize = 16,
-            FontWeight = FontWeights.SemiBold
-        });
-        statusContent.Children.Add(new Border
-        {
-            Width = 1,
-            Height = 18,
-            Margin = new Thickness(18, 0, 18, 0),
-            Background = new SolidColorBrush(Color.FromArgb(85, 255, 255, 255))
-        });
-        statusContent.Children.Add(new TextBlock
-        {
-            Text = "B  CLOSE",
-            Foreground = new SolidColorBrush(Color.FromRgb(169, 188, 204)),
-            FontSize = 14,
-            FontWeight = FontWeights.SemiBold
-        });
-        var status = new Border
-        {
-            Padding = new Thickness(22, 13, 22, 13),
-            CornerRadius = new CornerRadius(24),
-            BorderThickness = new Thickness(1),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
-            Background = new SolidColorBrush(Color.FromArgb(170, 4, 11, 19)),
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Child = statusContent
+            Canvas.SetLeft(centerpiece, stage.ActualWidth * visual.LogoX - centerpiece.ActualWidth / 2);
+            Canvas.SetTop(centerpiece, stage.ActualHeight * visual.LogoY - centerpiece.ActualHeight / 2);
         };
-        Grid.SetRow(status, 2);
-        layout.Children.Add(status);
-        root.Children.Add(layout);
+        stage.Children.Add(centerpiece);
+
+        if (visual.ShowStatus)
+        {
+            var statusContent = new StackPanel
+            {
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Orientation = Orientation.Horizontal
+            };
+            statusContent.Children.Add(new Ellipse
+            {
+                Width = 9,
+                Height = 9,
+                Margin = new Thickness(0, 0, 12, 0),
+                Fill = new SolidColorBrush(Color.FromRgb(94, 230, 168))
+            });
+            statusContent.Children.Add(new TextBlock
+            {
+                Text = visual.StatusText.ToUpperInvariant(),
+                Foreground = new SolidColorBrush(Color.FromRgb(225, 232, 240)),
+                FontSize = 16,
+                FontWeight = FontWeights.SemiBold
+            });
+            statusContent.Children.Add(new TextBlock
+            {
+                Text = "B  CLOSE",
+                Margin = new Thickness(22, 0, 0, 0),
+                Foreground = new SolidColorBrush(Color.FromRgb(160, 172, 184)),
+                FontSize = 14,
+                FontWeight = FontWeights.SemiBold
+            });
+            root.Children.Add(new Border
+            {
+                Padding = new Thickness(22, 12, 22, 12),
+                Margin = new Thickness(0, 0, 0, 48),
+                CornerRadius = new CornerRadius(24),
+                Background = new SolidColorBrush(Color.FromArgb(150, 0, 0, 0)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Child = statusContent
+            });
+        }
+
+        blackout = new Rectangle { Fill = Brushes.Black, Opacity = 0, IsHitTestVisible = false };
+        root.Children.Add(blackout);
 
         var window = new Window
         {
@@ -298,9 +309,9 @@ internal sealed class CurtainOverlayHost
         return window;
     }
 
-    private static bool TryCreateImage(string path, out System.Windows.Controls.Image image)
+    private static bool TryLoadBitmap(string path, out BitmapImage bitmap)
     {
-        image = new System.Windows.Controls.Image();
+        bitmap = new BitmapImage();
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return false;
@@ -308,13 +319,11 @@ internal sealed class CurtainOverlayHost
 
         try
         {
-            var source = new BitmapImage();
-            source.BeginInit();
-            source.CacheOption = BitmapCacheOption.OnLoad;
-            source.UriSource = new Uri(path, UriKind.Absolute);
-            source.EndInit();
-            source.Freeze();
-            image.Source = source;
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.UriSource = new Uri(path, UriKind.Absolute);
+            bitmap.EndInit();
+            bitmap.Freeze();
             return true;
         }
         catch
@@ -372,3 +381,21 @@ internal sealed class CurtainOverlayHost
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr windowHandle);
 }
+
+/// <summary>Everything the curtain draws, resolved for one game (fractions 0..1).</summary>
+internal sealed record CurtainVisual(
+    string Title,
+    string BackgroundPath,
+    double BackgroundOpacity,
+    double BackgroundScale,
+    double BackgroundX,
+    double BackgroundY,
+    bool BackgroundZoom,
+    string LogoPath,
+    double LogoX,
+    double LogoY,
+    double LogoWidth,
+    bool LogoShadow,
+    bool LogoZoom,
+    bool ShowStatus,
+    string StatusText);

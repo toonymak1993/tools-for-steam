@@ -42,6 +42,15 @@ internal sealed class OmniLibraryAchievementProvider
     private string _epicAccountId = string.Empty;
     private string _epicAssetTokenFingerprint = string.Empty;
     private IReadOnlyList<EpicLibraryAsset> _epicAssets = [];
+    private static readonly TimeSpan XboxSessionSkew = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan XboxTitleHistoryLifetime = TimeSpan.FromMinutes(15);
+    private const int XboxMaxPages = 20;
+    private const int XboxMaxAchievements = 2_000;
+    private readonly SemaphoreSlim _xboxSessionGate = new(1, 1);
+    private XboxLiveSession? _xboxSession;
+    private string _xboxTitleHistoryXuid = string.Empty;
+    private DateTimeOffset _xboxTitleHistoryFetchedAtUtc;
+    private IReadOnlyList<XboxTitleCandidate> _xboxTitleHistory = [];
 
     public OmniLibraryAchievementProvider(
         StoreSyncSettingsStore? settingsStore,
@@ -116,7 +125,11 @@ internal sealed class OmniLibraryAchievementProvider
         var identity = descriptor.Id.Equals(
                 "xbox-live",
                 StringComparison.OrdinalIgnoreCase)
-                ? $"{game?.StoreTitleId}|{ResolvedStoredXboxTitleId(provider, store, game)}|{HashSecret(provider.Credential)}|{HashSecret(provider.SecondaryCredential)}|{provider.AccountId}"
+                // Microsoft rotates the refresh token on every use. Keying on
+                // the account instead of the token keeps cached progress valid
+                // between refreshes while a sign-in, sign-out or account switch
+                // still invalidates it (ORBIT keys achievements the same way).
+                ? $"{game?.StoreTitleId}|{ResolvedStoredXboxTitleId(provider, store, game)}|{HashSecret(provider.Credential)}|{(string.IsNullOrWhiteSpace(provider.SecondaryCredential) ? "signed-out" : "signed-in")}|{provider.AccountId}"
             : descriptor.Id.Equals(
                 "epic-games",
                 StringComparison.OrdinalIgnoreCase)
@@ -279,7 +292,7 @@ internal sealed class OmniLibraryAchievementProvider
             return Unavailable(
                 "Xbox Network",
                 "not-configured",
-                "Sign in to Xbox from OmniLibrary settings to show verified achievement progress.",
+                "Sign in to Xbox once to show your verified achievement progress for every Xbox game.",
                 DateTimeOffset.UtcNow.AddDays(1));
         }
 
@@ -370,22 +383,87 @@ internal sealed class OmniLibraryAchievementProvider
         string refreshToken,
         CancellationToken cancellationToken)
     {
-        XboxLiveSession session;
+        // Like ORBIT: reuse the XSTS session until it expires and renew it
+        // once when Xbox answers 401, instead of running the whole Microsoft
+        // token chain for every opened game page.
+        for (var attempt = 0; ; attempt++)
+        {
+            var session = await GetXboxLiveSessionAsync(
+                refreshToken,
+                forceRefresh: attempt > 0,
+                cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await LoadXboxLiveAchievementsAsync(
+                    gameDetail,
+                    store,
+                    provider,
+                    session,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (XboxUnauthorizedException) when (attempt == 0)
+            {
+                refreshToken = session.RefreshToken;
+            }
+            catch (XboxUnauthorizedException)
+            {
+                throw new AchievementProviderException(
+                    "Xbox rejected the saved sign-in. Sign in to Xbox again in OmniLibrary settings.",
+                    DateTimeOffset.UtcNow.Add(AuthenticationFailureBackoff));
+            }
+        }
+    }
+
+    private async Task<XboxLiveSession> GetXboxLiveSessionAsync(
+        string refreshToken,
+        bool forceRefresh,
+        CancellationToken cancellationToken)
+    {
+        await _xboxSessionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            session = await XboxLiveAuthService.RefreshSessionAsync(
-                refreshToken,
-                _httpClient,
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (InvalidOperationException error)
-        {
-            throw new AchievementProviderException(
-                $"{error.Message} Sign in to Xbox again in OmniLibrary settings.",
-                DateTimeOffset.UtcNow.Add(AuthenticationFailureBackoff));
-        }
+            var cached = _xboxSession;
+            if (!forceRefresh &&
+                cached is not null &&
+                string.Equals(cached.RefreshToken, refreshToken, StringComparison.Ordinal) &&
+                DateTimeOffset.UtcNow < cached.ExpiresAtUtc - XboxSessionSkew)
+            {
+                return cached;
+            }
 
-        PersistXboxLiveSession(refreshToken, session);
+            XboxLiveSession session;
+            try
+            {
+                session = await XboxLiveAuthService.RefreshSessionAsync(
+                    refreshToken,
+                    _httpClient,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException error)
+            {
+                _xboxSession = null;
+                throw new AchievementProviderException(
+                    $"{error.Message} Sign in to Xbox again in OmniLibrary settings.",
+                    DateTimeOffset.UtcNow.Add(AuthenticationFailureBackoff));
+            }
+
+            PersistXboxLiveSession(refreshToken, session);
+            _xboxSession = session;
+            return session;
+        }
+        finally
+        {
+            _xboxSessionGate.Release();
+        }
+    }
+
+    private async Task<OmniLibraryAchievementRefreshResult> LoadXboxLiveAchievementsAsync(
+        UnifySteamGameDetailSnapshot gameDetail,
+        UnifySteamStoreConfiguration store,
+        OmniLibraryGameDataProviderConfiguration provider,
+        XboxLiveSession session,
+        CancellationToken cancellationToken)
+    {
         provider.SecondaryCredential = session.RefreshToken;
         provider.AccountId = session.Xuid;
         provider.AccountName = session.Gamertag;
@@ -420,20 +498,63 @@ internal sealed class OmniLibraryAchievementProvider
         }
 
         var productId = gameDetail.Game?.Id?.Trim() ?? string.Empty;
-        if (!string.IsNullOrWhiteSpace(productId))
+        if (!string.IsNullOrWhiteSpace(productId) &&
+            !string.Equals(
+                ResolvedStoredXboxTitleId(provider, store, gameDetail.Game),
+                titleId,
+                StringComparison.Ordinal))
         {
             PersistXboxLiveTitleId(session.RefreshToken, productId, titleId);
         }
 
-        var url =
-            $"https://achievements.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/achievements" +
-            $"?titleId={Uri.EscapeDataString(titleId)}&maxItems=1000";
-        using var document = await SendXboxLiveAsync(
-            url,
-            session,
-            contractVersion: "2",
-            cancellationToken).ConfigureAwait(false);
-        var achievements = ParseXboxAchievements(document.RootElement);
+        var achievements = new List<OmniLibraryAchievementItemMetadata>();
+        var seenTokens = new HashSet<string>(StringComparer.Ordinal);
+        var continuationToken = string.Empty;
+        for (var page = 0; ; page++)
+        {
+            if (page >= XboxMaxPages)
+            {
+                throw new AchievementProviderException(
+                    "Xbox returned an incomplete achievement list. The last good progress is kept.",
+                    DateTimeOffset.UtcNow.Add(DefaultFailureBackoff));
+            }
+            var url =
+                $"https://achievements.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/achievements" +
+                $"?titleId={Uri.EscapeDataString(titleId)}&maxItems=1000";
+            if (!string.IsNullOrWhiteSpace(continuationToken))
+            {
+                url += "&continuationToken=" + Uri.EscapeDataString(continuationToken);
+            }
+            using var document = await SendXboxLiveAsync(
+                url,
+                session,
+                contractVersion: "2",
+                cancellationToken,
+                achievementRequest: true).ConfigureAwait(false);
+            if (document is null)
+            {
+                // 404: Xbox has no achievement set for this title.
+                break;
+            }
+            achievements.AddRange(ParseXboxAchievements(document.RootElement));
+            if (achievements.Count > XboxMaxAchievements)
+            {
+                throw new AchievementProviderException(
+                    "Xbox returned an unexpectedly large achievement list. The last good progress is kept.",
+                    DateTimeOffset.UtcNow.Add(DefaultFailureBackoff));
+            }
+            continuationToken = ReadXboxContinuationToken(document.RootElement);
+            if (string.IsNullOrWhiteSpace(continuationToken) ||
+                continuationToken.Length > 2_048 ||
+                !seenTokens.Add(continuationToken))
+            {
+                break;
+            }
+        }
+        achievements = achievements
+            .GroupBy(item => item.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
         var metadata = achievements.Count == 0
             ? new OmniLibraryAchievementMetadata(
                 "Xbox Network",
@@ -467,36 +588,53 @@ internal sealed class OmniLibraryAchievementProvider
         XboxLiveSession session,
         CancellationToken cancellationToken)
     {
-        var candidates = new List<XboxTitleCandidate>();
-        var continuationToken = string.Empty;
-        for (var page = 0; page < 20; page++)
+        // One title-history scan serves every unmapped game opened within a
+        // short window, as in ORBIT, instead of paging it per game.
+        var now = DateTimeOffset.UtcNow;
+        if (!_xboxTitleHistoryXuid.Equals(session.Xuid, StringComparison.Ordinal) ||
+            now - _xboxTitleHistoryFetchedAtUtc >= XboxTitleHistoryLifetime)
         {
-            var url =
-                $"https://titlehub.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/titles/titlehistory/decoration/detail?maxItems=100";
-            if (!string.IsNullOrWhiteSpace(continuationToken))
+            var candidates = new List<XboxTitleCandidate>();
+            var continuationToken = string.Empty;
+            var seenTokens = new HashSet<string>(StringComparer.Ordinal);
+            for (var page = 0; page < XboxMaxPages; page++)
             {
-                url += "&continuationToken=" + Uri.EscapeDataString(continuationToken);
+                var url =
+                    $"https://titlehub.xboxlive.com/users/xuid({Uri.EscapeDataString(session.Xuid)})/titles/titlehistory/decoration/detail?maxItems=1000";
+                if (!string.IsNullOrWhiteSpace(continuationToken))
+                {
+                    url += "&continuationToken=" + Uri.EscapeDataString(continuationToken);
+                }
+                using var document = await SendXboxLiveAsync(
+                    url,
+                    session,
+                    contractVersion: "2",
+                    cancellationToken).ConfigureAwait(false);
+                if (document is null)
+                {
+                    break;
+                }
+                candidates.AddRange(ParseXboxTitleCandidates(document.RootElement));
+                continuationToken = ReadXboxContinuationToken(document.RootElement);
+                if (string.IsNullOrWhiteSpace(continuationToken) ||
+                    !seenTokens.Add(continuationToken))
+                {
+                    break;
+                }
             }
-            using var document = await SendXboxLiveAsync(
-                url,
-                session,
-                contractVersion: "2",
-                cancellationToken).ConfigureAwait(false);
-            candidates.AddRange(ParseXboxTitleCandidates(document.RootElement));
-            continuationToken = ReadXboxContinuationToken(document.RootElement);
-            if (string.IsNullOrWhiteSpace(continuationToken))
-            {
-                break;
-            }
+            _xboxTitleHistory = candidates;
+            _xboxTitleHistoryXuid = session.Xuid;
+            _xboxTitleHistoryFetchedAtUtc = now;
         }
-        return MatchXboxTitleCandidate(game, candidates)?.TitleId ?? string.Empty;
+        return MatchXboxTitleCandidate(game, _xboxTitleHistory)?.TitleId ?? string.Empty;
     }
 
-    private async Task<JsonDocument> SendXboxLiveAsync(
+    private async Task<JsonDocument?> SendXboxLiveAsync(
         string url,
         XboxLiveSession session,
         string contractVersion,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool achievementRequest = false)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.TryAddWithoutValidation(
@@ -504,10 +642,33 @@ internal sealed class OmniLibraryAchievementProvider
             $"XBL3.0 x={session.UserHash};{session.Token}");
         request.Headers.TryAddWithoutValidation("x-xbl-contract-version", contractVersion);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        // Achievement names and descriptions come back in this language when
+        // the title ships it (ORBIT sends the UI language the same way).
+        var language = CultureInfo.CurrentUICulture.Name;
+        request.Headers.TryAddWithoutValidation(
+            "Accept-Language",
+            string.IsNullOrWhiteSpace(language) ||
+            language.Equals("en-US", StringComparison.OrdinalIgnoreCase)
+                ? "en-US"
+                : $"{language}, en-US;q=0.8");
         using var response = await _httpClient.SendAsync(
             request,
             HttpCompletionOption.ResponseHeadersRead,
             cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.Unauthorized)
+        {
+            throw new XboxUnauthorizedException();
+        }
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+        if (achievementRequest && response.StatusCode == HttpStatusCode.Forbidden)
+        {
+            throw new AchievementProviderException(
+                "Xbox blocked access to this account's achievements. Check the Xbox privacy setting for game and app history.",
+                DateTimeOffset.UtcNow.AddHours(6));
+        }
         if (!response.IsSuccessStatusCode)
         {
             throw BuildProviderHttpError("Xbox Network", response);
@@ -1327,6 +1488,41 @@ internal sealed class OmniLibraryAchievementProvider
                 {
                     candidate.RawIds.Add(value);
                 }
+                // Title hub keeps the Store product ID and package family in
+                // the nested "detail" object; only the title ID is top-level.
+                if (TryGetProperty(node, "detail", out var detail) &&
+                    detail.ValueKind == JsonValueKind.Object)
+                {
+                    var nested = FirstJsonString(detail, field).Trim();
+                    if (!string.IsNullOrWhiteSpace(nested))
+                    {
+                        candidate.RawIds.Add(nested);
+                    }
+                }
+            }
+            if (TryGetProperty(node, "alternateTitleIds", out var alternates) &&
+                alternates.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var alternate in alternates.EnumerateArray().Take(30))
+                {
+                    var value = FirstJsonString(alternate, "value", "titleId").Trim();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        candidate.RawIds.Add(value);
+                    }
+                }
+            }
+            if (TryGetProperty(node, "devices", out var devices) &&
+                devices.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var device in devices.EnumerateArray().Take(20))
+                {
+                    if (device.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(device.GetString()))
+                    {
+                        candidate.Devices.Add(device.GetString()!.Trim());
+                    }
+                }
             }
         }
         return candidates.Values.ToList();
@@ -1397,8 +1593,20 @@ internal sealed class OmniLibraryAchievementProvider
         var titleMatches = distinct
             .Where(candidate => candidate.Names.Contains(title))
             .ToList();
-        return titleMatches.Count == 1
-            ? titleMatches[0]
+        if (titleMatches.Count == 1)
+        {
+            return titleMatches[0];
+        }
+        // Console and PC releases can share a name. As in ORBIT, accept only a
+        // single PC entry; anything still ambiguous stays unmapped.
+        var pcMatches = titleMatches
+            .Where(candidate => candidate.Devices.Any(device =>
+                device.Equals("PC", StringComparison.OrdinalIgnoreCase) ||
+                device.Equals("Win32", StringComparison.OrdinalIgnoreCase) ||
+                device.Equals("Windows", StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+        return pcMatches.Count == 1
+            ? pcMatches[0]
             : null;
     }
 
@@ -2409,7 +2617,12 @@ internal sealed class OmniLibraryAchievementProvider
     private sealed record XboxTitleCandidate(
         string TitleId,
         HashSet<string> Names,
-        HashSet<string> RawIds);
+        HashSet<string> RawIds)
+    {
+        public HashSet<string> Devices { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class XboxUnauthorizedException : Exception;
 }
 
 internal sealed record OmniLibraryAchievementRefreshResult(

@@ -1,8 +1,33 @@
 (() => {
+  // Bump on every change: an older copy in a Steam window keeps running otherwise.
+  const libVersion = 58;
   const existing = window.STFrontendLib;
-  if (existing?.version >= 48) {
+  if (existing?.version >= libVersion) {
     return;
   }
+
+  // Tools for Steam brand emblem: a hex shield with a bold T and an orbit ring.
+  const tfsLogoSvg = [
+    '<svg class="tfs-brand-emblem" viewBox="0 0 48 48" width="46" height="46" aria-hidden="true" focusable="false">',
+    "<defs>",
+    '<linearGradient id="tfsBrandFill" x1="8" y1="3" x2="40" y2="45" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0" stop-color="#5fd0ff"/><stop offset=".5" stop-color="#1a9fff"/><stop offset="1" stop-color="#7c5cff"/>',
+    "</linearGradient>",
+    '<linearGradient id="tfsBrandRing" x1="3" y1="34" x2="45" y2="14" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0" stop-color="#ffffff" stop-opacity="0"/><stop offset=".45" stop-color="#ffffff" stop-opacity=".9"/><stop offset="1" stop-color="#ffffff" stop-opacity=".15"/>',
+    "</linearGradient>",
+    '<radialGradient id="tfsBrandShine" cx="16" cy="10" r="26" gradientUnits="userSpaceOnUse">',
+    '<stop offset="0" stop-color="#ffffff" stop-opacity=".45"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/>',
+    "</radialGradient>",
+    "</defs>",
+    '<path d="M24 2.5 42.6 13.25v21.5L24 45.5 5.4 34.75v-21.5Z" fill="url(#tfsBrandFill)"/>',
+    '<path d="M24 2.5 42.6 13.25v21.5L24 45.5 5.4 34.75v-21.5Z" fill="url(#tfsBrandShine)"/>',
+    '<path d="M24 3.6 41.65 13.8v20.4L24 44.4 6.35 34.2V13.8Z" fill="none" stroke="#ffffff" stroke-opacity=".28" stroke-width="1"/>',
+    '<path d="M13.5 14.5h21v5.75h-7.6V35h-5.8V20.25h-7.6Z" fill="#0b1420"/>',
+    '<ellipse cx="24" cy="25" rx="21.5" ry="7.25" transform="rotate(-24 24 25)" fill="none" stroke="url(#tfsBrandRing)" stroke-width="2"/>',
+    '<circle cx="41" cy="14.6" r="2.3" fill="#ffffff"/>',
+    "</svg>",
+  ].join("");
 
   const steamToggleClasses = Object.freeze({
     toggle: "_9Ql-oVe_j8E-vsDdyVdWo",
@@ -25,6 +50,10 @@
     footerLegend: Object.freeze([]),
     autoFocusIndex: null,
     panelClassName: "",
+    panelEyebrow: "TOOLS FOR STEAM",
+    panelStyle: null,
+    pluginId: "",
+    pageId: "",
     sectionHeaders: Object.freeze([]),
     dividerAfterIndex: null,
     dividerAfterIndices: null,
@@ -974,12 +1003,19 @@
   }
 
   function createAccordionRowContent(createElement, withChildren, slot) {
+    const LeadingIcon = slot.leadingIcon;
     return createElement(
       "div",
       withChildren(
         {
           className: `steamloader-accordion-toggle${slot.expanded ? " is-expanded" : ""}`,
         },
+        LeadingIcon
+          ? createElement("span", withChildren(
+              { className: "steamloader-accordion-toggle-icon", "aria-hidden": "true" },
+              createElement(LeadingIcon, {}),
+            ))
+          : null,
         createElement(
           "div",
           withChildren(
@@ -996,6 +1032,12 @@
               : null,
           ),
         ),
+        slot.badge
+          ? createElement("span", {
+              className: "steamloader-badge steamloader-accordion-toggle-badge",
+              children: slot.badge,
+            })
+          : null,
         createElement("span", {
           className: "steamloader-accordion-toggle-arrow",
           children: "v",
@@ -1316,7 +1358,8 @@
       return createAccordionRowContent(createElement, withChildren, slot);
     }
 
-    if (slot.layout === "feature") {
+    // Native (Decky-style) layout shows feature tiles as ordinary list rows.
+    if (slot.layout === "feature" && window.__tfsNativeQuickAccessLayout !== true) {
       return createFeatureRowContent(createElement, withChildren, slot, trailingNode);
     }
 
@@ -1446,13 +1489,218 @@
       return;
     }
 
+    if (helpers.handleSlotClick(index, slot) === false) {
+      return;
+    }
+
     if (slot.role === "toggle") {
       playToggleSound(!slot.switchValue);
     } else if (!state?.nativeUi?.dialogButtonType) {
       playUiSound();
     }
+  }
 
-    helpers.handleSlotClick(index);
+  // Steam's own components (resolved by tfs-core in the shared Steam context),
+  // like Decky's @decky/ui. The Quick Access window reaches them via opener.
+  function getCoreUi() {
+    for (const candidate of [window, window.opener]) {
+      try {
+        const ui = candidate?.__tfs?.ui;
+        if (ui) {
+          return ui;
+        }
+      } catch {
+        // cross-window access can throw while Steam swaps windows
+      }
+    }
+    return null;
+  }
+
+  function applySliderValue(slot, nextValue) {
+    const step = Number(slot.step) > 0 ? Number(slot.step) : 1;
+    const next = Math.min(Number(slot.max), Math.max(Number(slot.min), Number(nextValue)));
+    if (!Number.isFinite(next)) {
+      return;
+    }
+    if (typeof slot.onValueChange === "function") {
+      slot.onValueChange(next);
+      return;
+    }
+    const steps = Math.round((next - (Number(slot.value) || 0)) / step);
+    const move = steps > 0 ? slot.buttonProps?.onMoveRight : slot.buttonProps?.onMoveLeft;
+    for (let i = 0; i < Math.abs(steps) && typeof move === "function"; i += 1) {
+      move({ preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} });
+    }
+  }
+
+  // Toggles and sliders render as Steam's real ToggleField / SliderField in
+  // the native (Decky-style) layout. Returns null to fall back to the row.
+  function createSteamFieldSlot(createElement, withChildren, slot, index, autoFocusIndex, helpers, backNavigation) {
+    if (window.__tfsNativeQuickAccessLayout !== true || !slot) {
+      return null;
+    }
+    const isToggle = slot.role === "toggle";
+    const isSlider = slot.layout === "slider" && Number(slot.max) > Number(slot.min);
+    const isStepper = slot.layout === "stepper";
+    if (!isToggle && !isSlider && !isStepper) {
+      return null;
+    }
+    const ui = getCoreUi();
+    const Component = isToggle ? ui?.ToggleField : isSlider ? ui?.SliderField : ui?.Field;
+    if (!Component) {
+      return null;
+    }
+
+    // Wraps the field in Steam's Focusable so the TFS grid navigation (two
+    // columns in the wide panel) also reaches Steam's own fields: up/down keep
+    // the column, left/right switch columns on toggles. Sliders and steppers
+    // keep left/right for their value.
+    const wrapField = (fieldElement, nativeKind) => {
+      const navProps = slot.buttonProps || {};
+      const wrapperProps = {
+        className: "tfs-native-field",
+        "data-slot-button": String(index),
+        "data-slot-native": nativeKind,
+        "data-slot-key": helpers.resolveSlotFocusKey?.(slot, index) || slot.slotKey || undefined,
+        "data-setting-scope": slot.settingScope || undefined,
+        "data-setting-key": slot.settingKey || undefined,
+      };
+      const Focusable = ui?.Focusable;
+      if (!Focusable) {
+        return createElement("div", withChildren(wrapperProps, fieldElement), slot.slotKey || `slot-${index}`);
+      }
+      const forward = (handler) =>
+        typeof handler === "function"
+          ? (event) => {
+              handler(event);
+              return true;
+            }
+          : undefined;
+      return createElement(
+        Focusable,
+        withChildren(
+          {
+            ...wrapperProps,
+            focusable: false,
+            noFocusRing: true,
+            onMoveUp: forward(navProps.onMoveUp),
+            onMoveDown: forward(navProps.onMoveDown),
+            onMoveLeft: nativeKind === "toggle" ? forward(navProps.onMoveLeft) : undefined,
+            onMoveRight: nativeKind === "toggle" ? forward(navProps.onMoveRight) : undefined,
+            // A on a value slider (e.g. reset to default) when the page offers it.
+            onOKButton: nativeKind === "slider" && typeof slot.onSliderActivate === "function"
+              ? () => {
+                  if (!slot.disabled) {
+                    slot.onSliderActivate();
+                  }
+                  return true;
+                }
+              : undefined,
+          },
+          fieldElement,
+        ),
+        slot.slotKey || `slot-${index}`,
+      );
+    };
+
+    const LeadingIcon = slot.leadingIcon;
+    const common = {
+      label: slot.title,
+      disabled: Boolean(slot.disabled),
+      icon: LeadingIcon ? createElement(LeadingIcon, {}) : undefined,
+      // The TFS cell draws the separator, like on every other row.
+      bottomSeparator: "none",
+      highlightOnFocus: true,
+      autoFocus: Number.isInteger(autoFocusIndex) && index === autoFocusIndex,
+      onGamepadFocus: () => {
+        helpers.rememberCurrentRouteSlot?.(index, slot);
+        helpers.rememberCurrentRouteIndex?.(index);
+        slot.buttonProps?.onGamepadFocus?.();
+      },
+      onCancelButton: backNavigation ? () => helpers.navigateBackFromRoute() : undefined,
+    };
+
+    if (isStepper) {
+      // Value picker as Steam's own Field row: left/right change the value,
+      // the arrows only show which way is still possible.
+      const move = (direction) => (event) => {
+        const handler = direction < 0 ? slot.buttonProps?.onMoveLeft : slot.buttonProps?.onMoveRight;
+        handler?.(event);
+        event?.stopPropagation?.();
+        return true;
+      };
+      // The current value (e.g. "150%") sits between the arrows.
+      const rawValue = slot.valueLabel ?? slot.value ?? slot.badge ?? "";
+      const stepperValue = rawValue === null || typeof rawValue === "object" ? "" : String(rawValue);
+      const arrow = (disabled, label) =>
+        createElement("span", {
+          className: `tfs-native-stepper-arrow${disabled ? " is-disabled" : ""}`,
+          "aria-hidden": "true",
+          children: label,
+        });
+      const stepperField = createElement(Component, {
+        ...common,
+        description: slot.copy || undefined,
+        focusable: !slot.disabled,
+        // Below the label: in Steam's narrow Quick Access column an inline
+        // picker squeezed the label into a few words per line.
+        childrenLayout: "below",
+        onActivate: () => {
+          if (!slot.disabled) {
+            helpers.handleSlotClick?.(index, slot);
+          }
+        },
+        onMoveLeft: move(-1),
+        onMoveRight: move(1),
+        children: createElement(
+          "span",
+          withChildren(
+            { className: "tfs-native-stepper" },
+            arrow(slot.stepperLeftDisabled, "‹"),
+            stepperValue !== ""
+              ? createElement("span", { className: "tfs-native-stepper-value", children: stepperValue })
+              : null,
+            arrow(slot.stepperRightDisabled, "›"),
+          ),
+        ),
+      });
+      return wrapField(stepperField, "stepper");
+    }
+
+    const field = isToggle
+      ? createElement(Component, {
+          ...common,
+          description: slot.copy || undefined,
+          checked: Boolean(slot.switchValue),
+          onChange: () => {
+            if (!slot.disabled) {
+              helpers.handleSlotClick?.(index, slot);
+            }
+          },
+        })
+      : createElement(Component, {
+          ...common,
+          // Optional line under the label (value sliders show their status here).
+          description: slot.sliderDescription || undefined,
+          value: Number(slot.value) || 0,
+          min: Number(slot.min),
+          max: Number(slot.max),
+          step: Number(slot.step) > 0 ? Number(slot.step) : 1,
+          showValue: true,
+          renderValue: (value) => {
+            if (typeof slot.formatValue === "function") {
+              try {
+                return String(slot.formatValue(Number(value)));
+              } catch {
+                // fall through to the plain value
+              }
+            }
+            return Number(value) === Number(slot.value) && slot.copy ? slot.copy : String(value);
+          },
+          onChange: (value) => applySliderValue(slot, value),
+        });
+
+    return wrapField(field, isToggle ? "toggle" : "slider");
   }
 
   function createButtonSlot(state, createElement, withChildren, slot, index, autoFocusIndex, helpers) {
@@ -1463,6 +1711,10 @@
     const backNavigation = typeof helpers.getBackNavigation === "function"
       ? helpers.getBackNavigation()
       : null;
+    const nativeField = createSteamFieldSlot(createElement, withChildren, slot, index, autoFocusIndex, helpers, backNavigation);
+    if (nativeField) {
+      return nativeField;
+    }
     const roleProps = createRoleProps(slot);
     const directionalButtonProps = getSlotDirectionalButtonProps(slot);
     const nativeComponentId = slot.nativeComponentId || nativeComponentByRole[slot.role || "action"] || "dialogButton";
@@ -1493,6 +1745,8 @@
           "data-slot-button": String(index),
           "data-slot-key": helpers.resolveSlotFocusKey?.(slot, index) || slot.slotKey || undefined,
           "data-slot-layout": slot.layout || undefined,
+          "data-slot-expanded": slot.layout === "accordion" ? String(Boolean(slot.expanded)) : undefined,
+          "aria-expanded": slot.layout === "accordion" ? Boolean(slot.expanded) : undefined,
           "data-native-component": nativeComponentId,
           "data-native-component-ready": nativeAvailable ? "true" : "false",
           "data-setting-scope": slot.settingScope || undefined,
@@ -1750,6 +2004,17 @@
   }
 
   function tryOpenSteamKeyboard(element, description, apiEndpointBase) {
+    // Direct path: tfs-core in the shared context drives Steam's keyboard
+    // without a round trip through the TFS service and the debugger.
+    for (const candidate of [window, window.opener]) {
+      try {
+        if (candidate?.__tfs?.keyboard?.show?.({ element })) {
+          return true;
+        }
+      } catch {
+      }
+    }
+
     if (requestTfsSteamKeyboard(element, description, apiEndpointBase)) {
       return true;
     }
@@ -1801,7 +2066,7 @@
   }
 
   function findEditorTextarea(editorDataKey) {
-    for (const element of document.querySelectorAll("#quickaccess_content_7 [data-editor-key]")) {
+    for (const element of document.querySelectorAll("#quickaccess_content_4747 [data-editor-key]")) {
       if (element.getAttribute("data-editor-key") === editorDataKey) {
         return element;
       }
@@ -2002,7 +2267,7 @@
           onBlur: (event) => {
             rememberEditorSelection(state, event.target);
             window.setTimeout(() => {
-              const panel = document.querySelector("#quickaccess_content_7 .steamloader-panel");
+              const panel = document.querySelector("#quickaccess_content_4747 .steamloader-panel");
               const activeElement = document.activeElement;
               if (
                 state.editorFocusCardKey !== editorDataKey ||
@@ -2254,10 +2519,12 @@
           onMoveLeft: (event) => {
             helpers.rememberVolumeActionFocus?.(0);
             slider.onMoveLeft?.(event);
+            return consumeCrossAxisNavigation(event);
           },
           onMoveRight: (event) => {
             helpers.rememberVolumeActionFocus?.(0);
             slider.onMoveRight?.(event);
+            return consumeCrossAxisNavigation(event);
           },
           style: {
             width: "100%",
@@ -2288,7 +2555,7 @@
     return createElement(
       "div",
       withChildren(
-        { className: "steamloader-volume-card" },
+        { className: "steamloader-volume-card steamloader-volume-panel" },
         createElement(
           "div",
           withChildren(
@@ -2360,6 +2627,8 @@
     state.nativeUi.renderError = "";
 
     const HeaderIcon = model.headerIcon === null ? null : model.headerIcon || helpers.DefaultIcon;
+    // The Tools for Steam home page carries the brand logo at the top.
+    const showBrand = model.routeKey === "root" && window.__tfsNativeQuickAccessLayout === true;
     const headerActions = Array.isArray(model.headerActions) ? model.headerActions : [];
     const topSlots = Array.isArray(model.topSlots) ? model.topSlots : [];
     const slots = Array.isArray(model.slots) ? model.slots : [];
@@ -2410,12 +2679,17 @@
       "div",
       withChildren(
         {
-          className: model.panelClassName
-            ? `steamloader-panel ${model.panelClassName}`
-            : "steamloader-panel",
+          className: [
+            "steamloader-panel",
+            model.panelClassName || "",
+            window.__tfsNativeQuickAccessLayout === true ? "tfs-native" : "",
+          ].filter(Boolean).join(" "),
           "data-route-key": model.routeKey || "",
+          "data-plugin-id": model.pluginId || undefined,
+          "data-page-id": model.pageId || undefined,
           "data-st-frontend-lib-version": String(window.STFrontendLib?.version || 37),
           "data-st-renderer": "st-frontend-lib",
+          style: model.panelStyle || undefined,
         },
         createElement(
           "div",
@@ -2425,19 +2699,47 @@
               "div",
               withChildren(
                 { className: "steamloader-header-main" },
-                HeaderIcon
+                showBrand
+                  ? createElement("span", {
+                      className: "tfs-brand-mark",
+                      dangerouslySetInnerHTML: { __html: tfsLogoSvg },
+                    })
+                  : null,
+                showBrand
+                  ? createElement(
+                      "div",
+                      withChildren(
+                        { className: "tfs-brand-text" },
+                        createElement(
+                          "div",
+                          withChildren(
+                            { className: "tfs-brand-line" },
+                            createElement("span", { className: "tfs-brand-word", children: "TFS" }),
+                            createElement("span", { className: "tfs-brand-name", children: "Tools for Steam" }),
+                          ),
+                        ),
+                        model.subtitle
+                          ? createElement("div", {
+                              className: "steamloader-subtitle tfs-brand-subtitle",
+                              children: model.subtitle,
+                            })
+                          : null,
+                      ),
+                    )
+                  : null,
+                !showBrand && HeaderIcon
                   ? createElement(
                       "div",
                       withChildren({ className: "steamloader-header-mark" }, createElement(HeaderIcon, {})),
                     )
                   : null,
-                createElement(
+                showBrand ? null : createElement(
                   "div",
                   withChildren(
                     { className: "steamloader-title-wrap" },
                     createElement("div", {
                       className: "steamloader-header-eyebrow",
-                      children: model.routeKey === "root" ? "QUICK ACCESS" : "TOOLS FOR STEAM  /  PLUGINS",
+                      children: model.panelEyebrow || (model.routeKey === "root" ? "TFS CONTROL CENTER" : "TOOLS FOR STEAM"),
                     }),
                     createElement("h1", {
                       className: "steamloader-title",
@@ -2671,741 +2973,12 @@
     return toast;
   }
 
-  function createPluginSdk(manifest = {}, options = {}) {
-    const apiBase = options.apiBase || window.__steamLoaderApiBase || "";
-    const pluginId = String(options.pluginId || manifest.id || "").trim();
-    const pluginApiBase = pluginId
-      ? `api/plugin-sdk/plugins/${encodeURIComponent(pluginId)}`
-      : "";
-
-    async function request(path, requestOptions = {}) {
-      const headers = { ...(requestOptions.headers || {}) };
-      let body = requestOptions.body;
-      const hasJsonBody =
-        body &&
-        typeof body === "object" &&
-        !(typeof FormData !== "undefined" && body instanceof FormData) &&
-        !(typeof Blob !== "undefined" && body instanceof Blob);
-
-      if (hasJsonBody) {
-        headers["Content-Type"] = headers["Content-Type"] || "application/json";
-        body = JSON.stringify(body);
-      }
-
-      const response = await fetch(joinApiPath(apiBase, path), {
-        ...requestOptions,
-        headers,
-        body,
-      });
-      const contentType = response.headers.get("content-type") || "";
-      const payload = contentType.includes("application/json")
-        ? await response.json()
-        : await response.text();
-
-      if (!response.ok) {
-        const message = payload && typeof payload === "object" && payload.message
-          ? payload.message
-          : `TFS API request failed (${response.status}).`;
-        throw new Error(message);
-      }
-
-      return payload;
-    }
-
-    function ensurePluginId() {
-      if (!pluginApiBase) {
-        throw new Error("TFS plugin SDK requires a manifest id.");
-      }
-    }
-
-    function pluginRequest(path, requestOptions = {}) {
-      ensurePluginId();
-      return request(`${pluginApiBase}/${String(path || "").replace(/^\/+/, "")}`, requestOptions);
-    }
-
-    function capabilityRequest(capability, operation, args = {}) {
-      return pluginRequest(`capabilities/${encodeURIComponent(capability)}`, {
-        method: "POST",
-        body: { operation, arguments: args },
-      });
-    }
-
-    const storage = {
-      async get() {
-        const payload = await pluginRequest("settings", { method: "GET" });
-        return payload?.settings || {};
-      },
-      async set(settings = {}) {
-        const payload = await pluginRequest("settings", { method: "POST", body: settings });
-        return payload?.settings || {};
-      },
-      async patch(partialSettings = {}) {
-        const current = await storage.get();
-        return storage.set({ ...current, ...partialSettings });
-      },
-      async remove(...keys) {
-        const current = await storage.get();
-        for (const key of keys.flat()) {
-          delete current[String(key)];
-        }
-        return storage.set(current);
-      },
-      clear() {
-        return storage.set({});
-      },
-    };
-
-    const secrets = {
-      async status() {
-        const payload = await pluginRequest("secrets", { method: "GET" });
-        return payload?.secrets || {};
-      },
-      async set(key, value) {
-        const payload = await pluginRequest(`secrets/${encodeURIComponent(key)}`, {
-          method: "POST",
-          body: { value: String(value ?? "") },
-        });
-        return payload?.secrets || {};
-      },
-      async clear(key) {
-        const payload = await pluginRequest(`secrets/${encodeURIComponent(key)}/clear`, {
-          method: "POST",
-          body: {},
-        });
-        return payload?.secrets || {};
-      },
-    };
-
-    const network = {
-      async request(networkRequest = {}) {
-        const response = await pluginRequest("network/request", {
-          method: "POST",
-          body: {
-            method: networkRequest.method || "GET",
-            url: networkRequest.url || "",
-            headers: networkRequest.headers || {},
-            body: networkRequest.body,
-            authorizationSecretKey: networkRequest.authorizationSecretKey || "",
-            authorizationScheme: networkRequest.authorizationScheme || "Bearer",
-          },
-        });
-        return {
-          ...response,
-          text: () => String(response?.bodyText || ""),
-          json: () => JSON.parse(String(response?.bodyText || "null")),
-        };
-      },
-      get(url, requestOptions = {}) {
-        return network.request({ ...requestOptions, method: "GET", url });
-      },
-      post(url, body = {}, requestOptions = {}) {
-        return network.request({ ...requestOptions, method: "POST", url, body });
-      },
-      put(url, body = {}, requestOptions = {}) {
-        return network.request({ ...requestOptions, method: "PUT", url, body });
-      },
-      patch(url, body = {}, requestOptions = {}) {
-        return network.request({ ...requestOptions, method: "PATCH", url, body });
-      },
-      delete(url, requestOptions = {}) {
-        return network.request({ ...requestOptions, method: "DELETE", url });
-      },
-    };
-
-    function bytesToBase64(value) {
-      const bytes = value instanceof Uint8Array
-        ? value
-        : value instanceof ArrayBuffer
-          ? new Uint8Array(value)
-          : ArrayBuffer.isView(value)
-            ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-            : null;
-      if (!bytes) {
-        throw new TypeError("TFS files.writeBytes expects an ArrayBuffer or typed array.");
-      }
-
-      let binary = "";
-      const chunkSize = 0x8000;
-      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-      }
-      return btoa(binary);
-    }
-
-    function base64ToBytes(value) {
-      const binary = atob(String(value || ""));
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
-      return bytes;
-    }
-
-    const files = {
-      list(path = "", options = {}) {
-        return pluginRequest("files/list", {
-          method: "POST",
-          body: { path: String(path || ""), recursive: Boolean(options.recursive) },
-        });
-      },
-      stat(path = "") {
-        return pluginRequest("files/stat", {
-          method: "POST",
-          body: { path: String(path || ""), recursive: false },
-        });
-      },
-      read(path, options = {}) {
-        return pluginRequest("files/read", {
-          method: "POST",
-          body: { path: String(path || ""), encoding: options.encoding || "utf8" },
-        });
-      },
-      async readText(path) {
-        const result = await files.read(path, { encoding: "utf8" });
-        return result?.content || "";
-      },
-      async readBytes(path) {
-        const result = await files.read(path, { encoding: "base64" });
-        return base64ToBytes(result?.content || "");
-      },
-      write(path, content, options = {}) {
-        const isBinary = content instanceof ArrayBuffer || ArrayBuffer.isView(content);
-        return pluginRequest("files/write", {
-          method: "POST",
-          body: {
-            path: String(path || ""),
-            content: isBinary ? bytesToBase64(content) : String(content ?? ""),
-            encoding: isBinary ? "base64" : options.encoding || "utf8",
-            append: Boolean(options.append),
-            overwrite: options.overwrite !== false,
-          },
-        });
-      },
-      writeText(path, content, options = {}) {
-        return files.write(path, String(content ?? ""), { ...options, encoding: "utf8" });
-      },
-      appendText(path, content) {
-        return files.writeText(path, content, { append: true });
-      },
-      writeBytes(path, content, options = {}) {
-        return files.write(path, content, options);
-      },
-      mkdir(path = "") {
-        return pluginRequest("files/directory", {
-          method: "POST",
-          body: { path: String(path || ""), recursive: true },
-        });
-      },
-      remove(path, options = {}) {
-        return pluginRequest("files/delete", {
-          method: "POST",
-          body: { path: String(path || ""), recursive: Boolean(options.recursive) },
-        });
-      },
-      move(sourcePath, destinationPath, options = {}) {
-        return pluginRequest("files/move", {
-          method: "POST",
-          body: {
-            sourcePath: String(sourcePath || ""),
-            destinationPath: String(destinationPath || ""),
-            overwrite: Boolean(options.overwrite),
-          },
-        });
-      },
-      copy(sourcePath, destinationPath, options = {}) {
-        return pluginRequest("files/copy", {
-          method: "POST",
-          body: {
-            sourcePath: String(sourcePath || ""),
-            destinationPath: String(destinationPath || ""),
-            overwrite: Boolean(options.overwrite),
-          },
-        });
-      },
-    };
-
-    const audio = {
-      getState: () => capabilityRequest("audio", "getState"),
-      setDefaultPlayback: (deviceId) => capabilityRequest("audio", "setDefaultPlayback", { deviceId }),
-      setDefaultCapture: (deviceId) => capabilityRequest("audio", "setDefaultCapture", { deviceId }),
-      setPlaybackVolume: (volume) => capabilityRequest("audio", "setPlaybackVolume", { volume }),
-      setCaptureVolume: (volume) => capabilityRequest("audio", "setCaptureVolume", { volume }),
-      adjustPlaybackVolume: (delta) => capabilityRequest("audio", "adjustPlaybackVolume", { delta }),
-      adjustCaptureVolume: (delta) => capabilityRequest("audio", "adjustCaptureVolume", { delta }),
-      togglePlaybackMute: () => capabilityRequest("audio", "togglePlaybackMute"),
-      toggleCaptureMute: () => capabilityRequest("audio", "toggleCaptureMute"),
-      setMixerVolume: (sessionId, volume) => capabilityRequest("audio", "setMixerVolume", { sessionId, volume }),
-      toggleMixerMute: (sessionId) => capabilityRequest("audio", "toggleMixerMute", { sessionId }),
-    };
-
-    const processes = {
-      getState: () => capabilityRequest("processes", "getState"),
-      activate: (handle) => capabilityRequest("processes", "activate", { handle }),
-    };
-
-    const display = {
-      getState: () => capabilityRequest("display", "getState"),
-      switchInternal: () => capabilityRequest("display", "switchInternal"),
-      switchExternal: () => capabilityRequest("display", "switchExternal"),
-      setResolution: (presetId) => capabilityRequest("display", "setResolution", { presetId }),
-      setRefreshRate: (refreshRate) => capabilityRequest("display", "setRefreshRate", { refreshRate }),
-    };
-
-    const themes = {
-      getState: () => capabilityRequest("themes", "getState"),
-      refreshCatalog: () => capabilityRequest("themes", "refreshCatalog"),
-      getStoreCatalog: (options = {}) => capabilityRequest("themes", "getStoreCatalog", options),
-      getStoreTheme: (storeThemeId) => capabilityRequest("themes", "getStoreTheme", { storeThemeId }),
-      installStoreTheme: (storeThemeId) => capabilityRequest("themes", "installStoreTheme", { storeThemeId }),
-      setEnabled: (themeId, enabled) => capabilityRequest("themes", "setEnabled", { themeId, enabled }),
-      toggleOption: (themeId, optionId) => capabilityRequest("themes", "toggleOption", { themeId, optionId }),
-      setChoice: (themeId, optionId, choiceId) => capabilityRequest("themes", "setChoice", { themeId, optionId, choiceId }),
-      adjustRange: (themeId, optionId, delta) => capabilityRequest("themes", "adjustRange", { themeId, optionId, delta }),
-      resetRange: (themeId, optionId) => capabilityRequest("themes", "resetRange", { themeId, optionId }),
-      createProfile: (title) => capabilityRequest("themes", "createProfile", { title }),
-      applyProfile: (profileId) => capabilityRequest("themes", "applyProfile", { profileId }),
-      updateProfile: (profileId) => capabilityRequest("themes", "updateProfile", { profileId }),
-      removeProfile: (profileId) => capabilityRequest("themes", "removeProfile", { profileId }),
-      setWatchEnabled: (enabled) => capabilityRequest("themes", "setWatchEnabled", { enabled }),
-    };
-
-    const artwork = {
-      getState: () => capabilityRequest("artwork", "getState"),
-      searchGames: (term) => capabilityRequest("artwork", "searchGames", { term }),
-      searchAssets: (gameId, assetType, options = {}) => capabilityRequest("artwork", "searchAssets", {
-        gameId,
-        assetType,
-        page: Number(options.page) || 0,
-      }),
-      apply: (appId, assetType, assetUrl) => capabilityRequest("artwork", "apply", { appId, assetType, assetUrl }),
-      toggleSetting: (key) => capabilityRequest("artwork", "toggleSetting", { key }),
-      setResultLimit: (value) => capabilityRequest("artwork", "setResultLimit", { value }),
-    };
-
-    const appStart = {
-      getState: () => capabilityRequest("app-start", "getState"),
-      getCatalog: () => capabilityRequest("app-start", "getCatalog"),
-      refreshCatalog: () => capabilityRequest("app-start", "refreshCatalog"),
-      add: (appId) => capabilityRequest("app-start", "add", { appId }),
-      remove: (shortcutId) => capabilityRequest("app-start", "remove", { shortcutId }),
-      toggleFavorite: (shortcutId) => capabilityRequest("app-start", "toggleFavorite", { shortcutId }),
-      launch: (shortcutId) => capabilityRequest("app-start", "launch", { shortcutId }),
-    };
-
-    const storeSync = {
-      getState: () => capabilityRequest("store-sync", "getState"),
-      getTitles: (storeId = "") => capabilityRequest("store-sync", "getTitles", { storeId }),
-      getArtworkPreview: (titleId) => capabilityRequest("store-sync", "getArtworkPreview", { titleId }),
-      toggleSetting: (key) => capabilityRequest("store-sync", "toggleSetting", { key }),
-      setStoreEnabled: (storeId, enabled) => capabilityRequest("store-sync", "setStoreEnabled", { storeId, enabled }),
-      setStorePath: (storeId, path) => capabilityRequest("store-sync", "setStorePath", { storeId, path }),
-      clearStorePath: (storeId) => capabilityRequest("store-sync", "clearStorePath", { storeId }),
-      setAdditionalPaths: (storeId, paths = []) => capabilityRequest("store-sync", "setAdditionalPaths", { storeId, paths }),
-      setTitleOverride: (titleId, options = {}) => capabilityRequest("store-sync", "setTitleOverride", {
-        titleId,
-        titleOverride: options.titleOverride || "",
-        artworkTitleOverride: options.artworkTitleOverride || "",
-        excluded: Boolean(options.excluded),
-      }),
-      clearTitleOverride: (titleId) => capabilityRequest("store-sync", "clearTitleOverride", { titleId }),
-      sync: () => capabilityRequest("store-sync", "sync"),
-      refreshStorefront: (storeId = "") => capabilityRequest("store-sync", "refreshStorefront", { storeId }),
-      setStorefrontEnabled: (storeId, enabled) => capabilityRequest("store-sync", "setStorefrontEnabled", { storeId, enabled }),
-      startStorefrontLogin: (storeId) => capabilityRequest("store-sync", "startStorefrontLogin", { storeId }),
-      completeStorefrontAuth: (storeId, value) => capabilityRequest("store-sync", "completeStorefrontAuth", { storeId, value }),
-      launchStorefrontGame: (storeId, gameId) => capabilityRequest("store-sync", "launchStorefrontGame", { storeId, gameId }),
-    };
-
-    const automation = {
-      getState: () => capabilityRequest("automation", "getState"),
-      toggleSetting: (key) => capabilityRequest("automation", "toggleSetting", { key }),
-      setExecutablePath: (path) => capabilityRequest("automation", "setExecutablePath", { path }),
-      resetExecutablePath: () => capabilityRequest("automation", "resetExecutablePath"),
-      toggleWatchedTitle: (titleId) => capabilityRequest("automation", "toggleWatchedTitle", { titleId }),
-    };
-
-    const performance = {
-      getState: () => capabilityRequest("performance", "getState"),
-      setOverlayLevel: (level) => capabilityRequest("performance", "setOverlayLevel", { level }),
-      toggleAutoTarget: () => capabilityRequest("performance", "toggleAutoTarget"),
-      setSettingValue: (key, value) => capabilityRequest("performance", "setSettingValue", { key, value }),
-      startOverlay: () => capabilityRequest("performance", "startOverlay"),
-      stopOverlay: () => capabilityRequest("performance", "stopOverlay"),
-      prepareElevatedHelper: () => capabilityRequest("performance", "prepareElevatedHelper"),
-    };
-
-    function confirmedPowerAction(operation, options = {}) {
-      if (options.confirmed !== true) {
-        return Promise.reject(new Error("TFS power actions require { confirmed: true } after explicit user confirmation."));
-      }
-      return capabilityRequest("power", operation, { confirmed: true });
-    }
-
-    const power = {
-      getState: () => capabilityRequest("power", "getState"),
-      startWindowsDesktop: (options) => confirmedPowerAction("startWindowsDesktop", options),
-      restartSteam: (options) => confirmedPowerAction("restartSteam", options),
-      sleepWindows: (options) => confirmedPowerAction("sleepWindows", options),
-      restartWindows: (options) => confirmedPowerAction("restartWindows", options),
-      shutdownWindows: (options) => confirmedPowerAction("shutdownWindows", options),
-    };
-
-    const system = {
-      getInfo: () => capabilityRequest("system", "getInfo"),
-      run: (fileName, arguments = [], options = {}) => capabilityRequest("system", "run", {
-        ...options,
-        fileName,
-        arguments,
-      }),
-      start: (fileName, arguments = [], options = {}) => capabilityRequest("system", "start", {
-        ...options,
-        fileName,
-        arguments,
-      }),
-      list: () => capabilityRequest("system", "list"),
-      status: (processId) => capabilityRequest("system", "status", { processId }),
-      stop: (processId) => capabilityRequest("system", "stop", { processId }),
-      stopAll: () => capabilityRequest("system", "stopAll"),
-      open: (target, arguments = [], options = {}) => capabilityRequest("system", "open", { ...options, target, arguments }),
-    };
-
-    const filesystem = {
-      paths: () => capabilityRequest("filesystem", "paths"),
-      stat: (path, options = {}) => capabilityRequest("filesystem", "stat", { ...options, path }),
-      list: (path = "", options = {}) => capabilityRequest("filesystem", "list", { ...options, path }),
-      readText: async (path, options = {}) => {
-        const result = await capabilityRequest("filesystem", "readText", { ...options, path });
-        return String(result?.content || "");
-      },
-      readBytes: async (path, options = {}) => {
-        const result = await capabilityRequest("filesystem", "readBytes", { ...options, path });
-        return base64ToBytes(result?.content || "");
-      },
-      writeText: (path, content, options = {}) => capabilityRequest("filesystem", "writeText", {
-        ...options,
-        path,
-        content: String(content ?? ""),
-      }),
-      appendText: (path, content, options = {}) => capabilityRequest("filesystem", "writeText", {
-        ...options,
-        path,
-        content: String(content ?? ""),
-        append: true,
-      }),
-      writeBytes: (path, content, options = {}) => capabilityRequest("filesystem", "writeBytes", {
-        ...options,
-        path,
-        content: bytesToBase64(content),
-      }),
-      mkdir: (path, options = {}) => capabilityRequest("filesystem", "mkdir", { ...options, path }),
-      remove: (path, options = {}) => capabilityRequest("filesystem", "delete", { ...options, path }),
-      copy: (sourcePath, destinationPath, options = {}) => capabilityRequest("filesystem", "copy", {
-        ...options,
-        sourcePath,
-        destinationPath,
-      }),
-      move: (sourcePath, destinationPath, options = {}) => capabilityRequest("filesystem", "move", {
-        ...options,
-        sourcePath,
-        destinationPath,
-      }),
-    };
-
-    const steam = {
-      targets: () => capabilityRequest("steam", "targets"),
-      evaluate: (targetId, expression) => capabilityRequest("steam", "evaluate", { targetId, expression }),
-      inject: (targetId, expression) => capabilityRequest("steam", "inject", { targetId, expression }),
-      get client() {
-        return window.SteamClient || null;
-      },
-      get ui() {
-        return {
-          React: window.SP_REACT || window.React || null,
-          ReactDOM: window.SP_REACTDOM || window.ReactDOM || null,
-          router: window.MainWindowBrowserManager || window.GamepadNavTree || null,
-        };
-      },
-    };
-
-    let backendProcessId = "";
-    let backendStartPromise = null;
-    const backend = {
-      start(options = {}) {
-        const backendManifest = manifest.backend && typeof manifest.backend === "object" ? manifest.backend : {};
-        const entryPoint = String(options.entryPoint || backendManifest.entryPoint || "").trim();
-        if (!entryPoint) {
-          return Promise.reject(new Error("This plugin does not declare backend.entryPoint."));
-        }
-        if (backendStartPromise) {
-          return backendStartPromise;
-        }
-        backendStartPromise = capabilityRequest("system", "startBackend", {
-          ...backendManifest,
-          ...options,
-          entryPoint,
-          arguments: options.arguments || backendManifest.arguments || [],
-          environment: { ...(backendManifest.environment || {}), ...(options.environment || {}) },
-          secretEnvironment: { ...(backendManifest.secretEnvironment || {}), ...(options.secretEnvironment || {}) },
-        }).then((result) => {
-          backendProcessId = String(result?.processId || "");
-          return result;
-        }).catch((error) => {
-          backendStartPromise = null;
-          throw error;
-        });
-        return backendStartPromise;
-      },
-      ready() {
-        return backendStartPromise || backend.start();
-      },
-      status() {
-        return backendProcessId
-          ? system.status(backendProcessId)
-          : Promise.resolve({ running: false, processId: "" });
-      },
-      async call(method, arguments = {}, options = {}) {
-        const process = await backend.ready();
-        return capabilityRequest("system", "call", {
-          processId: process.processId,
-          method,
-          arguments,
-          timeoutMs: options.timeoutMs || 30000,
-        });
-      },
-      async stop() {
-        if (!backendProcessId) {
-          backendStartPromise = null;
-          return { running: false, processId: "" };
-        }
-        const processId = backendProcessId;
-        backendProcessId = "";
-        backendStartPromise = null;
-        return system.stop(processId);
-      },
-    };
-
-    const notifications = {
-      async show(title, message, options = {}) {
-        const result = await pluginRequest("notifications/show", {
-          method: "POST",
-          body: {
-            title: String(title || ""),
-            message: String(message || ""),
-            level: options.level || "info",
-            durationMs: Number(options.durationMs) || 4500,
-          },
-        });
-        showPluginNotification(result);
-        return result;
-      },
-      success(title, message, options = {}) {
-        return notifications.show(title, message, { ...options, level: "success" });
-      },
-      warning(title, message, options = {}) {
-        return notifications.show(title, message, { ...options, level: "warning" });
-      },
-      error(title, message, options = {}) {
-        return notifications.show(title, message, { ...options, level: "error" });
-      },
-    };
-
-    const log = {};
-    for (const level of ["debug", "info", "warning", "error"]) {
-      log[level] = (message, data = null) => pluginRequest("logs/write", {
-        method: "POST",
-        body: {
-          level,
-          message: String(message || ""),
-          data,
-        },
-      });
-    }
-    log.warn = log.warning;
-
-    const lifecycleDisposers = new Set();
-    const lifecycleAbortController = typeof AbortController === "function" ? new AbortController() : null;
-    let lifecycleDisposed = false;
-    const lifecycle = {
-      get disposed() {
-        return lifecycleDisposed;
-      },
-      signal: lifecycleAbortController?.signal || null,
-      onDispose(callback) {
-        if (typeof callback !== "function") {
-          throw new TypeError("TFS lifecycle.onDispose expects a function.");
-        }
-        if (lifecycleDisposed) {
-          callback();
-          return () => {};
-        }
-        lifecycleDisposers.add(callback);
-        return () => lifecycleDisposers.delete(callback);
-      },
-      setTimeout(callback, delayMs = 0) {
-        const timerId = window.setTimeout(() => {
-          lifecycleDisposers.delete(cancel);
-          if (!lifecycleDisposed) {
-            callback();
-          }
-        }, Math.max(0, Number(delayMs) || 0));
-        const cancel = () => window.clearTimeout(timerId);
-        lifecycleDisposers.add(cancel);
-        return cancel;
-      },
-      setInterval(callback, delayMs = 1000) {
-        const timerId = window.setInterval(() => {
-          if (!lifecycleDisposed) {
-            callback();
-          }
-        }, Math.max(100, Number(delayMs) || 1000));
-        const cancel = () => window.clearInterval(timerId);
-        lifecycleDisposers.add(cancel);
-        return cancel;
-      },
-      dispose() {
-        if (lifecycleDisposed) {
-          return;
-        }
-        lifecycleDisposed = true;
-        lifecycleAbortController?.abort();
-        for (const dispose of [...lifecycleDisposers]) {
-          try {
-            dispose();
-          } catch {
-          }
-        }
-        lifecycleDisposers.clear();
-      },
-    };
-
-    const observableSources = {
-      audio: () => audio.getState(),
-      processes: () => processes.getState(),
-      display: () => display.getState(),
-      performance: () => performance.getState(),
-    };
-    const events = {
-      watch(source, listener, options = {}) {
-        const read = typeof source === "function"
-          ? source
-          : observableSources[String(source || "").trim().toLowerCase()];
-        if (typeof read !== "function" || typeof listener !== "function") {
-          throw new TypeError("TFS events.watch expects a supported source or reader function and a listener.");
-        }
-
-        let stopped = false;
-        let running = false;
-        let previousFingerprint = "";
-        const poll = async () => {
-          if (stopped || running || lifecycle.disposed) {
-            return;
-          }
-          running = true;
-          try {
-            const snapshot = await read();
-            const fingerprint = JSON.stringify(snapshot);
-            if (fingerprint !== previousFingerprint) {
-              const previous = previousFingerprint;
-              previousFingerprint = fingerprint;
-              await listener(snapshot, { initial: previous.length === 0 });
-            }
-          } catch (error) {
-            options.onError?.(error);
-          } finally {
-            running = false;
-          }
-        };
-
-        const cancelInterval = lifecycle.setInterval(poll, Math.max(1000, Number(options.intervalMs) || 2000));
-        const stop = () => {
-          if (stopped) {
-            return;
-          }
-          stopped = true;
-          cancelInterval();
-        };
-        lifecycle.onDispose(stop);
-        if (options.immediate !== false) {
-          void poll();
-        }
-        return stop;
-      },
-    };
-
-    lifecycle.onDispose(() => {
-      if (backendProcessId) {
-        void backend.stop().catch(() => {});
-      }
-    });
-
-    const declaredPermissions = new Set(
-      Array.isArray(manifest.permissions)
-        ? manifest.permissions.map((permission) => String(permission || "").trim().toLowerCase())
-        : [],
-    );
-
-    return {
-      version: 1,
-      sdkVersion: "1.0.0",
-      pluginId,
-      manifest: { ...manifest, id: pluginId || manifest.id || "" },
-      apiBase,
-      state: () => pluginRequest("state", { method: "GET" }),
-      storage,
-      secrets,
-      network,
-      files,
-      audio,
-      processes,
-      display,
-      themes,
-      artwork,
-      appStart,
-      storeSync,
-      automation,
-      performance,
-      power,
-      system,
-      filesystem,
-      backend,
-      steam,
-      notifications,
-      log,
-      lifecycle,
-      events,
-      dispose: () => lifecycle.dispose(),
-      permissions: Object.freeze([...declaredPermissions]),
-      hasPermission: (permission) => declaredPermissions.has(String(permission || "").trim().toLowerCase()),
-      ui: {
-        createSlot,
-        createNavigationSlot,
-        createBackSlot,
-        createToggleSlot,
-        createChoiceSlot,
-        createCommandSlot,
-        createAccordionSlot,
-        createFeatureNavigationSlot,
-        createInlineStepperSlot,
-        createSliderSlot,
-        createProgressSlot,
-        createSecretEditor,
-        createScreenModel,
-        createPanelShell,
-      },
-      diagnostics: () => ({
-        libraryVersion: window.STFrontendLib?.version || 48,
-        sdkVersion: "1.0.0",
-        pluginId,
-      }),
-    };
-  }
-
   function createDiagnostics(state) {
     const registry = getNativeRegistry(state);
     const localRegistry = refreshLocalRegistry();
 
     return {
-      version: 48,
+      version: libVersion,
       renderer: "st-frontend-lib",
       hasDialogButtonType: Boolean(state?.nativeUi?.dialogButtonType),
       steamToggleStyleAvailable: Boolean(state?.nativeUi?.steamToggleStyleAvailable),
@@ -3418,62 +2991,8 @@
     };
   }
 
-  function registerPlugin(manifest = {}, setup = {}, options = {}) {
-    const pluginId = String(options.pluginId || manifest.id || "").trim();
-    if (!pluginId) {
-      throw new Error("TFS plugin registration requires a manifest id.");
-    }
-
-    const sdk = createPluginSdk(manifest, { ...options, pluginId });
-    let definition;
-    try {
-      definition = typeof setup === "function" ? setup(sdk) : setup;
-    } catch (error) {
-      sdk.dispose();
-      throw error;
-    }
-    if (!definition || typeof definition !== "object") {
-      sdk.dispose();
-      throw new Error("TFS plugin setup must return a plugin definition object.");
-    }
-
-    window.ToolsForSteamCommunityPlugins ??= {};
-    window.ToolsForSteamCommunityPlugins[pluginId]?.dispose?.();
-    const definitionDispose = typeof definition.dispose === "function"
-      ? definition.dispose.bind(definition)
-      : null;
-    const entry = {
-      ...definition,
-      manifest: { ...manifest, id: pluginId },
-      sdk,
-      dispose() {
-        try {
-          definitionDispose?.();
-        } finally {
-          sdk.dispose();
-        }
-      },
-    };
-    window.ToolsForSteamCommunityPlugins[pluginId] = entry;
-    if (manifest.backend?.autoStart === true) {
-      void sdk.backend.ready().catch((error) => {
-        console.error(`[TFS:${pluginId}] Backend start failed`, error);
-      });
-    }
-    return entry;
-  }
-
-  function unregisterPlugin(pluginId) {
-    const normalizedPluginId = String(pluginId || "").trim();
-    const entry = window.ToolsForSteamCommunityPlugins?.[normalizedPluginId];
-    entry?.dispose?.();
-    if (window.ToolsForSteamCommunityPlugins && normalizedPluginId) {
-      delete window.ToolsForSteamCommunityPlugins[normalizedPluginId];
-    }
-  }
-
   window.STFrontendLib = {
-    version: 48,
+    version: libVersion,
     defaultModel,
     getReactPropertyKey,
     getReactFiber,
@@ -3516,15 +3035,11 @@
     createVolumePanel,
     createPanelShell,
     showPluginNotification,
-    createPluginSdk,
     createDiagnostics,
   };
 
-  window.TfsPluginSdk = {
-    version: 1,
-    sdkVersion: "1.0.0",
-    create: createPluginSdk,
-    register: registerPlugin,
-    unregister: unregisterPlugin,
-  };
+  // Tools for Steam ships fixed integrations only; drop the retired
+  // community plugin SDK globals left behind by older builds.
+  delete window.TfsPluginSdk;
+  delete window.ToolsForSteamCommunityPlugins;
 })();

@@ -144,6 +144,10 @@ internal sealed class SteamStartupEnvironmentProbe
             "already up to date",
             "already up-to-date",
             "no update required",
+            // Every normal start runs a quick "Verifying installation..." pass.
+            // Without its end marker the first minutes of each start looked
+            // like an update and blocked the splash recovery choices.
+            "verification complete",
             "launching steam");
         return lastActivity > lastCompletion;
     }

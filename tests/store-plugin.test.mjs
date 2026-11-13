@@ -178,7 +178,7 @@ test("Store overlay includes async price loading, controller navigation, alerts,
   assert.match(source, /displayCurrency === "REGION" \|\| displayCurrency === "BOTH"/);
   assert.match(source, /regionalCurrency === "EUR"/);
   assert.match(source, /steamloader-store-alert-list \{[^}]*padding-bottom: 76px/);
-  assert.match(source, /--store-accent: #66c0f4/);
+  assert.match(source, /--store-accent: #c6db78/);
   assert.match(source, /--store-success: #5ee6a8/);
   assert.match(source, /const outerTarget = container === main[\s\S]*?\? rail/);
 });

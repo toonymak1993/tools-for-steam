@@ -7,11 +7,13 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>ToolsForSteam</AssemblyName>
+    <!-- TFS hex emblem (same artwork as the QAM brand emblem); Start menu and desktop shortcuts show it. -->
+    <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <Product>Tools for Steam</Product>
-    <Version>0.4.1-beta.1</Version>
-    <AssemblyVersion>0.4.1.0</AssemblyVersion>
-    <FileVersion>0.4.1.0</FileVersion>
-    <InformationalVersion>0.4.1-beta.1</InformationalVersion>
+    <Version>0.2.0</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
+    <InformationalVersion>0.2.0</InformationalVersion>
     <DiscordClientId Condition="'$(DiscordClientId)' == ''">$(TOOLS_FOR_STEAM_DISCORD_CLIENT_ID)</DiscordClientId>
     <DiscordClientId Condition="'$(DiscordClientId)' == ''">1526906410359848990</DiscordClientId>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>

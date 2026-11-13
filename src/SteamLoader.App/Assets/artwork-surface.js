@@ -1,8 +1,9 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const version = 49;
+  const version = 64;
   const openRequestStorageKey = "ToolsForSteamArtworkOpenRequest";
   const inputStorageKey = "ToolsForSteamArtworkInput";
+  const steamInputRelayStorageKey = "ToolsForSteamArtworkSteamInputRelay";
   const overlayStateStorageKey = "ToolsForSteamArtworkOverlayState";
   const artworkChannelName = "ToolsForSteamArtworkChannel";
   const omniLibraryStoreChannelName = "ToolsForSteamOmniLibraryStores";
@@ -16,6 +17,26 @@
     properties: localizedText(101, 105, 103, 101, 110, 115, 99, 104, 97, 102, 116, 101, 110),
     cancel: localizedText(97, 98, 98, 114, 101, 99, 104, 101, 110),
   });
+  // Menu labels in the active Steam language come from Steam's own
+  // localization tokens; the English and German literals above stay only as a
+  // fallback while Steam's LocalizationManager is not reachable.
+  const steamCommandTokens = Object.freeze({
+    play: ["#GameAction_Play"],
+    addToFavorites: ["#GameAction_AddToFavorites"],
+    addTo: ["#GameAction_AddToCollection"],
+    manage: ["#GameAction_Manage"],
+    properties: ["#GameAction_GameProperties"],
+    cancel: ["#GameAction_Cancel", "#Button_Cancel"],
+  });
+  const fallbackCommandLabels = Object.freeze({
+    play: ["play", localizedCommands.play],
+    addToFavorites: ["add to favorites", localizedCommands.addToFavorites],
+    addTo: ["add to", localizedCommands.addTo],
+    manage: ["manage", localizedCommands.manage],
+    properties: ["properties", localizedCommands.properties],
+    cancel: ["cancel", localizedCommands.cancel],
+  });
+  let commandLabelCache = null;
 
   const existingArtworkRuntime = window.ToolsForSteamArtwork;
   if (existingArtworkRuntime?.version >= version) {
@@ -98,6 +119,8 @@
     lastOpenRequestNonce: 0,
     lastLocalOpenRequestNonce: "",
     reactPatchInstalled: false,
+    reactPatchRetryTimer: null,
+    reactPatchRetryDelay: 0,
     focusItems: [],
     focusIndex: 0,
     gamepadFrame: 0,
@@ -109,14 +132,22 @@
     ignoreOverlayInputUntil: 0,
     artworkChannel: null,
     artworkChannelHandler: null,
-    lastArtworkInputNonce: "",
+    recentArtworkInputNonces: [],
     inputPollTimer: null,
     inputStorageHandler: null,
     overlayAnnounceTimer: null,
     remoteOverlayActive: false,
     catchAllInstalled: false,
+    catchAllRegistration: null,
+    catchAllCallback: null,
     previousCatchAllGamepadInput: null,
     catchAllButtonState: {},
+    heldSteamButtons: new Set(),
+    steamInputRelayAt: 0,
+    steamInputRelayAnnouncedAt: 0,
+    lastBrowserGamepadInput: "",
+    lastBrowserGamepadInputAt: 0,
+    returnFocusElement: null,
     rawSteamButtons: [],
     catchAllReleaseTimer: null,
     catchAllSuppressUntil: 0,
@@ -237,18 +268,36 @@
     }
   }
 
-  function shouldForwardSteamButton(button, action) {
+  function isDirectionalArtworkAction(action) {
+    return action === "up" || action === "down" || action === "left" || action === "right";
+  }
+
+  function shouldForwardSteamButton(button, action, isRepeat) {
+    // Fresh presses always count; only Steam's held-button repeats are paced.
     const now = Date.now();
-    const repeatMs = action === "up" || action === "down" || action === "left" || action === "right"
-      ? 230
-      : 340;
+    const minimumGapMs = isRepeat ? 120 : 40;
     const lastMs = state.catchAllButtonState[button] || 0;
-    if (now - lastMs < repeatMs) {
+    if (now - lastMs < minimumGapMs) {
       return false;
     }
 
     state.catchAllButtonState[button] = now;
     return true;
+  }
+
+  function removeStaleArtworkCatchAllCallbacks(focusNav) {
+    // Steam keeps catch-all handlers in a list now. Handlers left behind by an
+    // earlier TFS runtime would otherwise stay registered until Steam restarts.
+    const handlers = focusNav?.m_rgCatchAllGamepadInput;
+    if (!Array.isArray(handlers)) {
+      return;
+    }
+
+    for (let index = handlers.length - 1; index >= 0; index -= 1) {
+      if (handlers[index]?.__steamToolsArtworkCatchAll) {
+        handlers.splice(index, 1);
+      }
+    }
   }
 
   function installArtworkCatchAllInput() {
@@ -257,26 +306,41 @@
       return;
     }
 
+    removeStaleArtworkCatchAllCallbacks(focusNav);
     const previous = focusNav.m_fnCatchAllGamepadInput;
-    const callback = (button) => {
+    // Steam calls catch-all handlers for button down and button up, with a
+    // repeat flag for held buttons: (button, isButtonDown, isRepeat).
+    const callback = (button, isButtonDown = true, isRepeat = false) => {
       const action = getArtworkActionFromSteamButton(button);
       const overlayInputActive = state.remoteOverlayActive || Boolean(state.overlay);
-      rememberRawSteamButton(button, action);
+      const isRelease = isButtonDown === false;
 
       if (!overlayInputActive) {
-        if (action && Date.now() < state.catchAllSuppressUntil) {
+        // The press that closed the overlay is still held: its release and
+        // repeats must not reach the Steam page underneath.
+        if (isRelease && state.heldSteamButtons.delete(button)) {
+          return true;
+        }
+        if (state.heldSteamButtons.has(button) || Date.now() < state.catchAllSuppressUntil) {
           return true;
         }
 
-        return typeof previous === "function" ? previous(button) : false;
+        return typeof previous === "function" ? previous(button, isButtonDown, isRepeat) : false;
       }
 
-      if (!action) {
+      if (isRelease) {
+        state.heldSteamButtons.delete(button);
         return true;
       }
 
-      if (shouldForwardSteamButton(button, action)) {
-        postArtworkMessage({ type: "input", action, source: "steam-catch-all" });
+      state.heldSteamButtons.add(button);
+      rememberRawSteamButton(button, action);
+      if (!action || (isRepeat && !isDirectionalArtworkAction(action))) {
+        return true;
+      }
+
+      if (shouldForwardSteamButton(button, action, Boolean(isRepeat))) {
+        postArtworkMessage({ type: "input", action, repeat: Boolean(isRepeat), source: "steam-catch-all" });
       }
 
       return true;
@@ -284,7 +348,8 @@
 
     callback.__steamToolsArtworkCatchAll = true;
     state.previousCatchAllGamepadInput = previous?.__steamToolsArtworkCatchAll ? null : previous;
-    focusNav.SetCatchAllGamepadInput(callback);
+    state.catchAllRegistration = focusNav.SetCatchAllGamepadInput(callback) || null;
+    state.catchAllCallback = callback;
     state.catchAllInstalled = true;
   }
 
@@ -294,38 +359,123 @@
       return;
     }
 
-    if (focusNav.m_fnCatchAllGamepadInput?.__steamToolsArtworkCatchAll) {
+    if (typeof state.catchAllRegistration?.Unregister === "function") {
+      state.catchAllRegistration.Unregister();
+    } else if (focusNav.m_fnCatchAllGamepadInput?.__steamToolsArtworkCatchAll) {
       focusNav.SetCatchAllGamepadInput(state.previousCatchAllGamepadInput || undefined);
+    }
+    if (Array.isArray(focusNav.m_rgCatchAllGamepadInput) && state.catchAllCallback) {
+      const index = focusNav.m_rgCatchAllGamepadInput.indexOf(state.catchAllCallback);
+      if (index >= 0) {
+        focusNav.m_rgCatchAllGamepadInput.splice(index, 1);
+      }
     }
 
     state.catchAllInstalled = false;
+    state.catchAllRegistration = null;
+    state.catchAllCallback = null;
     state.previousCatchAllGamepadInput = null;
     state.catchAllButtonState = {};
     state.catchAllSuppressUntil = 0;
+    state.heldSteamButtons.clear();
   }
 
   function releaseArtworkInputCapture() {
+    const wasActive = state.remoteOverlayActive;
     state.remoteOverlayActive = false;
+    if (!state.catchAllInstalled || (!wasActive && state.catchAllReleaseTimer)) {
+      return;
+    }
+
     if (state.catchAllReleaseTimer) {
       window.clearTimeout(state.catchAllReleaseTimer);
-      state.catchAllReleaseTimer = null;
     }
-    state.catchAllSuppressUntil = 0;
-    uninstallArtworkCatchAllInput();
+
+    // Keep catching briefly after the overlay closes so the closing B (or a
+    // late repeat) cannot trigger Steam's own Back on the page underneath.
+    const now = Date.now();
+    const releaseDeadline = now + 1500;
+    state.catchAllSuppressUntil = now + 220;
+    const finishRelease = () => {
+      if (state.remoteOverlayActive || state.overlay) {
+        state.catchAllReleaseTimer = null;
+        return;
+      }
+
+      const current = Date.now();
+      if (
+        current < releaseDeadline &&
+        (state.heldSteamButtons.size || current < state.catchAllSuppressUntil)
+      ) {
+        state.catchAllReleaseTimer = window.setTimeout(finishRelease, 60);
+        return;
+      }
+
+      state.catchAllReleaseTimer = null;
+      uninstallArtworkCatchAllInput();
+    };
+    state.catchAllReleaseTimer = window.setTimeout(finishRelease, 60);
   }
 
   function setRemoteOverlayActive(active) {
-    state.remoteOverlayActive = Boolean(active);
-    if (state.remoteOverlayActive) {
+    if (active) {
+      state.remoteOverlayActive = true;
       if (state.catchAllReleaseTimer) {
         window.clearTimeout(state.catchAllReleaseTimer);
         state.catchAllReleaseTimer = null;
       }
       state.catchAllSuppressUntil = 0;
       installArtworkCatchAllInput();
+      announceSteamInputRelay();
     } else {
       releaseArtworkInputCapture();
     }
+  }
+
+  function announceSteamInputRelay() {
+    // Tell the overlay window that Steam's own controller input is relayed,
+    // so it stops reading the same pad a second time via getGamepads().
+    if (!state.catchAllInstalled || state.overlay) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - state.steamInputRelayAnnouncedAt < 400) {
+      return;
+    }
+
+    state.steamInputRelayAnnouncedAt = now;
+    try {
+      getArtworkChannel()?.postMessage({ type: "steam-input-relay", at: now });
+    } catch {
+    }
+    try {
+      localStorage.setItem(steamInputRelayStorageKey, String(now));
+    } catch {
+    }
+  }
+
+  function noteSteamInputRelay(at = Date.now()) {
+    const value = Number(at) || 0;
+    if (value > state.steamInputRelayAt && value <= Date.now() + 1000) {
+      state.steamInputRelayAt = value;
+    }
+  }
+
+  function isSteamInputRelayActive() {
+    return Date.now() - state.steamInputRelayAt < 2500;
+  }
+
+  function rememberArtworkInputNonce(nonce) {
+    if (state.recentArtworkInputNonces.includes(nonce)) {
+      return false;
+    }
+
+    state.recentArtworkInputNonces.push(nonce);
+    if (state.recentArtworkInputNonces.length > 48) {
+      state.recentArtworkInputNonces.shift();
+    }
+    return true;
   }
 
   function consumeArtworkInput(raw) {
@@ -335,12 +485,25 @@
 
     try {
       const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (payload?.type !== "input" || !payload.action || payload.nonce === state.lastArtworkInputNonce) {
+      if (payload?.type !== "input" || !payload.action || !payload.nonce) {
         return;
       }
 
-      state.lastArtworkInputNonce = payload.nonce;
-      maybeRepeatGamepadAction(payload.action, String(payload.source || "remote"));
+      // The same input arrives over BroadcastChannel, the storage event and
+      // the storage poll; each nonce may act once, and old leftovers never.
+      const sentAt = Number.parseInt(String(payload.nonce), 10);
+      if (!rememberArtworkInputNonce(String(payload.nonce)) || (sentAt && Date.now() - sentAt > 1500)) {
+        return;
+      }
+
+      if (payload.source === "steam-catch-all") {
+        noteSteamInputRelay();
+      }
+      maybeRepeatGamepadAction(
+        payload.action,
+        String(payload.source || "remote"),
+        payload.repeat !== false,
+      );
     } catch {
     }
   }
@@ -363,6 +526,8 @@
   function handleArtworkChannelMessage(payload) {
     if (payload?.type === "input") {
       consumeArtworkInput(payload);
+    } else if (payload?.type === "steam-input-relay") {
+      noteSteamInputRelay(payload.at);
     } else if (payload?.type === "overlay-state") {
       consumeArtworkOverlayState(payload);
     }
@@ -403,6 +568,8 @@
           consumeArtworkInput(event.newValue);
         } else if (event.key === overlayStateStorageKey) {
           consumeArtworkOverlayState(event.newValue);
+        } else if (event.key === steamInputRelayStorageKey) {
+          noteSteamInputRelay(event.newValue);
         }
       };
       window.addEventListener("storage", state.inputStorageHandler);
@@ -413,6 +580,9 @@
         try {
           consumeArtworkInput(localStorage.getItem(inputStorageKey));
           consumeArtworkOverlayState(localStorage.getItem(overlayStateStorageKey));
+          if (state.overlay) {
+            noteSteamInputRelay(localStorage.getItem(steamInputRelayStorageKey));
+          }
         } catch {
         }
       }, 100);
@@ -552,10 +722,7 @@
       .steamtools-artwork-type-chip:hover,
       .steamtools-artwork-type-shoulder:focus,
       .steamtools-artwork-type-shoulder.is-controller-focus,
-      .steamtools-artwork-type-shoulder:hover,
-      .steamtools-artwork-asset:focus,
-      .steamtools-artwork-asset.is-controller-focus,
-      .steamtools-artwork-asset:hover {
+      .steamtools-artwork-type-shoulder:hover {
         outline: none;
         background: #485261;
         color: #ffffff;
@@ -569,6 +736,72 @@
 
       .steamtools-artwork-asset.is-applied .steamtools-artwork-asset-meta {
         color: #9ce8ad;
+      }
+
+      /* Artwork cards follow Steam's Big Picture capsules: the focused card
+         lifts slightly and a bright ring is painted above the image, so it
+         stays visible on full-bleed artwork and on already applied cards. */
+      .steamtools-artwork-asset {
+        transition: transform 140ms ease-out, box-shadow 140ms ease-out;
+      }
+
+      .steamtools-artwork-asset::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        border-radius: inherit;
+        pointer-events: none;
+        opacity: 0;
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.14), transparent 38%);
+        box-shadow:
+          inset 0 0 0 3px #ffffff,
+          inset 0 0 0 5px rgba(6, 11, 17, 0.5);
+        transition: opacity 140ms ease-out;
+      }
+
+      .steamtools-artwork-asset:hover::after {
+        opacity: 0.4;
+      }
+
+      .steamtools-artwork-asset:focus,
+      .steamtools-artwork-asset.is-controller-focus {
+        outline: none;
+        z-index: 1;
+        background: #3a4553;
+        color: #ffffff;
+        transform: scale(1.045);
+        box-shadow:
+          0 14px 30px rgba(0, 0, 0, 0.55),
+          0 0 24px rgba(99, 214, 255, 0.32);
+      }
+
+      .steamtools-artwork-asset.is-applied:focus,
+      .steamtools-artwork-asset.is-applied.is-controller-focus {
+        box-shadow:
+          0 14px 30px rgba(0, 0, 0, 0.55),
+          0 0 24px rgba(101, 226, 132, 0.4);
+      }
+
+      .steamtools-artwork-asset:focus::after,
+      .steamtools-artwork-asset.is-controller-focus::after {
+        opacity: 1;
+      }
+
+      .steamtools-artwork-asset.is-controller-focus .steamtools-artwork-asset-resolution {
+        color: #ffffff;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .steamtools-artwork-asset,
+        .steamtools-artwork-asset::after {
+          transition: none;
+        }
+
+        .steamtools-artwork-asset:focus,
+        .steamtools-artwork-asset.is-controller-focus {
+          transform: none;
+        }
       }
 
       .steamtools-artwork-search {
@@ -1718,14 +1951,79 @@
       .toLowerCase();
   }
 
+  function getSteamLocalization() {
+    try {
+      return window.LocalizationManager || window.opener?.LocalizationManager || null;
+    } catch {
+      return window.LocalizationManager || null;
+    }
+  }
+
+  function localizeSteamToken(token) {
+    try {
+      const value = getSteamLocalization()?.LocalizeString?.(token);
+      return typeof value === "string" && value && !value.startsWith("#") ? value : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // Normalized labels of one Steam menu command in every language TFS can
+  // see right now: Steam's current UI language plus the English/German fallback.
+  function getCommandLabels(name) {
+    const manager = getSteamLocalization();
+    let locale = "";
+    try {
+      locale = String(manager?.GetPreferredLocales?.()?.[0] || "");
+    } catch {
+    }
+    if (!commandLabelCache || commandLabelCache.manager !== manager || commandLabelCache.locale !== locale) {
+      commandLabelCache = { manager, locale, labels: new Map() };
+    }
+
+    let labels = commandLabelCache.labels.get(name);
+    if (!labels) {
+      labels = new Set((fallbackCommandLabels[name] || []).map(normalizeMenuText).filter(Boolean));
+      for (const token of steamCommandTokens[name] || []) {
+        const label = normalizeMenuText(localizeSteamToken(token));
+        if (label) {
+          labels.add(label);
+        }
+      }
+      commandLabelCache.labels.set(name, labels);
+    }
+    return labels;
+  }
+
+  function textIncludesCommand(text, name) {
+    for (const label of getCommandLabels(name)) {
+      if (text.includes(label)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function isPropertiesText(value) {
-    const text = normalizeMenuText(value);
-    return text === "properties" || text === localizedCommands.properties;
+    return getCommandLabels("properties").has(normalizeMenuText(value));
   }
 
   function isCancelText(value) {
-    const text = normalizeMenuText(value);
-    return text === "cancel" || text === localizedCommands.cancel;
+    return getCommandLabels("cancel").has(normalizeMenuText(value));
+  }
+
+  // Steam's "Properties" entry calls navigator.AppProperties(appid). Matching
+  // that handler (not the label) finds it in every Steam UI language.
+  function isAppPropertiesMenuItem(item) {
+    const source = getFunctionSource(item?.props?.onSelected || item?.props?.onClick || item?.onSelected);
+    return source.includes("AppProperties");
+  }
+
+  function hasNestedAppPropertiesMenuItem(items) {
+    return items.some((item) => {
+      const children = item?.props?.children;
+      return Array.isArray(children) && children.some(isAppPropertiesMenuItem);
+    });
   }
 
   function findPropertiesMenuIndex(items) {
@@ -2358,6 +2656,11 @@
       if (event?.stopPropagation) {
         event.stopPropagation();
       }
+      // The TFS Artworks page (a real Steam route from artwork-picker.js) is
+      // preferred; the overlay stays as fallback while it is not loaded.
+      const page = getArtworkPageRuntime();
+      const pageAppId = normalizeSteamAppId(normalizedContext?.appId);
+      if (pageAppId && page?.hasEditor?.() === true && page.openEditor(pageAppId)) return;
       requestArtworkPanel(normalizedContext);
     };
     const templateProps = template?.props || {};
@@ -2389,6 +2692,9 @@
     const appId = normalizeSteamAppId(normalizedContext?.appId);
     const curtain = window.ToolsForSteamCurtain;
     const enabled = curtain?.isGameEnabled?.(appId) === true;
+    // With the shared runtime the entry opens the per-game TFS Curtain page
+    // (a Steam route); without it, it falls back to the old on/off toggle.
+    const editor = curtain?.hasEditor?.() === true;
     let lastActivationAt = 0;
     const onSelected = (event) => {
       const now = Date.now();
@@ -2396,6 +2702,7 @@
       lastActivationAt = now;
       event?.preventDefault?.();
       event?.stopPropagation?.();
+      if (editor && curtain?.openEditor?.(appId)) return;
       void curtain?.toggleGame?.(
         appId,
         !enabled,
@@ -2418,7 +2725,190 @@
         onMouseUp: onSelected,
         onPointerUp: onSelected,
         onSelected,
-        children: `TFS Curtain: ${enabled ? "On" : "Off"}`,
+        children: editor ? `TFS Curtain... (${enabled ? "On" : "Off"})` : `TFS Curtain: ${enabled ? "On" : "Off"}`,
+      },
+    };
+  }
+
+  // TFS Trailers lives in Steam's shared context (trailer-core.js); Big
+  // Picture reaches it through window.opener.
+  function getTrailerRuntime() {
+    try {
+      return window.__tfsTrailers || window.opener?.__tfsTrailers || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getArtworkPageRuntime() {
+    try {
+      return window.__tfsArtworks || window.opener?.__tfsArtworks || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function createReactTrailerMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
+    const trailers = getTrailerRuntime();
+    const enabled = trailers?.isGameEnabled?.(appId) === true;
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) return;
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      getTrailerRuntime()?.openEditor?.(appId);
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-trailer-settings",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [templateProps.className, "steamtools-trailer-context-row"]
+          .filter(Boolean)
+          .join(" "),
+        "data-steamtools-trailer-row": "true",
+        "data-steamtools-trailer-app-id": String(appId || ""),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: `TFS Trailer... (${enabled ? "On" : "Off"})`,
+      },
+    };
+  }
+
+  // TFS Overture (game theme music) lives in the shared context as well.
+  function getOvertureRuntime() {
+    try {
+      return window.__tfsOverture || window.opener?.__tfsOverture || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function createReactOvertureMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) return;
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      getOvertureRuntime()?.openEditor?.(appId);
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-overture-settings",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [templateProps.className, "steamtools-overture-context-row"]
+          .filter(Boolean)
+          .join(" "),
+        "data-steamtools-overture-row": "true",
+        "data-steamtools-overture-app-id": String(appId || ""),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: "TFS Overture...",
+      },
+    };
+  }
+
+  // TFS Metadata (game details for non-Steam games), shared context.
+  function getMetadataRuntime() {
+    try {
+      return window.__tfsMetadata || window.opener?.__tfsMetadata || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function createReactMetadataMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) return;
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      getMetadataRuntime()?.openEditor?.(appId);
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-metadata-editor",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [templateProps.className, "steamtools-metadata-context-row"]
+          .filter(Boolean)
+          .join(" "),
+        "data-steamtools-metadata-row": "true",
+        "data-steamtools-metadata-app-id": String(appId || ""),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: "TFS Metadata...",
+      },
+    };
+  }
+
+  // TFS game profiles (TDP, frame rate, RTSS ... per game) from perf-tab.js, shared context.
+  // Offered only when this device has TDP control (handheld with a known AMD TDP range).
+  function getPerfTabRuntime() {
+    try {
+      return window.__tfsPerfTab || window.opener?.__tfsPerfTab || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function createReactGameProfileMenuItem(template, context) {
+    const normalizedContext = rememberArtworkContext(context) || context;
+    const appId = normalizeSteamAppId(normalizedContext?.appId);
+    const title = String(normalizedContext?.title || "");
+    const perfTab = getPerfTabRuntime();
+    const exists = perfTab?.hasGameProfileForApp?.(appId) === true;
+    let lastActivationAt = 0;
+    const onSelected = (event) => {
+      const now = Date.now();
+      if (now - lastActivationAt < 750) return;
+      lastActivationAt = now;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      getPerfTabRuntime()?.openGameProfileForApp?.(appId, title);
+    };
+    const templateProps = template?.props || {};
+    return {
+      ...template,
+      key: "tfs-game-profile",
+      props: {
+        ...templateProps,
+        disabled: false,
+        className: [templateProps.className, "steamtools-game-profile-context-row"]
+          .filter(Boolean)
+          .join(" "),
+        "data-steamtools-game-profile-row": "true",
+        "data-steamtools-game-profile-app-id": String(appId || ""),
+        onClick: onSelected,
+        onMouseUp: onSelected,
+        onPointerUp: onSelected,
+        onSelected,
+        children: perfTab?.gameProfileMenuLabel?.(exists) || (exists ? "TFS Game Profile..." : "TFS Game Profile (new)..."),
       },
     };
   }
@@ -2442,7 +2932,11 @@
   }
 
   function patchReactMenuItems(items, context) {
-    if (!isOpeningAppContextMenu(items)) {
+    // The game context menu is recognized by Steam's own handlers, never by
+    // its labels: the Properties entry (also in the game page's options menu,
+    // which has no Play entry) or the launch entry.
+    const hasAppPropertiesItem = Array.isArray(items) && items.some(isAppPropertiesMenuItem);
+    if (!hasAppPropertiesItem && !isOpeningAppContextMenu(items)) {
       return false;
     }
 
@@ -2450,6 +2944,10 @@
       if (
         items[index]?.key === "tfs-change-artwork" ||
         items[index]?.key === "tfs-curtain-toggle" ||
+        items[index]?.key === "tfs-trailer-settings" ||
+        items[index]?.key === "tfs-overture-settings" ||
+        items[index]?.key === "tfs-metadata-editor" ||
+        items[index]?.key === "tfs-game-profile" ||
         items[index]?.key === "tfs-omnilibrary-data-refresh" ||
         items[index]?.key === "tfs-omnilibrary-repair" ||
         items[index]?.key === "tfs-omnilibrary-uninstall"
@@ -2458,7 +2956,16 @@
       }
     }
 
-    const propertiesIndex = findPropertiesMenuIndex(items);
+    // Current Steam builds keep Properties in a Fragment together with its
+    // separator. That nested array is patched on its own, so the entries are
+    // not added a second time at this level.
+    if (!hasAppPropertiesItem && hasNestedAppPropertiesMenuItem(items)) {
+      return false;
+    }
+
+    const propertiesIndex = hasAppPropertiesItem
+      ? items.findIndex(isAppPropertiesMenuItem)
+      : findPropertiesMenuIndex(items);
     if (propertiesIndex < 0) {
       return false;
     }
@@ -2484,19 +2991,23 @@
     if (window.ToolsForSteamCurtain?.snapshot?.enabled === true) {
       additions.push(createReactCurtainMenuItem(template, resolvedContext));
     }
+    if (getTrailerRuntime()?.hasEditor?.() === true) {
+      additions.push(createReactTrailerMenuItem(template, resolvedContext));
+    }
+    if (getOvertureRuntime()?.hasEditor?.() === true) {
+      additions.push(createReactOvertureMenuItem(template, resolvedContext));
+    }
+    if (getMetadataRuntime()?.hasEditor?.(resolvedContext.appId) === true) {
+      additions.push(createReactMetadataMenuItem(template, resolvedContext));
+    }
+    if (getPerfTabRuntime()?.hasGameProfiles?.() === true) {
+      additions.push(createReactGameProfileMenuItem(template, resolvedContext));
+    }
     if (state.contextMenuEnabled) {
       additions.push(createReactArtworkMenuItem(template, resolvedContext));
     }
-    const managedStore = getManagedOmniLibraryStore(resolvedContext.appId);
-    if (managedStore) {
-      additions.push(
-        createReactOmniLibraryDataMenuItem(
-          template,
-          resolvedContext,
-          managedStore.id,
-        ),
-      );
-    }
+    // "Fix Game Data..." is no longer offered: "TFS Metadata..." covers the
+    // Steam match for OmniLibrary games (Luis, 2026-11-09).
     if (installedStore) {
       if (isRepairableOmniLibraryGame(installedStore, resolvedContext.appId)) {
         additions.push(
@@ -2511,8 +3022,55 @@
       return false;
     }
 
-    items.splice(propertiesIndex, 0, ...additions);
+    items.splice(propertiesIndex, 0, ...additions.map(withMenuAutoClose));
     return true;
+  }
+
+  /**
+   * Steam's menu item hides its menu only when its own click path reaches the
+   * end; our entries act earlier (pointer up, or they navigate to a TFS page),
+   * which left the context menu open over the new page. Close it explicitly
+   * through the menu instance found in the item's React fiber.
+   */
+  function closeSteamContextMenu(node) {
+    window.setTimeout(() => {
+      try {
+        const fiberKey = node && Object.keys(node).find((key) => key.startsWith("__reactFiber$"));
+        let fiber = fiberKey ? node[fiberKey] : null;
+        for (let depth = 0; fiber && depth < 60; depth += 1, fiber = fiber.return) {
+          const instance = fiber.stateNode?.instance;
+          if (instance && typeof instance.ForceHide === "function") {
+            instance.ForceHide();
+            return;
+          }
+        }
+      } catch {}
+    }, 0);
+  }
+
+  function withMenuAutoClose(item) {
+    const props = item?.props;
+    if (!props) return item;
+    const wrap = (handler) => (typeof handler === "function"
+      ? (event, ...rest) => {
+        const node = event?.currentTarget || event?.target || null;
+        try {
+          return handler(event, ...rest);
+        } finally {
+          closeSteamContextMenu(node);
+        }
+      }
+      : handler);
+    return {
+      ...item,
+      props: {
+        ...props,
+        onSelected: wrap(props.onSelected),
+        onClick: wrap(props.onClick),
+        onMouseUp: wrap(props.onMouseUp),
+        onPointerUp: wrap(props.onPointerUp),
+      },
+    };
   }
 
   function patchMenuRenderOutput(rendered, context) {
@@ -2718,6 +3276,38 @@
     return true;
   }
 
+  /**
+   * The React patch is what adds Curtain, Trailer, Overture, Metadata and
+   * Game Profile to the game context menu; the DOM fallback only adds the
+   * artwork and OmniLibrary rows. At injection time Steam may not have
+   * registered React or the LibraryContextMenu module yet (Steam start,
+   * library chunk loaded later), and a single failed attempt used to leave
+   * the menu with "TFS Artworks..." only until the next reinjection.
+   * Retry with backoff (each attempt scans the webpack modules, ~50 ms).
+   */
+  function scheduleReactContextMenuPatchRetry() {
+    if (state.reactPatchInstalled || state.reactPatchRetryTimer) {
+      return;
+    }
+
+    state.reactPatchRetryDelay = Math.min(
+      30000,
+      state.reactPatchRetryDelay ? state.reactPatchRetryDelay * 2 : 1000,
+    );
+    state.reactPatchRetryTimer = window.setTimeout(() => {
+      state.reactPatchRetryTimer = null;
+      if (!installReactContextMenuPatch()) {
+        scheduleReactContextMenuPatchRetry();
+      }
+    }, state.reactPatchRetryDelay);
+  }
+
+  function ensureReactContextMenuPatch() {
+    if (!installReactContextMenuPatch()) {
+      scheduleReactContextMenuPatchRetry();
+    }
+  }
+
   function getReactPropertyKey(element, prefix) {
     return element
       ? Object.getOwnPropertyNames(element).find((name) => name.startsWith(prefix))
@@ -2842,22 +3432,12 @@
       return "";
     }
 
-    const commandLabels = new Set([
-      "play",
-      localizedCommands.play,
-      "add to favorites",
-      localizedCommands.addToFavorites,
-      "add to",
-      localizedCommands.addTo,
-      "manage",
-      localizedCommands.manage,
-      "properties",
-      localizedCommands.properties,
-      "cancel",
-      localizedCommands.cancel,
-      "change artwork",
-      "tfs artworks",
-    ]);
+    const commandLabels = new Set(["change artwork", "tfs artworks"]);
+    for (const name of Object.keys(steamCommandTokens)) {
+      for (const label of getCommandLabels(name)) {
+        commandLabels.add(label);
+      }
+    }
 
     const candidates = [...menu.querySelectorAll("h1, h2, [class*='title'], [class*='Title'], div, span")]
       .filter((item) => item instanceof HTMLElement)
@@ -2993,31 +3573,96 @@
   function isGameContextMenu(menu) {
     const text = normalizeMenuText(textOf(menu));
     return (
-      (text.includes("properties") || text.includes(localizedCommands.properties)) &&
-      (
-        text.includes("play") ||
-        text.includes(localizedCommands.play) ||
-        text.includes("manage") ||
-        text.includes(localizedCommands.manage)
-      )
+      textIncludesCommand(text, "properties") &&
+      (textIncludesCommand(text, "play") || textIncludesCommand(text, "manage"))
     );
   }
 
-  function findMenuCandidates() {
-    return [...document.querySelectorAll("[role='menu'], [class*='contextmenu'], [class*='ContextMenu'], div")]
-      .filter((node) => node instanceof HTMLElement)
-      .filter((node) => node.offsetParent !== null)
-      .filter((node) => {
-        const rect = node.getBoundingClientRect();
-        if (rect.width < 240 || rect.width > Math.min(window.innerWidth, 1100) || rect.height < 180) {
-          return false;
-        }
+  // Text checks first, layout last: measuring every div of the Library on each
+  // DOM change was the main Tools for Steam cost while browsing (forced layout).
+  function isMenuCandidate(node) {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
 
-        const textLength = textOf(node).length;
-        return textLength > 30 && textLength < 1200;
-      })
-      .filter(isGameContextMenu)
-      .slice(0, 6);
+    const rawLength = (node.textContent || "").length;
+    if (rawLength <= 30 || rawLength > 4000) {
+      return false;
+    }
+
+    const textLength = textOf(node).length;
+    if (textLength <= 30 || textLength >= 1200 || !isGameContextMenu(node)) {
+      return false;
+    }
+
+    if (node.offsetParent === null) {
+      return false;
+    }
+
+    const rect = node.getBoundingClientRect();
+    return !(rect.width < 240 || rect.width > Math.min(window.innerWidth, 1100) || rect.height < 180);
+  }
+
+  function findMenuCandidates(root = document) {
+    const nodes = [];
+    if (root !== document && root instanceof HTMLElement) {
+      nodes.push(root);
+    }
+    if (typeof root?.querySelectorAll === "function") {
+      nodes.push(...root.querySelectorAll("[role='menu'], [class*='contextmenu'], [class*='ContextMenu'], div"));
+    }
+
+    const result = [];
+    for (const node of nodes) {
+      if (result.includes(node) || !isMenuCandidate(node)) {
+        continue;
+      }
+
+      result.push(node);
+      if (result.length >= 6) {
+        break;
+      }
+    }
+
+    return result;
+  }
+
+  // Only nodes Steam just inserted can be (or belong to) a new context menu.
+  function findMenusForAddedNodes(addedNodes) {
+    const menus = new Set();
+    // Sibling insertions share ancestors (a Library grid adds dozens of cells
+    // at once); test each ancestor once per batch, not once per added node.
+    const checkedAncestors = new Set();
+    for (const node of addedNodes) {
+      if (!(node instanceof HTMLElement) || !node.isConnected) {
+        continue;
+      }
+
+      // A game context menu always carries a Properties row. Library cells,
+      // artwork and focus rings never do, so they cost one string check.
+      const addedText = (node.textContent || "").toLowerCase();
+      if (!textIncludesCommand(addedText, "properties")) {
+        continue;
+      }
+
+      let ancestor = node.parentElement;
+      for (let depth = 0; ancestor && depth < 6; depth += 1, ancestor = ancestor.parentElement) {
+        if (checkedAncestors.has(ancestor)) {
+          break;
+        }
+        checkedAncestors.add(ancestor);
+        if (isMenuCandidate(ancestor)) {
+          menus.add(ancestor);
+          break;
+        }
+      }
+
+      for (const menu of findMenuCandidates(node)) {
+        menus.add(menu);
+      }
+    }
+
+    return [...menus].slice(0, 6);
   }
 
   function findPropertiesRow(menu) {
@@ -3387,16 +4032,22 @@
     state.contextTrackingInstalled = false;
   }
 
-  function patchMenus() {
+  function patchMenus(menus) {
     if (!state.contextMenuEnabled) {
       removeArtworkContextRows();
     }
 
-    for (const menu of findMenuCandidates()) {
+    for (const menu of Array.isArray(menus) ? menus : findMenuCandidates()) {
       if (!isGameContextMenu(menu)) {
         removeArtworkContextRows(menu);
         removeOmniLibraryUninstallContextRows(menu);
         continue;
+      }
+
+      // A game menu reached the DOM fallback: make sure the React patch is in
+      // place so the next opening carries all TFS entries.
+      if (!state.reactPatchInstalled) {
+        installReactContextMenuPatch();
       }
 
       const menuContext = getContextDataFromNode(menu);
@@ -3416,21 +4067,9 @@
       }
 
       const installedStore = getInstalledOmniLibraryStore(menuContext?.appId);
-      const managedStore = getManagedOmniLibraryStore(menuContext?.appId);
-      const dataRow = menu.querySelector(
-        ".steamtools-omnilibrary-data-context-row",
-      );
-      if (!managedStore) {
-        dataRow?.remove();
-      } else if (!dataRow) {
-        const row = createOmniLibraryDataContextRow(
-          propertiesRow,
-          menu,
-          menuContext,
-          managedStore.id,
-        );
-        parent.insertBefore(row, propertiesRow);
-      }
+      // "Fix Game Data..." is retired (see the React path); drop rows an
+      // older surface version may have left in an open menu.
+      menu.querySelector(".steamtools-omnilibrary-data-context-row")?.remove();
       const repairRow = menu.querySelector(
         ".steamtools-omnilibrary-repair-context-row",
       );
@@ -4404,17 +5043,79 @@
     firstAsset.scrollIntoView({ block: "start", inline: "nearest" });
   }
 
-  function getArtworkGridStep() {
-    const current = state.focusItems[state.focusIndex];
-    if (!current?.classList.contains("steamtools-artwork-asset")) {
-      return 1;
+  function getArtworkFocusGeometry(element) {
+    // The focused card is scaled around its centre, so take the centre from
+    // the rendered box and the size from the untransformed layout box.
+    const rect = element.getBoundingClientRect();
+    const width = element.offsetWidth || rect.width;
+    const height = element.offsetHeight || rect.height;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    return {
+      x,
+      y,
+      left: x - width / 2,
+      right: x + width / 2,
+      top: y - height / 2,
+      bottom: y + height / 2,
+    };
+  }
+
+  const artworkFocusGroupSelector = [
+    ".steamtools-artwork-grid",
+    ".steamtools-artwork-side",
+    ".steamtools-artwork-type-rail",
+    ".steamtools-artwork-search",
+    ".steamtools-metadata-actions",
+  ].join(", ");
+
+  function findArtworkFocusNeighbor(current, direction, items) {
+    // Spatial navigation like Steam: pick the nearest control beyond the
+    // current one's edge, preferring the same column or row. No wrap-around,
+    // and a move only reaches controls lying alongside the current section,
+    // so Right at the end of a grid row stays instead of jumping to the bar.
+    const from = getArtworkFocusGeometry(current);
+    const vertical = direction === "up" || direction === "down";
+    const group = current.closest?.(artworkFocusGroupSelector)?.getBoundingClientRect?.();
+    let best = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const item of items) {
+      if (item === current) {
+        continue;
+      }
+
+      const to = getArtworkFocusGeometry(item);
+      const gap =
+        direction === "down" ? to.top - from.bottom
+          : direction === "up" ? from.top - to.bottom
+            : direction === "right" ? to.left - from.right
+              : from.left - to.right;
+      if (gap < -2) {
+        continue;
+      }
+
+      if (
+        group &&
+        (vertical
+          ? to.right < group.left - 1 || to.left > group.left + group.width + 1
+          : to.bottom < group.top - 1 || to.top > group.top + group.height + 1)
+      ) {
+        continue;
+      }
+
+      const crossGap = vertical
+        ? Math.max(0, Math.max(from.left, to.left) - Math.min(from.right, to.right))
+        : Math.max(0, Math.max(from.top, to.top) - Math.min(from.bottom, to.bottom));
+      const centreOffset = vertical ? Math.abs(to.x - from.x) : Math.abs(to.y - from.y);
+      const score = Math.max(0, gap) + crossGap * 3 + centreOffset * 0.25;
+      if (score < bestScore) {
+        bestScore = score;
+        best = item;
+      }
     }
 
-    const grid = current.closest(".steamtools-artwork-grid");
-    const firstAsset = grid?.querySelector(".steamtools-artwork-asset");
-    const gridWidth = grid?.getBoundingClientRect().width || 0;
-    const itemWidth = firstAsset?.getBoundingClientRect().width || 0;
-    return Math.max(1, Math.floor(gridWidth / Math.max(1, itemWidth + 8)));
+    return best;
   }
 
   function moveArtworkFocus(direction) {
@@ -4423,49 +5124,16 @@
       return;
     }
 
-    if (
-      state.overlayMode === "metadata" &&
-      ((state.focusZone === "side" && direction === "right") ||
-       (state.focusZone === "assets" && direction === "left"))
-    ) {
-      toggleArtworkFocusZone();
-      return;
-    }
-
-    const zoneItems = getArtworkZoneItems();
-    if (!zoneItems.length) {
-      return;
-    }
-
     const current = state.focusItems[state.focusIndex];
-    const zoneIndex = Math.max(0, zoneItems.indexOf(current));
-    const step =
-      state.focusZone === "side"
-        ? direction === "up" || direction === "left"
-          ? -1
-          : 1
-        : direction === "up"
-        ? -getArtworkGridStep()
-        : direction === "down"
-          ? getArtworkGridStep()
-          : direction === "left"
-            ? -1
-            : 1;
-    const nextZoneIndex = (zoneIndex + step + zoneItems.length) % zoneItems.length;
-    state.focusIndex = state.focusItems.indexOf(zoneItems[nextZoneIndex]);
-    applyArtworkFocus();
-  }
-
-  function toggleArtworkFocusZone() {
-    refreshArtworkFocus();
-    const nextZone = state.focusZone === "assets" ? "side" : "assets";
-    const nextItems = getArtworkZoneItems(nextZone);
-    if (!nextItems.length) {
+    const next = current
+      ? findArtworkFocusNeighbor(current, direction, state.focusItems)
+      : state.focusItems[0];
+    if (!next) {
       return;
     }
 
-    state.focusZone = nextZone;
-    state.focusIndex = state.focusItems.indexOf(nextItems[0]);
+    state.focusIndex = state.focusItems.indexOf(next);
+    state.focusZone = getArtworkItemZone(next);
     applyArtworkFocus();
   }
 
@@ -4514,35 +5182,37 @@
       isPreviousTypeKey ||
       isNextTypeKey;
 
+    // Nothing typed while the overlay is open may reach the Steam page below.
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
     if (!handled) {
       return;
     }
 
     event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
 
     if (Date.now() < state.ignoreOverlayInputUntil) {
       return;
     }
 
     const source = key.startsWith("Gamepad") ? "steam-key" : "keyboard";
+    const isRepeat = Boolean(event.repeat);
     if (key === "ArrowUp") {
-      maybeRepeatGamepadAction("up", source);
+      maybeRepeatGamepadAction("up", source, isRepeat);
     } else if (key === "ArrowDown") {
-      maybeRepeatGamepadAction("down", source);
+      maybeRepeatGamepadAction("down", source, isRepeat);
     } else if (key === "ArrowLeft") {
-      maybeRepeatGamepadAction("left", source);
+      maybeRepeatGamepadAction("left", source, isRepeat);
     } else if (key === "ArrowRight") {
-      maybeRepeatGamepadAction("right", source);
+      maybeRepeatGamepadAction("right", source, isRepeat);
     } else if (key === "Escape" || key === "GamepadB") {
-      maybeRepeatGamepadAction("b", source);
+      maybeRepeatGamepadAction("b", source, isRepeat);
     } else if (isPreviousTypeKey) {
-      maybeRepeatGamepadAction("previous-type", source);
+      maybeRepeatGamepadAction("previous-type", source, isRepeat);
     } else if (isNextTypeKey) {
-      maybeRepeatGamepadAction("next-type", source);
+      maybeRepeatGamepadAction("next-type", source, isRepeat);
     } else {
-      maybeRepeatGamepadAction("a", source);
+      maybeRepeatGamepadAction("a", source, isRepeat);
     }
   }
 
@@ -4573,7 +5243,7 @@
     }
   }
 
-  function maybeRepeatGamepadAction(action, source = "browser-gamepad") {
+  function maybeRepeatGamepadAction(action, source = "browser-gamepad", isRepeat = true) {
     const now = Date.now();
     if (now < state.ignoreOverlayInputUntil) {
       return;
@@ -4583,6 +5253,14 @@
     if (isSteamSource) {
       state.lastSteamGamepadInput = action;
       state.lastSteamGamepadInputAt = now;
+      // The browser pad may have reported this very press a moment earlier.
+      if (
+        action === state.lastBrowserGamepadInput &&
+        now - state.lastBrowserGamepadInputAt < 220
+      ) {
+        state.lastBrowserGamepadInput = "";
+        return;
+      }
     } else if (
       action === state.lastSteamGamepadInput &&
       now - state.lastSteamGamepadInputAt < 220
@@ -4590,13 +5268,23 @@
       return;
     }
 
-    const repeatDelay = state.lastGamepadInput === action ? 170 : 260;
-    if (state.lastGamepadInput === action && now - state.lastGamepadInputAt < repeatDelay) {
+    // A fresh press always counts, so quick taps are never swallowed; held
+    // buttons and the per-frame browser gamepad poll repeat at a steady pace.
+    const freshPress = !isRepeat && source !== "browser-gamepad";
+    if (
+      !freshPress &&
+      state.lastGamepadInput === action &&
+      now - state.lastGamepadInputAt < 150
+    ) {
       return;
     }
 
     state.lastGamepadInput = action;
     state.lastGamepadInputAt = now;
+    if (source === "browser-gamepad") {
+      state.lastBrowserGamepadInput = action;
+      state.lastBrowserGamepadInputAt = now;
+    }
     handleGamepadAction(action);
   }
 
@@ -4636,7 +5324,11 @@
 
     const gamepads = typeof navigator.getGamepads === "function" ? navigator.getGamepads() : [];
     const gamepad = [...gamepads].find(Boolean);
-    if (gamepad) {
+    // Steam's relayed input is authoritative; reading the same pad here as
+    // well made every press move twice. The browser pad is only a fallback.
+    if (gamepad && isSteamInputRelayActive()) {
+      state.pressedGamepadButtons = getPressedArtworkGamepadActions();
+    } else if (gamepad) {
       const pressed = new Set();
       const buttonMap = [
         [0, "a"],
@@ -4820,7 +5512,7 @@
     hint.append(createElement("span", "steamtools-artwork-controller-key", "A"));
     hint.append(createElement("span", null, "Select"));
     hint.append(createElement("span", "steamtools-artwork-controller-key", "B"));
-    hint.append(createElement("span", null, "Close"));
+    hint.append(createElement("span", null, "Back"));
     state.overlay.append(hint);
 
     window.requestAnimationFrame(() => refreshArtworkFocus());
@@ -5036,7 +5728,7 @@
     hint.append(createElement("span", "steamtools-artwork-controller-key", "A"));
     hint.append(createElement("span", null, "Apply"));
     hint.append(createElement("span", "steamtools-artwork-controller-key", "B"));
-    hint.append(createElement("span", null, "Close"));
+    hint.append(createElement("span", null, "Back"));
     state.overlay.append(hint);
 
     if (state.error || state.applying) {
@@ -5060,7 +5752,32 @@
     });
   }
 
+  // The old artwork overlay is retired: every way that used to open it (game
+  // context menu, Quick Access, open requests) now opens the TFS Artworks page.
+  function openArtworkPage(appId) {
+    const id = normalizeSteamAppId(appId);
+    if (!id) return false;
+    try {
+      const page = getArtworkPageRuntime();
+      if (page?.openEditor?.(id)) return true;
+    } catch {}
+    try {
+      const store = window.SteamUIStore || window.opener?.SteamUIStore;
+      const main = store?.m_WindowStore?.GamepadUIMainWindowInstance;
+      if (typeof main?.Navigate === "function") {
+        main.Navigate(`/tfs/artworks/${id}`);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
   function openOverlay(context) {
+    if (!openArtworkPage(context?.appId)) {
+      console.warn("[Tools for Steam] The TFS Artworks page is not available yet.", context);
+    }
+    return;
+    // eslint-disable-next-line no-unreachable
     injectStyles();
 
     state.overlayMode = "artwork";
@@ -5076,7 +5793,9 @@
     state.focusZone = "side";
     state.pendingInitialAssetsFocus = true;
 
-    closeOverlay();
+    const returnFocusElement = getOverlayReturnFocusElement();
+    closeOverlay({ restoreFocus: false });
+    state.returnFocusElement = returnFocusElement;
     state.ignoreOverlayInputUntil = Date.now() + 700;
     state.currentOpenKey = getOpenRequestKey(state.appId, state.title);
     state.overlay = createElement("div", "steamtools-artwork-overlay");
@@ -5112,7 +5831,9 @@
     state.focusZone = "side";
     state.pendingInitialAssetsFocus = false;
 
-    closeOverlay();
+    const returnFocusElement = getOverlayReturnFocusElement();
+    closeOverlay({ restoreFocus: false });
+    state.returnFocusElement = returnFocusElement;
     state.overlayMode = "metadata";
     state.ignoreOverlayInputUntil = Date.now() + 700;
     state.currentOpenKey = `metadata:${getOpenRequestKey(state.appId, state.title)}`;
@@ -5131,7 +5852,37 @@
     void loadMetadataSnapshot(false).then(() => searchMetadataMatches(state.query));
   }
 
-  function closeOverlay() {
+  function getOverlayReturnFocusElement() {
+    // Reopening keeps the original Steam target instead of an overlay button.
+    if (state.overlay && state.returnFocusElement) {
+      return state.returnFocusElement;
+    }
+
+    const active = document.activeElement;
+    return active instanceof HTMLElement &&
+      active !== document.body &&
+      !active.closest(".steamtools-artwork-overlay")
+      ? active
+      : null;
+  }
+
+  function restoreOverlayReturnFocus(element) {
+    // Hand focus back to the Steam control that was focused before the
+    // overlay opened, so B lands where the user came from.
+    if (!(element instanceof HTMLElement) || !element.isConnected) {
+      return;
+    }
+
+    try {
+      element.focus({ preventScroll: true });
+    } catch {
+    }
+  }
+
+  function closeOverlay(options = {}) {
+    const returnFocusElement = state.returnFocusElement;
+    const hadOverlay = Boolean(state.overlay);
+    state.returnFocusElement = null;
     state.gameSearchRequestId += 1;
     state.assetRequestId += 1;
     disconnectAnimatedPreviewObserver();
@@ -5150,6 +5901,9 @@
     state.currentOpenKey = "";
     state.focusItems = [];
     state.focusIndex = 0;
+    if (hadOverlay && options.restoreFocus !== false) {
+      restoreOverlayReturnFocus(returnFocusElement);
+    }
   }
 
   function destroy() {
@@ -5189,6 +5943,11 @@
       state.refreshTimer = null;
     }
 
+    if (state.reactPatchRetryTimer) {
+      window.clearTimeout(state.reactPatchRetryTimer);
+      state.reactPatchRetryTimer = null;
+    }
+
     state.observer?.disconnect();
     state.observer = null;
     try {
@@ -5225,7 +5984,7 @@
     injectStyles();
     installContextActivationCapture();
     installContextTracking();
-    installReactContextMenuPatch();
+    ensureReactContextMenuPatch();
     installOmniLibraryContextMenuLifecycle();
     void loadArtworkSettings();
   }
@@ -5235,13 +5994,32 @@
     injectStyles();
     installContextActivationCapture();
     installContextTracking();
-    installReactContextMenuPatch();
+    ensureReactContextMenuPatch();
     installOmniLibraryContextMenuLifecycle();
     startArtworkSettingsPolling();
     startOpenRequestPolling();
-    state.observer = new MutationObserver(() => {
+    state.pendingMenuNodes = new Set();
+    state.observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node.nodeType === 1 && !node.classList?.contains("steamtools-artwork-context-row")) {
+            state.pendingMenuNodes.add(node);
+          }
+        }
+      }
+      if (!state.pendingMenuNodes.size) {
+        return;
+      }
+
       window.clearTimeout(state.refreshTimer);
-      state.refreshTimer = window.setTimeout(patchMenus, 80);
+      state.refreshTimer = window.setTimeout(() => {
+        const addedNodes = [...state.pendingMenuNodes];
+        state.pendingMenuNodes.clear();
+        const menus = findMenusForAddedNodes(addedNodes);
+        if (menus.length) {
+          patchMenus(menus);
+        }
+      }, 80);
     });
     state.observer.observe(document.documentElement, { childList: true, subtree: true });
   }

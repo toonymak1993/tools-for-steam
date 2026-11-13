@@ -19,9 +19,7 @@ public sealed class SteamWindowFocusService
     public async Task<string> FocusSteamWindowAsync(CancellationToken cancellationToken)
     {
         var candidates = GetSteamWindowCandidates()
-            .OrderByDescending(window =>
-                window.Title.Contains("Big Picture", StringComparison.OrdinalIgnoreCase) ||
-                window.Title.Contains("Gamepad", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(window => SteamBigPictureForegroundDetector.IsBigPictureWindowTitle(window.Title))
             .ThenByDescending(window => window.Title.Contains("Steam", StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(window =>
                 string.Equals(window.ProcessName, "steamwebhelper", StringComparison.OrdinalIgnoreCase))

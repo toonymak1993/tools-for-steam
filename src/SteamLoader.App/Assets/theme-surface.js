@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 14;
+  const stateVersion = 16;
   const themeScanEventName = "steamtools:theme-scan-complete";
   const localizedText = (...codes) => String.fromCharCode(...codes);
   const localizedSignals = Object.freeze({
@@ -23,21 +23,52 @@
     allGames: localizedText(65, 76, 76, 69, 32, 83, 80, 73, 69, 76, 69),
     installed: localizedText(73, 78, 83, 84, 65, 76, 76, 73, 69, 82, 84),
   });
-  const detailViewMarkers = [
-    localizedSignals.playtime,
-    "PLAYTIME",
-    "PLAY TIME",
-    localizedSignals.activityNative,
-    "ACTIVITY",
-    localizedSignals.achievements,
-    "ACHIEVEMENTS",
-    localizedSignals.lastSession,
-    "LAST SESSION",
-    localizedSignals.manage,
-    "MANAGE",
-    localizedSignals.friendsPlaying,
-    "FRIENDS WHO PLAY",
-  ];
+  // Library and game page labels used as layout signals. Steam's own
+  // localization tokens give them in the active UI language; the English and
+  // German literals stay as a fallback while LocalizationManager is unreachable.
+  const textSignalDefinitions = Object.freeze({
+    play: { literals: ["PLAY", localizedSignals.play], tokens: ["#GameAction_Play"] },
+    playtime: {
+      literals: ["PLAYTIME", "PLAY TIME", localizedSignals.playtime],
+      tokens: ["#AppDetails_SectionTitle_PlayTime"],
+    },
+    lastPlayed: {
+      literals: ["LAST PLAYED", localizedSignals.lastPlayed],
+      tokens: ["#AppDetails_SectionTitle_LastPlayed"],
+    },
+    activity: {
+      literals: ["ACTIVITY", localizedSignals.activityAscii],
+      tokens: ["#AppDetails_SectionTitle_Activity", "#AppDetails_Tab_Activity"],
+    },
+    yourStuff: { literals: ["YOUR STUFF", localizedSignals.yourStuff], tokens: ["#AppDetails_Tab_YourStuff"] },
+    gameInfo: { literals: ["GAME INFO", localizedSignals.gameInfo], tokens: ["#AppDetails_Tab_GameInfo"] },
+    achievements: {
+      literals: ["ACHIEVEMENTS", localizedSignals.achievements],
+      tokens: ["#AppDetails_SectionTitle_Achievements"],
+    },
+    lastSession: { literals: ["LAST SESSION", localizedSignals.lastSession], tokens: [] },
+    manage: { literals: ["MANAGE", localizedSignals.manage], tokens: ["#GameAction_Manage"] },
+    friendsPlaying: {
+      literals: ["FRIENDS WHO PLAY", localizedSignals.friendsPlaying],
+      tokens: ["#AppDetails_SectionTitle_Friends"],
+    },
+    spaceRequired: {
+      literals: ["SPACE REQUIRED", localizedSignals.spaceRequired],
+      tokens: ["#AppDetails_SectionTitle_DiskSpaceRequired"],
+    },
+    steamCloud: { literals: ["STEAM CLOUD"], tokens: ["#AppDetails_SectionTitle_CloudStatus"] },
+    controller: { literals: ["CONTROLLER"], tokens: ["#AppDetails_SectionTitle_Controller"] },
+    community: { literals: ["COMMUNITY"], tokens: ["#AppDetails_Tab_Community"] },
+    recentGames: { literals: ["RECENT GAMES", localizedSignals.recentGames], tokens: ["#LibraryHome_RecentGames"] },
+    libraryMore: { literals: ["VIEW MORE IN YOUR LIBRARY", localizedSignals.libraryMore], tokens: [] },
+    whatsNew: { literals: ["WHAT'S NEW", localizedSignals.whatsNew], tokens: ["#LibraryHome_NewUpdates"] },
+    recommended: { literals: ["RECOMMENDED", localizedSignals.recommended], tokens: ["#HomeTab_Recommended"] },
+    allGames: { literals: ["ALL GAMES", localizedSignals.allGames], tokens: ["#LibraryTab_AllGames"] },
+    installed: { literals: ["INSTALLED", localizedSignals.installed], tokens: ["#LibraryTab_Installed"] },
+    otherLibraryTabs: { literals: ["NON-STEAM", "SOUNDTRACKS", "CONTROLLER FRIENDLY"], tokens: [] },
+  });
+  const detailViewMarkerSignals = ["playtime", "activity", "achievements", "lastSession", "manage", "friendsPlaying"];
+  let textSignalCache = null;
   const appIdPatterns = [
     /\/apps\/(\d+)\//i,
     /\/images\/apps\/(\d+)\//i,
@@ -239,6 +270,57 @@
       .toUpperCase();
   }
 
+  function getSteamLocalization() {
+    try {
+      return window.LocalizationManager || window.opener?.LocalizationManager || null;
+    } catch {
+      return window.LocalizationManager || null;
+    }
+  }
+
+  function normalizeSignal(value) {
+    return normalizeText(value).replace(/[?:!.…]+$/u, "").trim();
+  }
+
+  function getTextSignals(name) {
+    const manager = getSteamLocalization();
+    let locale = "";
+    try {
+      locale = String(manager?.GetPreferredLocales?.()?.[0] || "");
+    } catch {
+    }
+    if (!textSignalCache || textSignalCache.manager !== manager || textSignalCache.locale !== locale) {
+      textSignalCache = { manager, locale, values: new Map() };
+    }
+
+    let values = textSignalCache.values.get(name);
+    if (!values) {
+      const definition = textSignalDefinitions[name] || { literals: [], tokens: [] };
+      const signals = new Set(definition.literals.map(normalizeSignal));
+      for (const token of definition.tokens) {
+        let localized = "";
+        try {
+          localized = manager?.LocalizeString?.(token);
+        } catch {
+        }
+        if (typeof localized === "string" && localized && !localized.startsWith("#")) {
+          signals.add(normalizeSignal(localized));
+        }
+      }
+      values = [...signals].filter((signal) => signal.length >= 2);
+      textSignalCache.values.set(name, values);
+    }
+    return values;
+  }
+
+  function hasTextSignal(text, ...names) {
+    return names.some((name) => getTextSignals(name).some((signal) => text.includes(signal)));
+  }
+
+  function countTextSignals(text, names) {
+    return names.reduce((count, name) => count + (hasTextSignal(text, name) ? 1 : 0), 0);
+  }
+
   function classText(node) {
     return String(node?.className || "").toLowerCase();
   }
@@ -334,28 +416,18 @@
       return 0;
     }
 
-    const signals = [
-      "PLAY TIME",
-      "PLAYTIME",
-      localizedSignals.playtime,
-      "LAST PLAYED",
-      localizedSignals.lastPlayed,
-      "STEAM CLOUD",
-      "CONTROLLER",
-      "ACTIVITY",
-      localizedSignals.activityAscii,
-      "YOUR STUFF",
-      localizedSignals.yourStuff,
-      "COMMUNITY",
-      "GAME INFO",
-      localizedSignals.gameInfo,
-      "ACHIEVEMENTS",
-      localizedSignals.achievements,
-      "SPACE REQUIRED",
-      localizedSignals.spaceRequired,
-    ];
-
-    return signals.reduce((count, signal) => count + (text.includes(signal) ? 1 : 0), 0);
+    return countTextSignals(text, [
+      "playtime",
+      "lastPlayed",
+      "steamCloud",
+      "controller",
+      "activity",
+      "yourStuff",
+      "community",
+      "gameInfo",
+      "achievements",
+      "spaceRequired",
+    ]);
   }
 
   function isHomeOrLibraryHub(container) {
@@ -364,26 +436,13 @@
       return false;
     }
 
-    const hubSignals = [
-      "RECENT GAMES",
-      localizedSignals.recentGames,
-      "VIEW MORE IN YOUR LIBRARY",
-      localizedSignals.libraryMore,
-      "WHAT'S NEW",
-      localizedSignals.whatsNew,
-      "RECOMMENDED",
-      localizedSignals.recommended,
-    ];
-
     const detailSignals = getDetailTextSignalCount(container);
-    const hasCloudOrTabs =
-      text.includes("STEAM CLOUD") ||
-      text.includes("YOUR STUFF") ||
-      text.includes(localizedSignals.yourStuff) ||
-      text.includes("GAME INFO") ||
-      text.includes(localizedSignals.gameInfo);
+    const hasCloudOrTabs = hasTextSignal(text, "steamCloud", "yourStuff", "gameInfo");
 
-    return hubSignals.some((signal) => text.includes(signal)) && (!hasCloudOrTabs || detailSignals < 3);
+    return (
+      hasTextSignal(text, "recentGames", "libraryMore", "whatsNew", "recommended") &&
+      (!hasCloudOrTabs || detailSignals < 3)
+    );
   }
 
   function isLibraryGridSurface() {
@@ -405,20 +464,8 @@
 
     const text = normalizeText(document.body?.innerText || "");
     const detailSignals = getDetailTextSignalCount(document.body);
-    const hasLibraryTabs =
-      text.includes("ALL GAMES") ||
-      text.includes(localizedSignals.allGames) ||
-      text.includes("INSTALLED") ||
-      text.includes(localizedSignals.installed) ||
-      text.includes("NON-STEAM") ||
-      text.includes("SOUNDTRACKS") ||
-      text.includes("CONTROLLER FRIENDLY");
-    const hasDetailChrome =
-      text.includes("STEAM CLOUD") ||
-      text.includes("YOUR STUFF") ||
-      text.includes(localizedSignals.yourStuff) ||
-      text.includes("GAME INFO") ||
-      text.includes(localizedSignals.gameInfo);
+    const hasLibraryTabs = hasTextSignal(text, "allGames", "installed", "otherLibraryTabs");
+    const hasDetailChrome = hasTextSignal(text, "steamCloud", "yourStuff", "gameInfo");
 
     state.lastSurfaceProbeIsLibraryGrid = hasLibraryTabs && (!hasDetailChrome || detailSignals < 3);
     return Boolean(state.lastSurfaceProbeIsLibraryGrid);
@@ -543,12 +590,7 @@
       }
 
       const text = normalizeText(current.innerText || "");
-      let markerHits = 0;
-      for (const marker of detailViewMarkers) {
-        if (text.includes(marker)) {
-          markerHits += 1;
-        }
-      }
+      const markerHits = countTextSignals(text, detailViewMarkerSignals);
 
       if (!isHomeOrLibraryHub(current) && (markerHits >= 2 || isLikelyDetailViewContainer(current))) {
         return current;
@@ -692,13 +734,8 @@
         rect.height <= 140 &&
         rect.top >= containerRect.top + 180 &&
         rect.top <= containerRect.top + 470 &&
-        (text.includes("PLAYTIME") ||
-          text.includes(localizedSignals.playtime) ||
-          text.includes("LAST PLAYED") ||
-          text.includes(localizedSignals.lastPlayed) ||
-          text.includes("CONTROLLER") ||
-          text.startsWith("PLAY ") ||
-          text.startsWith(`${localizedSignals.play} `)))
+        (hasTextSignal(text, "playtime", "lastPlayed", "controller") ||
+          getTextSignals("play").some((signal) => text.startsWith(`${signal} `))))
       );
     });
 
@@ -988,6 +1025,13 @@
     state.scanHandle = null;
     state.lastScanAt = Date.now();
 
+    // No CSS Loader theme active: nothing to mark. Skipping avoids innerText
+    // (forced layout + whole-page text) on every Library change.
+    if (!state.lastCssText) {
+      state.didInitialFullScan = false;
+      return;
+    }
+
     if (isLibraryGridSurface()) {
       state.didInitialFullScan = true;
       queueCleanup();
@@ -1079,6 +1123,10 @@
 
     if (!state.observer) {
       state.observer = new MutationObserver((mutations) => {
+        if (!state.lastCssText) {
+          return;
+        }
+
         let shouldCleanup = false;
         const cssOnlyLibraryGrid = isLibraryGridSurface();
 

@@ -27,10 +27,11 @@ public sealed class MainWindowViewModel : BindableBase
     private readonly ReleaseUpdateService _releaseUpdateService;
     private readonly SupportBundleService _supportBundleService;
     private readonly SteamInstallationService _steamInstallationService;
-    private readonly string _shellLaunchArguments;
-    private readonly bool _shellBootstrapMode;
     private readonly bool _consoleStartupMode;
     private readonly bool _runStartupSyncOnInitialize;
+    private readonly ConsoleStartChromeCover? _consoleChromeCover;
+    private readonly ConsoleShellState _consoleShellState = new();
+    private WindowsShellVisibilityService? _shellVisibilityService;
     private readonly SteamStartupEnvironmentProbe _steamEnvironmentProbe;
     private readonly SteamStartupTimingPolicy _startupTimingPolicy;
     private readonly SteamSplashStartupCoordinator? _splashStartupCoordinator;
@@ -38,7 +39,7 @@ public sealed class MainWindowViewModel : BindableBase
     private bool _isBusy;
     private bool _isRunning;
     private bool _autostartEnabled;
-    private string _startupMode = SteamLoaderRuntime.StartupModeShell;
+    private string _startupMode = SteamLoaderRuntime.StartupModeConsole;
     private bool _initialized;
     private bool _showStartupSplash;
     private bool _showFirstRunSetup;
@@ -78,11 +79,11 @@ public sealed class MainWindowViewModel : BindableBase
         ReleaseUpdateService releaseUpdateService,
         SupportBundleService supportBundleService,
         SteamInstallationService steamInstallationService,
-        string shellLaunchArguments,
-        bool shellBootstrapMode,
         bool consoleStartupMode,
-        bool runStartupSyncOnInitialize)
+        bool runStartupSyncOnInitialize,
+        ConsoleStartChromeCover? consoleChromeCover = null)
     {
+        _consoleChromeCover = consoleChromeCover;
         _processManager = processManager;
         _autostartService = autostartService;
         _shellService = shellService;
@@ -90,8 +91,6 @@ public sealed class MainWindowViewModel : BindableBase
         _releaseUpdateService = releaseUpdateService;
         _supportBundleService = supportBundleService;
         _steamInstallationService = steamInstallationService;
-        _shellLaunchArguments = shellLaunchArguments;
-        _shellBootstrapMode = shellBootstrapMode;
         _consoleStartupMode = consoleStartupMode;
         _runStartupSyncOnInitialize = runStartupSyncOnInitialize;
         _steamEnvironmentProbe = new SteamStartupEnvironmentProbe(
@@ -122,7 +121,9 @@ public sealed class MainWindowViewModel : BindableBase
         StartDesktopCommand = new RelayCommand(StartDesktop);
         CompleteFirstRunCommand = new RelayCommand(CompleteFirstRunSetup, () => !IsBusy);
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, () => !IsBusy);
-        InstallUpdateCommand = new AsyncRelayCommand(InstallUpdateAsync, () => !IsBusy && _updateSnapshot?.CanInstall == true);
+        InstallUpdateCommand = new AsyncRelayCommand(
+            InstallUpdateAsync,
+            () => !IsBusy && _updateSnapshot is { UpdateAvailable: true, CanInstall: true });
         ExportSupportBundleCommand = new AsyncRelayCommand(ExportSupportBundleAsync, () => !IsBusy);
         ContinueWaitingFromSplashCommand = new RelayCommand(ContinueWaitingFromSplash);
         RestartSteamFromSplashCommand = new AsyncRelayCommand(
@@ -353,16 +354,14 @@ public sealed class MainWindowViewModel : BindableBase
 
     public string StatusPillText => IsRunning ? "Running" : "Stopped";
 
-    public string AutostartButtonText => StartupMode == SteamLoaderRuntime.StartupModeShell
+    public string AutostartButtonText => SteamLoaderRuntime.IsConsoleStartupMode(StartupMode)
         ? "Switch to Tray Startup"
-        : "Switch to Shell Startup";
+        : "Switch to Console Startup";
 
     public string AutostartMenuText => StartupMode switch
     {
-        SteamLoaderRuntime.StartupModeShell => "Startup Mode: Shell takeover",
         SteamLoaderRuntime.StartupModeTray => "Startup Mode: eTray",
-        SteamLoaderRuntime.StartupModeXbox => "Startup Mode: Xbox Mode",
-        _ => "Startup Mode: Shell takeover"
+        _ => "Startup Mode: Console mode"
     };
 
     public AsyncRelayCommand StartCommand { get; }
@@ -478,7 +477,7 @@ public sealed class MainWindowViewModel : BindableBase
             RecoveryHintText = BuildRecoveryHintText(status);
 
             StartupMode = settings.StartupMode;
-            AutostartEnabled = string.Equals(settings.StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase);
+            AutostartEnabled = SteamLoaderRuntime.IsConsoleStartupMode(settings.StartupMode);
             AutostartStateText = BuildAutostartStateText(settings.StartupMode);
         }
         catch (Exception exception)
@@ -544,12 +543,12 @@ public sealed class MainWindowViewModel : BindableBase
     {
         try
         {
-            var nextMode = string.Equals(StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase)
+            var nextMode = SteamLoaderRuntime.IsConsoleStartupMode(StartupMode)
                 ? SteamLoaderRuntime.StartupModeTray
-                : SteamLoaderRuntime.StartupModeShell;
+                : SteamLoaderRuntime.StartupModeConsole;
             var settings = _settingsService.SetStartupMode(nextMode);
             StartupMode = settings.StartupMode;
-            AutostartEnabled = string.Equals(settings.StartupMode, SteamLoaderRuntime.StartupModeShell, StringComparison.OrdinalIgnoreCase);
+            AutostartEnabled = SteamLoaderRuntime.IsConsoleStartupMode(settings.StartupMode);
             AutostartStateText = BuildAutostartStateText(settings.StartupMode);
             ErrorText = string.Empty;
         }
@@ -576,9 +575,33 @@ public sealed class MainWindowViewModel : BindableBase
     {
         try
         {
-            _shellService.StartWindowsShellIfNeeded();
+            SwitchToWindowsDesktop();
             ErrorText = string.Empty;
-            RecoveryHintText = "Windows desktop was requested. You can return to Steam after recovery.";
+            RecoveryHintText = "Windows desktop was requested. Press the Guide button or open Big Picture to return to the console.";
+        }
+        catch (Exception exception)
+        {
+            ErrorText = exception.Message;
+        }
+    }
+
+    private void SwitchToWindowsDesktop()
+    {
+        _shellVisibilityService ??= new WindowsShellVisibilityService();
+        ConsoleDesktopSwitcher.SwitchToDesktop(
+            _shellService,
+            _shellVisibilityService,
+            _consoleShellState,
+            minimizeBigPicture: true);
+    }
+
+    public void ReturnToConsole()
+    {
+        try
+        {
+            var result = SteamClientLaunchService.RequestSteamAttention(_steamInstallationService);
+            SteamStartupDiagnostics.Write($"return to console requested: {result.Message}");
+            ErrorText = string.Empty;
         }
         catch (Exception exception)
         {
@@ -633,7 +656,7 @@ public sealed class MainWindowViewModel : BindableBase
         try
         {
             _updateSnapshot ??= await _releaseUpdateService.CheckAsync();
-            if (_updateSnapshot.CanInstall != true)
+            if (!_updateSnapshot.UpdateAvailable || !_updateSnapshot.CanInstall)
             {
                 UpdateStateText = _updateSnapshot.Message;
                 return;
@@ -651,6 +674,11 @@ public sealed class MainWindowViewModel : BindableBase
                 processIds);
 
             UpdateStateText = _updateSnapshot.Message;
+            if (!_updateSnapshot.InstallInProgress)
+            {
+                return;
+            }
+
             _ = System.Windows.Application.Current.Dispatcher.BeginInvoke(() =>
             {
                 System.Windows.Application.Current.Shutdown();
@@ -824,10 +852,8 @@ public sealed class MainWindowViewModel : BindableBase
 
     private void EnsureShellBootstrapMonitor()
     {
-        if (!SteamLoaderRuntime.ShouldStartShellHandOffMonitor(
-                _shellBootstrapMode,
-                _consoleStartupMode) ||
-            _shellBootstrapMonitorTask is not null)
+        // Only a launch that owns the startup splash has a hand-off to finish.
+        if (!_consoleStartupMode || _shellBootstrapMonitorTask is not null)
         {
             return;
         }
@@ -892,11 +918,6 @@ public sealed class MainWindowViewModel : BindableBase
 
                 case SteamSplashNextAction.CompleteWithSteam:
                     SteamStartupDiagnostics.Write("splash hand-off confirmed from stable Steam UI and foreground signals");
-                    if (!await WaitBeforeWindowsShellHandoffAsync())
-                    {
-                        break;
-                    }
-
                     CompleteStartupSplashHandOff(steamReady: true);
                     return;
 
@@ -1112,6 +1133,16 @@ public sealed class MainWindowViewModel : BindableBase
     {
         SteamStartupDiagnostics.Write("user opened the Windows desktop from the startup splash");
         CompleteStartupSplashHandOff(steamReady: false);
+        try
+        {
+            // An explicit choice: keep the desktop until Big Picture is
+            // brought back, even if Steam finishes loading behind it.
+            SwitchToWindowsDesktop();
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"desktop switch from the splash failed: {exception.Message}");
+        }
     }
 
     private static bool TryFocusSteamWindow(IntPtr preferredHandle = default)
@@ -1180,7 +1211,7 @@ public sealed class MainWindowViewModel : BindableBase
                     fallbackHandle = process.MainWindowHandle;
                     if (!preferSteamTitle ||
                         process.MainWindowTitle.Contains("Steam", StringComparison.OrdinalIgnoreCase) ||
-                        process.MainWindowTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase))
+                        SteamBigPictureForegroundDetector.IsBigPictureWindowTitle(process.MainWindowTitle))
                     {
                         return process.MainWindowHandle;
                     }
@@ -1208,11 +1239,8 @@ public sealed class MainWindowViewModel : BindableBase
             return;
         }
 
+        // Console Mode keeps Explorer running; the hand-off only ends the splash.
         _windowsShellStarted = true;
-        if (_shellBootstrapMode)
-        {
-            _shellService.StartWindowsShellIfNeeded();
-        }
     }
 
     private async Task DismissStartupSplashAsync()
@@ -1230,49 +1258,6 @@ public sealed class MainWindowViewModel : BindableBase
         SplashOverlayOpacity = 1.0;
     }
 
-    private async Task<bool> WaitBeforeWindowsShellHandoffAsync()
-    {
-        ApplyGeneralSettingsSnapshot(_settingsService.GetSnapshot());
-        var holdSeconds = WindowsShellStartDelaySeconds;
-
-        if (holdSeconds <= 0)
-        {
-            return true;
-        }
-
-        ServiceStateText = IsGermanUi ? "Steam ist bereit" : "Steam is ready";
-        ServiceDetailText = IsGermanUi
-            ? $"Steam ist im Vordergrund bestätigt. Der Windows-Desktop startet in {holdSeconds} s."
-            : $"Steam is confirmed in the foreground. Starting the Windows desktop in {holdSeconds}s.";
-        await Task.Delay(TimeSpan.FromSeconds(holdSeconds));
-
-        // The configurable hold can be several seconds long. Steam may close,
-        // switch to a login/error page, or lose foreground during that time.
-        // Revalidate once before uncovering the desktop instead of trusting the
-        // earlier observation indefinitely.
-        var status = await _processManager.GetStatusAsync();
-        var runtime = _steamEnvironmentProbe.Capture();
-        _lastKnownStatus = status;
-        var uiState = status?.SteamUiState ?? SteamUiState.Unknown;
-        var stillReady = runtime.SteamRunning &&
-            runtime.Windows.IsSteamForeground &&
-            !runtime.ErrorReporterRunning &&
-            uiState is not (SteamUiState.Login or SteamUiState.Offline or SteamUiState.Error) &&
-            (runtime.Windows.HasLikelyGamepadWindow ||
-             (runtime.Windows.HasVisibleSteamWindow && uiState == SteamUiState.Gamepad));
-
-        if (stillReady)
-        {
-            return true;
-        }
-
-        SteamStartupDiagnostics.Write(
-            $"Steam readiness changed during shell hand-off hold; continuing monitor " +
-            $"(running={runtime.SteamRunning}, foreground={runtime.Windows.IsSteamForeground}, ui={uiState})");
-        ApplyShellBootstrapStatus(status, runtime);
-        return false;
-    }
-
     private void CompleteStartupSplashHandOff(bool steamReady)
     {
         // Clear the splash without a fade so the manager UI cannot flash between
@@ -1286,7 +1271,26 @@ public sealed class MainWindowViewModel : BindableBase
             TryFocusSteamWindow();
         }
 
+        // Console Mode: with Steam ready and "Hide Windows Shell" on, the
+        // taskbar stays hidden and the background host keeps it hidden while
+        // Big Picture is up. With the option off (the default) or on a desktop
+        // fallback it comes back right away.
+        var keepShellHidden = steamReady && ShouldKeepShellHiddenAfterHandOff();
+        _consoleChromeCover?.Stop(restoreChrome: !keepShellHidden);
         CompleteShellBootstrap();
+    }
+
+    private bool ShouldKeepShellHiddenAfterHandOff()
+    {
+        try
+        {
+            return _settingsService.ShouldHideWindowsShellInConsoleMode();
+        }
+        catch (Exception exception)
+        {
+            SteamStartupDiagnostics.Write($"hide Windows shell setting could not be read; showing the taskbar: {exception.Message}");
+            return false;
+        }
     }
 
     private void ApplyShellBootstrapStatus(
@@ -1346,13 +1350,9 @@ public sealed class MainWindowViewModel : BindableBase
     {
         return startupMode switch
         {
-            SteamLoaderRuntime.StartupModeShell =>
-                "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer.",
             SteamLoaderRuntime.StartupModeTray =>
                 "eTray mode is active. Windows starts normally, then Tools for Steam runs from the tray, syncs launchers, and starts Steam in dev mode.",
-            SteamLoaderRuntime.StartupModeXbox =>
-                "Xbox Mode is active. Windows launches Tools for Steam as the gaming Home app, then TFS starts Steam and injects the Quick Access panel.",
-            _ => "Shell takeover is active. Tools for Steam starts before Explorer, syncs launchers, starts Steam in dev mode, and then hands the session back to Windows Explorer."
+            _ => "Console mode is active. Explorer stays the Windows shell; Tools for Steam starts at sign-in, covers the desktop, opens Steam Big Picture, and hides the taskbar while Big Picture is up."
         };
     }
 

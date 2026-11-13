@@ -22,9 +22,9 @@ const bluetoothSource = fs.readFileSync(
   "utf8",
 );
 
-test("System exposes Windows Update, HDR, and a Bluetooth subpage", () => {
+test("System exposes Windows Update and a Bluetooth subpage; HDR stays in Steam's Quick Settings", () => {
   assert.match(popupSource, /makeNavigationSlot\(\s*"Windows Update"/);
-  assert.match(popupSource, /makeSettingToggleSlot\(\s*"system",\s*"hdr"/);
+  assert.doesNotMatch(popupSource, /makeSettingToggleSlot\(\s*"system",\s*"hdr"/);
   assert.match(popupSource, /pageId:\s*"system-bluetooth"/);
   assert.match(popupSource, /pageId === "system-windows-update"/);
   assert.match(popupSource, /pageId === "system-bluetooth"/);

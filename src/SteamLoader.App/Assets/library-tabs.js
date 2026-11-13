@@ -4,7 +4,70 @@
 // This layer separates those shortcuts into enabled store tabs and removes them from
 // NON-STEAM without creating a persistent Steam collection.
 (() => {
-  const stateVersion = "omnilibrary-store-tabs-v68-tabmaster";
+  // The Library lives in Big Picture's main window. Other Steam windows only
+  // ran idle copies of this compositor (timers, observers, summary fetches).
+  if (window.__tfsSurfaceRole && window.__tfsSurfaceRole !== "gamepad") {
+    const idle = window.__steamLoaderLibraryTabsState;
+    if (idle) {
+      for (const key of ["patchTimer", "bumperRebindTimer", "libraryRefreshTimer"]) {
+        if (idle[key]) {
+          window.clearInterval(idle[key]);
+          idle[key] = 0;
+        }
+      }
+      for (const key of ["patchSoonTimer", "mountRetryTimer", "layoutVerifyTimer", "downloadRefreshTimer", "summaryRetryTimer", "tilePatchTimer"]) {
+        if (idle[key]) {
+          window.clearTimeout(idle[key]);
+          idle[key] = 0;
+        }
+      }
+      try {
+        idle.tileObserver?.disconnect?.();
+      } catch (_) {}
+      // Starve the old closures: with no enabled store and no Tab Hero they
+      // stop re-arming their timers on the next tick.
+      try {
+        idle.omniLibraryStateUnsubscribe?.();
+      } catch (_) {}
+      idle.omniLibraryStateUnsubscribe = null;
+      try {
+        idle.channel?.close?.();
+      } catch (_) {}
+      if (typeof idle.storageHandler === "function") {
+        window.removeEventListener("storage", idle.storageHandler);
+      }
+      if (typeof idle.visibilityHandler === "function") {
+        document.removeEventListener("visibilitychange", idle.visibilityHandler);
+      }
+      idle.pluginEnabled = false;
+      idle.storeStates = new Map();
+      idle.tabHeroSnapshot = { enabled: false, revision: 0, customTabs: [], native: {}, order: [] };
+      idle.version = "inactive-outside-big-picture";
+    }
+    return;
+  }
+
+  const stateVersion = "omnilibrary-store-tabs-v78-library-only-focus";
+  // TabMaster-style route tabs (every tab a real /library/tab/<id> route) are
+  // off for now: in the live test LB/RB stopped moving between our tabs. The
+  // v72 virtual navigation with the catch-all bumper handler is active again.
+  const nativeRouteTabs = false;
+
+  function getRouteLibraryTabId() {
+    for (const candidate of [window, window.opener]) {
+      try {
+        const path = candidate?.SteamUIStore?.m_WindowStore?.GamepadUIMainWindowInstance?.m_history?.location?.pathname;
+        const match = typeof path === "string" ? path.match(/^\/library\/tab\/([^/?#]+)/) : null;
+        if (match) {
+          return decodeURIComponent(match[1]);
+        }
+        if (typeof path === "string") {
+          return "";
+        }
+      } catch (_) {}
+    }
+    return "";
+  }
   const xboxTabId = "tfs-xbox";
   const xboxCloudTabId = "tfs-xbox-cloud";
   const epicTabId = "tfs-epic";
@@ -19,16 +82,14 @@
     "Soundtracks",
   ]);
   const tabTopology = window.__steamLoaderOmniLibraryTabTopology;
-  const retiredTabRuntimeKey = ["__steamLoader", "Tab", "Hero"].join("");
-  const retiredCustomTabPrefix = ["tab", "hero-"].join("");
-  const retiredFilterMarkerKey = ["__steamLoader", "Tab", "HeroFilter"].join("");
-  const retiredOriginalTitleKey = ["__steamLoader", "Tab", "HeroOriginalTitle"].join("");
-  try {
-    window[retiredTabRuntimeKey]?.dispose?.();
-    delete window[retiredTabRuntimeKey];
-    window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroSettings.v1"].join(""));
-    window.localStorage?.removeItem(["ToolsForSteam", "Tab", "heroCatalog.v1"].join(""));
-  } catch (_) {}
+  // Tab Hero is OmniLibrary's tab manager. It never patches Steam itself: this
+  // file is the single compositor for Steam's own tabs, OmniLibrary's store
+  // and platform tabs, and Tab Hero's renames, order and filter tabs.
+  const tabHero = window.__steamLoaderTabHero;
+  const tabHeroCustomTabPrefix = "tabhero-";
+  const tabHeroFilterMarkerKey = "__steamLoaderTabHeroFilter";
+  const tabHeroOriginalTitleKey = "__steamLoaderTabHeroOriginalTitle";
+  const tabHeroFilterCacheMs = 2000;
   const defaultStoreDefinitions = [
     {
       id: "xbox-game-pass",
@@ -77,6 +138,8 @@
   const bumperRebindIntervalMs = 1000;
   const bumperHeldFallbackMs = 700;
   const maximumInitialPatchAttempts = 32;
+  const virtualCollectionInputLifetimeMs = 5000;
+  const virtualCollectionHydrationCheckMs = 2500;
   const omniLibraryStoreStorageKey = "ToolsForSteamOmniLibraryStoresChanged";
   const omniLibraryStoreChannelName = "ToolsForSteamOmniLibraryStores";
   const omniLibraryUninstallNoticeId =
@@ -101,19 +164,61 @@
     }
   }
 
+  // The last good summary is kept per Steam profile so the store tabs can be
+  // composed the moment Steam starts, before TFS has answered. The live
+  // summary replaces it as soon as it arrives.
+  const summaryCacheStorageKey = "ToolsForSteamOmniLibrarySummaryCacheV1";
+  const summaryCacheMaxAgeMs = 14 * 24 * 60 * 60 * 1000;
+  const summaryCacheWriteIntervalMs = 60000;
+
+  function readCachedSummary() {
+    try {
+      const document = JSON.parse(
+        window.localStorage?.getItem(summaryCacheStorageKey) || "null",
+      );
+      const snapshot = document?.snapshot;
+      if (
+        Date.now() - Number(document?.savedAt || 0) >= summaryCacheMaxAgeMs ||
+        snapshot?.pluginEnabled !== true ||
+        !Array.isArray(snapshot?.stores)
+      ) {
+        return null;
+      }
+      // A cached revision must never be mistaken for the live one: TFS
+      // numbers revisions from zero again after every start.
+      return { ...snapshot, revision: -1, cached: true };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeCachedSummary(snapshot) {
+    if (!snapshot || snapshot.backendUnavailable || snapshot.cached) {
+      return;
+    }
+    try {
+      window.localStorage?.setItem(
+        summaryCacheStorageKey,
+        JSON.stringify({ savedAt: Date.now(), snapshot }),
+      );
+    } catch (_) {}
+  }
+
   function getOmniLibraryStateStore() {
     const existing = window.__steamLoaderOmniLibraryStateStore;
-    if (existing?.version === 4) {
+    if (existing?.version === 5) {
       return existing;
     }
 
     const listeners = new Set();
     const shared = {
-      version: 4,
-      snapshot: null,
+      version: 5,
+      snapshot: existing?.snapshot || readCachedSummary(),
       request: null,
       followUpRequest: null,
       lastFetchAt: 0,
+      lastCacheWriteAt: 0,
+      lastCachedRevision: null,
       async refresh(force = false) {
         if (shared.request) {
           if (!force) {
@@ -156,6 +261,14 @@
               snapshot?.pluginEnabled !== shared.snapshot?.pluginEnabled;
             shared.snapshot = snapshot;
             shared.lastFetchAt = Date.now();
+            if (
+              shared.lastCachedRevision !== Number(snapshot?.revision || 0) &&
+              shared.lastFetchAt - shared.lastCacheWriteAt >= summaryCacheWriteIntervalMs
+            ) {
+              shared.lastCachedRevision = Number(snapshot?.revision || 0);
+              shared.lastCacheWriteAt = shared.lastFetchAt;
+              writeCachedSummary(snapshot);
+            }
             if (changed) {
               for (const listener of listeners) {
                 try {
@@ -235,8 +348,29 @@
     } catch (_) {}
   }
 
+  function buildTabHeroLayoutSignature(snapshot) {
+    // Catalog discovery is informational UI state. Only these editable fields
+    // can change the rendered Library topology or a custom tab's contents.
+    try {
+      return JSON.stringify({
+        enabled: snapshot?.enabled !== false,
+        order: snapshot?.order || [],
+        native: snapshot?.native || {},
+        customTabs: snapshot?.customTabs || [],
+      });
+    } catch (_) {
+      return "";
+    }
+  }
+
   const previousState = window.__steamLoaderLibraryTabsState;
   if (previousState?.version !== stateVersion) {
+    try {
+      previousState?.returnFocusUnlisten?.();
+    } catch (_) {}
+    if (previousState) {
+      previousState.returnFocusUnlisten = null;
+    }
     if (previousState?.patchTimer) {
       window.clearInterval(previousState.patchTimer);
     }
@@ -259,6 +393,10 @@
 
     if (previousState?.libraryRefreshTimer) {
       window.clearInterval(previousState.libraryRefreshTimer);
+    }
+
+    if (previousState?.summaryRetryTimer) {
+      window.clearTimeout(previousState.summaryRetryTimer);
     }
 
     if (previousState?.downloadRefreshTimer) {
@@ -374,7 +512,7 @@
     } catch (_) {}
 
     try {
-      previousState?.[["tab", "HeroUnsubscribe"].join("")]?.();
+      previousState?.tabHeroUnsubscribe?.();
     } catch (_) {}
 
     document.getElementById(emulatorSystemSurfaceId)?.remove();
@@ -423,6 +561,14 @@
           nativeTabTemplates: new Map(),
           nativeTabOrder: [],
           virtualCollections: new WeakMap(),
+          collectionAppsCache: new WeakMap(),
+          tabHeroFilterResults: new WeakMap(),
+          tabHeroUnsubscribe: null,
+          tabHeroRevision: Number(tabHero?.getSnapshot?.()?.revision || 0),
+          tabHeroSnapshot: tabHero?.getSnapshot?.() || null,
+          tabHeroLayoutSignature: buildTabHeroLayoutSignature(
+            tabHero?.getSnapshot?.() || null,
+          ),
           derivedTopologyCache: null,
           activationResolved: false,
           pluginEnabled: false,
@@ -436,6 +582,8 @@
           managedCloudAppIds: new Set(),
           managedActiveDownloadAppIds: new Set(),
           libraryRefreshTimer: 0,
+          summaryRetryTimer: 0,
+          summaryRetryDelayMs: 0,
           downloadRefreshTimer: 0,
           downloadRequestInFlight: false,
           downloadAppIdsSignature: "",
@@ -495,12 +643,60 @@
     } catch (_) {}
   }
 
+  function getTabHeroSnapshot() {
+    return state.tabHeroSnapshot || {
+      enabled: false,
+      revision: 0,
+      customTabs: [],
+      native: {},
+      order: [],
+    };
+  }
+
+  // Tab Hero is part of OmniLibrary: it is active only while the OmniLibrary
+  // plugin is on, and it steps back completely while the third-party
+  // TabMaster plugin owns the tab row, so two managers never rewrite it.
+  function isTabHeroEnabled() {
+    return Boolean(
+      tabHero &&
+      state.pluginEnabled === true &&
+      state.tabMasterOwnsLayout !== true &&
+      getTabHeroSnapshot().enabled !== false,
+    );
+  }
+
+  function getTabHeroCustomDefinitions() {
+    if (!isTabHeroEnabled()) {
+      return [];
+    }
+    return (getTabHeroSnapshot().customTabs || [])
+      .filter((definition) => definition?.enabled !== false)
+      .map((definition) => ({
+        ...definition,
+        id: String(definition.id || ""),
+        tabId: String(definition.id || ""),
+        mode: String(definition.id || ""),
+        owner: "tabhero",
+      }))
+      .filter((definition) => definition.id.startsWith(tabHeroCustomTabPrefix));
+  }
+
+  function isTabHeroTabId(tabId) {
+    const id = String(tabId || "");
+    return isTabHeroEnabled() && getTabHeroSnapshot().customTabs?.some(
+      (definition) => definition?.id === id && definition?.enabled !== false,
+    ) === true;
+  }
+
   function getEnabledVirtualDefinitions() {
-    return getEnabledStoreDefinitions();
+    return [
+      ...getEnabledStoreDefinitions(),
+      ...getTabHeroCustomDefinitions(),
+    ];
   }
 
   function isLibraryTabRuntimeEnabled() {
-    return getEnabledVirtualDefinitions().length > 0;
+    return getEnabledVirtualDefinitions().length > 0 || isTabHeroEnabled();
   }
 
   function removeOmniLibraryUninstallNotice() {
@@ -659,8 +855,10 @@
     return true;
   }
 
+  // Every tab without a native Steam route of its own: OmniLibrary store and
+  // platform tabs and Tab Hero filter tabs share one virtual-tab path.
   function isManagedStoreTabId(tabId) {
-    return getEnabledStoreDefinitions().some(
+    return isTabHeroTabId(tabId) || getEnabledStoreDefinitions().some(
       (definition) => definition.tabId === String(tabId || ""));
   }
 
@@ -687,7 +885,8 @@
         const id = String(tab?.id || "");
         return Boolean(
           id &&
-          !isManagedStoreTabId(id)
+          !isManagedStoreTabId(id) &&
+          !(isTabHeroEnabled() && tabHero.isProtectedTab?.(tab) === true)
         );
       })
       .map((tab) => String(tab.id));
@@ -697,7 +896,12 @@
       ...visibleNativeIds.filter((routeId) => !preferredRoutes.includes(routeId)),
     ];
     if (!backingRoutes.length) {
-      backingRoutes.push(...preferredRoutes);
+      const nativeSettings = getTabHeroSnapshot().native || {};
+      backingRoutes.push(
+        ...preferredRoutes.filter(
+          (routeId) => nativeSettings[routeId]?.hidden !== true,
+        ),
+      );
     }
     if (!backingRoutes.length) {
       backingRoutes.push("AllGames");
@@ -709,6 +913,22 @@
     const routeToAvoid = backingRoutes.includes(selectedTabId)
       ? selectedTabId
       : state.nativeRouteEchoTabId;
+    // Never back a store tab with the native tab right next to it: LB/RB to
+    // that neighbour would then select the route Steam already shows, Steam
+    // drops the transition and the store tab stays on screen (GOG -> Soundtrack).
+    const runtimeIndex = runtimeTabs.findIndex((tab) => String(tab?.id || "") === normalizedTabId);
+    if (runtimeIndex >= 0 && runtimeTabs.length > 1) {
+      const neighbours = new Set([
+        String(runtimeTabs[(runtimeIndex + 1) % runtimeTabs.length]?.id || ""),
+        String(runtimeTabs[(runtimeIndex - 1 + runtimeTabs.length) % runtimeTabs.length]?.id || ""),
+        String(routeToAvoid || ""),
+        getRouteLibraryTabId(),
+      ]);
+      const safeRoute = backingRoutes.find((routeId) => !neighbours.has(routeId));
+      if (safeRoute) {
+        return safeRoute;
+      }
+    }
     return tabTopology?.chooseDistinctBackingRoute
       ? tabTopology.chooseDistinctBackingRoute(
           backingRoutes,
@@ -772,7 +992,7 @@
     };
   }
 
-  async function refreshXboxAppIds(force = false) {
+  async function refreshXboxAppIds(force = false, useCachedSnapshot = false) {
     if (state.libraryRequestInFlight) {
       state.libraryForceRefreshPending =
         state.libraryForceRefreshPending || force;
@@ -781,7 +1001,12 @@
 
     state.libraryRequestInFlight = true;
     try {
-      const snapshot = await omniLibraryStateStore.refresh(force);
+      const snapshot = useCachedSnapshot && omniLibraryStateStore.snapshot?.cached
+        ? omniLibraryStateStore.snapshot
+        : await omniLibraryStateStore.refresh(force);
+      if (!snapshot?.cached) {
+        state.summaryRetryDelayMs = 0;
+      }
       const wasRuntimeActive = isLibraryTabRuntimeEnabled();
       const activationWasResolved = state.activationResolved === true;
       const previousPluginEnabled = state.pluginEnabled === true;
@@ -1010,6 +1235,7 @@
         state.routeRefreshRequested = true;
         scheduleXboxTabPatch();
       }
+      scheduleSummaryRetry();
     } finally {
       state.libraryRequestInFlight = false;
       if (state.libraryForceRefreshPending) {
@@ -1019,6 +1245,24 @@
         }, 0);
       }
     }
+  }
+
+  // At Steam start TFS can still be coming up. Waiting for the 60-second
+  // refresh left the Library without store tabs for up to a minute, so a
+  // failed summary is retried quickly with a bounded backoff.
+  function scheduleSummaryRetry() {
+    if (state.summaryRetryTimer) {
+      return;
+    }
+    const delay = Math.min(
+      30000,
+      Math.max(1000, Number(state.summaryRetryDelayMs || 0) * 2),
+    );
+    state.summaryRetryDelayMs = delay;
+    state.summaryRetryTimer = window.setTimeout(() => {
+      state.summaryRetryTimer = 0;
+      void refreshXboxAppIds(true);
+    }, delay);
   }
 
   function getReactPropertyKey(element, prefix) {
@@ -1422,31 +1666,48 @@
       if (document.visibilityState === "hidden") {
         return;
       }
-      const touchesLibraryTabs = mutations.some((mutation) => {
-        if (mutation.target?.closest?.('[role="tablist"]')) {
-          return true;
+      // Big Picture mutates the document constantly. Classify each batch in
+      // one pass and stop as soon as both answers are known.
+      let touchesLibraryTabs = false;
+      let touchesLibraryGrid = false;
+      for (const mutation of mutations) {
+        touchesLibraryTabs ||= Boolean(
+          mutation.target?.closest?.('[role="tablist"]'),
+        );
+        touchesLibraryGrid ||= Boolean(
+          mutation.target?.closest?.('[role="gridcell"]'),
+        );
+        for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
+          for (const node of nodes || []) {
+            if (touchesLibraryTabs && touchesLibraryGrid) {
+              break;
+            }
+            if (!(node instanceof Element)) {
+              continue;
+            }
+            touchesLibraryTabs ||= Boolean(
+              node.matches?.('[role="tablist"], [role="tab"]') ||
+              node.querySelector?.('[role="tablist"], [role="tab"]'),
+            );
+            touchesLibraryGrid ||= Boolean(
+              node.matches?.('[role="gridcell"]') ||
+              node.querySelector?.('[role="gridcell"]'),
+            );
+          }
         }
-
-        return [...mutation.addedNodes, ...mutation.removedNodes].some((node) =>
-          node instanceof Element &&
-          (node.matches?.('[role="tablist"], [role="tab"]') ||
-           node.querySelector?.('[role="tablist"], [role="tab"]')));
-      });
-      const touchesLibraryGrid = mutations.some((mutation) => {
-        if (mutation.target?.closest?.('[role="gridcell"]')) {
-          return true;
+        if (touchesLibraryTabs && touchesLibraryGrid) {
+          break;
         }
-
-        return [...mutation.addedNodes, ...mutation.removedNodes].some((node) =>
-          node instanceof Element &&
-          (node.matches?.('[role="gridcell"]') ||
-           node.querySelector?.('[role="gridcell"]')));
-      });
+      }
       if (touchesLibraryTabs && mountedLibraryTabLayoutNeedsPatch()) {
         // The Library route can mount after the store summary is already
         // cached. Patch that first native tab row immediately instead of
-        // waiting for LB/RB or the low-frequency repair timer.
+        // waiting for LB/RB or the low-frequency repair timer. Every new
+        // mount is a fresh React row, so it gets its own render pulse; the
+        // single pulse per session left later visits without store tabs
+        // until the first LB/RB.
         state.forceRenderRequested = true;
+        state.layoutVerificationResetRequested = true;
         scheduleXboxTabPatch();
       }
       if (touchesLibraryGrid) {
@@ -1558,14 +1819,16 @@
       "Soundtracks",
     ];
     return knownNativeIds.some((id) => ids.has(id)) ||
-      Array.from(ids).some((id) => String(id).startsWith("tfs-"));
+      Array.from(ids).some((id) =>
+        String(id).startsWith(tabHeroCustomTabPrefix) ||
+        String(id).startsWith("tfs-"));
   }
 
   function isInjectedXboxTab(tab) {
     const id = String(tab?.id || "");
     return Boolean(
-      tab?.[retiredFilterMarkerKey] ||
-      id.startsWith(retiredCustomTabPrefix) ||
+      tab?.[tabHeroFilterMarkerKey] ||
+      id.startsWith(tabHeroCustomTabPrefix) ||
       legacyManagedTabIds.has(id) ||
       storeDefinitions.some((definition) =>
         id === definition.tabId || id === definition.title)
@@ -1647,7 +1910,101 @@
     }
   }
 
-  function getVirtualCollection(sourceCollection, mode) {
+  function getCollectionAppCount(collection) {
+    try {
+      const apps = collection?.apps;
+      if (Number.isFinite(apps?.size)) {
+        return apps.size;
+      }
+      if (Number.isFinite(apps?.length)) {
+        return apps.length;
+      }
+      return Number(collection?.allApps?.length || 0);
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  function collectionHasExactAppIds(collection, appIds) {
+    const current = getCollectionAppIds(collection);
+    if (current.length !== appIds.length) {
+      return false;
+    }
+    const expected = new Set(appIds);
+    return current.every((appId) => expected.has(appId));
+  }
+
+  function getCollectionAppsRecord(collection) {
+    const now = Date.now();
+    const recent = state.collectionAppsCache.get(collection);
+    if (recent && now - Number(recent.checkedAt || 0) < 100) {
+      return recent;
+    }
+    const appIds = getCollectionAppIds(collection);
+    const signature = appIds.join(",");
+    if (recent?.signature === signature) {
+      recent.checkedAt = now;
+      return recent;
+    }
+    const appsById = new Map();
+    for (const app of Array.from(collection?.allApps || collection?.visibleApps || [])) {
+      const appId = Number(app?.appid ?? app?.appId ?? app?.nAppID ?? app);
+      if (Number.isInteger(appId) && appId > 0 && typeof app === "object") {
+        appsById.set(appId, app);
+      }
+    }
+    const apps = appIds.map((appId) =>
+      appsById.get(appId) ||
+      window.appStore?.GetAppOverviewByAppID?.(appId) ||
+      { appid: appId });
+    const record = { signature, apps, checkedAt: now };
+    state.collectionAppsCache.set(collection, record);
+    return record;
+  }
+
+  // Tab Hero filters evaluate Steam's live app overviews. Results are reused
+  // briefly per source collection so one render pass does not run every
+  // filter several times; a settings change clears the cache immediately.
+  function getTabHeroFilteredAppIds(sourceCollection, definition) {
+    const sourceRecord = getCollectionAppsRecord(sourceCollection);
+    let filterCache = state.tabHeroFilterResults.get(sourceCollection);
+    if (!filterCache) {
+      filterCache = new Map();
+      state.tabHeroFilterResults.set(sourceCollection, filterCache);
+    }
+    const definitionSignature = JSON.stringify({
+      filters: definition.filters,
+      matchMode: definition.matchMode,
+      categories: definition.categories,
+    });
+    const previousResult = filterCache.get(definition.id);
+    if (
+      previousResult?.sourceSignature === sourceRecord.signature &&
+      previousResult?.definitionSignature === definitionSignature &&
+      Date.now() - Number(previousResult?.evaluatedAt || 0) < tabHeroFilterCacheMs
+    ) {
+      return previousResult.appIds;
+    }
+    const appIds = tabHero.filterApps(
+      sourceRecord.apps,
+      definition,
+      {
+        collectionStore: window.collectionStore,
+        installFolderStore: window.installFolderStore,
+        achievementProgressCache: window.appAchievementProgressCache,
+      },
+    ).map((app) => Number(app?.appid ?? app?.appId ?? app?.nAppID ?? app))
+      .filter((appId) => Number.isInteger(appId) && appId > 0);
+    filterCache.set(definition.id, {
+      sourceSignature: sourceRecord.signature,
+      definitionSignature,
+      appIds,
+      evaluatedAt: Date.now(),
+    });
+    return appIds;
+  }
+
+  function getVirtualCollection(sourceCollection, mode, tabHeroDefinition = null) {
     if (!sourceCollection || typeof sourceCollection !== "object") {
       return sourceCollection;
     }
@@ -1658,55 +2015,82 @@
       state.virtualCollections.set(sourceCollection, cached);
     }
 
-    const storeDefinition = storeDefinitions.find((definition) => definition.mode === mode);
-    // Store/platform tabs already have their exact app-id set in the compact
-    // summary. Avoid enumerating the full Non-Steam collection once per tab;
-    // this keeps rendering proportional to each platform instead of
-    // platform-count x total-library-size.
-    const sourceIds = storeDefinition
-      ? []
-      : getCollectionAppIds(sourceCollection);
-    let topology = state.derivedTopologyCache;
-    if (topology?.signature !== state.xboxAppIdsSignature) {
-      const enabledDefinitions = getEnabledStoreDefinitions();
-      const visibleManagedAppIds = enabledDefinitions.flatMap((definition) =>
-        Array.from(state.storeStates.get(definition.id)?.appIds || []));
-      const visibleInstalledAppIds = enabledDefinitions.flatMap((definition) =>
-        Array.from(state.storeStates.get(definition.id)?.installedAppIds || []));
-      const visibleManagedAppIdSet = new Set(visibleManagedAppIds);
-      topology = {
-        signature: state.xboxAppIdsSignature,
-        visibleManagedAppIds,
-        visibleInstalledAppIds,
-        hiddenManagedAppIds: new Set(
-          Array.from(state.managedAppIds)
-            .filter((appId) => !visibleManagedAppIdSet.has(appId)),
-        ),
-      };
-      state.derivedTopologyCache = topology;
-    }
-    const requestedIds = storeDefinition
-      ? Array.from(state.storeStates.get(storeDefinition.id)?.appIds || [])
-      : mode === "allGames"
-        ? sourceIds
-            .filter((appId) => !state.managedAppIds.has(appId))
-            .concat(topology.visibleManagedAppIds)
-        : mode === "installed"
+    const storeDefinition = tabHeroDefinition
+      ? null
+      : storeDefinitions.find((definition) => definition.mode === mode);
+    let entry = cached[mode];
+    // Steam renders the tab row on many focus and selection changes, and every
+    // render asks for each collection twice. Enumerating and sorting the whole
+    // library each time made LB/RB and D-Pad input lag on large libraries, so
+    // the app-id list is rebuilt only when its inputs change. The age limit
+    // covers a same-size swap that the collection size cannot reveal.
+    const inputKey = storeDefinition
+      ? state.xboxAppIdsSignature
+      : `${state.xboxAppIdsSignature}|${getCollectionAppCount(sourceCollection)}`;
+    const now = Date.now();
+    let appIds = entry?.appIds;
+    let signature = entry?.targetSignature;
+    let recomputed = false;
+    if (
+      tabHeroDefinition ||
+      !entry ||
+      !Array.isArray(appIds) ||
+      entry.inputKey !== inputKey ||
+      now - Number(entry.inputAt || 0) >= virtualCollectionInputLifetimeMs
+    ) {
+      // Store/platform tabs already have their exact app-id set in the compact
+      // summary. Avoid enumerating the full Non-Steam collection once per tab;
+      // this keeps rendering proportional to each platform instead of
+      // platform-count x total-library-size.
+      const sourceIds = storeDefinition || tabHeroDefinition
+        ? []
+        : getCollectionAppIds(sourceCollection);
+      let topology = state.derivedTopologyCache;
+      if (topology?.signature !== state.xboxAppIdsSignature) {
+        const enabledDefinitions = getEnabledStoreDefinitions();
+        const visibleManagedAppIds = enabledDefinitions.flatMap((definition) =>
+          Array.from(state.storeStates.get(definition.id)?.appIds || []));
+        const visibleInstalledAppIds = enabledDefinitions.flatMap((definition) =>
+          Array.from(state.storeStates.get(definition.id)?.installedAppIds || []));
+        const visibleManagedAppIdSet = new Set(visibleManagedAppIds);
+        topology = {
+          signature: state.xboxAppIdsSignature,
+          visibleManagedAppIds,
+          visibleInstalledAppIds,
+          hiddenManagedAppIds: new Set(
+            Array.from(state.managedAppIds)
+              .filter((appId) => !visibleManagedAppIdSet.has(appId)),
+          ),
+        };
+        state.derivedTopologyCache = topology;
+      }
+      const requestedIds = storeDefinition
+        ? Array.from(state.storeStates.get(storeDefinition.id)?.appIds || [])
+        : tabHeroDefinition
+          ? getTabHeroFilteredAppIds(sourceCollection, tabHeroDefinition)
+        : mode === "allGames"
           ? sourceIds
               .filter((appId) => !state.managedAppIds.has(appId))
-              .concat(topology.visibleInstalledAppIds)
-          : sourceIds.filter((appId) => !topology.hiddenManagedAppIds.has(appId));
-    const appIds = Array.from(new Set(requestedIds));
-    appIds.sort((left, right) => left - right);
-    const signature = appIds.join(",");
-    let entry = cached[mode];
+              .concat(topology.visibleManagedAppIds)
+          : mode === "installed"
+            ? sourceIds
+                .filter((appId) => !state.managedAppIds.has(appId))
+                .concat(topology.visibleInstalledAppIds)
+            // NON-STEAM keeps only the user's own shortcuts: OmniLibrary games
+            // already have their store tab, listing them twice cluttered it.
+            : sourceIds.filter((appId) => !state.managedAppIds.has(appId));
+      appIds = Array.from(new Set(requestedIds));
+      appIds.sort((left, right) => left - right);
+      signature = appIds.join(",");
+      recomputed = true;
+    }
 
     if (!entry) {
       try {
         const Collection = sourceCollection.constructor;
         const collection = new Collection(
-          storeDefinition?.tabId || `tfs-${mode}`,
-          storeDefinition?.title || sourceCollection.displayName || mode,
+          storeDefinition?.tabId || tabHeroDefinition?.id || `tfs-${mode}`,
+          storeDefinition?.title || tabHeroDefinition?.title || sourceCollection.displayName || mode,
         );
         entry = { collection, signature: "", lastSetAt: 0 };
       } catch (_) {
@@ -1714,20 +2098,37 @@
       }
       cached[mode] = entry;
     }
+    if (recomputed) {
+      entry.inputKey = inputKey;
+      entry.inputAt = now;
+      entry.appIds = appIds;
+      entry.targetSignature = signature;
+    }
 
-    const currentTitle = storeDefinition?.title;
+    if (tabHeroDefinition && entry.collection !== sourceCollection) {
+      try {
+        entry.collection.__steamLoaderTabHeroRequestedCount = appIds.length;
+      } catch (_) {}
+    }
+
+    const currentTitle = storeDefinition?.title || tabHeroDefinition?.title;
     if (currentTitle && entry.collection && entry.collection.displayName !== currentTitle) {
       try {
         entry.collection.displayName = currentTitle;
       } catch (_) {}
     }
 
-    const currentSignature = getCollectionAppIds(entry.collection)
-      .sort((left, right) => left - right)
-      .join(",");
-    const shouldRetryHydration =
-      currentSignature !== signature &&
-      Date.now() - Number(entry.lastSetAt || 0) >= 2500;
+    // Steam can drop ids it has not loaded yet. Verify the hydrated set at the
+    // retry cadence only, instead of sorting it again on every render.
+    let shouldRetryHydration = false;
+    if (
+      entry.signature === signature &&
+      now - Number(entry.lastSetAt || 0) >= virtualCollectionHydrationCheckMs &&
+      now - Number(entry.lastHydrationCheckAt || 0) >= virtualCollectionHydrationCheckMs
+    ) {
+      entry.lastHydrationCheckAt = now;
+      shouldRetryHydration = !collectionHasExactAppIds(entry.collection, appIds);
+    }
     if (
       (entry.signature !== signature || shouldRetryHydration) &&
       typeof entry.collection?.SetApps === "function"
@@ -1834,14 +2235,14 @@
       tab?.__steamLoaderNativeAllGamesTab ||
       tab?.__steamLoaderNativeInstalledTab ||
       tab;
-    const originalTitle = template?.[retiredOriginalTitleKey];
+    const originalTitle = template?.[tabHeroOriginalTitleKey];
     if (typeof originalTitle !== "string") {
       return template;
     }
 
     const restored = { ...template, title: originalTitle };
     try {
-      delete restored[retiredOriginalTitleKey];
+      delete restored[tabHeroOriginalTitleKey];
     } catch (_) {}
     return restored;
   }
@@ -1896,17 +2297,21 @@
 
     const tabMasterOwnsLayout =
       tabTopology?.hasTabMasterOwnership?.(tabs) === true;
+    state.tabMasterOwnsLayout = tabMasterOwnsLayout;
     rememberNativeTabTemplates(tabs, tabMasterOwnsLayout);
     const baseTabs = tabs.filter((tab) => !isInjectedXboxTab(tab));
     const enabledDefinitions = getEnabledStoreDefinitions();
+    const tabHeroDefinitions = getTabHeroCustomDefinitions();
     const visibleTabs = baseTabs.map(getNativeTemplateTab);
     // Missing entries in a TabMaster-owned list are user intent, not a
     // transient Steam render. Preserve that visible list byte-for-byte.
     const restoredTabs = tabMasterOwnsLayout
       ? visibleTabs
       : restoreRememberedNativeTabs(visibleTabs);
-    if (!enabledDefinitions.length) {
-      return restoredTabs;
+    if (!enabledDefinitions.length && !tabHeroDefinitions.length) {
+      return isTabHeroEnabled()
+        ? tabHero.composeTabs(restoredTabs)
+        : restoredTabs;
     }
     const currentDesktopTab = restoredTabs.find((tab) => tab?.id === "DesktopApps" && tab?.content);
     const rememberedDesktopTab = state.nativeTabTemplates.get("DesktopApps");
@@ -1924,22 +2329,34 @@
     const nativeCollection = getContentCollection(storeTemplateTab?.content);
     const nativeAllGamesCollection = getContentCollection(nativeAllGamesTab?.content);
     const nativeInstalledCollection = getContentCollection(nativeInstalledTab?.content);
-    if (!storeTemplateTab || !nativeCollection) {
+    if (
+      (enabledDefinitions.length && (!storeTemplateTab || !nativeCollection)) ||
+      (tabHeroDefinitions.length && (!nativeAllGamesTab || !nativeAllGamesCollection))
+    ) {
       setStatus("waiting for Steam's Library collections");
-      return restoredTabs;
+      return isTabHeroEnabled()
+        ? tabHero.composeTabs(restoredTabs)
+        : restoredTabs;
     }
 
-    const filteredDesktopCollection = currentDesktopTab
+    const hasStoreTabs = enabledDefinitions.length > 0;
+    const filteredDesktopCollection = hasStoreTabs && currentDesktopTab
       ? getVirtualCollection(nativeCollection, "nonSteam")
       : null;
     const storeCollections = new Map(enabledDefinitions.map((definition) => [
       definition.id,
       getVirtualCollection(nativeCollection, definition.mode),
     ]));
-    const allGamesCollection = nativeAllGamesCollection
+    // Tab Hero filters start from Steam's complete game list, so a filter tab
+    // can contain OmniLibrary games next to Steam games.
+    const customCollections = new Map(tabHeroDefinitions.map((definition) => [
+      definition.id,
+      getVirtualCollection(nativeAllGamesCollection, definition.mode, definition),
+    ]));
+    const allGamesCollection = hasStoreTabs && nativeAllGamesCollection
       ? getVirtualCollection(nativeAllGamesCollection, "allGames")
       : null;
-    const installedCollection = nativeInstalledCollection
+    const installedCollection = hasStoreTabs && nativeInstalledCollection
       ? getVirtualCollection(nativeInstalledCollection, "installed")
       : null;
     const normalizedTabs = restoredTabs.map((tab) =>
@@ -1963,24 +2380,63 @@
     );
     const storeTabs = enabledDefinitions.map((definition) =>
       buildXboxTab(storeTemplateTab, storeCollections.get(definition.id), definition));
+    const customTabs = tabHeroDefinitions
+      .map((definition) => ({
+        definition,
+        collection: customCollections.get(definition.id),
+      }))
+      .filter(({ definition, collection }) =>
+        !(
+          definition.autoHide === true &&
+          Number(collection?.__steamLoaderTabHeroRequestedCount) === 0
+        ))
+      .map(({ definition, collection }) =>
+        buildTabHeroTab(nativeAllGamesTab, collection, definition));
+    let combinedTabs;
     if (tabTopology?.buildCanonicalTabOrder) {
       const storeTabsById = new Map(storeTabs.map((tab) => [String(tab.id), tab]));
-      return tabTopology
+      combinedTabs = tabTopology
         .buildCanonicalTabOrder(
           normalizedTabs,
           enabledDefinitions,
           storeDefinitions,
         )
         .map((tab) => storeTabsById.get(String(tab?.id || "")) || tab);
+    } else {
+      const desktopIndex = normalizedTabs.findIndex((tab) => tab?.id === "DesktopApps");
+      const insertIndex = desktopIndex >= 0 ? desktopIndex + 1 : normalizedTabs.length;
+      combinedTabs = [
+        ...normalizedTabs.slice(0, insertIndex),
+        ...storeTabs,
+        ...normalizedTabs.slice(insertIndex),
+      ];
     }
 
-    const desktopIndex = normalizedTabs.findIndex((tab) => tab?.id === "DesktopApps");
-    const insertIndex = desktopIndex >= 0 ? desktopIndex + 1 : normalizedTabs.length;
-    return [
-      ...normalizedTabs.slice(0, insertIndex),
-      ...storeTabs,
-      ...normalizedTabs.slice(insertIndex),
-    ];
+    // One pass decides the final row: OmniLibrary's store block stays a
+    // protected unit, and Tab Hero orders, renames and hides everything else.
+    combinedTabs = [...combinedTabs, ...customTabs];
+    return isTabHeroEnabled()
+      ? tabHero.composeTabs(combinedTabs)
+      : combinedTabs;
+  }
+
+  function buildTabHeroTab(templateTab, collection, definition) {
+    const cleanTemplate = withoutTabMasterFooter(templateTab);
+    return {
+      ...cleanTemplate,
+      id: definition.id,
+      key: definition.id,
+      title: definition.title,
+      content: cloneContentElement(
+        cleanTemplate.content,
+        getContentCollection(cleanTemplate.content),
+        collection,
+        `${definition.id}-native-content`,
+      ),
+      renderTabAddon: buildCountAddon(cleanTemplate, collection),
+      [tabHeroFilterMarkerKey]: definition.id,
+      __steamLoaderTabOwner: "tabhero",
+    };
   }
 
   function tabsSignature(tabs) {
@@ -2092,7 +2548,16 @@
 
     // Steam can keep an old tab row mounted underneath the active one. Its tab
     // nodes still have dimensions and their own computed opacity is 1, while a
-    // parent hides the whole row. Inspect the ancestor chain as well.
+    // parent hides the whole row. Inspect the ancestor chain as well. The
+    // native check covers the whole chain without one style read per level.
+    if (typeof element.checkVisibility === "function") {
+      return element.checkVisibility({
+        opacityProperty: true,
+        visibilityProperty: true,
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+      });
+    }
     let current = element;
     for (let depth = 0; current && depth < 24; depth += 1) {
       const style = window.getComputedStyle(current);
@@ -2250,7 +2715,11 @@
           storeDefinitions,
         )
       : sourceTabs;
-    const plannedTabs = omniLibraryTabs;
+    // Navigation reads the same composed order the row renders, without
+    // recording a catalog observation (that would trigger another render).
+    const plannedTabs = isTabHeroEnabled()
+      ? tabHero.composeTabs(omniLibraryTabs, { observe: false })
+      : omniLibraryTabs;
     // Runtime tab props can briefly contain OmniLibrary tabs that Steam has not
     // mounted yet. Keep their intended order, but never expose such entries to
     // controller navigation.
@@ -2387,6 +2856,16 @@
       return false;
     }
 
+    // The catch-all hook, the vgp event and the React tab handler all see the
+    // same physical press. Once the first layer moved, the others only need
+    // to consume it; measuring the tab rows again just delayed the switch.
+    if (
+      state.heldBumperDirections instanceof Set &&
+      state.heldBumperDirections.has(direction)
+    ) {
+      return true;
+    }
+
     const navigation = getLiveLibraryNavigation();
     if (!navigation) {
       return false;
@@ -2466,7 +2945,28 @@
     return numericButton === 11 ? -1 : numericButton === 12 ? 1 : 0;
   }
 
+  function hasFocusedTabCandidate() {
+    if (document.activeElement?.closest?.('[role="tab"]')) {
+      return true;
+    }
+    try {
+      return Boolean(document.querySelector(
+        '[role="tab"]:focus, [role="tab"].gpfocus, [role="tab"].gpfocuswithin, ' +
+        '[role="tab"] :focus, [role="tab"] .gpfocus, [role="tab"] .gpfocuswithin',
+      ));
+    } catch (_) {
+      return true;
+    }
+  }
+
   function getControllerFocusedLibraryTab() {
+    // Every horizontal D-Pad press reaches this check up to three times. Only
+    // measure the tab rows when controller focus is actually on a tab;
+    // otherwise moving through the game grid paid for a full style pass.
+    if (!hasFocusedTabCandidate()) {
+      return null;
+    }
+
     const visibleTabs = getVisibleLibraryTabs();
     if (!visibleTabs.length) {
       return null;
@@ -2529,12 +3029,45 @@
     );
   }
 
+  // FocusNavController lives in Steam's SharedJSContext; this compositor runs
+  // in Big Picture's window, which reaches it through window.opener.
+  function getFocusNavController() {
+    for (const candidate of [window, window.opener]) {
+      try {
+        if (candidate?.FocusNavController?.SetCatchAllGamepadInput) {
+          return candidate.FocusNavController;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // Steam keeps catch-all callbacks in a list now (SetCatchAllGamepadInput
+  // pushes and returns { Unregister }). Older builds re-pushed every second
+  // and piled up hundreds of stale Library callbacks; drop all but ours.
+  function purgeStaleLibraryCatchAll(list, keep) {
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const entry = list[index];
+      if (entry !== keep && entry?.__steamLoaderXboxLibraryBumpers) {
+        list.splice(index, 1);
+      }
+    }
+  }
+
   function uninstallLibraryBumperInput() {
-    const focusNav = state.catchAllController || window.FocusNavController;
+    const focusNav = state.catchAllController || getFocusNavController();
+    try {
+      state.catchAllRegistration?.Unregister?.();
+    } catch (_) {}
+    state.catchAllRegistration = null;
+    if (Array.isArray(focusNav?.m_rgCatchAllGamepadInput)) {
+      purgeStaleLibraryCatchAll(focusNav.m_rgCatchAllGamepadInput, null);
+    }
     const current = focusNav?.m_fnCatchAllGamepadInput;
     if (
       state.catchAllInstalled &&
       focusNav?.SetCatchAllGamepadInput &&
+      !Array.isArray(focusNav.m_rgCatchAllGamepadInput) &&
       (
         current === state.catchAllGamepadInput ||
         current?.__steamLoaderXboxLibraryBumpers === stateVersion
@@ -2612,14 +3145,58 @@
   }
 
   function installLibraryBumperInput() {
+    if (nativeRouteTabs) {
+      // Steam's tab row switches tabs itself; drop any interception left over.
+      if (state.catchAllInstalled || state.libraryBumperKeyHandler || state.libraryBumperEventHandler) {
+        uninstallLibraryBumperInput();
+      }
+      const focusNav = getFocusNavController();
+      if (Array.isArray(focusNav?.m_rgCatchAllGamepadInput)) {
+        purgeStaleLibraryCatchAll(focusNav.m_rgCatchAllGamepadInput, null);
+      }
+      return;
+    }
+
     if (!isLibraryTabRuntimeEnabled()) {
       uninstallLibraryBumperInput();
       return;
     }
 
     state.handleLibraryBumperInput = handleLibraryBumperInput;
-    const focusNav = window.FocusNavController;
-    if (focusNav?.SetCatchAllGamepadInput) {
+    state.releaseLibraryBumperInput = releaseLibraryBumperInput;
+    const focusNav = getFocusNavController();
+    const catchAllList = focusNav?.m_rgCatchAllGamepadInput;
+    if (focusNav?.SetCatchAllGamepadInput && Array.isArray(catchAllList)) {
+      // Current Steam: register once and keep the Unregister handle. Steam
+      // calls the list from newest to oldest with (button, down, repeat), so
+      // TFS modal captures registered later still take precedence.
+      purgeStaleLibraryCatchAll(catchAllList, state.catchAllGamepadInput);
+      if (
+        !state.catchAllGamepadInput ||
+        state.catchAllController !== focusNav ||
+        !catchAllList.includes(state.catchAllGamepadInput)
+      ) {
+        const callback = function (button, down = true) {
+          const currentState = window.__steamLoaderLibraryTabsState;
+          if (down === false) {
+            currentState?.releaseLibraryBumperInput?.(button);
+            return false;
+          }
+          return Boolean(currentState?.handleLibraryBumperInput?.(button));
+        };
+        callback.__steamLoaderXboxLibraryBumpers = stateVersion;
+        try {
+          state.catchAllRegistration = focusNav.SetCatchAllGamepadInput(callback);
+          state.catchAllGamepadInput = callback;
+          state.catchAllController = focusNav;
+        } catch (_) {
+          state.catchAllRegistration = null;
+          state.catchAllGamepadInput = null;
+        }
+      }
+      state.catchAllInstalled = Boolean(state.catchAllGamepadInput);
+      state.catchAllMissingSince = 0;
+    } else if (focusNav?.SetCatchAllGamepadInput) {
       const current = focusNav.m_fnCatchAllGamepadInput;
       if (
         current?.__steamLoaderXboxLibraryBumpers === stateVersion
@@ -2797,6 +3374,22 @@
       const handlerThis = this;
       const direction = getBumperDirection(event);
       if (!direction) {
+        return nativeHandler.call(handlerThis, event, ...args);
+      }
+
+      if (nativeRouteTabs) {
+        // Steam's row handler still holds Steam's own tab list. Step through
+        // the composed list instead and let Steam's router show the tab.
+        const runtime = state.navigationRuntime || navigation;
+        const tabs = Array.isArray(runtime?.tabs) ? runtime.tabs : [];
+        const nextTabId = getAdjacentTabId(tabs, runtime?.activeTab, direction, runtime?.wrapAround ?? true);
+        if (nextTabId && typeof runtime?.onShowTab === "function") {
+          runtime.onShowTab(nextTabId);
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
+          event?.stopImmediatePropagation?.();
+          return true;
+        }
         return nativeHandler.call(handlerThis, event, ...args);
       }
 
@@ -3166,7 +3759,25 @@
         recordLibraryRuntimeError("Library navigation", error);
       }
 
+      // Leaving a store tab for the native tab whose route is already active:
+      // Steam sees no route change and does not render, so re-render the row
+      // and the grid ourselves right away.
+      const routeBefore = getRouteLibraryTabId();
+      const leavingStoreForSameRoute =
+        isManagedStoreTabId(previousVirtualTabId) &&
+        !isManagedStoreTabId(state.virtualActiveTabId) &&
+        routeBefore &&
+        routeBefore === nativeRouteTabId;
       const result = nativeOnShowTab.call(this, nativeRouteTabId, ...args);
+      if (leavingStoreForSameRoute) {
+        try {
+          state.forceRenderRequested = true;
+          state.routeRefreshRequested = true;
+          patchXboxTabBasis();
+        } catch (error) {
+          recordLibraryRuntimeError("Library same-route refresh", error);
+        }
+      }
       try {
         scheduleXboxTileBadges();
       } catch (error) {
@@ -3197,6 +3808,10 @@
   }
 
   function buildLibraryTabProps(props) {
+    if (nativeRouteTabs) {
+      return buildRouteLibraryTabProps(props);
+    }
+
     const tabs = mergeXboxTab(props.tabs);
     const onShowTab = isLibraryTabRuntimeEnabled()
       ? getNavigationHandler(props.onShowTab)
@@ -3236,6 +3851,28 @@
         }
       : null;
     return nextProps;
+  }
+
+  // Steam's Library validates the routed tab against its own list before our
+  // tabs exist and falls back to the first tab. The route still names the tab
+  // the user picked, so take it from there once our tabs are part of the row.
+  function buildRouteLibraryTabProps(props) {
+    const tabs = mergeXboxTab(props.tabs);
+    const availableTabIds = new Set(tabs.map((tab) => String(tab?.id || "")));
+    const routeTabId = getRouteLibraryTabId();
+    const activeTab = routeTabId && availableTabIds.has(routeTabId)
+      ? routeTabId
+      : availableTabIds.has(String(props.activeTab || ""))
+        ? props.activeTab
+        : String(tabs[0]?.id || props.activeTab || "");
+    if (state.virtualActiveTabId) {
+      setVirtualActiveTabId("", true);
+    }
+    const onShowTab = getNativeNavigationHandler(props.onShowTab);
+    state.navigationCursorTabId = String(activeTab || "");
+    state.navigationCursorAt = Date.now();
+    state.navigationRuntime = { tabs, activeTab, onShowTab, wrapAround: props.wrapAround ?? true };
+    return { ...props, tabs, activeTab, onShowTab };
   }
 
   function getOriginalComponent(component) {
@@ -3426,8 +4063,44 @@
       storeDefinitions.some((definition) =>
         !enabledTabIds.has(definition.tabId) &&
         visibleTabIds.has(definition.tabId)) ||
-      [...legacyManagedTabIds].some((tabId) => visibleTabIds.has(tabId))
+      [...legacyManagedTabIds].some((tabId) => visibleTabIds.has(tabId)) ||
+      tabHeroLayoutNeedsPatch(visibleTabs)
     );
+  }
+
+  // Compares the mounted row with Tab Hero's saved layout: hidden tabs still
+  // shown, filter tabs missing, a rename not applied, or the order differing.
+  function tabHeroLayoutNeedsPatch(tabElements) {
+    if (!isTabHeroEnabled()) {
+      return Array.from(tabElements || []).some((element) =>
+        getVisibleLibraryTabId(element).startsWith(tabHeroCustomTabPrefix));
+    }
+    const snapshot = getTabHeroSnapshot();
+    const elements = Array.from(tabElements || []);
+    const ids = elements.map(getVisibleLibraryTabId);
+    const idSet = new Set(ids);
+    for (const definition of snapshot.customTabs || []) {
+      if (definition.enabled === false && idSet.has(definition.id)) {
+        return true;
+      }
+      if (definition.enabled !== false && definition.autoHide !== true && !idSet.has(definition.id)) {
+        return true;
+      }
+    }
+    for (const [tabId, settings] of Object.entries(snapshot.native || {})) {
+      if (settings?.hidden === true && idSet.has(tabId)) {
+        return true;
+      }
+      if (settings?.hidden !== true && settings?.title && idSet.has(tabId)) {
+        const element = elements.find((candidate) => getVisibleLibraryTabId(candidate) === tabId);
+        if (!String(element?.textContent || "").trim().includes(settings.title)) {
+          return true;
+        }
+      }
+    }
+    const desiredOrder = (snapshot.order || []).filter((id) => idSet.has(id));
+    const liveOrder = ids.filter((id) => desiredOrder.includes(id));
+    return desiredOrder.join("|") !== liveOrder.join("|");
   }
 
   function mountedLibraryTabLayoutNeedsPatch() {
@@ -3452,7 +4125,8 @@
         [...enabledTabIds].some((tabId) => !tabIds.has(tabId)) ||
         [...managedTabIds].some(
           (tabId) => !enabledTabIds.has(tabId) && tabIds.has(tabId),
-        )
+        ) ||
+        tabHeroLayoutNeedsPatch(tabList.querySelectorAll('[role="tab"]'))
       ) {
         return true;
       }
@@ -3460,32 +4134,60 @@
     return false;
   }
 
+  // The Library tab row is always an ancestor of a mounted tab list. Walking
+  // up from those few DOM nodes replaces a walk over Steam's whole React tree,
+  // which took tens of milliseconds and ran on every retry, repair and timer,
+  // up to 32 times at Steam start while the Library was not even open.
+  function findLibraryTabNodesFromDom() {
+    const nodes = [];
+    const visited = new Set();
+    const tabLists = document.querySelectorAll('[role="tablist"]');
+    for (const tabList of tabLists) {
+      let fiber = getReactFiber(tabList);
+      for (let depth = 0; fiber && depth < 96; depth += 1, fiber = fiber.return) {
+        if (visited.has(fiber)) {
+          continue;
+        }
+        visited.add(fiber);
+        if (getTabArrays(fiber).some(isLibraryTabsArray)) {
+          nodes.push(fiber);
+        }
+      }
+    }
+    return { nodes, tabListCount: tabLists.length };
+  }
+
   function patchXboxTabBasis() {
     try {
       installLibraryBumperInput();
       const runtimeActive = isLibraryTabRuntimeEnabled();
-      const rootFiber = getRootFiber();
-      if (!rootFiber) {
-        setStatus("waiting for Steam Library");
-        scheduleInitialLibraryPatchRetry();
-        return false;
+      const domSearch = findLibraryTabNodesFromDom();
+      const libraryNodes = domSearch.nodes;
+      if (!libraryNodes.length && domSearch.tabListCount > 0) {
+        // A tab list is mounted but its row was not among the ancestors.
+        // Keep the complete search as the fallback for that layout.
+        const rootFiber = getRootFiber();
+        if (!rootFiber) {
+          setStatus("waiting for Steam Library");
+          scheduleInitialLibraryPatchRetry();
+          return false;
+        }
+        walkFiber(rootFiber, (node) => {
+          if (getTabArrays(node).some(isLibraryTabsArray)) {
+            libraryNodes.push(node);
+          }
+        });
       }
 
-      const libraryNodes = [];
       const forceUpdateHosts = new Set();
-      walkFiber(rootFiber, (node) => {
-        if (!getTabArrays(node).some(isLibraryTabsArray)) {
-          return;
-        }
-
-        libraryNodes.push(node);
+      for (const node of libraryNodes) {
         let current = node;
         for (let depth = 0; current && depth < 64; depth += 1, current = current.return) {
           if (typeof current.stateNode?.forceUpdate === "function") {
             forceUpdateHosts.add(current.stateNode);
           }
         }
-      });
+      }
 
       if (!libraryNodes.length) {
         setStatus("waiting for native Library tabs");
@@ -3546,10 +4248,16 @@
       const activeFilterLabel = enabledDefinitions.length <= 6
         ? enabledDefinitions.map((definition) => definition.title).join(" + ")
         : `${enabledDefinitions.length} native tabs`;
+      const tabHeroCustomCount = getTabHeroCustomDefinitions().length;
       setStatus(
         enabledDefinitions.length
-          ? `${activeFilterLabel} active (${state.managedAppIds.size} managed games, dynamic LB/RB navigation)`
-          : "No connected OmniLibrary store is ready for a native tab",
+          ? `${activeFilterLabel} active (${state.managedAppIds.size} managed games, ` +
+            `${tabHeroCustomCount} Tab Hero tabs, one compositor)`
+          : isTabHeroEnabled()
+            ? `Tab Hero active (${tabHeroCustomCount} custom tabs, no store tab ready)`
+            : state.tabMasterOwnsLayout
+              ? "TabMaster owns the tab row; Tab Hero is paused"
+              : "No connected OmniLibrary store is ready for a native tab",
       );
       scheduleLibraryTabReveal(
         isManagedStoreTabId(state.virtualActiveTabId)
@@ -3835,6 +4543,37 @@
   }
 
   state.refreshStoreState = requestOmniLibraryStoreStateRefresh;
+  if (!state.tabHeroUnsubscribe && tabHero?.subscribe) {
+    state.tabHeroUnsubscribe = tabHero.subscribe((snapshot, reason) => {
+      const nextRevision = Number(snapshot?.revision || 0);
+      if (reason === "subscribe" && nextRevision === state.tabHeroRevision) {
+        return;
+      }
+      const nextLayoutSignature = buildTabHeroLayoutSignature(snapshot);
+      const layoutChanged =
+        nextLayoutSignature !== state.tabHeroLayoutSignature;
+      state.tabHeroRevision = nextRevision;
+      state.tabHeroSnapshot = snapshot;
+      state.tabHeroLayoutSignature = nextLayoutSignature;
+      if (!layoutChanged) {
+        // Catalog observations can arrive from another Steam webview. They are
+        // useful to the Tabs page, but must never re-render or navigate the
+        // Library surface.
+        return;
+      }
+      state.virtualCollections = new WeakMap();
+      state.collectionAppsCache = new WeakMap();
+      state.tabHeroFilterResults = new WeakMap();
+      state.forceRenderRequested = true;
+      state.layoutVerificationResetRequested = true;
+      if (isLibraryTabRuntimeEnabled()) {
+        ensureActiveRuntimeTimers();
+        ensureXboxTileObserver();
+        installLibraryBumperInput();
+      }
+      scheduleXboxTabPatch();
+    });
+  }
   if (!state.channel && typeof window.BroadcastChannel === "function") {
     try {
       state.channel = new window.BroadcastChannel(omniLibraryStoreChannelName);
@@ -3897,6 +4636,225 @@
     window.addEventListener("storage", state.storageHandler);
   }
 
+  // -------------------------------------------------------------------------
+  // Back from a game page: land on the same game, with focus, not at the top.
+  // -------------------------------------------------------------------------
+  const libraryTileSelector = "._1pwP4eeP1zQD7PEgmsep0W";
+
+  function getMainWindowHistory() {
+    for (const candidate of [window, window.opener]) {
+      try {
+        const history = candidate?.SteamUIStore?.m_WindowStore?.GamepadUIMainWindowInstance?.m_history;
+        if (history?.location && typeof history.listen === "function") {
+          return history;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function getReactFiberOf(element) {
+    const key = element && Object.keys(element).find((name) => name.startsWith("__reactFiber"));
+    return key ? element[key] : null;
+  }
+
+  function getTileAppId(element) {
+    let fiber = getReactFiberOf(element);
+    for (let depth = 0; fiber && depth < 6; depth += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      const appId = props?.app?.appid || props?.appid || props?.appOverview?.appid || props?.overview?.appid;
+      if (appId) {
+        return Number(appId);
+      }
+    }
+    return 0;
+  }
+
+  // Steam's Focusable keeps its navigation node in a ref; BTakeFocus() moves
+  // the gamepad focus there exactly like a D-pad move would.
+  function getTileNavNode(element) {
+    let fiber = getReactFiberOf(element);
+    for (let depth = 0; fiber && depth < 8; depth += 1, fiber = fiber.return) {
+      let hook = fiber.memoizedState;
+      for (let index = 0; hook && index < 30; index += 1, hook = hook.next) {
+        const node = hook.memoizedState?.current;
+        if (
+          node &&
+          node.m_element === element &&
+          (typeof node.BTakeFocus === "function" || typeof node.TakeFocus === "function")
+        ) {
+          return node;
+        }
+      }
+    }
+    return null;
+  }
+
+  function takeTileFocus(node) {
+    if (typeof node?.BTakeFocus === "function") {
+      return node.BTakeFocus() !== false;
+    }
+    if (typeof node?.TakeFocus === "function") {
+      node.TakeFocus();
+      return true;
+    }
+    return false;
+  }
+
+  function findTileForApp(appId) {
+    // The hashed class is Steam's library tile; after a Steam update that
+    // renames it, fall back to every focusable element.
+    let candidates = document.querySelectorAll(libraryTileSelector);
+    if (!candidates.length) {
+      candidates = document.querySelectorAll(".Focusable");
+    }
+    for (const element of candidates) {
+      if (getTileAppId(element) === appId) {
+        return element;
+      }
+    }
+    return null;
+  }
+
+  function getScrollParent(element) {
+    for (let node = element?.parentElement; node; node = node.parentElement) {
+      const style = window.getComputedStyle(node);
+      if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 4) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  function rememberLibraryReturn(appId, tabPath) {
+    const tile = findTileForApp(appId);
+    const scroller = getScrollParent(tile);
+    state.returnFocus = {
+      appId,
+      tabPath,
+      virtualTabId: state.virtualActiveTabId || "",
+      scrollTop: scroller ? scroller.scrollTop : null,
+      at: Date.now(),
+    };
+  }
+
+  function restoreLibraryReturn(target) {
+    if (!target?.appId) {
+      return;
+    }
+    if (state.returnFocusTimer) {
+      window.clearTimeout(state.returnFocusTimer);
+    }
+    const startedAt = Date.now();
+    let scrolled = false;
+    let confirmedAt = 0;
+    // Never fight the player: at most two focus moves, and only a short
+    // window after the first one in which Steam may still reset the grid.
+    let takes = 0;
+    const maxTakes = 2;
+    const settleWindowMs = 250;
+    const tick = () => {
+      state.returnFocusTimer = 0;
+      if (Date.now() - startedAt > 2500 || !/^\/library\//.test(getMainWindowHistory()?.location?.pathname || "")) {
+        return;
+      }
+      const tile = findTileForApp(target.appId);
+      if (!tile) {
+        // Long libraries render rows lazily: scroll back to where the game was.
+        const anyTile = document.querySelector(libraryTileSelector) || document.querySelector(".Focusable");
+        const scroller = getScrollParent(anyTile);
+        if (scroller && !scrolled && Number.isFinite(target.scrollTop)) {
+          scroller.scrollTop = target.scrollTop;
+          scrolled = true;
+        }
+        state.returnFocusTimer = window.setTimeout(tick, 40);
+        return;
+      }
+      const node = getTileNavNode(tile);
+      if (!node) {
+        state.returnFocusTimer = window.setTimeout(tick, 40);
+        return;
+      }
+      // BHasFocus is only reliable while Big Picture itself has OS focus.
+      const hasFocus = document.hasFocus()
+        ? (typeof node.BHasFocus === "function" ? node.BHasFocus() : tile.classList.contains("gpfocus"))
+        : confirmedAt > 0;
+      if (!hasFocus) {
+        if (takes >= maxTakes || (confirmedAt && Date.now() - confirmedAt > settleWindowMs)) {
+          // Focus left after it had settled: that was the player moving on.
+          return;
+        }
+        try {
+          if (!takeTileFocus(node)) {
+            state.returnFocusTimer = window.setTimeout(tick, 50);
+            return;
+          }
+        } catch (error) {
+          recordLibraryRuntimeError("Library return focus", error);
+          return;
+        }
+        takes += 1;
+        if (!document.hasFocus()) {
+          return;
+        }
+      } else if (!confirmedAt) {
+        confirmedAt = Date.now();
+      }
+      // Steam may reset the grid once more right after mounting; watch briefly.
+      if (!confirmedAt || Date.now() - confirmedAt < settleWindowMs) {
+        state.returnFocusTimer = window.setTimeout(tick, 50);
+      }
+    };
+    state.returnFocusTimer = window.setTimeout(tick, 30);
+  }
+
+  function installLibraryReturnFocus() {
+    if (state.returnFocusUnlisten) {
+      return;
+    }
+    const history = getMainWindowHistory();
+    if (!history) {
+      return;
+    }
+    let lastPath = history.location.pathname || "";
+    const listener = (update) => {
+      try {
+        const location = update?.location || update || history.location;
+        const path = String(location?.pathname || history.location.pathname || "");
+        const previousPath = lastPath;
+        lastPath = path;
+        const appMatch = path.match(/^\/library\/app\/(\d+)/);
+        // Library tabs only. Home keeps Steam's own behaviour (Luis 2026-11-11:
+        // restoring there made navigation jump back and forth).
+        if (appMatch && /^\/library\/tab\//.test(previousPath)) {
+          rememberLibraryReturn(Number(appMatch[1]), previousPath);
+          return;
+        }
+        const target = state.returnFocus;
+        if (
+          target &&
+          path === target.tabPath &&
+          /^\/library\/app\//.test(previousPath) &&
+          Date.now() - target.at < 6 * 60 * 60 * 1000
+        ) {
+          state.returnFocus = null;
+          restoreLibraryReturn(target);
+        } else if (target && !/^\/library\/app\//.test(path)) {
+          state.returnFocus = null;
+        }
+      } catch (error) {
+        recordLibraryRuntimeError("Library return tracking", error);
+      }
+    };
+    try {
+      state.returnFocusUnlisten = history.listen(listener);
+    } catch (error) {
+      recordLibraryRuntimeError("Library return tracking", error);
+    }
+  }
+
+  installLibraryReturnFocus();
+
   if (!state.visibilityHandler) {
     state.visibilityHandler = () => {
       if (document.visibilityState !== "hidden") {
@@ -3940,6 +4898,11 @@
     }, libraryRefreshIntervalMs);
   }
 
+  if (omniLibraryStateStore.snapshot?.cached && !state.activationResolved) {
+    // Compose the last known store tabs right away; the live summary that
+    // follows replaces them as soon as TFS answers.
+    void refreshXboxAppIds(false, true);
+  }
   if (document.visibilityState !== "hidden") {
     void refreshXboxAppIds(true);
   }

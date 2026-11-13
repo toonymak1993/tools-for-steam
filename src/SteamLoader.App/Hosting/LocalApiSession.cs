@@ -87,8 +87,11 @@ public static class LocalApiSession
             return false;
         }
 
+        // Frontend bundles hold no secrets (the session token only travels in the
+        // debugger-evaluated loader), and module imports cannot attach headers.
         return path.Equals("/health", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWith("/api/plugin-activator/images/", StringComparison.OrdinalIgnoreCase);
+            path.StartsWith("/api/plugin-activator/images/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith(FrontendBundleRegistry.RoutePrefix, StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsAuthorized(string expectedToken, string? headerToken, string? queryToken, string method)

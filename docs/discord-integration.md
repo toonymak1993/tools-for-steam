@@ -11,6 +11,45 @@ The Discord core plugin uses the official Discord Social SDK. Its normal user fl
 
 Discord Desktop is optional for sign-in. The Social SDK can use the browser flow directly.
 
+## Discord Web in Big Picture
+
+**Open Discord** on the Discord page (Quick Access) opens discord.com as a Big Picture page
+(`/tfs/discord`, `Assets/tfs-discord.mjs`). It works without connecting the Social SDK account;
+sign in on Discord's own page (the QR code from the Discord phone app is easiest).
+
+- The page is a Steam BrowserView created through Big Picture's own window
+  (`GamepadUIMainWindowInstance.CreateBrowserView`) and rendered with Steam's own browser host
+  component, the same one Steam uses for its built-in web browser. Steam therefore provides the
+  web-browser controller layout (right stick = mouse, RT = click, LT = right click, left stick =
+  scroll) and its on-screen keyboard for `<input>`/`<textarea>` fields.
+- Steam ignores contenteditable editors such as Discord's message box. A second page helper
+  (`DiscordWebBridge.KeyboardHelperScript`) reports trusted clicks into any text field (and Tab
+  focus) through the DevTools binding `tfsDiscordKeyboard` ("show"/"hide" only, never text).
+  The backend forwards that to `ToolsForSteamDiscord.keyboard()` in SharedJSContext, which calls
+  the BrowserView's own keyboard reference (`m_refKeyboard.ShowVirtualKeyboard`), the same call
+  Steam makes for inputs. Discord focusing the box by itself (channel switch) opens nothing.
+- Steam Controller 2 / Steam Deck extras: **L4/R4** page up/down in the chat, **L5** mark read,
+  **R5** jump to newest messages, **right stick click** right-clicks at the cursor. The Steam and
+  Quick Access buttons are never consumed by the page.
+- TFS adds: **A** click at the cursor, **B** closes Discord's popups first and leaves the page
+  when none is open, **X** mute, **Y** quick switcher, **LB/RB** previous/next server, **D-pad
+  up/down** previous/next channel, **D-pad left/right** previous/next unread channel, **View**
+  deafen, **Menu** opens the Discord menu (mute, deafen, direct messages, mark read, reload,
+  leave, close). Steam offers no input API for BrowserViews, so these go through the backend
+  (`/api/discord/web/*`, `DiscordWebBridge`) as DevTools input into the Discord page. Only a fixed
+  list of Discord shortcuts is accepted.
+- Leaving the page keeps Discord running, so voice continues in the background. **Close
+  Discord** (Discord menu or Quick Access) ends it. While it runs, Quick Access shows
+  **Return to Discord**, mute and deafen.
+- Selecting a server or an online friend on the Discord page opens it in Discord Web (in-app
+  navigation, no reload). The server details page still offers the desktop app.
+- The page helper injected into discord.com reads only the cursor position, the number of open
+  popups, the user panel's mute/deafen switches and whether a voice connection is shown. It never
+  reads messages, tokens or form values. A drawn cursor follows the mouse for handhelds where
+  Windows hides the pointer.
+- Microphone: Steam's BrowserView has no permission prompt, so the bridge sets the DevTools
+  permission override for Discord's origins (logged in `data\discord-web.log` when CEF refuses).
+
 ## Discord application configuration
 
 The production application is `1526906410359848990`. In the

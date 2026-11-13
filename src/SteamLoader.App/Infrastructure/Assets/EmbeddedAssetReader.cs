@@ -16,6 +16,19 @@ internal static class EmbeddedAssetReader
         return buffer.ToArray();
     }
 
+    /// <summary>Opens an embedded asset, or returns null when it is not part of this build.</summary>
+    public static Stream? TryOpenStream(string relativePath)
+    {
+        try
+        {
+            return OpenStream(relativePath);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+    }
+
     private static Stream OpenStream(string relativePath)
     {
         var assembly = typeof(EmbeddedAssetReader).Assembly;

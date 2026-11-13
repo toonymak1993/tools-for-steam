@@ -9,10 +9,11 @@ public sealed record UpdateCheckSnapshot(
     string? ReleaseUrl,
     string? AssetName,
     DateTimeOffset? PublishedAtUtc,
-    string Channel,
-    bool IsPrerelease,
     string? ReleaseName,
     DateTimeOffset CheckedAtUtc,
     bool InstallInProgress = false,
     string? InstallState = null,
-    int? InstallProgressPercent = null);
+    int? InstallProgressPercent = null,
+    // True when this TFS installs new releases on its own (installed builds
+    // only; a development build from bin\ never replaces itself).
+    bool AutomaticInstall = false);

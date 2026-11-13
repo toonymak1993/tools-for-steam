@@ -129,6 +129,12 @@ public sealed class TfsPerformanceService : IDisposable
             UpdateTimerSchedule(configuration);
             configuration = _settingsStore.Load();
             _lastProfileFingerprint = 0;
+            if (key == "frame-limit")
+            {
+                SyncManagedFrameLimits(configuration);
+                configuration = _settingsStore.Load();
+            }
+
             RefreshWhileRunning(configuration);
             return BuildSnapshot(configuration, BuildSettingValueStatusText(key, configuration));
         }
@@ -316,6 +322,69 @@ public sealed class TfsPerformanceService : IDisposable
         profile.ApplyGameProfile(executableName, configuration.FrameLimit);
         _lastProfileProcessId = telemetry.ProcessId;
         _lastProfileFingerprint = fingerprint;
+        RememberManagedProfile(executableName);
+    }
+
+    private void RememberManagedProfile(string executableName)
+    {
+        var configuration = _settingsStore.Load();
+        if (configuration.ManagedFrameLimitProfiles.Contains(executableName, StringComparer.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        configuration.ManagedFrameLimitProfiles.Add(executableName);
+        _settingsStore.Save(configuration);
+    }
+
+    /// <summary>
+    /// Writes the current limit into every RTSS game profile TFS manages. Before this, a new
+    /// value (and "Off") only reached the game running at that moment; every other game kept
+    /// its old limit until it was the foreground 3D app again.
+    /// </summary>
+    private void SyncManagedFrameLimits(PerformanceSettingsConfiguration configuration)
+    {
+        var installation = _installationService.Detect();
+        if (!installation.Installed || string.IsNullOrWhiteSpace(installation.InstallPath))
+        {
+            return;
+        }
+
+        var profilesDirectory = Path.Combine(installation.InstallPath, "Profiles");
+        if (!configuration.ManagedFrameLimitProfilesAdopted)
+        {
+            // Profiles written by TFS before this list existed: adopt every game profile with a limit.
+            foreach (var name in RtssProfileFiles.FindProfilesWithFrameLimit(profilesDirectory))
+            {
+                if (!configuration.ManagedFrameLimitProfiles.Contains(name, StringComparer.OrdinalIgnoreCase))
+                {
+                    configuration.ManagedFrameLimitProfiles.Add(name);
+                }
+            }
+
+            configuration.ManagedFrameLimitProfilesAdopted = true;
+            _settingsStore.Save(configuration);
+        }
+
+        if (configuration.ManagedFrameLimitProfiles.Count == 0)
+        {
+            return;
+        }
+
+        using var profile = new RtssProfileClient(installation.InstallPath);
+        foreach (var executableName in configuration.ManagedFrameLimitProfiles.ToArray())
+        {
+            try
+            {
+                profile.ApplyGameProfile(executableName, configuration.FrameLimit);
+            }
+            catch (Exception exception) when (exception is InvalidOperationException or IOException or UnauthorizedAccessException)
+            {
+                SaveUnavailableStatus($"RTSS profile {executableName}: {exception.Message}");
+            }
+        }
+
+        _lastProfileFingerprint = 0;
     }
 
     private (double Cpu, long MemoryMb) ReadProcessMetrics(int processId)

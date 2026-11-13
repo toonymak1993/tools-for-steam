@@ -117,6 +117,32 @@ public sealed class SteamDevToolsClient
             target.Title.StartsWith("MainMenu", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Which part of Steam a target is, so each frontend surface runs only
+    /// where it has work: "shared" (SharedJSContext: webpack, stores, input),
+    /// "gamepad" (Big Picture's main window: library, game pages, overlays),
+    /// "menu" (Steam menu/context popups: themes only), "quickaccess", "page".
+    /// </summary>
+    internal static string ClassifySurfaceRole(SteamDevToolsTarget target)
+    {
+        if (string.Equals(target.Title, "SharedJSContext", StringComparison.OrdinalIgnoreCase))
+        {
+            return "shared";
+        }
+
+        if (IsQuickAccessTarget(target))
+        {
+            return "quickaccess";
+        }
+
+        if (IsSteamMenuSurfaceTarget(target))
+        {
+            return "menu";
+        }
+
+        return IsBigPictureMainTarget(target) ? "gamepad" : "page";
+    }
+
     private static bool IsSteamMenuSurfaceTarget(SteamDevToolsTarget target)
     {
         return target.Title.Equals("Menu", StringComparison.OrdinalIgnoreCase) ||

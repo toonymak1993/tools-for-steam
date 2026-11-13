@@ -12,6 +12,8 @@ public sealed record UnifySteamSnapshot(
     public bool WatchersActive { get; init; }
 
     public int WatcherCount { get; init; }
+
+    public OmniLibraryActivityState Activity { get; init; } = OmniLibraryActivityState.Idle;
 }
 
 public sealed record OmniLibraryGameDataState(
@@ -159,6 +161,27 @@ public sealed record OmniLibrarySyncHealthState(
 {
     public static OmniLibrarySyncHealthState Empty { get; } =
         new(null, null, null, null, string.Empty, string.Empty);
+
+    /// <summary>A remote catalog check of this store is running right now.</summary>
+    public bool CheckRunning { get; init; }
+
+    public DateTimeOffset? CheckStartedAtUtc { get; init; }
+}
+
+/// <summary>
+/// What OmniLibrary's background work is doing across all stores, for the
+/// Status page: paused for a running game, and the shortcut/artwork queue.
+/// </summary>
+public sealed record OmniLibraryActivityState(
+    bool BackgroundPaused,
+    string PauseReason,
+    DateTimeOffset? ResumeAtUtc,
+    bool ShortcutSyncRunning,
+    string ShortcutSyncStoreId,
+    int QueuedShortcutSyncCount)
+{
+    public static OmniLibraryActivityState Idle { get; } =
+        new(false, string.Empty, null, false, string.Empty, 0);
 }
 
 public sealed record UnifySteamStoreState(
@@ -202,6 +225,21 @@ public sealed record UnifySteamStoreState(
 
     public bool GogGalaxyLaunchEnabled { get; init; }
 
+    /// <summary>Emulation library: install emulators automatically once a system has ROMs.</summary>
+    public bool AutoInstallEmulators { get; init; }
+
+    /// <summary>Emulation library: also import ROMs from ORBIT's ROM folders.</summary>
+    public bool ImportOrbitRoms { get; init; }
+
+    /// <summary>Emulation library: also import installed emulators' game folders and lists.</summary>
+    public bool ImportEmulatorLibraries { get; init; }
+
+    /// <summary>Emulation library: ORBIT's ROM folder exists on this PC.</summary>
+    public bool OrbitRomsAvailable { get; init; }
+
+    /// <summary>Emulation library: folder TFS installs emulators into.</summary>
+    public string EmulatorFolderPath { get; init; } = string.Empty;
+
     public bool AchievementsEnabled { get; init; } = true;
 
     public bool AchievementProviderConfigured { get; init; }
@@ -237,7 +275,39 @@ public sealed record OmniLibraryRomSystemState(
     public bool EmulatorDetected { get; init; }
 
     public bool Fullscreen { get; init; } = true;
+
+    /// <summary>Emulator that starts this system's games now (empty when none is ready).</summary>
+    public string EmulatorId { get; init; } = string.Empty;
+
+    /// <summary>The user's choice; empty means automatic.</summary>
+    public string SelectedEmulatorId { get; init; } = string.Empty;
+
+    /// <summary>Emulator TFS installs for this system when none is ready.</summary>
+    public string InstallEmulatorId { get; init; } = string.Empty;
+
+    public string InstallEmulatorTitle { get; init; } = string.Empty;
+
+    public bool CanInstallEmulator { get; init; }
+
+    public string InstallState { get; init; } = "idle";
+
+    public int InstallProgressPercent { get; init; }
+
+    public string InstallMessage { get; init; } = string.Empty;
+
+    /// <summary>The emulator in use needs BIOS/firmware files TFS cannot provide.</summary>
+    public bool FirmwareRequired { get; init; }
+
+    public bool Experimental { get; init; }
+
+    public IReadOnlyList<OmniLibraryRomEmulatorOption> Emulators { get; init; } = [];
 }
+
+public sealed record OmniLibraryRomEmulatorOption(
+    string Id,
+    string Title,
+    bool Installed,
+    bool CanInstall);
 
 public sealed record OmniLibraryLifecycleSnapshot(
     string Authentication,

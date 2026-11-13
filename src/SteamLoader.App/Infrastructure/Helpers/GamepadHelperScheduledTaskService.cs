@@ -8,8 +8,8 @@ internal sealed class GamepadHelperScheduledTaskService
     {
         _taskService = new ElevatedHelperTaskService(
             taskName: "GamepadHelper",
-            displayName: "TFS Xbox Mode helper",
-            taskDescription: "Launches the Tools for Steam Xbox Mode helper with elevation on demand.",
+            displayName: "TFS gamepad helper",
+            taskDescription: "Launches the Tools for Steam gamepad helper with elevation on demand.",
             executablePath: executablePath,
             runArguments: SteamLoaderRuntime.GamepadHelperArgument,
             registerArguments: SteamLoaderRuntime.RegisterGamepadHelperTaskArgument,

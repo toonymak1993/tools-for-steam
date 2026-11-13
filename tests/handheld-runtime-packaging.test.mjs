@@ -9,7 +9,6 @@ const installer = fs.readFileSync(path.join(root, "installer", "ToolsForSteam.is
 const preparation = fs.readFileSync(path.join(root, "scripts", "prepare-handheld-runtime.ps1"), "utf8");
 const publisher = fs.readFileSync(path.join(root, "scripts", "publish-installer.ps1"), "utf8");
 const variants = fs.readFileSync(path.join(root, "scripts", "publish-installer-variants.ps1"), "utf8");
-const xboxSnapshot = fs.readFileSync(path.join(root, "scripts", "XboxHostPayloadSnapshot.ps1"), "utf8");
 const systemControl = fs.readFileSync(
   path.join(root, "src", "SteamLoader.App", "Infrastructure", "Handheld", "HandheldSystemControlService.cs"),
   "utf8",
@@ -44,19 +43,17 @@ test("installer and preparation script pin the same handheld driver hashes", () 
   assert.equal(installerHidHide, preparedHidHide);
 });
 
-test("installer builds must bind verification to the packaged Xbox host version", () => {
-  assert.doesNotMatch(installer, /#define\s+XboxHostBuildVersion\s+"[^"]+"/i);
-  assert.match(installer, /#error\s+XboxHostBuildVersion\s+must match/i);
-  assert.match(installer, /#error\s+XboxHostRequiresDeveloperMode\s+must match/i);
-  assert.match(installer, /#error\s+XboxHostPayloadDir\s+must point to the immutable/i);
-  assert.match(xboxSnapshot, /AppxManifest\.xml/i);
-  assert.match(xboxSnapshot, /Guid.*NewGuid/i);
-  assert.match(publisher, /New-XboxHostPayloadSnapshot/i);
-  assert.match(publisher, /\/DXboxHostPayloadDir=\$\(\$xboxHostSnapshot\.Directory\)/i);
-  assert.match(variants, /New-XboxHostPayloadSnapshot/i);
-  assert.match(variants, /\/DXboxHostBuildVersion=\$xboxHostPackageVersion/i);
-  assert.match(variants, /\/DXboxHostRequiresDeveloperMode=\$xboxHostDeveloperModeDefine/i);
-  assert.match(variants, /\/DXboxHostPayloadDir=\$\(\$xboxHostSnapshot\.Directory\)/i);
+test("installer no longer builds, ships or offers the removed Xbox Mode", () => {
+  assert.doesNotMatch(installer, /XboxHostBuildVersion|XboxHostPayloadDir|XboxHostRequiresDeveloperMode/);
+  assert.doesNotMatch(installer, /ToolsForSteam\.XboxHost\.msix|XboxModePackage\.ps1|ExternalModeRadio|TfsXboxTitle/);
+  assert.doesNotMatch(installer, /AllowDevelopmentWithoutDevLicense/);
+  assert.doesNotMatch(publisher, /XboxHost|Build-XboxHost/i);
+  assert.doesNotMatch(variants, /XboxHost/i);
+  // Older installs are still cleaned up: Gaming Home hand-back, package and certificates.
+  assert.match(installer, /procedure RemoveLegacyXboxModeIntegration;/);
+  assert.match(installer, /procedure LeaveLegacyXboxModeBeforeInstall;/);
+  assert.match(installer, /--restore-xbox-mode/);
+  assert.match(installer, /Type: filesandordirs; Name: "\{app\}\\XboxMode"/);
 });
 
 test("MSI OEM takeover leaves the installed Store package intact", () => {

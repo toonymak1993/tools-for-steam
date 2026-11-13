@@ -71,6 +71,8 @@ public sealed class SteamStartupEnvironmentProbeTests
     [InlineData("")]
     [InlineData("Steam started normally")]
     [InlineData("Checking for update\nAlready up to date")]
+    // Steam's normal start after an applied update (bootstrap_log.txt, 2026-11-13).
+    [InlineData("Update complete, launching Steam...\nShutdown\nStartup - updater built Nov 12 2026\nVerifying installation...\nVerifying executable file sizes only (quick mode)\nVerification complete")]
     public void IsBootstrapUpdateActive_RejectsInactiveLogs(string log)
     {
         Assert.False(SteamStartupEnvironmentProbe.IsBootstrapUpdateActive(log));

@@ -58,17 +58,74 @@ public sealed class SteamSplashStartupCoordinatorTests
     }
 
     [Fact]
-    public void Observe_UpdateMakesManualRestartUnavailable()
+    public void Observe_RunningUpdateCountsAsProgressAndIsNeverRestartable()
     {
         var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
         var runtime = CreateRuntime(updateInProgress: true);
 
-        var decision = coordinator.Observe(
-            StartedAt.AddSeconds(25), runtime, SteamClientStartupStage.Updating,
-            SteamUiState.Updating, hostAvailable: true, hostSteamSignalReady: false);
+        SteamSplashDecision decision = null!;
+        for (var seconds = 2; seconds <= 240; seconds += 2)
+        {
+            decision = coordinator.Observe(
+                StartedAt.AddSeconds(seconds), runtime, SteamClientStartupStage.Updating,
+                SteamUiState.Updating, hostAvailable: true, hostSteamSignalReady: false);
+            Assert.Equal(SteamSplashNextAction.Wait, decision.Action);
+        }
 
-        Assert.True(decision.ShowRecoveryActions);
+        Assert.False(decision.ShowRecoveryActions);
         Assert.False(decision.CanRestartSteam);
+    }
+
+    [Fact]
+    public void Observe_ColdStartGetsNoRecoveryChoicesWhileSteamKeepsProgressing()
+    {
+        var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
+        var noSteam = CreateRuntime();
+        var steamOnly = CreateRuntime() with { SteamRunning = true };
+        var webHelper = steamOnly with { WebHelperRunning = true };
+
+        // Nothing for 40 s, steam.exe at 40 s, web helper at 65 s: never "taking longer".
+        for (var seconds = 2; seconds < 40; seconds += 2)
+        {
+            Assert.False(Observe(coordinator, seconds, noSteam).ShowRecoveryActions);
+        }
+
+        for (var seconds = 40; seconds < 65; seconds += 2)
+        {
+            Assert.False(Observe(coordinator, seconds, steamOnly).ShowRecoveryActions);
+        }
+
+        for (var seconds = 65; seconds < 95; seconds += 2)
+        {
+            Assert.False(Observe(coordinator, seconds, webHelper).ShowRecoveryActions);
+        }
+
+        // 30 s without any new signal after the usual start time: now offer choices.
+        var stalled = Observe(coordinator, 96, webHelper);
+        Assert.True(stalled.ShowRecoveryActions);
+        Assert.Equal(SteamSplashNextAction.Wait, stalled.Action);
+    }
+
+    [Fact]
+    public void Observe_ProgressMovesTheDesktopFallbackButNotBeyondTheAbsoluteLimit()
+    {
+        var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
+        var steamOnly = CreateRuntime() with { SteamRunning = true };
+        var webHelper = steamOnly with { WebHelperRunning = true };
+
+        // The web helper appears at 4:50, right before the 5 min safety limit.
+        Observe(coordinator, 10, steamOnly);
+        Assert.Equal(SteamSplashNextAction.Wait, Observe(coordinator, 290, webHelper).Action);
+        Assert.Equal(SteamSplashNextAction.Wait, Observe(coordinator, 360, webHelper).Action);
+        Assert.Equal(SteamSplashNextAction.CompleteWithDesktop, Observe(coordinator, 411, webHelper).Action);
+
+        // An endless update still ends at the absolute limit.
+        var updating = new SteamSplashStartupCoordinator(Timing, StartedAt);
+        var update = CreateRuntime(updateInProgress: true);
+        Assert.Equal(SteamSplashNextAction.Wait, Observe(updating, 14 * 60, update, SteamClientStartupStage.Updating).Action);
+        Assert.Equal(
+            SteamSplashNextAction.CompleteWithDesktop,
+            Observe(updating, 15 * 60 + 1, update, SteamClientStartupStage.Updating).Action);
     }
 
     [Fact]
@@ -95,7 +152,7 @@ public sealed class SteamSplashStartupCoordinatorTests
     [Theory]
     [InlineData(SteamUiState.Login)]
     [InlineData(SteamUiState.Offline)]
-    public void Observe_LoginAndOfflineScreensNeverCountAsReadyOrRestartable(SteamUiState uiState)
+    public void Observe_LoginAndOfflineScreensInBigPictureAreHandedToSteam(SteamUiState uiState)
     {
         var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
         var runtime = CreateRuntime(visible: true, gamepad: true, foreground: true);
@@ -107,6 +164,24 @@ public sealed class SteamSplashStartupCoordinatorTests
             StartedAt.AddSeconds(6), runtime, SteamClientStartupStage.Ready,
             uiState, hostAvailable: true, hostSteamSignalReady: true);
 
+        // The user has to sign in or confirm in Big Picture: the splash must
+        // not cover that screen, and nothing restarts Steam.
+        Assert.Equal(SteamSplashNextAction.Wait, first.Action);
+        Assert.Equal(SteamSplashNextAction.CompleteWithSteam, second.Action);
+        Assert.False(second.CanRestartSteam);
+    }
+
+    [Theory]
+    [InlineData(SteamUiState.Login)]
+    [InlineData(SteamUiState.Offline)]
+    public void Observe_LoginAndOfflineWithoutBigPictureNeverCountAsReadyOrRestartable(SteamUiState uiState)
+    {
+        var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
+        var runtime = CreateRuntime(visible: true, gamepad: false, foreground: true);
+
+        var first = Observe(coordinator, 5, runtime, SteamClientStartupStage.Ready, uiState);
+        var second = Observe(coordinator, 6, runtime, SteamClientStartupStage.Ready, uiState);
+
         Assert.Equal(SteamSplashNextAction.Wait, first.Action);
         Assert.Equal(SteamSplashNextAction.Wait, second.Action);
         Assert.True(second.ShowRecoveryActions);
@@ -114,7 +189,7 @@ public sealed class SteamSplashStartupCoordinatorTests
     }
 
     [Fact]
-    public void Observe_StopsStealingFocusAndOffersActionsAfterBoundedAttempts()
+    public void Observe_HandsOverToReadyBigPictureAfterBoundedFocusAttempts()
     {
         var coordinator = new SteamSplashStartupCoordinator(Timing, StartedAt);
         var runtime = CreateRuntime(visible: true, gamepad: true, foreground: false);
@@ -134,9 +209,21 @@ public sealed class SteamSplashStartupCoordinatorTests
 
         Assert.All(new[] { first, second, third }, decision =>
             Assert.Equal(SteamSplashNextAction.FocusSteam, decision.Action));
-        Assert.Equal(SteamSplashNextAction.Wait, bounded.Action);
-        Assert.True(bounded.ShowRecoveryActions);
+        // Never keep covering a ready Big Picture just because Windows refused
+        // the foreground.
+        Assert.Equal(SteamSplashNextAction.CompleteWithSteam, bounded.Action);
+        Assert.False(bounded.ShowRecoveryActions);
     }
+
+    private static SteamSplashDecision Observe(
+        SteamSplashStartupCoordinator coordinator,
+        int seconds,
+        SteamRuntimeObservation runtime,
+        SteamClientStartupStage stage = SteamClientStartupStage.Starting,
+        SteamUiState uiState = SteamUiState.Starting) =>
+        coordinator.Observe(
+            StartedAt.AddSeconds(seconds), runtime, stage,
+            uiState, hostAvailable: true, hostSteamSignalReady: false);
 
     private static SteamRuntimeObservation CreateRuntime(
         bool visible = false,

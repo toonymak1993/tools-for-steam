@@ -7,7 +7,7 @@
 [![Release](https://img.shields.io/badge/release-0.4.1--beta.1-2ea44f?style=for-the-badge)](https://github.com/toonymak1993/tools-for-steam/releases)
 [![Windows](https://img.shields.io/badge/platform-Windows_10%2F11-0078d4?style=for-the-badge&logo=windows)](#requirements)
 [![Plugins](https://img.shields.io/badge/plugins-included_only-2ea44f?style=for-the-badge)](#built-in-tools)
-[![Xbox Mode](https://img.shields.io/badge/Xbox_Mode-controller_first-107c10?style=for-the-badge&logo=xbox)](#three-startup-modes)
+[![Console Mode](https://img.shields.io/badge/Console_Mode-controller_first-107c10?style=for-the-badge)](#startup-modes)
 
 Tools for Steam (TFS) brings a SteamOS-style experience to Windows gaming PCs and handhelds. It integrates directly into Steam's Quick Access panel, starts cleanly into Big Picture, and keeps the important Windows and gaming controls reachable without leaving the controller.
 
@@ -18,7 +18,7 @@ Tools for Steam (TFS) brings a SteamOS-style experience to Windows gaming PCs an
 ![Tools for Steam running inside Steam Big Picture](docs/assets/tfs.png)
 
 > [!IMPORTANT]
-> The current public build is a beta. TFS changes the current user's startup experience and integrates with Steam UI surfaces that can change after Steam updates. Read [Safety and recovery](#safety-and-recovery) before enabling Shell or Xbox Mode.
+> The current public build is a beta. TFS changes the current user's startup experience and integrates with Steam UI surfaces that can change after Steam updates. Read [Safety and recovery](#safety-and-recovery) before enabling Console Mode.
 
 ## Why Tools for Steam?
 
@@ -27,7 +27,7 @@ Windows is a powerful gaming platform, but it was not designed to feel like a co
 | Console feature | What TFS provides |
 |---|---|
 | Native controller UI | A Tools for Steam tab inside Steam Quick Access, built for `A`, `B`, bumpers, D-pad, and sticks |
-| Console startup | Shell Mode or the signed Xbox Mode Gaming Home package starts the gaming session without exposing the normal desktop first |
+| Console startup | Console Mode starts the gaming session right after sign-in and covers the desktop until Big Picture is ready |
 | One gaming hub | Launcher discovery, non-Steam shortcuts, collections, and SteamGridDB artwork |
 | System controls | Audio, displays, windows, performance, themes, apps, power, and recovery from Big Picture |
 | Curated tools | Included plugins selected and shipped by the Tools for Steam author |
@@ -38,7 +38,7 @@ TFS is part of **GCM — Gaming Console Mode**. The goal is simple: on a living-
 
 - Controller-native Plugin Activator with artwork, descriptions, and direct on/off controls for included plugins.
 - No public marketplace, community catalog, third-party installation, or community runtime in the product.
-- Signed Xbox Mode host package with installer recovery, rollback snapshots, and diagnostic collection.
+- Console Mode with Explorer as the shell, installer rollback snapshots and a desktop that stays reachable if the gaming start fails.
 - Controller focus and Store card layout fixes across 720p, 1080p, and larger displays.
 
 ## TDP Control and handheld support
@@ -106,15 +106,13 @@ For internal development and release publishing, create and approve a Discord ap
 
 The Plugin Activator is a controller-friendly list of the plugins included in the current Tools for Steam build. Each row contains its artwork, a short description, current state, and a direct Activate or Deactivate control. Safety-critical plugins remain active. It does not discover, download, install, update, or execute third-party plugins.
 
-## Three startup modes
+## Startup modes
 
-### Shell Mode
+### Console Mode
 
-TFS starts before Explorer, prepares Steam Big Picture and the local bridge, then restores Explorer behind Steam. This provides the broadest console-style flow on normal Windows 10 and Windows 11 systems.
+Explorer stays the Windows shell. A visible Task Scheduler sign-in task of the current user starts TFS right after sign-in; TFS covers the desktop with its splash, opens Steam Big Picture and hides the taskbar while Big Picture is up. Start Windows Desktop shows the desktop, and the Guide button or Big Picture brings the console back. If TFS fails, the normal desktop is simply there.
 
-### Xbox Mode
-
-On compatible Windows 11 systems with Gaming FSE support, TFS installs a signed Gaming Home package and becomes the controller-first gaming home while Explorer remains the Windows shell. The installer hides this option when the platform capability is unavailable. Public sideloaded builds use Windows Developer Mode for the protected Gaming Home capability and disclose that system-wide change on the startup-mode page.
+The former Shell Mode (TFS as the Windows shell) and the Windows Xbox Mode integration were removed. Installs that used either are moved to Console Mode automatically: Explorer becomes the shell again, the Windows Gaming Home settings from before TFS are restored, and the old Gaming Home package and its certificate are removed.
 
 ### Tray Mode
 
@@ -125,8 +123,7 @@ Windows starts normally and TFS runs quietly as a tray-style launcher service. T
 - Windows 10 or Windows 11 x64;
 - Steam with Big Picture / Gamepad UI;
 - a controller for the intended console experience;
-- permission to install per-user software under `%LOCALAPPDATA%`;
-- compatible Windows 11 Gaming FSE support specifically for Xbox Mode.
+- permission to install per-user software under `%LOCALAPPDATA%`.
 
 TFS starts Steam with the required local DevTools endpoint on `127.0.0.1:8080` when necessary. If Steam is already running without it, TFS can perform one controlled restart to attach correctly. The local TFS API listens on `127.0.0.1:47652` and uses a private session token for protected routes.
 
@@ -135,18 +132,15 @@ TFS starts Steam with the required local DevTools endpoint on `127.0.0.1:8080` w
 1. Open [GitHub Releases](https://github.com/toonymak1993/tools-for-steam/releases).
 2. For the first official beta, expand the newest **Pre-release** entry.
 3. Download `ToolsForSteamSetup.exe`.
-4. Run the installer and choose Tray, Shell, or Xbox Mode when available.
+4. Run the installer and choose Shell or Tray Mode.
 
 The installer:
 
 - installs per-user under `%LOCALAPPDATA%\Programs\ToolsForSteam`;
-- verifies platform and Xbox Mode requirements;
-- safely leaves an active Xbox Mode session before replacing files;
-- closes TFS, helpers, Xbox Host, and Steam when required;
+- closes TFS, helpers, and Steam when required;
 - creates a rollback snapshot before an update;
-- installs the signed Xbox Host package and public certificate;
-- restores a safe startup mode if setup cannot complete;
-- writes Xbox Mode diagnostics for failed installations.
+- removes the retired Xbox Mode package, certificate, and Gaming Home settings left by older versions;
+- restores a safe startup mode if setup cannot complete.
 
 Installed builds can update from GitHub releases. Public installer assets are named `ToolsForSteamSetup.exe`.
 
@@ -170,7 +164,7 @@ dotnet build .\SteamLoader.slnx
 dotnet run --project .\src\SteamLoader.App\SteamLoader.App.csproj
 ```
 
-Build the complete installer, including the signed Xbox Host package:
+Build the complete installer:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-installer.ps1
@@ -182,7 +176,7 @@ Outputs:
 - `dist\installer\ToolsForSteamSetup-<version>.exe` — versioned copy;
 - `dist\portable\ToolsForSteam.exe` — internal installer payload.
 
-The Xbox Host build requires the configured TFS signing certificate. If `TFS_XBOX_HOST_SCCD` points to a Microsoft-signed descriptor (or one is placed at `dist\signing\ToolsForSteam.XboxHost.sccd`), the build validates that it authorizes `GCM.ToolsForSteam.XboxHost_kpg9gzy2ksp2j` and the MSIX certificate chain. Otherwise it deliberately uses `CustomCapability.DeveloperMode.SCCD`; the installer then discloses and enables Windows Developer Mode only when Xbox Mode is selected. The unsigned Microsoft-submission template remains at `src\ToolsForSteam.XboxHost\Package\CustomCapability.request.xml`. The outer installer should also be Authenticode-signed for broad public distribution.
+The outer installer should be Authenticode-signed for broad public distribution.
 
 ## Repository map
 
@@ -190,22 +184,20 @@ The Xbox Host build requires the configured TFS signing certificate. If `TFS_XBO
 |---|---|
 | `src/SteamLoader.App/Hosting` | Local API, Plugin Activator routes, Steam injection, and live state |
 | `src/SteamLoader.App/Infrastructure` | Audio, displays, handhelds, Store Sync, Steam, themes, artwork, and native services |
-| `src/SteamLoader.App/Assets` | Quick Access, Plugin Activator, game-page, controller, and Steam UI assets |
-| `src/ToolsForSteam.XboxHost` | Signed Gaming Home / Xbox Mode package |
-| `sdk` | Owner-only plugin development material retained for first-party work |
+| `src/SteamLoader.App/Assets` | Quick Access, Plugin Activator, game-page, controller, and Steam UI assets (`tfs-core.mjs` = Decky-style runtime in Steam's shared context) |
 | `scripts` | Build, installer, release, and owner development helpers |
-| `installer` | Inno Setup definition and Xbox Mode recovery tools |
-| `tests` | Runtime, Plugin Activator, Xbox Mode, launcher, and update regression tests |
+| `installer` | Inno Setup definition and startup-mode recovery |
+| `tests` | Runtime, Plugin Activator, startup mode, launcher, and update regression tests |
 
 ## Beta status
 
-This is the first official beta of the complete TFS platform: console startup, Xbox Mode, curated built-in tools, the Plugin Activator, and the first MSI Claw A8 TDP integration.
+This is the first official beta of the complete TFS platform: console startup, curated built-in tools, the Plugin Activator, and the first MSI Claw A8 TDP integration.
 
 Feedback is especially useful for:
 
 - Steam Beta and stable-client UI compatibility;
 - controller focus at 720p, 1080p, ultrawide, and 4K;
-- fresh installs and upgrades while Xbox Mode is active;
+- fresh installs and upgrades in Console Mode, including installs moving over from the removed Shell Mode and Xbox Mode;
 - MSI Claw A8 power limits and automatic game profiles;
 - activation and deactivation of included plugins.
 

@@ -90,7 +90,11 @@ public sealed record ThemeStoreThemeState(
     bool InstalledVersionMatches,
     string StatusText,
     string PreviewImageUrl,
-    string PreviewThumbnailUrl);
+    string PreviewThumbnailUrl)
+{
+    /// <summary>Every DeckThemes preview image (full size), for the store gallery.</summary>
+    public IReadOnlyList<string> GalleryImageUrls { get; init; } = [];
+}
 
 public sealed record ThemeStoreCatalogState(
     string Search,

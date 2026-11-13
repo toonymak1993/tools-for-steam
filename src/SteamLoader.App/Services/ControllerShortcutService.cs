@@ -46,7 +46,9 @@ public sealed class ControllerShortcutService
     private readonly Func<Task<bool>> _tryOpenExternalGameQuickAccessAsync;
     private readonly Func<ControllerShortcutSettingsSnapshot> _settingsProvider;
     private readonly Action<string>? _diagnosticLog;
+    private readonly Func<bool> _isCaptureActive;
     private readonly SemaphoreSlim _shortcutGate = new(1, 1);
+    private bool _captureSuppressed;
 
     private ShortcutContext _context;
     private ShortcutContext _detectedContext;
@@ -89,8 +91,10 @@ public sealed class ControllerShortcutService
         Func<ControllerShortcutSettingsSnapshot>? settingsProvider = null,
         Func<IReadOnlyList<ushort>>? hidControllerButtonMasksProvider = null,
         Func<Task<bool>>? openInGameOverlayAsync = null,
-        Func<Task<bool>>? openInGameQuickAccessAsync = null)
+        Func<Task<bool>>? openInGameQuickAccessAsync = null,
+        Func<bool>? isCaptureActive = null)
     {
+        _isCaptureActive = isCaptureActive ?? ControllerShortcutCaptureGate.IsActive;
         _isEnabled = isEnabled;
         _isBigPictureForeground = isBigPictureForeground;
         _isGameInForeground = isGameInForeground;
@@ -201,6 +205,30 @@ public sealed class ControllerShortcutService
             return;
         }
 
+        if (IsCaptureActiveSafe())
+        {
+            // The Overlay settings recorder is listening: a combination held
+            // for the recording must not open a Steam menu underneath it, and
+            // buttons still held when it stops must not fire on release.
+            if (!_captureSuppressed)
+            {
+                _captureSuppressed = true;
+                Log("capture-suppress begin");
+            }
+
+            _steamMenuPress.EnterContext(steamMenuDown, nowUtc);
+            _steamQuickAccessPress.EnterContext(steamQuickAccessDown, nowUtc);
+            _inGameOverlayPress.EnterContext(inGameOverlayDown, nowUtc);
+            _inGameQuickAccessPress.EnterContext(inGameQuickAccessDown, nowUtc);
+            return;
+        }
+
+        if (_captureSuppressed)
+        {
+            _captureSuppressed = false;
+            Log("capture-suppress end");
+        }
+
         if (context == ShortcutContext.BigPicture)
         {
             PollShortPress(
@@ -234,6 +262,18 @@ public sealed class ControllerShortcutService
                 settings.InGameQuickAccessHoldMilliseconds,
                 ShortcutIntent.InGameQuickAccess,
                 "in-game-quick-access");
+        }
+    }
+
+    private bool IsCaptureActiveSafe()
+    {
+        try
+        {
+            return _isCaptureActive();
+        }
+        catch
+        {
+            return false;
         }
     }
 

@@ -1,6 +1,6 @@
 (() => {
   const apiBase = window.__steamLoaderApiBase || "__STEAMLOADER_API_BASE__";
-  const version = 22;
+  const version = 23;
   const maxConcurrentArtworkLoads = 3;
   const rootId = "steamloader-store-root";
   const styleId = "steamloader-store-style";
@@ -32,6 +32,15 @@
   ];
 
   const previous = window.__steamLoaderStoreOverlay;
+  // The Store overlay is hosted by Big Picture's main window. Other windows
+  // only polled its state every 700 ms and ran a 58 ms gamepad timer.
+  if (window.__tfsSurfaceRole && window.__tfsSurfaceRole !== "gamepad") {
+    previous?.cleanup?.();
+    document.getElementById(rootId)?.remove();
+    document.getElementById(styleId)?.remove();
+    delete window.__steamLoaderStoreOverlay;
+    return;
+  }
   if (previous?.version === version) {
     previous.ensureMounted?.();
     return;
@@ -1301,9 +1310,9 @@
     const header = el("header", "steamloader-store-header");
     const brand = el("div", "steamloader-store-brand");
     brand.append(
-      textEl("div", "steamloader-store-kicker", "TOOLS FOR STEAM"),
-      textEl("h1", "steamloader-store-title", "Wishlist"),
-      textEl("p", "steamloader-store-subtitle", state.snapshot?.statusText || "Wishlist deals, trends and price alerts in one place."),
+      textEl("div", "steamloader-store-kicker", "TFS  /  GAME DESK"),
+      textEl("h1", "steamloader-store-title", "The Store"),
+      textEl("p", "steamloader-store-subtitle", state.snapshot?.statusText || "Your games, current prices, and the ones worth watching."),
     );
     const actions = el("div", "steamloader-store-header-actions");
     if (state.snapshot?.refreshedAtUtc) {
@@ -1355,18 +1364,18 @@
     const hero = getWishlist().find((game) => game.isOnSale) || trending[0];
     if (hero) main.append(renderHero(hero));
     const wishlistDeals = getWishlist().filter((game) => game.isOnSale);
-    appendGameSection(main, "From your wishlist · on sale", "Steam and TFS wishlist games discounted right now", wishlistDeals, "portrait");
+    appendGameSection(main, "On your list. On sale.", "Discounts on games you already saved", wishlistDeals, "portrait");
     const suggestions = shuffledGames(trending, "fresh");
     main.append(renderSuggestionControls());
-    appendGameSection(main, "Fresh picks for you", "A new mix from the direct stores every time Wishlist opens", suggestions.slice(0, 12), "landscape");
-    appendGameSection(main, "Try something different", "", suggestions.slice(12, 24), "landscape");
-    appendGameSection(main, "Deep discounts", "Randomized regional deals with direct links to the actual store", shuffledGames(getFeatured(), "discounts").slice(0, 14), "portrait");
+    appendGameSection(main, "Around the stores", "A changing mix from the stores you can buy from directly", suggestions.slice(0, 12), "landscape");
+    appendGameSection(main, "Off the usual path", "", suggestions.slice(12, 24), "landscape");
+    appendGameSection(main, "Price cuts", "Regional deals with links to the store listing", shuffledGames(getFeatured(), "discounts").slice(0, 14), "portrait");
   }
 
   function renderSuggestionControls() {
     const controls = el("div", "steamloader-store-suggestion-controls");
     controls.append(
-      textEl("span", "", "Suggestions rotate on every visit."),
+      textEl("span", "", "A different shelf each time you open the Store."),
       buttonEl("Shuffle suggestions", "steamloader-store-button is-soft", () => {
         state.discoverySeed = Date.now() + Math.floor(Math.random() * 100000);
         state.focusIndex = 0;
@@ -1990,7 +1999,7 @@
     if (copy) heading.append(textEl("p", "", copy));
     section.append(heading);
     if (!games.length) {
-      section.append(textEl("div", "steamloader-store-empty is-compact", title.startsWith("From") ? "No wishlist sale is available right now." : "No games available."));
+      section.append(textEl("div", "steamloader-store-empty is-compact", title.startsWith("On your list") ? "Nothing on your list is discounted right now." : "No games available."));
     } else {
       const rail = el("div", `steamloader-store-rail is-${cardMode}`);
       games.forEach((game) => rail.append(renderGameCard(game, cardMode)));
@@ -2673,15 +2682,15 @@
     style.id = styleId;
     style.textContent = `
       .steamloader-store-root {
-        --store-bg: #071017;
-        --store-panel: rgba(15, 25, 34, .9);
-        --store-panel-solid: #101b24;
-        --store-text: #f1f5f7;
-        --store-muted: #94a3ad;
-        --store-dim: #60717d;
-        --store-accent: #66c0f4;
-        --store-accent-strong: #1a9fff;
-        --store-blue: #66c0f4;
+        --store-bg: #0d151b;
+        --store-panel: rgba(23, 34, 42, .94);
+        --store-panel-solid: #19252d;
+        --store-text: #f1f1e9;
+        --store-muted: #a4b0b5;
+        --store-dim: #788a92;
+        --store-accent: #c6db78;
+        --store-accent-strong: #a9c74e;
+        --store-blue: #b9d47b;
         --store-success: #5ee6a8;
         --store-success-strong: #13d889;
         --store-success-ink: #032016;
@@ -2691,28 +2700,25 @@
         display: none;
         color: var(--store-text);
         font-family: "Motiva Sans", "Segoe UI", sans-serif;
-        background:
-          radial-gradient(circle at 18% 12%, rgba(26, 159, 255, .18), transparent 34%),
-          radial-gradient(circle at 85% 72%, rgba(25, 124, 198, .17), transparent 32%),
-          linear-gradient(145deg, #081119 0%, #0a1117 52%, #07151a 100%);
+        background: #0d151b;
       }
       .steamloader-store-root, .steamloader-store-root * { box-sizing: border-box; }
       .steamloader-store-root.is-open { display: block; }
       .steamloader-store-shell { height: 100%; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; overflow: hidden; }
-      .steamloader-store-header { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 16px 40px 10px; }
+      .steamloader-store-header { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 22px 44px 16px; border-top: 4px solid var(--store-accent-strong); background: #172229; }
       .steamloader-store-brand { min-width: 0; }
-      .steamloader-store-kicker { color: var(--store-accent); font-size: 10px; font-weight: 900; letter-spacing: .18em; }
-      .steamloader-store-title { margin: 1px 0 0; font-size: clamp(20px, 2.2vw, 30px); line-height: 1; letter-spacing: -.03em; }
+      .steamloader-store-kicker { color: var(--store-accent); font-size: 10px; font-weight: 800; letter-spacing: .13em; }
+      .steamloader-store-title { margin: 4px 0 0; font-size: clamp(26px, 2.6vw, 36px); line-height: 1; letter-spacing: -.045em; }
       .steamloader-store-subtitle { display: none; }
       .steamloader-store-header-actions { display: flex; align-items: center; gap: 10px; flex: none; }
-      .steamloader-store-updated { margin-right: 4px; color: var(--store-dim); font-size: 11px; font-weight: 750; }
+      .steamloader-store-updated { margin-right: 4px; color: var(--store-muted); font-size: 11px; font-weight: 650; }
       .steamloader-store-button, .steamloader-store-mini-button, .steamloader-store-tab, .steamloader-store-card, .steamloader-store-currency-card, .steamloader-store-modal-close, .steamloader-store-region-trigger, .steamloader-store-region-option {
         border: 1px solid rgba(255,255,255,.09); color: var(--store-text); font: inherit; cursor: pointer; outline: none;
       }
-      .steamloader-store-button { min-height: 46px; padding: 0 20px; border-radius: 14px; font-weight: 850; background: rgba(255,255,255,.07); }
-      .steamloader-store-button.is-primary { border-color: rgba(102,192,244,.48); color: #061522; background: linear-gradient(135deg, #66c0f4, #1a9fff); box-shadow: 0 10px 34px rgba(26,159,255,.24); }
+      .steamloader-store-button { min-height: 46px; padding: 0 20px; border-radius: 5px; font-weight: 750; background: #26343c; }
+      .steamloader-store-button.is-primary { border-color: #b2cb5d; color: #172012; background: var(--store-accent); box-shadow: none; }
       .steamloader-store-button.is-soft { background: rgba(255,255,255,.06); }
-      .steamloader-store-button.is-wishlist { border-color: rgba(102,192,244,.38); color: var(--store-accent); background: rgba(26,159,255,.12); }
+      .steamloader-store-button.is-wishlist { border-color: rgba(198,219,120,.5); color: var(--store-accent); background: rgba(198,219,120,.1); }
       .steamloader-store-button.is-danger { color: #ffb7bd; background: rgba(255,91,106,.1); }
       .steamloader-store-button:disabled { opacity: .45; cursor: default; }
       .steamloader-store-button:hover, .steamloader-store-button:focus-visible, .steamloader-store-button.is-controller-focus,
@@ -2722,15 +2728,15 @@
       .steamloader-store-region-trigger:hover, .steamloader-store-region-trigger.is-controller-focus,
       .steamloader-store-region-option:hover, .steamloader-store-region-option.is-controller-focus,
       .steamloader-store-modal-close:hover, .steamloader-store-modal-close.is-controller-focus {
-        border-color: var(--store-accent); box-shadow: 0 0 0 3px rgba(102,192,244,.2), 0 18px 48px rgba(0,0,0,.38); transform: translateY(-2px);
+        border-color: var(--store-accent); box-shadow: 0 0 0 2px rgba(198,219,120,.42); transform: none;
       }
       .steamloader-store-card.is-controller-focus, .steamloader-store-currency-card.is-controller-focus, .steamloader-store-region-option.is-controller-focus { transform: none; }
-      .steamloader-store-tabs { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 42px; padding: 0 40px 8px; border-bottom: 1px solid rgba(255,255,255,.06); }
+      .steamloader-store-tabs { display: flex; align-items: center; justify-content: flex-start; gap: 4px; min-height: 48px; padding: 0 38px; border-bottom: 1px solid #35434b; background: #172229; }
       .steamloader-store-bumper { padding: 5px 9px; border-radius: 7px; color: #101820; background: rgba(255,255,255,.8); font-size: 10px; font-weight: 950; }
-      .steamloader-store-tab { position: relative; min-width: 108px; padding: 9px 16px; border-color: transparent; border-radius: 13px; color: var(--store-muted); background: transparent; font-weight: 800; font-size: 13px; }
-      .steamloader-store-tab.is-active { color: #fff; background: rgba(255,255,255,.065); }
-      .steamloader-store-tab.is-active::after { content: ""; position: absolute; left: 30%; right: 30%; bottom: -7px; height: 4px; border-radius: 9px; background: var(--store-accent-strong); box-shadow: 0 0 18px rgba(26,159,255,.6); }
-      .steamloader-store-main { overflow: auto; padding: 14px 40px 40px; scroll-padding: 20px 20px 80px; scrollbar-width: none; }
+      .steamloader-store-tab { position: relative; min-width: 108px; padding: 12px 16px; border-color: transparent; border-radius: 0; color: var(--store-muted); background: transparent; font-weight: 700; font-size: 13px; }
+      .steamloader-store-tab.is-active { color: var(--store-text); background: #26353d; }
+      .steamloader-store-tab.is-active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 3px; border-radius: 0; background: var(--store-accent); box-shadow: none; }
+      .steamloader-store-main { overflow: auto; padding: 22px 44px 44px; scroll-padding: 20px 20px 80px; scrollbar-width: none; background: linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px) 0 0 / 72px 72px, #0d151b; }
       .steamloader-store-main::-webkit-scrollbar { display: none; }
       .steamloader-store-notice, .steamloader-store-empty { padding: 24px; border: 1px solid rgba(255,255,255,.08); border-radius: 18px; color: var(--store-muted); background: rgba(255,255,255,.035); }
       .steamloader-store-notice.is-error { margin-bottom: 18px; color: #ffc0c5; border-color: rgba(255,91,106,.28); background: rgba(255,91,106,.08); }
@@ -2740,27 +2746,33 @@
       .steamloader-store-empty.is-actionable > strong { color: var(--store-text); font-size: 16px; }
       .steamloader-store-empty.is-actionable > span { flex: 1 1 360px; }
       .steamloader-store-empty.is-compact { padding: 18px; }
-      .steamloader-store-hero { position: relative; isolation: isolate; min-height: min(36vh, 390px); overflow: hidden; border: 1px solid rgba(255,255,255,.1); border-radius: 30px; background: #111b22; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+      .steamloader-store-hero { position: relative; isolation: isolate; min-height: min(29vh, 265px); overflow: hidden; border: 1px solid #3c4c51; border-radius: 5px; background: #111b22; box-shadow: none; }
       .steamloader-store-hero::before { content: ""; position: absolute; inset: 0; z-index: -2; background-image: var(--store-hero-image); background-size: cover; background-position: center 30%; transform: scale(1.02); }
-      .steamloader-store-hero::after { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, rgba(5,12,17,.97) 0%, rgba(5,12,17,.78) 38%, rgba(5,12,17,.16) 75%), linear-gradient(0deg, rgba(5,12,17,.62), transparent 55%); }
-      .steamloader-store-hero-content { width: min(620px, 62%); padding: 48px; }
-      .steamloader-store-hero-label, .steamloader-store-best-label { color: var(--store-accent); font-size: 11px; font-weight: 900; letter-spacing: .17em; }
-      .steamloader-store-hero-title { margin: 9px 0 8px; font-size: clamp(34px, 4vw, 66px); line-height: .98; letter-spacing: -.045em; text-shadow: 0 6px 24px rgba(0,0,0,.45); }
+      .steamloader-store-hero::after { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, rgba(8,17,21,.98) 0%, rgba(8,17,21,.9) 30%, rgba(8,17,21,.12) 76%), linear-gradient(0deg, rgba(8,17,21,.34), transparent 55%); }
+      .steamloader-store-hero-content { width: min(620px, 62%); padding: 28px 48px; border-left: 5px solid var(--store-accent-strong); }
+      .steamloader-store-hero-label, .steamloader-store-best-label { color: var(--store-accent); font-size: 11px; font-weight: 800; letter-spacing: .09em; }
+      .steamloader-store-hero-title { margin: 10px 0 6px; font-size: clamp(32px, 3.5vw, 52px); line-height: 1; letter-spacing: -.045em; text-shadow: 0 3px 14px rgba(0,0,0,.5); }
       .steamloader-store-hero-store { color: var(--store-muted); font-size: 15px; font-weight: 750; }
-      .steamloader-store-hero-price { display: flex; align-items: baseline; gap: 12px; min-height: 44px; margin: 16px 0 20px; }
+      .steamloader-store-hero-price { display: flex; align-items: baseline; gap: 12px; min-height: 38px; margin: 12px 0 16px; }
       .steamloader-store-hero-price strong { font-size: 30px; }
       .steamloader-store-hero-price span { color: var(--store-muted); font-size: 17px; }
-      .steamloader-store-section { margin-top: 36px; }
-      .steamloader-store-suggestion-controls { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 34px; padding: 14px 16px 14px 20px; border: 1px solid rgba(102,192,244,.18); border-radius: 17px; color: var(--store-muted); background: rgba(26,159,255,.07); font-size: 12px; font-weight: 750; }
+      .steamloader-store-section { margin-top: 38px; }
+      .steamloader-store-section:nth-of-type(even) { margin-left: clamp(0px, 2vw, 30px); }
+      .steamloader-store-suggestion-controls { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 34px; padding: 10px 0; border-top: 1px solid #45534d; border-bottom: 1px solid #45534d; border-radius: 0; color: var(--store-muted); background: transparent; font-size: 12px; font-weight: 650; }
       .steamloader-store-suggestion-controls .steamloader-store-button { min-height: 38px; padding: 0 15px; font-size: 11px; }
-      .steamloader-store-section-head { margin-bottom: 14px; }
+      .steamloader-store-section-head { margin-bottom: 14px; padding-left: 14px; border-left: 3px solid var(--store-accent-strong); }
+      .steamloader-store-section:nth-of-type(even) .steamloader-store-section-head { border-left-color: #678397; }
       .steamloader-store-section-head h2, .steamloader-store-page-head h2 { margin: 0; font-size: 24px; letter-spacing: -.025em; }
       .steamloader-store-section-head p, .steamloader-store-page-head p { margin: 5px 0 0; color: var(--store-muted); font-size: 13px; font-weight: 650; }
-      .steamloader-store-rail { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(150px, 190px); gap: 14px; overflow-x: auto; overflow-y: hidden; padding: 5px 5px 18px; margin: -5px; scroll-snap-type: x proximity; scrollbar-width: none; }
+      .steamloader-store-rail { display: flex; align-items: flex-start; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 4px 4px 18px; margin: -4px; scroll-snap-type: x proximity; scrollbar-width: none; }
       .steamloader-store-rail::-webkit-scrollbar { display: none; }
-      .steamloader-store-rail.is-landscape { grid-auto-columns: minmax(210px, 260px); }
+      .steamloader-store-rail.is-portrait > .steamloader-store-card { flex: 0 0 176px; }
+      .steamloader-store-rail.is-portrait > .steamloader-store-card:nth-child(5n + 1) { flex-basis: 204px; }
+      .steamloader-store-rail.is-landscape > .steamloader-store-card { flex: 0 0 244px; }
+      .steamloader-store-rail.is-landscape > .steamloader-store-card:first-child { flex-basis: 316px; }
+      .steamloader-store-rail.is-landscape > .steamloader-store-card:nth-child(4n + 3) { flex-basis: 274px; }
       .steamloader-store-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 190px)); justify-content: start; gap: 16px; margin-top: 20px; }
-      .steamloader-store-card { position: relative; min-width: 0; max-width: 100%; padding: 0; overflow: hidden; border-radius: 20px; text-align: left; background: var(--store-panel-solid); box-shadow: 0 14px 38px rgba(0,0,0,.24); transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease; scroll-snap-align: start; }
+      .steamloader-store-card { position: relative; min-width: 0; max-width: 100%; padding: 0; overflow: hidden; border-radius: 4px; text-align: left; background: var(--store-panel-solid); box-shadow: none; transition: border-color 150ms ease, background-color 150ms ease; scroll-snap-align: start; }
       .steamloader-store-card-art { position: relative; aspect-ratio: 2 / 3; overflow: hidden; background: linear-gradient(135deg, #173140, #112029); }
       .steamloader-store-card.is-landscape .steamloader-store-card-art { aspect-ratio: 16 / 10; }
       .steamloader-store-artwork-frame { position: relative; width: 100%; height: 100%; overflow: hidden; }
@@ -2776,13 +2788,14 @@
       }
       @keyframes steamloader-store-artwork-loader-reveal { to { opacity: 1; } }
       .steamloader-store-card-art img { width: 100%; height: 100%; object-fit: cover; display: block; transition: opacity 180ms ease, transform 250ms ease; }
-      .steamloader-store-card:hover .steamloader-store-card-art img { transform: scale(1.035); }
+      .steamloader-store-card:hover .steamloader-store-card-art img { transform: scale(1.018); }
       .steamloader-store-card-placeholder { width: 100%; height: 100%; display: grid; place-items: center; color: rgba(255,255,255,.5); font-size: 42px; font-weight: 950; }
       .steamloader-store-rating, .steamloader-store-heart { position: absolute; top: 10px; padding: 7px 10px; border-radius: 10px; font-weight: 900; backdrop-filter: blur(12px); }
       .steamloader-store-rating { left: 10px; color: #baf8d9; background: rgba(4,13,18,.82); font-size: 12px; }
       .steamloader-store-heart { right: 10px; color: var(--store-accent); background: rgba(4,13,18,.75); font-size: 18px; }
-      .steamloader-store-card-info { position: relative; min-height: 116px; padding: 14px; }
-      .steamloader-store-card-title { min-height: 38px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 15px; font-weight: 900; line-height: 1.25; }
+      .steamloader-store-card-info { position: relative; min-height: 116px; padding: 14px; border-top: 2px solid #435158; }
+      .steamloader-store-card:hover .steamloader-store-card-info, .steamloader-store-card.is-controller-focus .steamloader-store-card-info { border-top-color: var(--store-accent); }
+      .steamloader-store-card-title { min-height: 38px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 15px; font-weight: 800; line-height: 1.25; }
       .steamloader-store-card-source { margin-top: 4px; color: var(--store-blue); font-size: 9px; font-weight: 900; letter-spacing: .07em; text-transform: uppercase; }
       .steamloader-store-card-store { margin-top: 4px; padding-right: 50px; color: var(--store-muted); font-size: 11px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .steamloader-store-card-price { display: flex; align-items: baseline; gap: 7px; margin-top: 8px; }
@@ -2808,7 +2821,7 @@
       .steamloader-store-search-key:hover, .steamloader-store-search-key:focus-visible, .steamloader-store-search-key.is-controller-focus { border-color: var(--store-accent); color: #061522; background: var(--store-accent); box-shadow: 0 0 0 3px rgba(102,192,244,.2), 0 14px 36px rgba(0,0,0,.38); transform: translateY(-2px); }
       .steamloader-store-search-keyboard-hint { margin-top: 14px; color: var(--store-muted); font-size: 11px; font-weight: 800; text-align: center; white-space: pre; }
       .steamloader-store-alert-list { display: grid; gap: 12px; margin-top: 24px; padding-bottom: 76px; }
-      .steamloader-store-alert-card { display: grid; grid-template-columns: 78px minmax(190px,1fr) 145px 190px minmax(205px,auto) auto; align-items: center; gap: 18px; min-height: 126px; padding: 16px 18px; border: 1px solid rgba(255,255,255,.08); border-radius: 22px; background: rgba(255,255,255,.035); }
+      .steamloader-store-alert-card { display: grid; grid-template-columns: 78px minmax(190px,1fr) 145px 190px minmax(205px,auto) auto; align-items: center; gap: 18px; min-height: 126px; padding: 16px 18px; border: 1px solid #33434a; border-left: 3px solid #6b868f; border-radius: 3px; background: #17232b; }
       .steamloader-store-alert-card.is-reached { border-color: rgba(94,230,168,.42); background: rgba(48,181,123,.1); }
       .steamloader-store-alert-art { width: 78px; height: 94px; overflow: hidden; border-radius: 14px; background: linear-gradient(135deg, #173140, #112029); box-shadow: 0 9px 22px rgba(0,0,0,.28); }
       .steamloader-store-alert-image { width: 100%; height: 100%; display: block; object-fit: cover; transition: opacity 180ms ease; }
@@ -2835,7 +2848,7 @@
       .steamloader-store-alert-state.is-reached { color: var(--store-success); }
       .steamloader-store-alert-actions { display: grid; gap: 7px; min-width: 116px; }
       .steamloader-store-alert-actions .steamloader-store-button { min-height: 42px; padding: 0 13px; }
-      .steamloader-store-settings-panel { position: relative; margin-top: 26px; padding: 28px; border: 1px solid rgba(255,255,255,.08); border-radius: 24px; background: rgba(255,255,255,.035); }
+      .steamloader-store-settings-panel { position: relative; margin-top: 26px; padding: 28px; border: 1px solid #33434a; border-radius: 3px; background: #17232b; }
       .steamloader-store-settings-panel h3 { margin: 0 0 16px; }
       .steamloader-store-region-setting { position: relative; display: grid; grid-template-columns: minmax(0,1fr) minmax(300px, .55fr); align-items: center; gap: 24px; margin-bottom: 28px; padding: 22px; border: 1px solid rgba(255,255,255,.08); border-radius: 20px; background: rgba(8,17,24,.62); }
       .steamloader-store-region-setting h3 { margin: 0 0 5px; }
@@ -2861,12 +2874,12 @@
       .steamloader-store-data-note { display: flex; flex-direction: column; gap: 7px; margin-top: 20px; padding: 18px; border-radius: 16px; color: var(--store-muted); background: rgba(0,0,0,.18); font-size: 12px; line-height: 1.45; }
       .steamloader-store-data-note strong { color: var(--store-accent); font-size: 13px; }
       .steamloader-store-modal-backdrop { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; padding: 42px; background: rgba(0,5,9,.7); backdrop-filter: blur(12px); }
-      .steamloader-store-modal { width: min(1500px, 94vw); height: min(850px, 90vh); display: grid; grid-template-rows: minmax(220px, 34%) minmax(0, 1fr); overflow: hidden; border: 1px solid rgba(255,255,255,.13); border-radius: 30px; background: #111820; box-shadow: 0 35px 120px rgba(0,0,0,.65); }
+      .steamloader-store-modal { width: min(1500px, 94vw); height: min(850px, 90vh); display: grid; grid-template-rows: minmax(220px, 34%) minmax(0, 1fr); overflow: hidden; border: 1px solid #53626a; border-radius: 5px; background: #111820; box-shadow: 0 24px 80px rgba(0,0,0,.6); }
       .steamloader-store-modal-banner { position: relative; isolation: isolate; display: flex; align-items: flex-end; padding: 38px 44px; overflow: hidden; }
       .steamloader-store-modal-banner::before { content: ""; position: absolute; inset: 0; z-index: -2; background-image: var(--store-detail-image); background-size: cover; background-position: center 25%; }
       .steamloader-store-modal-banner::after { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(0deg, #111820 0%, rgba(17,24,32,.15) 75%), linear-gradient(90deg, rgba(9,13,18,.72), transparent 70%); }
       .steamloader-store-modal-title { margin: 0; font-size: clamp(34px, 4.2vw, 70px); line-height: .96; letter-spacing: -.045em; text-shadow: 0 6px 25px #000; }
-      .steamloader-store-modal-close { position: absolute; top: 22px; right: 24px; width: 54px; height: 54px; border-radius: 17px; color: #fff; background: rgba(5,8,12,.62); font-size: 30px; }
+      .steamloader-store-modal-close { position: absolute; top: 22px; right: 24px; width: 54px; height: 54px; border-radius: 4px; color: #fff; background: rgba(5,8,12,.76); font-size: 30px; }
       .steamloader-store-modal-body { overflow: auto; padding: 0 32px 32px; }
       .steamloader-store-modal-body { scrollbar-width: none; }
       .steamloader-store-modal-body::-webkit-scrollbar { display: none; }
@@ -2900,11 +2913,11 @@
       .steamloader-store-retailer-shortcuts > span { color: var(--store-muted); font-size: 11px; }
       .steamloader-store-retailer-actions { display: flex; flex-wrap: wrap; gap: 8px; }
       .steamloader-store-retailer-actions .steamloader-store-button { min-height: 38px; padding: 0 14px; font-size: 11px; }
-      .steamloader-store-activity-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 14px; margin-top: 20px; padding: 14px 16px 14px 20px; border: 1px solid rgba(102,192,244,.3); border-radius: 17px; background: rgba(26,159,255,.1); }
+      .steamloader-store-activity-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 14px; margin-top: 20px; padding: 14px 16px 14px 20px; border: 1px solid #65754d; border-left: 4px solid var(--store-accent); border-radius: 3px; background: #1c2b2c; }
       .steamloader-store-activity-banner > span { color: var(--store-muted); font-size: 12px; }
-      .steamloader-store-undo-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 12px; margin-top: 18px; padding: 13px 14px 13px 18px; border: 1px solid rgba(102,192,244,.34); border-radius: 17px; background: rgba(17,48,70,.92); box-shadow: 0 14px 34px rgba(0,0,0,.25); }
+      .steamloader-store-undo-banner { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 12px; margin-top: 18px; padding: 13px 14px 13px 18px; border: 1px solid #65754d; border-left: 4px solid var(--store-accent); border-radius: 3px; background: #1c2b2c; box-shadow: none; }
       .steamloader-store-undo-banner > span { color: var(--store-muted); font-size: 12px; }
-      .steamloader-store-wishlist-toolbar { display: grid; grid-template-columns: minmax(170px,.45fr) minmax(0,1fr) auto; align-items: center; gap: 12px; margin-top: 16px; padding: 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 19px; background: rgba(8,17,24,.72); }
+      .steamloader-store-wishlist-toolbar { display: grid; grid-template-columns: minmax(170px,.45fr) minmax(0,1fr) auto; align-items: center; gap: 12px; margin-top: 16px; padding: 12px; border: 1px solid #33434a; border-radius: 3px; background: #17232b; }
       .steamloader-store-filter-search, .steamloader-store-filter-chip, .steamloader-store-setting-row { min-height: 40px; padding: 0 14px; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; outline: none; color: var(--store-text); background: rgba(255,255,255,.055); font: inherit; font-size: 11px; font-weight: 850; white-space: nowrap; }
       .steamloader-store-filter-search { overflow: hidden; text-align: left; text-overflow: ellipsis; }
       .steamloader-store-filter-search.is-active, .steamloader-store-filter-chip.is-active { border-color: var(--store-accent); color: #061522; background: var(--store-accent); }
@@ -2933,7 +2946,7 @@
       .steamloader-store-kind-badge { color: #ffd8a8 !important; background: rgba(255,153,61,.13) !important; }
       .steamloader-store-kind-badge.is-official { color: #bfe8ff !important; background: rgba(102,192,244,.12) !important; }
       .steamloader-store-offer-store small { color: var(--store-dim); font-size: 9px; }
-      .steamloader-store-qol-settings { margin-top: 22px; padding: 20px; border: 1px solid rgba(255,255,255,.08); border-radius: 20px; background: rgba(8,17,24,.62); }
+      .steamloader-store-qol-settings { margin-top: 22px; padding: 20px; border: 1px solid #33434a; border-radius: 3px; background: #17232b; }
       .steamloader-store-qol-settings h3 { margin-bottom: 8px; }
       .steamloader-store-setting-rows { display: grid; gap: 10px; }
       .steamloader-store-setting-row { width: 100%; min-height: 68px; display: grid; grid-template-columns: minmax(180px,.4fr) minmax(0,1fr) auto; align-items: center; gap: 14px; text-align: left; white-space: normal; }
@@ -2942,9 +2955,9 @@
       .steamloader-store-setting-row.is-static { padding: 12px 14px; }
       .steamloader-store-offer-skeleton, .steamloader-store-card-skeleton, .steamloader-store-hero-skeleton { overflow: hidden; background: linear-gradient(100deg, rgba(255,255,255,.035) 25%, rgba(255,255,255,.09) 45%, rgba(255,255,255,.035) 65%); background-size: 300% 100%; animation: steamloader-store-shimmer 1.4s infinite; }
       .steamloader-store-offer-skeleton { height: 72px; margin-top: 9px; border-radius: 16px; }
-      .steamloader-store-hero-skeleton { height: min(36vh, 390px); border-radius: 30px; }
+      .steamloader-store-hero-skeleton { height: min(29vh, 265px); border-radius: 5px; }
       .steamloader-store-skeleton-rail { display: grid; grid-template-columns: repeat(7, 1fr); gap: 16px; margin-top: 36px; }
-      .steamloader-store-card-skeleton { aspect-ratio: 2/3; border-radius: 20px; }
+      .steamloader-store-card-skeleton { aspect-ratio: 2/3; border-radius: 4px; }
       .steamloader-store-footer { min-height: 54px; display: flex; align-items: center; gap: 25px; padding: 0 48px; border-top: 1px solid rgba(255,255,255,.06); color: var(--store-muted); background: rgba(5,11,16,.88); font-size: 12px; font-weight: 750; }
       .steamloader-store-footer-source { margin-left: auto; color: var(--store-dim); }
       @keyframes steamloader-store-shimmer { to { background-position: -200% 0; } }
@@ -2953,7 +2966,11 @@
         .steamloader-store-subtitle, .steamloader-store-updated { display: none; }
         .steamloader-store-tabs { padding-left: 24px; padding-right: 24px; overflow-x: auto; justify-content: flex-start; }
         .steamloader-store-main { padding-left: 24px; padding-right: 24px; }
-        .steamloader-store-rail { grid-auto-columns: minmax(130px, 165px); }
+        .steamloader-store-rail.is-portrait > .steamloader-store-card { flex-basis: 150px; }
+        .steamloader-store-rail.is-portrait > .steamloader-store-card:nth-child(5n + 1) { flex-basis: 174px; }
+        .steamloader-store-rail.is-landscape > .steamloader-store-card { flex-basis: 210px; }
+        .steamloader-store-rail.is-landscape > .steamloader-store-card:first-child { flex-basis: 260px; }
+        .steamloader-store-rail.is-landscape > .steamloader-store-card:nth-child(4n + 3) { flex-basis: 230px; }
         .steamloader-store-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 165px)); }
         .steamloader-store-hero-content { width: 78%; padding: 32px; }
         .steamloader-store-currency-grid { grid-template-columns: 1fr; }

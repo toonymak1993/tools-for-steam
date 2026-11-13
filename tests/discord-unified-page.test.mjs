@@ -41,7 +41,10 @@ test("Discord opens the unified friends, servers, and settings page", async () =
     favoritesIndex >= 0 && favoritesIndex < friendsIndex && friendsIndex < serversIndex && serversIndex < manageIndex,
     "favorite servers should render above friends, regular servers, and management",
   );
-  assert.match(socialPage, /\(\) => openDiscordGuild\(guild\.id\)/);
+  assert.match(socialPage, /\(\) => openDiscordWeb\(\{ guildId: guild\?\.id \}\)/, "servers open in Discord Web");
+  assert.match(socialPage, /\(\) => openDiscordWeb\(\{ userId: friend\?\.id \}\)/, "friends open their profile in Discord Web");
+  assert.match(socialPage, /const discordWebSlots = buildDiscordWebSlots\(\);\s*const socialSlots = \[\s*\.\.\.discordWebSlots,/);
+  assert.match(socialPage, /\[\.\.\.discordWebSlots, \.\.\.actionSlots, settingsSlot\]/, "Discord Web works without connecting");
   assert.match(socialPage, /setDiscordGuildFavorite\(guild\?\.id, !isFavorite\)/);
   assert.match(socialPage, /badge: isFavorite \? "Favorite"/);
   assert.match(socialPage, /friend\?\.status !== "offline"/);

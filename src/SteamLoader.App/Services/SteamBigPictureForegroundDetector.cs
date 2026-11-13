@@ -34,6 +34,69 @@ internal static class SteamBigPictureForegroundDetector
         }
     }
 
+    /// <summary>
+    /// True only when the foreground window is Steam's Big Picture window
+    /// itself (by title). The desktop Steam client and a minimized Big Picture
+    /// window do not count.
+    /// </summary>
+    public static bool IsGamepadUiForeground()
+    {
+        var foregroundHandle = GetForegroundWindow();
+        return foregroundHandle != IntPtr.Zero &&
+            IsGamepadUiWindow(TryCreateCandidate(foregroundHandle, foregroundHandle, expectedSteamRoot: null));
+    }
+
+    /// <summary>
+    /// Visible, non-minimized Steam Big Picture windows (by title).
+    /// </summary>
+    public static IReadOnlyList<IntPtr> FindGamepadUiWindows()
+    {
+        var foregroundHandle = GetForegroundWindow();
+        var handles = new List<IntPtr>();
+        EnumWindows(
+            (windowHandle, _) =>
+            {
+                var candidate = TryCreateCandidate(windowHandle, foregroundHandle, expectedSteamRoot: null);
+                if (IsGamepadUiWindow(candidate))
+                {
+                    handles.Add(windowHandle);
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+        return handles;
+    }
+
+    private static bool IsGamepadUiWindow(SteamWindowCandidate? candidate)
+    {
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        return IsBigPictureWindowTitle(candidate.Title);
+    }
+
+    /// <summary>
+    /// Steam localizes the Big Picture window title ("Steam Big Picture Mode",
+    /// "Big-Picture-Modus", "Modo Big Picture", ...). The "Big Picture" brand
+    /// survives in every language, sometimes hyphenated, so only that part is
+    /// matched, never a whole (English) title.
+    /// </summary>
+    internal static bool IsBigPictureWindowTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        var normalizedTitle = title.Replace('-', ' ');
+        return normalizedTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase) ||
+            normalizedTitle.Contains("BigPicture", StringComparison.OrdinalIgnoreCase) ||
+            normalizedTitle.Contains("Gamepad", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static SteamWindowSnapshot Capture(string? expectedSteamRoot = null)
     {
         var foregroundHandle = GetForegroundWindow();
@@ -120,10 +183,7 @@ internal static class SteamBigPictureForegroundDetector
 
         var title = GetWindowTitle(windowHandle);
         var className = GetWindowClassName(windowHandle);
-        var normalizedTitle = title.Replace('-', ' ');
-        var titleLooksGamepad =
-            normalizedTitle.Contains("Big Picture", StringComparison.OrdinalIgnoreCase) ||
-            normalizedTitle.Contains("Gamepad", StringComparison.OrdinalIgnoreCase);
+        var titleLooksGamepad = IsBigPictureWindowTitle(title);
         var chromiumOrSdlWindow =
             className.Contains("Chrome_WidgetWin", StringComparison.OrdinalIgnoreCase) ||
             className.Contains("SDL", StringComparison.OrdinalIgnoreCase);

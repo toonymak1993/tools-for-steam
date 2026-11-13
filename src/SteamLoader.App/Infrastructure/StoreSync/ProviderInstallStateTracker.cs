@@ -12,7 +12,11 @@ internal static class ProviderInstallStateTracker
         MissingObservations = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object MissingGate = new();
 
-    public static void Reconcile(
+    /// <returns>
+    /// True when a game was seen missing once and needs a confirming pass
+    /// before it is marked uninstalled.
+    /// </returns>
+    public static bool Reconcile(
         string storeId,
         UnifySteamStoreConfiguration store,
         IReadOnlyDictionary<string, UnifySteamDownloadStatus> statuses,
@@ -23,7 +27,7 @@ internal static class ProviderInstallStateTracker
     {
         if (!store.Enabled || store.Cache?.Games is null)
         {
-            return;
+            return false;
         }
 
         var games = store.Cache.Games
@@ -33,13 +37,17 @@ internal static class ProviderInstallStateTracker
                 IsOperationRelevant(
                     UnifySteamDownloadStatusStore.Get(statuses, storeId, game.Id).Status)))
         {
-            return;
+            return false;
         }
 
+        // A loader throws when a launcher's install list exists but cannot be
+        // read (for example while the launcher rewrites it). The pass then
+        // fails as a whole and nothing is marked uninstalled.
         var installed = loadInstalled(store);
         var now = DateTimeOffset.UtcNow;
         var changed = new Dictionary<string, UnifySteamGameCacheEntry>(StringComparer.OrdinalIgnoreCase);
         var cleared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var confirmationPending = false;
 
         foreach (var game in games)
         {
@@ -85,7 +93,21 @@ internal static class ProviderInstallStateTracker
                 continue;
             }
 
-            if (game.Installed && ConfirmMissing(storeId, game.Id, now))
+            if (!game.Installed)
+            {
+                continue;
+            }
+
+            // A game on a drive that is currently absent (SD card, USB drive,
+            // network share) is not uninstalled; keep it until the drive is
+            // back or its folder is gone from a present drive.
+            if (IsOnUnavailableVolume(game.InstallPath))
+            {
+                ResetMissing(storeId, game.Id);
+                continue;
+            }
+
+            if (ConfirmMissing(storeId, game.Id, now))
             {
                 cleared.Add(game.Id);
                 // The local provider is authoritative. Once removal is
@@ -93,11 +115,15 @@ internal static class ProviderInstallStateTracker
                 // the game looking installed or busy in Steam.
                 UnifySteamDownloadStatusStore.Clear(storeId, game.Id);
             }
+            else
+            {
+                confirmationPending = true;
+            }
         }
 
         if (changed.Count == 0 && cleared.Count == 0)
         {
-            return;
+            return confirmationPending;
         }
 
         settings.Update(latest =>
@@ -147,6 +173,59 @@ internal static class ProviderInstallStateTracker
         {
             // The local state is already persisted. A later startup or
             // periodic reconciliation can retry the optional shortcut sync.
+        }
+
+        return confirmationPending;
+    }
+
+    /// <summary>
+    /// True when the path lives on a drive that is not present right now.
+    /// Such a game cannot be judged installed or uninstalled.
+    /// </summary>
+    internal static bool IsOnUnavailableVolume(string? path)
+    {
+        var root = TryGetVolumeRoot(path);
+        return !string.IsNullOrWhiteSpace(root) && !Directory.Exists(root);
+    }
+
+    /// <summary>
+    /// True only when the folder is gone from a drive that is present: the
+    /// signature of a game folder deleted outside its launcher.
+    /// </summary>
+    internal static bool IsMissingFromAvailableVolume(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            return !Directory.Exists(path.Trim()) && !IsOnUnavailableVolume(path);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string TryGetVolumeRoot(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            var trimmed = path.Trim().Trim('"');
+            return Path.IsPathFullyQualified(trimmed)
+                ? Path.GetPathRoot(Path.GetFullPath(trimmed)) ?? string.Empty
+                : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
         }
     }
 

@@ -16,7 +16,9 @@ public sealed class SteamStartupHistoryStoreTests
             var policy = store.GetTimingPolicy(isHandheld: false);
 
             Assert.False(policy.IsAdaptive);
-            Assert.Equal(TimeSpan.FromSeconds(30), policy.StartupGracePeriod);
+            Assert.Equal(TimeSpan.FromSeconds(75), policy.StartupGracePeriod);
+            // A cold start never sees recovery choices within the first 45 s.
+            Assert.True(policy.ShowRecoveryActionsAfter >= TimeSpan.FromSeconds(45));
         }
         finally
         {
@@ -44,8 +46,8 @@ public sealed class SteamStartupHistoryStoreTests
             var policy = store.GetTimingPolicy(isHandheld: false);
 
             Assert.True(policy.IsAdaptive);
-            Assert.InRange(policy.StartupGracePeriod, TimeSpan.FromSeconds(25), TimeSpan.FromSeconds(90));
-            Assert.InRange(policy.SplashSafetyTimeout, TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(10));
+            Assert.InRange(policy.StartupGracePeriod, TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(150));
+            Assert.InRange(policy.SplashSafetyTimeout, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10));
         }
         finally
         {

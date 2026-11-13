@@ -15,12 +15,12 @@ internal sealed class HandheldPerformanceProfileCoordinator
     {
         _performanceService = performanceService;
         _notificationService = notificationService;
-        _gameMonitor = new HybridGameProcessMonitor(steamRootPath);
+        _gameMonitor = new HybridGameProcessMonitor(steamRootPath, performanceService.HasProfile);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        if (!HandheldDeviceCatalog.IsSupported(HandheldDeviceCatalog.Detect()))
+        if (!HandheldDeviceCatalog.SupportsTdp(HandheldDeviceCatalog.Detect()))
         {
             return;
         }

@@ -166,6 +166,27 @@ public sealed class SteamLoaderSettingsControllerShortcutTests
     }
 
     [Fact]
+    public void OverlayRecorderGate_StaysOpenBrieflyAfterEachInputStatePoll()
+    {
+        ControllerShortcutCaptureGate.ResetForTests();
+        try
+        {
+            Assert.False(ControllerShortcutCaptureGate.IsActive());
+
+            ControllerShortcutCaptureGate.MarkActive();
+
+            Assert.True(ControllerShortcutCaptureGate.IsActive());
+            Assert.True(ControllerShortcutCaptureGate.HoldOpenWindow <= TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            ControllerShortcutCaptureGate.ResetForTests();
+        }
+
+        Assert.False(ControllerShortcutCaptureGate.IsActive());
+    }
+
+    [Fact]
     public void RawHidControllerUsages_MapBackAndRightStickAsOneChord()
     {
         var mask = HidMenuButtonMonitor.ConvertButtonUsagesToXInputMask([7, 10]);

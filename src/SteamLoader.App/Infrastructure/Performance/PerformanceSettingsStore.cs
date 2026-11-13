@@ -99,6 +99,12 @@ public sealed class PerformanceSettingsStore
         configuration.MetricsWindow = RoundToStep(Math.Clamp(configuration.MetricsWindow, 100, 5000), 100);
         configuration.OverlayDrawRate = RoundToStep(Math.Clamp(configuration.OverlayDrawRate, 1, 120), 5);
         configuration.FrameLimit = NormalizeFrameLimit(configuration.FrameLimit);
+        configuration.ManagedFrameLimitProfiles = (configuration.ManagedFrameLimitProfiles ?? [])
+            .Where(name => !string.IsNullOrWhiteSpace(name) &&
+                string.Equals(name, Path.GetFileName(name), StringComparison.Ordinal) &&
+                name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
         return configuration;
     }
 
@@ -156,4 +162,13 @@ internal sealed class PerformanceSettingsConfiguration
     public int FrameLimit { get; set; }
 
     public bool FrameLimitConfigured { get; set; }
+
+    /// <summary>
+    /// RTSS game profiles (exe names) that carry a TFS frame limit. A new limit, "Off"
+    /// included, is written to all of them, not only to the game running right now.
+    /// </summary>
+    public List<string> ManagedFrameLimitProfiles { get; set; } = [];
+
+    /// <summary>Set once older RTSS profiles with a limit were adopted into the list above.</summary>
+    public bool ManagedFrameLimitProfilesAdopted { get; set; }
 }

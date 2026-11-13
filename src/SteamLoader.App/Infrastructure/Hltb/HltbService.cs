@@ -8,12 +8,15 @@ namespace SteamLoader.App.Infrastructure.Hltb;
 
 public sealed class HltbService
 {
-    private const string SearchUrl = "https://howlongtobeat.com/api/bleed";
-    private const string SearchInitUrl = "https://howlongtobeat.com/api/bleed/init";
+    private const string BaseUrl = "https://howlongtobeat.com";
+    private const string DefaultSearchEndpoint = "/api/search/site";
     private const string BrowserUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromHours(12);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    // Shared across requests; updated when the site moved its search path.
+    private static string CurrentSearchEndpoint { get; set; } = DefaultSearchEndpoint;
 
     private readonly HltbSettingsStore _settingsStore;
     private readonly object _gate = new();
@@ -239,36 +242,34 @@ public sealed class HltbService
             Timeout = TimeSpan.FromSeconds(18)
         };
 
-        var authState = await FetchAuthTokenAsync(httpClient, cancellationToken)
-            ?? throw new InvalidOperationException("HowLongToBeat did not return an auth token.");
+        // Exact name/alias matches of any title variant win over a fuzzy match
+        // ("... Game of the Year Edition" must land on the base game, not on
+        // a similar-looking remaster).
+        HltbSearchResult? bestMatch = null;
+        var searched = new List<(string Title, IReadOnlyList<HltbSearchResult> Results)>();
+        foreach (var searchTitle in BuildSearchTitles(requestedTitle))
+        {
+            var results = await SearchAsync(httpClient, searchTitle, cancellationToken);
+            searched.Add((searchTitle, results));
+            bestMatch = SelectBestMatch(searchTitle, appId, results, allowFuzzy: false);
+            if (bestMatch is not null)
+            {
+                break;
+            }
+        }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, SearchUrl);
-        request.Headers.TryAddWithoutValidation("Origin", "https://howlongtobeat.com");
-        request.Headers.Referrer = new Uri("https://howlongtobeat.com/");
-        request.Headers.TryAddWithoutValidation("Accept", "*/*");
-        request.Headers.TryAddWithoutValidation("Accept-Language", "en-US,en;q=0.9");
-        request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache");
-        request.Headers.TryAddWithoutValidation("Pragma", "no-cache");
-        request.Headers.TryAddWithoutValidation("Sec-Fetch-Dest", "empty");
-        request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "cors");
-        request.Headers.TryAddWithoutValidation("Sec-Fetch-Site", "same-origin");
-        request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-        request.Headers.TryAddWithoutValidation("x-auth-token", authState.Token);
-        request.Headers.TryAddWithoutValidation("x-hp-key", authState.HpKey);
-        request.Headers.TryAddWithoutValidation("x-hp-val", authState.HpVal);
-        request.Content = new StringContent(
-            JsonSerializer.Serialize(BuildSearchPayload(requestedTitle, authState), JsonOptions),
-            Encoding.UTF8,
-            "application/json");
+        if (bestMatch is null)
+        {
+            foreach (var (searchTitle, results) in searched)
+            {
+                bestMatch = SelectBestMatch(searchTitle, appId, results);
+                if (bestMatch is not null)
+                {
+                    break;
+                }
+            }
+        }
 
-        using var response = await httpClient.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var payload = await JsonSerializer.DeserializeAsync<HltbSearchResponse>(stream, JsonOptions, cancellationToken)
-            ?? new HltbSearchResponse();
-
-        var bestMatch = SelectBestMatch(requestedTitle, appId, payload.Data);
         if (bestMatch is null)
         {
             return new HltbCacheEntry
@@ -297,13 +298,84 @@ public sealed class HltbService
         };
     }
 
-    private static async Task<HltbSearchInitResponse?> FetchAuthTokenAsync(HttpClient httpClient, CancellationToken cancellationToken)
+    /// <summary>
+    /// One search on howlongtobeat.com: fetch a search token from the init
+    /// endpoint, then post the search. HLTB moves this endpoint every few
+    /// months (/api/search, /api/find, /api/seek, /api/bleed, /api/search/site
+    /// ...). A 404 makes us read the current path from the site's own
+    /// JavaScript once and retry, so the next move does not break the stats.
+    /// </summary>
+    private static async Task<IReadOnlyList<HltbSearchResult>> SearchAsync(
+        HttpClient httpClient,
+        string title,
+        CancellationToken cancellationToken)
     {
-        using var request = new HttpRequestMessage(
-            HttpMethod.Get,
-            $"{SearchInitUrl}?t={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
-        request.Headers.TryAddWithoutValidation("Origin", "https://howlongtobeat.com");
-        request.Headers.Referrer = new Uri("https://howlongtobeat.com/");
+        var endpoint = CurrentSearchEndpoint;
+        var rediscovered = false;
+        var tokenRefreshed = false;
+
+        while (true)
+        {
+            var authState = await FetchAuthTokenAsync(httpClient, endpoint, cancellationToken);
+            if (authState is null && !rediscovered)
+            {
+                rediscovered = true;
+                endpoint = await DiscoverSearchEndpointAsync(httpClient, endpoint, cancellationToken);
+                continue;
+            }
+
+            if (authState is null || string.IsNullOrWhiteSpace(authState.Token))
+            {
+                throw new InvalidOperationException("HowLongToBeat did not return a search token.");
+            }
+
+            using var request = CreateHltbRequest(HttpMethod.Post, BaseUrl + endpoint);
+            request.Headers.TryAddWithoutValidation("x-auth-token", authState.Token);
+            if (!string.IsNullOrWhiteSpace(authState.HpKey))
+            {
+                request.Headers.TryAddWithoutValidation("x-hp-key", authState.HpKey);
+                request.Headers.TryAddWithoutValidation("x-hp-val", authState.HpVal);
+            }
+
+            request.Content = new StringContent(
+                JsonSerializer.Serialize(BuildSearchPayload(title, authState), JsonOptions),
+                Encoding.UTF8,
+                "application/json");
+
+            using var response = await httpClient.SendAsync(request, cancellationToken);
+            if ((response.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.MethodNotAllowed) &&
+                !rediscovered)
+            {
+                rediscovered = true;
+                endpoint = await DiscoverSearchEndpointAsync(httpClient, endpoint, cancellationToken);
+                continue;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden && !tokenRefreshed)
+            {
+                // The site's own client refreshes an expired token once, too.
+                tokenRefreshed = true;
+                continue;
+            }
+
+            if ((int)response.StatusCode == 429)
+            {
+                throw new InvalidOperationException("HowLongToBeat is rate limiting searches right now.");
+            }
+
+            response.EnsureSuccessStatusCode();
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var payload = await JsonSerializer.DeserializeAsync<HltbSearchResponse>(stream, JsonOptions, cancellationToken)
+                ?? new HltbSearchResponse();
+            return payload.Data ?? [];
+        }
+    }
+
+    private static HttpRequestMessage CreateHltbRequest(HttpMethod method, string url)
+    {
+        var request = new HttpRequestMessage(method, url);
+        request.Headers.TryAddWithoutValidation("Origin", BaseUrl);
+        request.Headers.Referrer = new Uri(BaseUrl + "/");
         request.Headers.TryAddWithoutValidation("Accept", "*/*");
         request.Headers.TryAddWithoutValidation("Accept-Language", "en-US,en;q=0.9");
         request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache");
@@ -312,16 +384,133 @@ public sealed class HltbService
         request.Headers.TryAddWithoutValidation("Sec-Fetch-Mode", "cors");
         request.Headers.TryAddWithoutValidation("Sec-Fetch-Site", "same-origin");
         request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+        return request;
+    }
+
+    /// <returns>The token, or null when the init endpoint does not exist (moved).</returns>
+    private static async Task<HltbSearchInitResponse?> FetchAuthTokenAsync(
+        HttpClient httpClient,
+        string endpoint,
+        CancellationToken cancellationToken)
+    {
+        using var request = CreateHltbRequest(
+            HttpMethod.Get,
+            $"{BaseUrl}{endpoint}/init?t={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
 
         using var response = await httpClient.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
+        if (response.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.MethodNotAllowed)
+        {
+            return null;
+        }
 
+        response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         return await JsonSerializer.DeserializeAsync<HltbSearchInitResponse>(stream, JsonOptions, cancellationToken);
     }
 
-    private static Dictionary<string, object?> BuildSearchPayload(string title, HltbSearchInitResponse authState)
+    /// <summary>
+    /// Reads the current search path from the site's JavaScript bundles
+    /// (the page calls <c>fetch(`/api/.../init?t=...`)</c> before searching).
+    /// Falls back to the previous path when nothing is found.
+    /// </summary>
+    private static async Task<string> DiscoverSearchEndpointAsync(
+        HttpClient httpClient,
+        string previousEndpoint,
+        CancellationToken cancellationToken)
     {
+        try
+        {
+            using var pageRequest = CreateHltbRequest(HttpMethod.Get, BaseUrl + "/");
+            pageRequest.Headers.Remove("Accept");
+            pageRequest.Headers.TryAddWithoutValidation("Accept", "text/html");
+            using var pageResponse = await httpClient.SendAsync(pageRequest, cancellationToken);
+            pageResponse.EnsureSuccessStatusCode();
+            var html = await pageResponse.Content.ReadAsStringAsync(cancellationToken);
+
+            foreach (var scriptPath in ExtractScriptPaths(html).Take(40))
+            {
+                using var scriptRequest = CreateHltbRequest(HttpMethod.Get, BaseUrl + scriptPath);
+                using var scriptResponse = await httpClient.SendAsync(scriptRequest, cancellationToken);
+                if (!scriptResponse.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                var script = await scriptResponse.Content.ReadAsStringAsync(cancellationToken);
+                var endpoint = ExtractSearchEndpoint(script);
+                if (!string.IsNullOrWhiteSpace(endpoint))
+                {
+                    CurrentSearchEndpoint = endpoint;
+                    return endpoint;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // Keep the previous path; the caller reports the search error.
+        }
+
+        return previousEndpoint;
+    }
+
+    internal static IEnumerable<string> ExtractScriptPaths(string html)
+    {
+        return System.Text.RegularExpressions.Regex
+            .Matches(html ?? string.Empty, "/_next/static/chunks/[A-Za-z0-9_\\-./]+?\\.js")
+            .Select(match => match.Value)
+            .Distinct(StringComparer.Ordinal);
+    }
+
+    /// <summary>"/api/search/site" from <c>fetch(`/api/search/site/init?t=${Date.now()}`)</c>.</summary>
+    internal static string? ExtractSearchEndpoint(string script)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            script ?? string.Empty,
+            "[\"'`](/api/[A-Za-z0-9_\\-/]+?)/init\\?t=");
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    /// <summary>
+    /// Title variants tried in order: the cleaned title, then without edition
+    /// suffixes ("Definitive Edition", "GOTY", "- Remastered" ...).
+    /// </summary>
+    internal static IReadOnlyList<string> BuildSearchTitles(string title)
+    {
+        var titles = new List<string>();
+        var cleaned = System.Text.RegularExpressions.Regex
+            .Replace(title ?? string.Empty, "[™®©]", string.Empty)
+            .Replace('–', '-')
+            .Replace('—', '-');
+        cleaned = string.Join(' ', cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (!string.IsNullOrWhiteSpace(cleaned))
+        {
+            titles.Add(cleaned);
+        }
+
+        var withoutEdition = System.Text.RegularExpressions.Regex.Replace(
+            cleaned,
+            "\\s*[-:(]?\\s*(?:the\\s+)?(?:definitive|complete|ultimate|deluxe|enhanced|gold|goty|game of the year|anniversary|director'?s cut|remastered|special|standard|digital deluxe|premium)(?:\\s+edition)?\\s*\\)?\\s*$",
+            string.Empty,
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim(' ', '-', ':');
+        if (!string.IsNullOrWhiteSpace(withoutEdition) &&
+            !titles.Contains(withoutEdition, StringComparer.OrdinalIgnoreCase))
+        {
+            titles.Add(withoutEdition);
+        }
+
+        return titles;
+    }
+
+    internal static Dictionary<string, object?> BuildSearchPayload(string title, HltbSearchInitResponse authState)
+    {
+        // Matches the payload of the site's own search (filters are
+        // {mode, values} objects since the /api/search/site version).
+        static Dictionary<string, object?> AnyFilter() => new()
+        {
+            ["mode"] = "include",
+            ["values"] = Array.Empty<string>(),
+        };
+
         var payload = new Dictionary<string, object?>
         {
             ["searchType"] = "games",
@@ -334,7 +523,7 @@ public sealed class HltbService
                 ["games"] = new Dictionary<string, object?>
                 {
                     ["userId"] = 0,
-                    ["platform"] = string.Empty,
+                    ["platform"] = AnyFilter(),
                     ["sortCategory"] = "popular",
                     ["rangeCategory"] = "main",
                     ["rangeTime"] = new Dictionary<string, object?>
@@ -344,16 +533,11 @@ public sealed class HltbService
                     },
                     ["gameplay"] = new Dictionary<string, object?>
                     {
-                        ["perspective"] = string.Empty,
-                        ["flow"] = string.Empty,
-                        ["genre"] = string.Empty,
-                        ["difficulty"] = string.Empty,
+                        ["perspective"] = AnyFilter(),
+                        ["flow"] = AnyFilter(),
+                        ["genre"] = AnyFilter(),
                     },
-                    ["rangeYear"] = new Dictionary<string, object?>
-                    {
-                        ["min"] = string.Empty,
-                        ["max"] = string.Empty,
-                    },
+                    ["year"] = AnyFilter(),
                     ["modifier"] = string.Empty,
                 },
                 ["users"] = new Dictionary<string, object?>
@@ -371,14 +555,20 @@ public sealed class HltbService
             ["useCache"] = true,
         };
 
-        payload[authState.HpKey] = authState.HpVal;
+        // Older endpoint versions wanted a honeypot key/value in the body.
+        if (!string.IsNullOrWhiteSpace(authState.HpKey))
+        {
+            payload[authState.HpKey] = authState.HpVal;
+        }
+
         return payload;
     }
 
-    private static HltbSearchResult? SelectBestMatch(
+    internal static HltbSearchResult? SelectBestMatch(
         string requestedTitle,
         int? appId,
-        IReadOnlyList<HltbSearchResult> results)
+        IReadOnlyList<HltbSearchResult> results,
+        bool allowFuzzy = true)
     {
         if (results.Count == 0)
         {
@@ -410,10 +600,21 @@ public sealed class HltbService
             return aliasMatch;
         }
 
-        return results
-            .OrderBy(result => ScoreResult(normalizedRequestedTitle, result))
-            .ThenByDescending(result => result.CompAllCount)
-            .FirstOrDefault();
+        if (!allowFuzzy)
+        {
+            return null;
+        }
+
+        var best = results
+            .Select(result => (Result: result, Score: ScoreResult(normalizedRequestedTitle, result)))
+            .OrderBy(candidate => candidate.Score)
+            .ThenByDescending(candidate => candidate.Result.CompAllCount)
+            .First();
+
+        // A loose search can return unrelated games; showing their times on
+        // the wrong page is worse than showing nothing.
+        var tolerance = Math.Max(3, normalizedRequestedTitle.Length / 3);
+        return best.Score <= tolerance ? best.Result : null;
     }
 
     private static int ScoreResult(string normalizedRequestedTitle, HltbSearchResult result)
@@ -562,13 +763,13 @@ public sealed class HltbService
             : "--";
     }
 
-    private sealed class HltbSearchResponse
+    internal sealed class HltbSearchResponse
     {
         [JsonPropertyName("data")]
         public List<HltbSearchResult> Data { get; set; } = [];
     }
 
-    private sealed class HltbSearchInitResponse
+    internal sealed class HltbSearchInitResponse
     {
         [JsonPropertyName("token")]
         public string Token { get; set; } = string.Empty;
@@ -580,7 +781,7 @@ public sealed class HltbService
         public string HpVal { get; set; } = string.Empty;
     }
 
-    private sealed class HltbSearchResult
+    internal sealed class HltbSearchResult
     {
         [JsonPropertyName("game_id")]
         public int GameId { get; set; }

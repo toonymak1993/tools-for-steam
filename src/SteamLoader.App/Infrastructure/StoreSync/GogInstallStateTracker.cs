@@ -104,11 +104,13 @@ internal static class GogInstallStateTracker
         }
 
         // An existing TFS transaction directory without a launchable manifest
-        // is a partial installation, not evidence of an uninstall.
+        // is a partial installation, not evidence of an uninstall. A cached
+        // install on a drive that is absent right now proves nothing either.
         var conclusive =
-            !sawExistingDirectory ||
-            transaction is null ||
-            transaction.Phase is GogOperationPhases.Canceled or GogOperationPhases.Ready;
+            (!sawExistingDirectory ||
+             transaction is null ||
+             transaction.Phase is GogOperationPhases.Canceled or GogOperationPhases.Ready) &&
+            !ProviderInstallStateTracker.IsOnUnavailableVolume(cachedInstallPath);
         var missing = new GogInstallProbe(
             conclusive,
             false,
@@ -119,7 +121,10 @@ internal static class GogInstallStateTracker
         return missing;
     }
 
-    public static void Reconcile(
+    /// <returns>
+    /// True when a game was seen missing once and needs a confirming pass.
+    /// </returns>
+    public static bool Reconcile(
         UnifySteamStoreConfiguration store,
         IReadOnlyDictionary<string, UnifySteamDownloadStatus> statuses,
         StoreSyncSettingsStore settings,
@@ -128,9 +133,10 @@ internal static class GogInstallStateTracker
     {
         if (!store.Enabled || store.Cache?.Games is null)
         {
-            return;
+            return false;
         }
 
+                var confirmationPending = false;
                 var transactions = GogOperationJournal.GetAll()
                     .ToDictionary(
                         transaction => transaction.GameId,
@@ -227,18 +233,26 @@ internal static class GogInstallStateTracker
                     var uninstallPending =
                         status.Status is "uninstall-action-required" or "uninstalling" ||
                         transaction?.IsUninstall == true;
-                    if ((game.Installed || uninstallPending) &&
-                        ConfirmMissing(game.Id, now))
+                    if (!game.Installed && !uninstallPending)
+                    {
+                        continue;
+                    }
+
+                    if (ConfirmMissing(game.Id, now))
                     {
                         cleared.Add(game.Id);
                         UnifySteamDownloadStatusStore.Clear("gog-galaxy", game.Id);
                         GogOperationJournal.Clear(game.Id);
                     }
+                    else
+                    {
+                        confirmationPending = true;
+                    }
                 }
 
                 if (changed.Count == 0 && cleared.Count == 0)
                 {
-                    return;
+                    return confirmationPending;
                 }
 
                 settings.Update(latest =>
@@ -288,6 +302,8 @@ internal static class GogInstallStateTracker
                 {
                     // The next local install-state pass or startup check can retry.
                 }
+
+                return confirmationPending;
     }
 
     internal static bool IsOperationRelevant(

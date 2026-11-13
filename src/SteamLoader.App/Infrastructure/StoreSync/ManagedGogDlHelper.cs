@@ -22,6 +22,7 @@ internal static class ManagedGogDlHelper
     {
         Timeout = TimeSpan.FromMinutes(3),
     };
+    private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(4);
 
     public static string ToolDirectory =>
         Path.Combine(AppContext.BaseDirectory, "data", "omnilibrary", "helpers");
@@ -107,21 +108,28 @@ internal static class ManagedGogDlHelper
 
             try
             {
+                // HttpClient.Timeout ends at the response headers. Bound the
+                // body as well so a stalled connection cannot hang sign-in or
+                // the first catalog preparation forever.
+                using var downloadTimeout = new CancellationTokenSource(DownloadTimeout);
                 using var response = HttpClient.GetAsync(
                         DownloadUrl,
-                        HttpCompletionOption.ResponseHeadersRead)
+                        HttpCompletionOption.ResponseHeadersRead,
+                        downloadTimeout.Token)
                     .GetAwaiter()
                     .GetResult();
                 response.EnsureSuccessStatusCode();
 
-                using (var source = response.Content.ReadAsStream())
+                using (var source = response.Content.ReadAsStream(downloadTimeout.Token))
                 using (var destination = new FileStream(
                            temporaryPath,
                            FileMode.CreateNew,
                            FileAccess.Write,
                            FileShare.None))
                 {
-                    source.CopyTo(destination);
+                    source.CopyToAsync(destination, downloadTimeout.Token)
+                        .GetAwaiter()
+                        .GetResult();
                     destination.Flush(flushToDisk: true);
                 }
 
@@ -133,6 +141,12 @@ internal static class ManagedGogDlHelper
 
                 File.Move(temporaryPath, ToolPath, overwrite: true);
                 return ToolPath;
+            }
+            catch (OperationCanceledException exception)
+            {
+                throw new InvalidOperationException(
+                    "The GOG helper download did not finish in time. Check the internet connection and try again.",
+                    exception);
             }
             finally
             {

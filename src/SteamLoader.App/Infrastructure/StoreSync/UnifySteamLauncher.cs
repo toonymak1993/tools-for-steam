@@ -45,6 +45,7 @@ internal static class UnifySteamLauncher
     private static readonly object EpicDownloadLogGate = new();
     private static readonly object GogDownloadLogGate = new();
     private static readonly object EaHandoffLogGate = new();
+    private static readonly object WorkerErrorLogGate = new();
 
     internal sealed record GogLaunchTask(
         int Index,
@@ -119,14 +120,15 @@ internal static class UnifySteamLauncher
 
     public static int Install(string target)
     {
+        EnterBackgroundWorkerMode();
+        if (!TryParseTarget(target, out var storeId, out var gameId))
+        {
+            ShowError("The OmniLibrary install target is invalid. Refresh the store library and try again.");
+            return 1;
+        }
+
         try
         {
-            if (!TryParseTarget(target, out var storeId, out var gameId))
-            {
-                ShowError("The OmniLibrary install target is invalid. Refresh the store library and try again.");
-                return 1;
-            }
-
             if (ShouldAbortPendingDownloadWorker(storeId, gameId))
             {
                 return 0;
@@ -144,6 +146,10 @@ internal static class UnifySteamLauncher
         }
         catch (Exception exception)
         {
+            MarkWorkerOperationFailed(
+                storeId,
+                gameId,
+                $"The download stopped unexpectedly: {exception.Message} Select Retry Download to continue.");
             ShowError($"The OmniLibrary download failed: {exception.Message}");
             return 1;
         }
@@ -151,16 +157,17 @@ internal static class UnifySteamLauncher
 
     public static int Repair(string target)
     {
+        EnterBackgroundWorkerMode();
+        if (!TryParseTarget(target, out var storeId, out var gameId) ||
+            !storeId.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase))
+        {
+            ShowError(
+                "The OmniLibrary repair target is invalid. Refresh the GOG library and try again.");
+            return 1;
+        }
+
         try
         {
-            if (!TryParseTarget(target, out var storeId, out var gameId) ||
-                !storeId.Equals("gog-galaxy", StringComparison.OrdinalIgnoreCase))
-            {
-                ShowError(
-                    "The OmniLibrary repair target is invalid. Refresh the GOG library and try again.");
-                return 1;
-            }
-
             if (ShouldAbortPendingDownloadWorker(storeId, gameId))
             {
                 return 0;
@@ -178,8 +185,66 @@ internal static class UnifySteamLauncher
         }
         catch (Exception exception)
         {
+            MarkWorkerOperationFailed(
+                storeId,
+                gameId,
+                $"The GOG repair stopped unexpectedly: {exception.Message} Select Retry Download to continue.");
             ShowError($"The GOG repair failed: {exception.Message}");
             return 1;
+        }
+    }
+
+    // Download, repair, uninstall and cleanup workers run hidden, usually while
+    // the user is in Big Picture. A modal Windows dialog there cannot be reached
+    // with a controller, and it kept the worker alive, so the Download Center
+    // showed the transfer as running forever. Workers log the error instead and
+    // leave a terminal status the Download Center already presents.
+    private static bool s_backgroundWorker;
+
+    private static void EnterBackgroundWorkerMode()
+    {
+        s_backgroundWorker = true;
+    }
+
+    internal static bool IsBackgroundWorkerMode => s_backgroundWorker;
+
+    private static void MarkWorkerOperationFailed(
+        string storeId,
+        string gameId,
+        string detail)
+    {
+        try
+        {
+            var current = UnifySteamDownloadStatusStore.Get(storeId, gameId);
+            if (!UnifySteamDownloadStatusStore.IsBusyOperation(current.Status) ||
+                (current.WorkerProcessId > 0 &&
+                 current.WorkerProcessId != Environment.ProcessId))
+            {
+                // A terminal status is already recorded, or another worker
+                // owns this game; never overwrite either.
+                return;
+            }
+
+            UnifySteamDownloadStatusStore.Update(
+                storeId,
+                gameId,
+                current.Status switch
+                {
+                    "uninstalling" => "uninstall-failed",
+                    "canceling" => "cancel-failed",
+                    _ => "failed",
+                },
+                current.ProgressPercent,
+                detail,
+                workerProcessId: 0,
+                downloadedBytes: current.DownloadedBytes,
+                totalBytes: current.TotalBytes,
+                attempt: current.Attempt);
+        }
+        catch
+        {
+            // The status store is best effort here; a dead worker is still
+            // detected and marked failed by the status normalization.
         }
     }
 
@@ -424,6 +489,8 @@ internal static class UnifySteamLauncher
 
     public static int Run(string target)
     {
+        // Background OmniLibrary sync pauses while this launcher runs a game.
+        using var gameSession = OmniLibraryGameActivity.EnterGameSession();
         try
         {
             if (!TryParseTarget(target, out var storeId, out var gameId))
@@ -450,14 +517,15 @@ internal static class UnifySteamLauncher
 
     public static int Uninstall(string target)
     {
+        EnterBackgroundWorkerMode();
+        if (!TryParseTarget(target, out var storeId, out var gameId))
+        {
+            ShowError("The OmniLibrary uninstall target is invalid. Refresh the store library and try again.");
+            return 1;
+        }
+
         try
         {
-            if (!TryParseTarget(target, out var storeId, out var gameId))
-            {
-                ShowError("The OmniLibrary uninstall target is invalid. Refresh the store library and try again.");
-                return 1;
-            }
-
             return storeId switch
             {
                 "xbox-game-pass" => UninstallXbox(gameId),
@@ -468,11 +536,53 @@ internal static class UnifySteamLauncher
         }
         catch (Exception exception)
         {
+            MarkWorkerOperationFailed(
+                storeId,
+                gameId,
+                $"The uninstall stopped unexpectedly: {exception.Message} Select Retry Uninstall to try again.");
             ShowError($"The OmniLibrary uninstall action failed: {exception.Message}");
             return 1;
         }
     }
 
+    // Steam's Play button only ever starts an installed game. Downloads,
+    // updates and store install hand-offs start from the OmniLibrary row on
+    // the game page (download-core.js) or the Download Center, never from
+    // Play. Steam treats this launcher process as the running game, so a
+    // download started here kept the game "running" for the whole transfer.
+    // Pressing Play on a game that is not installed therefore ends quietly:
+    // no worker, no store window, no modal error in Big Picture.
+    internal static int DeclineLaunchUntilInstalled(string storeId, string gameId)
+    {
+        var current = UnifySteamDownloadStatusStore.Get(storeId, gameId);
+        WriteWorkerErrorLog(
+            $"Play ignored for {storeId}:{gameId}: the game is not installed " +
+            $"(download status '{current.Status}'). Downloads start from the " +
+            "game page Download row or the Download Center.");
+        return 0;
+    }
+
+    // An update or repair that is still writing files must finish first.
+    private static bool IsTransferBlockingLaunch(string storeId, string gameId)
+    {
+        var status = UnifySteamDownloadStatusStore.Get(storeId, gameId).Status;
+        return UnifySteamDownloadStatusStore.IsActivelyTransferring(status) ||
+            string.Equals(status, "uninstalling", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Launching ends "Ready to play" and old errors, but never drops a paused
+    // or running transfer: the Download row keeps offering Resume for it.
+    private static void ClearFinishedDownloadStatus(string storeId, string gameId)
+    {
+        var status = UnifySteamDownloadStatusStore.Get(storeId, gameId).Status;
+        if (UnifySteamDownloadStatusStore.IsActivelyTransferring(status) ||
+            string.Equals(status, "paused", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        UnifySteamDownloadStatusStore.Clear(storeId, gameId);
+    }
     private static int RunRom(string gameId)
     {
         var configuration = LoadStoreSyncConfiguration();
@@ -515,25 +625,36 @@ internal static class UnifySteamLauncher
             (system.Id.Equals("psp", StringComparison.OrdinalIgnoreCase)
                 ? store.ToolPath
                 : string.Empty);
-        var emulatorPath = UnifySteamService.ResolveRomEmulatorExecutable(
-            system.Id,
+        var selection = OmniLibraryEmulatorDetector.Resolve(
+            system,
+            systemSettings?.EmulatorId,
             configuredPath);
-        if (string.IsNullOrWhiteSpace(emulatorPath))
+        if (!selection.Ready || selection.Emulator is null)
         {
+            var missing = selection.InstallCandidate?.Title ?? system.EmulatorTitle;
             return Fail(
-                $"{system.EmulatorTitle} was not found. Install it or select {system.EmulatorExecutableName} in OmniLibrary's {system.Title} settings.");
+                selection.InstallCandidate?.CanInstall == true
+                    ? $"{missing} is not installed yet. Install it in Tools for Steam: Quick Access > OmniLibrary > Emulation > {system.Title}."
+                    : $"{missing} was not found. Install it or select its executable in OmniLibrary's {system.Title} settings.");
         }
 
+        var emulator = selection.Emulator;
+        var fullscreen = systemSettings?.Fullscreen ?? true;
+        OmniLibraryEmulatorCatalog.PrepareFullscreenConfiguration(
+            emulator.Id,
+            selection.ExecutablePath,
+            fullscreen);
         var startInfo = new ProcessStartInfo
         {
-            FileName = emulatorPath,
-            WorkingDirectory = Path.GetDirectoryName(emulatorPath) ?? string.Empty,
+            FileName = selection.ExecutablePath,
+            WorkingDirectory = Path.GetDirectoryName(selection.ExecutablePath) ?? string.Empty,
             UseShellExecute = false,
         };
-        foreach (var argument in BuildRomLaunchArguments(
-                     system.Id,
+        foreach (var argument in OmniLibraryEmulatorCatalog.BuildLaunchArguments(
+                     emulator.Id,
                      romPath,
-                     systemSettings?.Fullscreen ?? true))
+                     selection.CorePath,
+                     fullscreen))
         {
             startInfo.ArgumentList.Add(argument);
         }
@@ -541,48 +662,33 @@ internal static class UnifySteamLauncher
         using var emulatorProcess = Process.Start(startInfo);
         if (emulatorProcess is null)
         {
-            return Fail($"{system.EmulatorTitle} could not be started.");
+            return Fail($"{emulator.Title} could not be started.");
         }
 
         // Keep the Steam shortcut's launcher process alive for the complete
         // emulation session. Steam can then retain its Running state, overlay
-        // ownership and play-time tracking until PPSSPP exits.
+        // ownership and play-time tracking until the emulator exits.
         emulatorProcess.WaitForExit();
         return emulatorProcess.ExitCode;
     }
 
     internal static IReadOnlyList<string> BuildPpssppLaunchArguments(
         string romPath) =>
-        BuildRomLaunchArguments("psp", romPath, fullscreen: true);
+        OmniLibraryEmulatorCatalog.BuildLaunchArguments("ppsspp", romPath, null, fullscreen: true);
 
+    /// <summary>Launch arguments of a system's recommended emulator.</summary>
     internal static IReadOnlyList<string> BuildRomLaunchArguments(
         string systemId,
         string romPath,
-        bool fullscreen)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(romPath);
-        var fullRomPath = Path.GetFullPath(romPath);
-        return systemId.Trim().ToLowerInvariant() switch
-        {
-            "psp" => fullscreen
-                ? ["--fullscreen", "--pause-menu-exit", fullRomPath]
-                : ["--pause-menu-exit", fullRomPath],
-            "gamecube" => fullscreen
-                ? ["--batch", "--config=Dolphin.Display.Fullscreen=True", "--exec", fullRomPath]
-                : ["--batch", "--exec", fullRomPath],
-            "game-boy-advance" => fullscreen
-                ? ["-f", fullRomPath]
-                : [fullRomPath],
-            "nintendo-64" => fullscreen
-                ? ["--system", "Nintendo 64", "--no-file-prompt", "--fullscreen", fullRomPath]
-                : ["--system", "Nintendo 64", "--no-file-prompt", fullRomPath],
-            _ => throw new InvalidOperationException(
-                $"Unsupported ROM system '{systemId}'."),
-        };
-    }
-
+        bool fullscreen) =>
+        OmniLibraryEmulatorCatalog.BuildLaunchArguments(
+            OmniLibraryRomSystemRegistry.GetRequired(systemId).EmulatorIds[0],
+            romPath,
+            null,
+            fullscreen);
     public static int CancelDownload(string target)
     {
+        EnterBackgroundWorkerMode();
         if (!TryParseTarget(target, out var storeId, out var gameId))
         {
             ShowError(
@@ -1320,6 +1426,26 @@ internal static class UnifySteamLauncher
 
             var legendary = ResolveLegendaryTool(installWhenMissing: true);
             var alreadyInstalled = IsEpicGameInstalled(legendary, appName);
+            if (alreadyInstalled &&
+                UnifySteamService.IsLegendaryRecordWithDeletedFolder(
+                    UnifySteamService.LegendaryInstalledJsonPath,
+                    appName))
+            {
+                // The folder was deleted outside OmniLibrary. Drop only the
+                // stale record so this request downloads the game again
+                // instead of reporting it installed.
+                var staleRecordExitCode = RunHiddenAndWait(
+                    legendary,
+                    [
+                        "-y",
+                        "uninstall",
+                        appName,
+                        "--keep-files",
+                        "--skip-uninstaller",
+                    ]);
+                alreadyInstalled = staleRecordExitCode != 0;
+            }
+
             var updateRequired = IsEpicUpdateRequired(alreadyInstalled, cachedGame);
             if (alreadyInstalled && !updateRequired)
             {
@@ -1669,8 +1795,17 @@ internal static class UnifySteamLauncher
                     gameId,
                     "failed",
                     0,
-                    "The store operation queue timed out.");
+                    "The store operation queue timed out.",
+                    workerProcessId: 0);
                 return 1;
+            }
+
+            // The user may cancel or stop tracking a transfer while it waits
+            // for the store queue. Do not start it once the queue frees up.
+            if (waitingStatus == "queued" &&
+                ShouldAbortPendingDownloadWorker(storeId, gameId))
+            {
+                return 0;
             }
 
             return action();
@@ -2562,9 +2697,14 @@ internal static class UnifySteamLauncher
     {
         if (TryGetInstalledXboxGame(productId, out var game))
         {
+            if (IsTransferBlockingLaunch("xbox-game-pass", productId))
+            {
+                return DeclineLaunchUntilInstalled("xbox-game-pass", productId);
+            }
+
             if (UnifySteamService.IsXboxAppxShellTarget(game.ExecutablePath))
             {
-                UnifySteamDownloadStatusStore.Clear("xbox-game-pass", productId);
+                ClearFinishedDownloadStatus("xbox-game-pass", productId);
                 return TryOpenShellTarget(game.ExecutablePath)
                     ? 0
                     : Fail("Windows could not launch this Xbox app package.");
@@ -2573,12 +2713,15 @@ internal static class UnifySteamLauncher
             if (!string.IsNullOrWhiteSpace(game.ExecutablePath) &&
                 File.Exists(game.ExecutablePath))
             {
+                ClearFinishedDownloadStatus("xbox-game-pass", productId);
                 return XboxStoreLaunchHost.Run(new XboxStoreLaunchHost.LaunchPayload(
                     game.ExecutablePath,
                     game.InstallPath));
             }
 
-            return InstallXbox(productId);
+            // Registered but without a launch target: a repair or reinstall
+            // starts from the game page Download row, not from Play.
+            return DeclineLaunchUntilInstalled("xbox-game-pass", productId);
         }
 
         var cachedGame = GetXboxCachedGame(productId);
@@ -2589,7 +2732,7 @@ internal static class UnifySteamLauncher
                 : Fail("Xbox Cloud Gaming could not be opened for this game.");
         }
 
-        return InstallXbox(productId);
+        return DeclineLaunchUntilInstalled("xbox-game-pass", productId);
     }
 
     private static void UpdateXboxInstallProgress(
@@ -2748,11 +2891,17 @@ internal static class UnifySteamLauncher
         var cachedGame = GetEpicCachedGame(appName);
         if (cachedGame?.DeliveryProvider == "ea-app")
         {
+            if (!cachedGame.Installed)
+            {
+                // The EA app install starts from the game page Download row.
+                return DeclineLaunchUntilInstalled("epic-games", appName);
+            }
+
             var eaHandoffLegendary = ResolveLegendaryTool(installWhenMissing: true);
             return OpenEaAppAction(
                 eaHandoffLegendary,
                 cachedGame,
-                installationRequested: !cachedGame.Installed);
+                installationRequested: false);
         }
 
         if (cachedGame?.IsPreloaded == true)
@@ -2766,9 +2915,28 @@ internal static class UnifySteamLauncher
             return 0;
         }
 
+        // Play only starts installed games. Installs, store hand-offs and
+        // updates start from the game page Download row.
+        var externalLauncher = cachedGame?.RequiresExternalLauncher == true;
+        if (externalLauncher && !cachedGame!.Installed)
+        {
+            return DeclineLaunchUntilInstalled("epic-games", appName);
+        }
+
+        var legendary = externalLauncher
+            ? string.Empty
+            : ResolveLegendaryTool(installWhenMissing: true);
+        if ((!externalLauncher && !IsEpicGameInstalled(legendary, appName)) ||
+            IsTransferBlockingLaunch("epic-games", appName))
+        {
+            return DeclineLaunchUntilInstalled("epic-games", appName);
+        }
+
         if (ShouldEnsureUbisoftAccountLink(cachedGame) &&
             !EnsureUbisoftAccountLink(
-                ResolveLegendaryTool(installWhenMissing: true),
+                string.IsNullOrEmpty(legendary)
+                    ? ResolveLegendaryTool(installWhenMissing: true)
+                    : legendary,
                 cachedGame!,
                 out var accountLinkDetail))
         {
@@ -2781,40 +2949,29 @@ internal static class UnifySteamLauncher
             return 0;
         }
 
-        if (cachedGame?.RequiresExternalLauncher == true)
+        if (externalLauncher)
         {
             return OpenExternalPublisherAction(
-                cachedGame,
-                cachedGame.Installed
-                    ? ExternalPublisherOperation.Launch
-                    : ExternalPublisherOperation.Install);
+                cachedGame!,
+                ExternalPublisherOperation.Launch);
         }
 
-        var legendary = ResolveLegendaryTool(installWhenMissing: true);
-        var epicManagedInstall = IsEpicGameInstalled(legendary, appName);
-        if (!epicManagedInstall)
-        {
-            // The native Steam action currently reads Download. Finish that action
-            // without launching the game automatically.
-            return InstallEpic(appName);
-        }
-
-        if (cachedGame is not null &&
+        // An available update never runs from Play: the installed version
+        // starts, and Legendary must not refuse it for being out of date.
+        var updatePending =
+            cachedGame is not null &&
             !string.IsNullOrWhiteSpace(cachedGame.LatestVersion) &&
             !string.IsNullOrWhiteSpace(cachedGame.Version) &&
             !string.Equals(
                 cachedGame.LatestVersion,
                 cachedGame.Version,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return InstallEpic(appName);
-        }
+                StringComparison.OrdinalIgnoreCase);
 
         if (!CompleteEpicWindowsSetup(legendary, cachedGame, appName))
         {
             return 1;
         }
-        UnifySteamDownloadStatusStore.Clear("epic-games", appName);
+        ClearFinishedDownloadStatus("epic-games", appName);
         TrySyncEpicCloudSaves(
             legendary,
             cachedGame,
@@ -2823,6 +2980,10 @@ internal static class UnifySteamLauncher
 
         var executablePath = TryGetEpicExecutablePath(legendary, appName);
         var launchArguments = new List<string> { "launch", appName };
+        if (updatePending)
+        {
+            launchArguments.Add("--skip-version-check");
+        }
         var requiresEpicLauncherBridge =
             cachedGame?.RequiresEpicLauncherBridge == true ||
             EpicCompatibilityCatalog.Get(appName).FakeEpicLauncher;
@@ -3479,31 +3640,18 @@ internal static class UnifySteamLauncher
         var installRoot = FindKnownGogInstallRoot(baseDirectory, gameId);
         if (string.IsNullOrWhiteSpace(installRoot) || !Directory.Exists(installRoot))
         {
-            return InstallGog(gameId);
+            // Installs start from the game page Download row, never from Play.
+            return DeclineLaunchUntilInstalled("gog-galaxy", gameId);
         }
 
-        var configuration = LoadStoreSyncConfiguration();
-        var updateAvailable =
-            configuration.UnifySteam.Stores.TryGetValue(
-                "gog-galaxy",
-                out var configuredGogStore) &&
-            configuredGogStore.Cache?.Games?.FirstOrDefault(game =>
-                game is not null &&
-                string.Equals(
-                    game.Id,
-                    gameId,
-                    StringComparison.OrdinalIgnoreCase)) is { } configuredGame &&
-            configuredGame.Installed &&
-            !string.IsNullOrWhiteSpace(configuredGame.Version) &&
-            !string.IsNullOrWhiteSpace(configuredGame.LatestVersion) &&
-            !string.Equals(
-                configuredGame.Version,
-                configuredGame.LatestVersion,
-                StringComparison.OrdinalIgnoreCase);
-        if (updateAvailable)
+        if (IsTransferBlockingLaunch("gog-galaxy", gameId))
         {
-            return InstallGog(gameId);
+            return DeclineLaunchUntilInstalled("gog-galaxy", gameId);
         }
+
+        // An available update never runs from Play; the installed version
+        // starts and the update waits for the Download row.
+        var configuration = LoadStoreSyncConfiguration();
 
         var gogdl = ResolveGogTool(installWhenMissing: false);
         var authPath = FindGogAuthPath();
@@ -3535,12 +3683,10 @@ internal static class UnifySteamLauncher
                 return Fail($"GOG could not finish preparing this game: {preparationError}");
             }
 
-            UnifySteamDownloadStatusStore.Update(
-                "gog-galaxy",
-                gameId,
-                "completed",
-                100,
-                "Installed.");
+            // Launching ends the "Ready to play" state, like Epic and Xbox.
+            // The status above is this launch's own setup step (no transfer
+            // can run here, IsTransferBlockingLaunch returned earlier).
+            UnifySteamDownloadStatusStore.Clear("gog-galaxy", gameId);
         }
 
         var launchTask = ResolveGogLaunchTask(installRoot, gameId);
@@ -5565,6 +5711,32 @@ internal static class UnifySteamLauncher
         }
     }
 
+    private static void WriteWorkerErrorLog(string message)
+    {
+        try
+        {
+            lock (WorkerErrorLogGate)
+            {
+                var directory = Path.Combine(AppContext.BaseDirectory, "data");
+                Directory.CreateDirectory(directory);
+                var path = Path.Combine(directory, "omnilibrary-worker.log");
+                const long maximumLogBytes = 1L * 1024 * 1024;
+                if (File.Exists(path) && new FileInfo(path).Length >= maximumLogBytes)
+                {
+                    File.Move(path, $"{path}.old", overwrite: true);
+                }
+
+                File.AppendAllText(
+                    path,
+                    $"{DateTimeOffset.Now:O} pid={Environment.ProcessId} " +
+                    $"{NormalizeEpicDownloadDiagnostic(message)}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+        }
+    }
+
     private static void WriteEaHandoffLog(string gameId, string message)
     {
         try
@@ -6542,6 +6714,12 @@ internal static class UnifySteamLauncher
 
     private static void ShowError(string message)
     {
+        if (s_backgroundWorker)
+        {
+            WriteWorkerErrorLog(message);
+            return;
+        }
+
         System.Windows.MessageBox.Show(
             message,
             "OmniLibrary",

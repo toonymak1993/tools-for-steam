@@ -489,7 +489,14 @@ public sealed class StoreSyncSettingsStore
             unifyStoreConfiguration.RomSystems = new Dictionary<string, OmniLibraryRomSystemConfiguration>(
                 unifyStoreConfiguration.RomSystems ?? [],
                 StringComparer.OrdinalIgnoreCase);
-            foreach (var romSystem in OmniLibraryRomSystemRegistry.Supported)
+            // Only the Emulation library carries per-system settings; the
+            // first four systems keep their entries everywhere for older builds.
+            var isRomLibraryStore = storeId.Equals(
+                OmniLibraryRomSystemRegistry.StoreId,
+                StringComparison.OrdinalIgnoreCase);
+            foreach (var romSystem in OmniLibraryRomSystemRegistry.Supported.Where(system =>
+                         isRomLibraryStore ||
+                         system.Id is "psp" or "gamecube" or "game-boy-advance" or "nintendo-64"))
             {
                 if (!unifyStoreConfiguration.RomSystems.TryGetValue(
                         romSystem.Id,
@@ -502,6 +509,10 @@ public sealed class StoreSyncSettingsStore
 
                 romSystemConfiguration.EmulatorPath = NormalizeStoredPath(
                     romSystemConfiguration.EmulatorPath);
+                romSystemConfiguration.EmulatorId =
+                    romSystem.EmulatorIds.FirstOrDefault(id => id.Equals(
+                        romSystemConfiguration.EmulatorId?.Trim(),
+                        StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
             }
 
             if (storeId.Equals(OmniLibraryRomSystemRegistry.StoreId, StringComparison.OrdinalIgnoreCase))
@@ -1000,6 +1011,15 @@ public sealed class UnifySteamStoreConfiguration
     public Dictionary<string, OmniLibraryRomSystemConfiguration> RomSystems { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Emulation library: install a system's emulator once it has ROMs.</summary>
+    public bool AutoInstallEmulators { get; set; } = true;
+
+    /// <summary>Emulation library: also import ROMs from ORBIT's Documents\ORBIT\ROMs folders.</summary>
+    public bool ImportOrbitRoms { get; set; } = true;
+
+    /// <summary>Emulation library: also import games from installed emulators' game folders and lists.</summary>
+    public bool ImportEmulatorLibraries { get; set; } = true;
+
     public string AuthPath { get; set; } = string.Empty;
 
     /// <summary>
@@ -1060,6 +1080,9 @@ public sealed class UnifySteamStoreConfiguration
 public sealed class OmniLibraryRomSystemConfiguration
 {
     public string EmulatorPath { get; set; } = string.Empty;
+
+    /// <summary>Chosen emulator id; empty means the first ready emulator, recommended one first.</summary>
+    public string EmulatorId { get; set; } = string.Empty;
 
     public bool Fullscreen { get; set; } = true;
 }

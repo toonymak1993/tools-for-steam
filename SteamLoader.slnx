@@ -1,9 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/SteamLoader.App/SteamLoader.App.csproj" />
-    <Project Path="src/ToolsForSteam.Splash/ToolsForSteam.Splash.csproj" />
-    <Project Path="src/ToolsForSteam.XboxHost/ToolsForSteam.XboxHost.csproj" />
-  </Folder>
+    <Project Path="src/ToolsForSteam.Splash/ToolsForSteam.Splash.csproj" />  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SteamLoader.App.Tests/SteamLoader.App.Tests.csproj" />
   </Folder>

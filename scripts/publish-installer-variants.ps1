@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path $PSScriptRoot "XboxHostPayloadSnapshot.ps1")
 $innoCandidates = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
@@ -27,19 +26,6 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "Handheld replacement runtime preparation failed."
 }
-
-$xboxHostPackagePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.msix"
-$xboxHostCertificatePath = Join-Path $projectRoot "dist\xbox-host\ToolsForSteam.XboxHost.cer"
-$xboxHostSnapshot = New-XboxHostPayloadSnapshot `
-    -ProjectRoot $projectRoot `
-    -PackagePath $xboxHostPackagePath `
-    -CertificatePath $xboxHostCertificatePath
-
-try {
-    $snapshotMetadata = Get-XboxHostPayloadMetadata -PackagePath $xboxHostSnapshot.PackagePath
-    $xboxHostPackageVersion = $snapshotMetadata.Version
-    $xboxHostRequiresDeveloperMode = $snapshotMetadata.RequiresDeveloperMode
-    $xboxHostDeveloperModeDefine = if ($xboxHostRequiresDeveloperMode) { 1 } else { 0 }
 
 New-Item -ItemType Directory -Path $variantOutputDir -Force | Out-Null
 Get-ChildItem -LiteralPath $variantOutputDir -Filter '*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -99,9 +85,6 @@ foreach ($variant in $variants) {
         "/DVariantOutputBaseFilename=$($variant.OutputBase)"
         "/DVariantWizardStyle=$($variant.WizardStyle)"
         "/DVariantCustomPages=$($variant.CustomPages)"
-        "/DXboxHostBuildVersion=$xboxHostPackageVersion"
-        "/DXboxHostRequiresDeveloperMode=$xboxHostDeveloperModeDefine"
-        "/DXboxHostPayloadDir=$($xboxHostSnapshot.Directory)"
         $issPath
     )
 
@@ -131,7 +114,3 @@ foreach ($variant in $variants) {
     Write-Host ("  {0}" -f (Join-Path $variantOutputDir $variant.FileName))
 }
 Write-Host ("Notes: {0}" -f $notesPath)
-}
-finally {
-    Remove-XboxHostPayloadSnapshot -ProjectRoot $projectRoot -Snapshot $xboxHostSnapshot
-}

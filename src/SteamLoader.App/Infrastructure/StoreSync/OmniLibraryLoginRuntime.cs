@@ -150,6 +150,44 @@ internal static class OmniLibraryLoginRuntime
         return profile is not null;
     }
 
+    // Covers a first-time helper download (bounded separately) plus the
+    // helper's own two-minute sign-in limit.
+    private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromMinutes(6);
+
+    private const int ShowWindowRestore = 9;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr windowHandle);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr windowHandle, int command);
+
+    /// <summary>
+    /// Brings an already open sign-in window back in front. A second Sign In
+    /// press used to do nothing when the window had fallen behind Big Picture.
+    /// </summary>
+    public static void TryActivate(Process process)
+    {
+        try
+        {
+            process.Refresh();
+            var handle = process.MainWindowHandle;
+            if (handle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            ShowWindow(handle, ShowWindowRestore);
+            SetForegroundWindow(handle);
+        }
+        catch
+        {
+            // Activation is a convenience; the window remains usable.
+        }
+    }
+
     private sealed class StoreLoginWindow : Window
     {
         private static readonly SolidColorBrush WindowBackground = new(WpfColor.FromRgb(12, 16, 22));
@@ -390,7 +428,12 @@ internal static class OmniLibraryLoginRuntime
             _statusText.Text = $"Sign-in confirmed. Connecting {_profile.Title} to OmniLibrary…";
             try
             {
-                await Task.Run(() => _profile.Authenticate(authorizationCode));
+                // Close and Escape are disabled while the account is being
+                // connected. Bound that phase so a stalled helper download or
+                // network call can never leave this full-screen, top-most
+                // window stuck over Big Picture without a way out.
+                await Task.Run(() => _profile.Authenticate(authorizationCode))
+                    .WaitAsync(AuthenticationTimeout);
                 if (!string.IsNullOrWhiteSpace(_profile.ExpectedState))
                 {
                     _webView.CoreWebView2.CookieManager.DeleteAllCookies();
@@ -400,6 +443,13 @@ internal static class OmniLibraryLoginRuntime
                     $"{_profile.Title} is connected. Your library will now sync automatically.";
                 await Task.Delay(650);
                 Close();
+            }
+            catch (TimeoutException)
+            {
+                _completing = false;
+                _closeButton.IsEnabled = true;
+                ShowFailure(
+                    $"Connecting {_profile.Title} took too long. Check the internet connection, close this window and sign in again.");
             }
             catch (Exception exception)
             {

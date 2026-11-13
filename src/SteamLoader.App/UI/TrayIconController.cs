@@ -22,6 +22,7 @@ public sealed class TrayIconController : IDisposable
     private readonly Forms.ToolStripMenuItem _restartHostItem;
     private readonly Forms.ToolStripMenuItem _stopHostItem;
     private readonly Forms.ToolStripMenuItem _startDesktopItem;
+    private readonly Forms.ToolStripMenuItem _returnToConsoleItem;
     private readonly Forms.ToolStripMenuItem _openFolderItem;
     private readonly Forms.ToolStripMenuItem _checkUpdatesItem;
     private readonly Forms.ToolStripMenuItem _exportSupportBundleItem;
@@ -58,6 +59,7 @@ public sealed class TrayIconController : IDisposable
         _restartHostItem = new Forms.ToolStripMenuItem("Restart Background Host", null, (_, _) => _viewModel.RestartCommand.Execute(null));
         _stopHostItem = new Forms.ToolStripMenuItem("Stop Background Host", null, (_, _) => _viewModel.StopCommand.Execute(null));
         _startDesktopItem = new Forms.ToolStripMenuItem("Start Windows Desktop", null, (_, _) => _viewModel.StartWindowsDesktop());
+        _returnToConsoleItem = new Forms.ToolStripMenuItem("Return to Console (Big Picture)", null, (_, _) => _viewModel.ReturnToConsole());
         _openFolderItem = new Forms.ToolStripMenuItem("Open Install Folder", null, (_, _) => _viewModel.OpenInstallFolder());
         _checkUpdatesItem = new Forms.ToolStripMenuItem("Check for Updates", null, async (_, _) => await _viewModel.CheckForUpdatesAsync());
         _exportSupportBundleItem = new Forms.ToolStripMenuItem("Export Support Bundle", null, async (_, _) => await _viewModel.ExportSupportBundleAsync());
@@ -75,6 +77,7 @@ public sealed class TrayIconController : IDisposable
             _restartHostItem,
             _stopHostItem,
             new Forms.ToolStripSeparator(),
+            _returnToConsoleItem,
             _startDesktopItem,
             _openFolderItem,
             _checkUpdatesItem,
