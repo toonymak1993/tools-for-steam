@@ -191,3 +191,133 @@ test("the row sits directly under Play, above HowLongToBeat, with either wrappin
   const keys = steamOutput.props.value({ overview: { appid: 440 } }).props.children.map((child) => child.key || child.type);
   deepEqual(keys, ["PlaySection", "Rest"]);
 });
+
+test("Steam's own action button: Install / Pause / Resume for OmniLibrary games, installed Play untouched", () => {
+  const { resolveNativeAction, displayStatus } = load().window.__tfsOmniDownloads.internals;
+  const status = (game, entry = null, storeId) => resolveNativeAction(record(game, entry, storeId));
+
+  deepEqual(status({}), { status: displayStatus.Install, action: "install" });
+  assert.equal(status({ installed: true }), null, "installed: Steam's own Play (Curtain hooks RunGame)");
+  assert.equal(status({ installed: true, updateAvailable: true }), null, "update pending: Play stays, the row offers Update");
+  assert.equal(status({ cloudPlayable: true }, null, "xbox-game-pass"), null);
+  assert.equal(status({}, null, "rom-library"), null);
+  assert.equal(resolveNativeAction({ storeId: "", game: null }), null);
+
+  const running = { download: { status: "downloading", progressPercent: 40 } };
+  // Without Steam's enum (tests), Pause is unknown: Cancel when allowed.
+  deepEqual(status(running, { canPause: true, canCancel: true }), { status: displayStatus.Cancel, action: "cancel" });
+  displayStatus.Pause = 7;
+  displayStatus.Resume = 22;
+  deepEqual(status(running, { canPause: true, canCancel: true }), { status: 7, action: "pause" });
+  deepEqual(status({ download: { status: "paused" } }, { canResume: true }), { status: 22, action: "resume" });
+  deepEqual(status({ download: { status: "paused" } }, { canResume: false }), { status: displayStatus.Install, action: "install" });
+  deepEqual(status({ download: { status: "failed" } }), { status: displayStatus.Install, action: "install" });
+  deepEqual(status({ download: { status: "action-required" } }), { status: displayStatus.Install, action: "install" });
+  deepEqual(status({ download: { status: "uninstalling" } }), { status: displayStatus.InstallUnavailable, action: "" });
+  deepEqual(status({ download: { status: "canceling" } }), { status: displayStatus.InstallUnavailable, action: "" });
+});
+
+test("the overview proxy changes only the display status, never identity", () => {
+  const { withDisplayStatus, isOverviewLive } = load().window.__tfsOmniDownloads.internals;
+  const pcd = { display_status: 11, status_percentage: 100, clientid: "0" };
+  const overview = {
+    appid: appId,
+    per_client_data: [pcd],
+    get selected_per_client_data() { return this.per_client_data[0]; },
+    GetGameID() { return "123"; },
+  };
+  const proxied = withDisplayStatus(overview, 9);
+  assert.equal(proxied.selected_per_client_data.display_status, 9);
+  assert.equal(proxied.selected_per_client_data.status_percentage, undefined);
+  assert.equal(proxied.per_client_data[0].display_status, 9);
+  assert.equal(proxied.appid, appId);
+  assert.equal(proxied.GetGameID(), "123");
+  assert.equal(overview.selected_per_client_data.display_status, 11, "Steam's object is untouched");
+  assert.equal(withDisplayStatus(overview, 9), proxied, "cached per status");
+  assert.equal(isOverviewLive(proxied), false);
+
+  // While Steam launches/runs the game its own status wins.
+  pcd.display_status = 4;
+  assert.equal(proxied.selected_per_client_data.display_status, 4);
+  assert.equal(isOverviewLive(proxied), true);
+});
+
+test("the native button patch routes clicks for our proxies only and restores Steam's button", async () => {
+  const hooks = [];
+  const React = {
+    ...fakeReact,
+    useState: (value) => [value, () => {}],
+    useEffect: (fn) => { hooks.push(fn); },
+    useRef: (value) => ({ current: value }),
+  };
+  const steamClicks = [];
+  class ButtonImpl {
+    get OnClick() {
+      const bound = (...args) => steamClicks.push(args);
+      Object.defineProperty(this, "OnClick", { value: bound, configurable: true, writable: true });
+      return bound;
+    }
+  }
+  ButtonImpl.prototype.isReactComponent = {};
+  Object.defineProperty(ButtonImpl.prototype, "OnClick", { ...Object.getOwnPropertyDescriptor(ButtonImpl.prototype, "OnClick"), configurable: true });
+  const originalRender = (props) => React.createElement(ButtonImpl, props);
+  const forwardRef = { $$typeof: Symbol.for("react.forward_ref"), render: originalRender };
+  const modules = {
+    7: Object.assign(function factory() {}, { toString: () => "bShowStreamingSelector ShowStreamingMenu strGameActionDetailsOverride" }),
+  };
+  const req = (id) => (String(id) === "7" ? { Button: forwardRef } : {});
+  req.m = modules;
+  const posts = [];
+  const tfs = {
+    React,
+    whenReady: Promise.resolve(),
+    webpack: { getWebpackRequire: () => req, getModules: () => [] },
+    routes: { patch: () => () => {} },
+  };
+  const context = vm.createContext({
+    window: { __tfs: tfs, setTimeout: () => 0, clearTimeout: () => {} },
+    URL,
+    URLSearchParams,
+    console,
+    Symbol,
+    fetch: async (url, init) => {
+      if (init?.method === "POST") posts.push([String(url), JSON.parse(init.body)]);
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  vm.runInContext(source, context, { filename: "download-core.js" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const api = context.window.__tfsOmniDownloads;
+  assert.notEqual(forwardRef.render, originalRender, "render wrapped");
+
+  // A Steam game: stock element, Steam's click.
+  const steamElement = forwardRef.render({ overview: { appid: 440 } }, null);
+  assert.equal(steamElement.type, ButtonImpl);
+
+  // Our game: a host element; the host hands the button a proxied overview.
+  const pcd = { display_status: 11 };
+  const overview = { appid: appId, per_client_data: [pcd], get selected_per_client_data() { return this.per_client_data[0]; } };
+  const hosted = forwardRef.render({ overview }, null);
+  assert.notEqual(hosted.type, ButtonImpl);
+  api.internals.state.cache.set(appId, { at: Date.now(), record: record({}) });
+  const rendered = hosted.type(hosted.props);
+  assert.equal(rendered.type, ButtonImpl);
+  assert.equal(rendered.props.overview.selected_per_client_data.display_status, api.internals.displayStatus.Install);
+  assert.equal(api.nativeButton, true);
+
+  const ours = Object.create(ButtonImpl.prototype);
+  ours.props = rendered.props;
+  ours.OnClick({}, { stopPropagation() {}, preventDefault() {} });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(steamClicks.length, 0, "Steam's install wizard never opens for our game");
+  assert.ok(posts.some(([url, body]) => url.endsWith("api/unifystore/games/install") && body.gameId === "fn"));
+
+  const theirs = Object.create(ButtonImpl.prototype);
+  theirs.props = { overview: { appid: 440 } };
+  theirs.OnClick("x");
+  assert.equal(steamClicks.length, 1, "Steam games keep Steam's click");
+
+  api.destroy();
+  assert.equal(forwardRef.render, originalRender, "render restored");
+  assert.ok(Object.getOwnPropertyDescriptor(ButtonImpl.prototype, "OnClick").get, "getter restored");
+});

@@ -6362,7 +6362,7 @@ public sealed class SteamLoaderApiServer : IAsyncDisposable
             if (_omniLibraryLoginProcesses.TryGetValue(descriptor.Id, out var existing) &&
                 !existing.HasExited)
             {
-                OmniLibraryLoginRuntime.TryActivate(existing);
+                OmniLibraryLoginRuntime.TryActivate(existing, descriptor.Id);
                 return snapshot;
             }
 

@@ -230,7 +230,7 @@ test("OmniLibrary overview links to one page per library with real store logos",
   assert.match(popup, /title: localLibrary \? "ROM Folder" : "Install & Downloads"/);
 });
 
-test("Steam's Play button is never touched; OmniLibrary downloads run from their own game page row", () => {
+test("installed games keep Steam's own Play; downloads use Steam's action button through an overview proxy plus the game page row", () => {
   const surface = read("src/SteamLoader.App/Assets/xbox-library-surface.js");
   const downloads = read("src/SteamLoader.App/Assets/download-core.js");
   const host = read("src/SteamLoader.App/Hosting/SteamLoaderBackgroundHost.cs");
@@ -257,6 +257,12 @@ test("Steam's Play button is never touched; OmniLibrary downloads run from their
   assert.match(downloads, /summary\.pluginEnabled !== true/);
   assert.doesNotMatch(downloads, /nodeValue/);
   assert.doesNotMatch(downloads, /querySelectorAll/);
+  // Steam's button is steered through React (overview proxy + OnClick seam),
+  // never by DOM relabelling, and an installed game is always left stock so
+  // Steam's RunGame (and TFS Curtain's hook on it) runs as for any game.
+  assert.match(downloads, /"bShowStreamingSelector", "ShowStreamingMenu", "strGameActionDetailsOverride"/);
+  assert.match(downloads, /if \(game\.installed \|\| game\.cloudPlayable\) return null;\s*return \{ status: displayStatus\.Install, action: "install" \};/);
+  assert.match(downloads, /if \(!spec \|\| isOverviewLive\(overview\)\) return fallback\(\.\.\.args\);/);
 });
 
 test("enhanced OmniLibrary game pages feed Steam native stores without replacing its details UI", () => {
@@ -1449,7 +1455,14 @@ test("OmniLibrary sign-in cannot hang and Sign In never blocks on catalog prepar
 
   assert.match(login, /\.WaitAsync\(AuthenticationTimeout\)/);
   assert.match(login, /catch \(TimeoutException\)[\s\S]{0,120}_closeButton\.IsEnabled = true;/);
-  assert.match(api, /OmniLibraryLoginRuntime\.TryActivate\(existing\);/);
+  assert.match(api, /OmniLibraryLoginRuntime\.TryActivate\(existing, descriptor\.Id\);/);
+  // The window covers Big Picture's monitor, takes the foreground itself and
+  // is never restored (SW_RESTORE shrank the maximized window).
+  assert.doesNotMatch(login, /WindowState = WindowState\.Maximized/);
+  assert.doesNotMatch(login, /ShowWindowRestore/);
+  assert.match(login, /OmniLibraryLoginWindowFocus\.CoverTargetMonitor\(_handle\)/);
+  assert.match(login, /OmniLibraryLoginWindowFocus\.TryBringToForeground\(_handle, keepTopMost: true\)/);
+  assert.match(login, /AddScriptToExecuteOnDocumentCreatedAsync\(\s*OmniLibraryLoginGamepad\.NavigationScript\)/);
   const startLogin = storeSync.slice(
     storeSync.indexOf("public StoreSyncSnapshot StartUnifySteamLogin"),
     storeSync.indexOf("public StoreSyncSnapshot CompleteUnifySteamManualAuth"),

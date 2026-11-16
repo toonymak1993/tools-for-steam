@@ -15,7 +15,7 @@
 //  - actions use the same endpoints as the Quick Access Download Center:
 //    POST /api/unifystore/games/install and /api/unifystore/downloads/action.
 (() => {
-  const version = 1;
+  const version = 2;
   const role = window.__tfsSurfaceRole;
   if (role && role !== "shared") return "skipped";
 
@@ -147,7 +147,7 @@
    * stay hidden (installed and idle, not an OmniLibrary game, cloud only).
    * record = { storeId, game, entry } where entry is the Download Center row.
    */
-  function describe(record, { hintActive = false, busyAction = "" } = {}) {
+  function describe(record, { hintActive = false, busyAction = "", nativeButton = false } = {}) {
     const game = record?.game;
     if (!game || !record.storeId || record.storeId === "rom-library") return null;
     const storeId = record.storeId;
@@ -269,6 +269,14 @@
         view.actions.push(install());
         break;
       }
+    }
+
+    if (nativeButton && view.status !== "update") {
+      // Steam's own button already offers Install / Pause / Resume / Retry
+      // (resolveNativeAction); the row keeps the progress and the rest.
+      view.actions = view.actions.filter((action) => !["install", "pause", "resume"].includes(action.id));
+      if (view.status === "not-installed" && !hintActive) return null;
+      if (view.status === "not-installed") view.detail = "Select Install to download it first.";
     }
 
     if (busyAction) {
@@ -656,6 +664,7 @@
       const view = describe(record, {
         hintActive: hintAt > 0 && Date.now() - hintAt < launchHintMs,
         busyAction: state.busy.get(appId) || "",
+        nativeButton: Boolean(native.unpatchRender && native.unpatchClick && !native.broken),
       });
       if (!view) return null;
 
@@ -785,10 +794,393 @@
       try { tfs.css?.add?.(cssId, css, { targets: ["gamepad"] }); } catch {}
       registerSteamEvents();
       state.removePatch = tfs.routes.patch(routePath, patchAppRoute, { id: patchId });
+      attachNativeActionButton(tfs, 0);
     } catch (error) {
       console.warn("[TFS Downloads] route patch failed", error);
       state.retryTimer = window.setTimeout(register, 10000);
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Steam's own action button (UnifyDeck's approach, ported)
+  //
+  // Steam's action button (Play / Install / Update / Pause ...) picks its
+  // label, icon and tone from one value:
+  // overview.selected_per_client_data.display_status. For an OmniLibrary
+  // game that is not installed (or is downloading) the button is handed a
+  // Proxy of the app overview that answers that one read with OUR state,
+  // and its click runs OUR action. Nothing is written to Steam's shared
+  // overview; identity (appid, GameID, BIsModOrShortcut) always comes from
+  // the real object.
+  //
+  //  - not installed           -> Steam's "Install"; click starts our download
+  //  - downloading / preparing -> Steam's "Pause" (or "Cancel"); click pauses
+  //  - paused                  -> Steam's "Resume"; click resumes
+  //  - failed / action needed  -> Steam's "Install"; click retries / opens store
+  //  - canceling/uninstalling  -> disabled "Install"
+  //  - installed (incl. update pending) -> untouched: Steam's own Play and
+  //    RunGame, so TFS Curtain (which hooks RunGame) keeps working
+  //  - while Steam itself launches/runs the game -> untouched
+  //
+  // Two seams, found by shape (no minified names): the button is an
+  // exported React.forwardRef whose module source holds
+  // bShowStreamingSelector / ShowStreamingMenu / strGameActionDetailsOverride;
+  // its inner class exposes OnClick as a bind-caching prototype getter. If
+  // either seam is missing the button stays completely stock (a proxied
+  // overview with Steam's click would open Steam's install wizard), and the
+  // download row below the play section keeps working as before.
+  // -----------------------------------------------------------------------
+
+  const nativeBrand = "__tfsOmniNativeWrapper";
+  const nativeStash = (key) => `__tfsOmniNativeOrig_${key}`;
+  const actionButtonNeedles = ["bShowStreamingSelector", "ShowStreamingMenu", "strGameActionDetailsOverride"];
+
+  /** Steam's live statuses: while Steam sets one of these its own button stays. */
+  const liveDisplayStatuses = new Set([1, 4, 36]);
+
+  /** EDisplayStatus values (read from Steam at runtime when possible). */
+  const displayStatus = {
+    Cancel: 1,
+    Install: 9,
+    Play: 11,
+    InstallUnavailable: 14,
+    Update: 20,
+    Pause: 0,
+    Resume: 0,
+  };
+
+  const native = {
+    unpatchRender: null,
+    unpatchClick: null,
+    broken: false,
+    retryTimer: 0,
+    specs: new WeakMap(), // proxy -> { current: spec }
+    byStatus: new WeakMap(), // overview -> Map<status, proxy>
+    pcdByStatus: new WeakMap(), // real pcd -> Map<status, proxy>
+    realPcd: new WeakMap(), // pcd proxy -> real pcd
+    Host: null,
+  };
+
+  function readDisplayStatusEnum(tfs) {
+    try {
+      const modules = tfs?.webpack?.getModules?.() || [];
+      for (const { exports: moduleExports } of modules) {
+        if (!moduleExports || typeof moduleExports !== "object") continue;
+        for (const key of Object.keys(moduleExports)) {
+          let value;
+          try { value = moduleExports[key]; } catch { continue; }
+          if (value && typeof value === "object" &&
+              typeof value.ReadyToInstall === "number" && typeof value.ReadyToLaunch === "number" &&
+              typeof value.Launching === "number" && typeof value.DownloadPaused === "number") {
+            return value;
+          }
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function resolveDisplayStatuses(tfs) {
+    const steam = readDisplayStatusEnum(tfs);
+    if (!steam) return;
+    if (typeof steam.ReadyToInstall === "number") displayStatus.Install = steam.ReadyToInstall;
+    if (typeof steam.ReadyToLaunch === "number") displayStatus.Play = steam.ReadyToLaunch;
+    if (typeof steam.Launching === "number") displayStatus.Cancel = steam.Launching;
+    if (typeof steam.InvalidPlatform === "number") displayStatus.InstallUnavailable = steam.InvalidPlatform;
+    if (typeof steam.UpdateRequired === "number") displayStatus.Update = steam.UpdateRequired;
+    if (typeof steam.Downloading === "number") displayStatus.Pause = steam.Downloading;
+    if (typeof steam.DownloadPaused === "number") displayStatus.Resume = steam.DownloadPaused;
+    const live = [steam.Launching, steam.Running, steam.Terminating].filter((value) => typeof value === "number");
+    if (live.length === 3) {
+      liveDisplayStatuses.clear();
+      for (const value of live) liveDisplayStatuses.add(value);
+    }
+  }
+
+  function isLivePcd(pcd) {
+    const real = pcd?.display_status;
+    return typeof real === "number" && liveDisplayStatuses.has(real);
+  }
+
+  function withStatusPcd(pcd, status) {
+    if (!pcd || typeof pcd !== "object") return pcd;
+    // selected_per_client_data is a getter that runs with the overview proxy
+    // as `this`, so it may already hand back one of our proxies. Never wrap
+    // a proxy: the real row must stay one step away.
+    const real = native.realPcd.get(pcd) || pcd;
+    let byStatus = native.pcdByStatus.get(real);
+    if (!byStatus) native.pcdByStatus.set(real, (byStatus = new Map()));
+    let proxy = byStatus.get(status);
+    if (!proxy) {
+      proxy = new Proxy(real, {
+        get(target, key, receiver) {
+          if (key === "display_status") return isLivePcd(target) ? target.display_status : status;
+          // An installed-looking 100% must not print beside Install.
+          if (key === "status_percentage" && !isLivePcd(target)) return undefined;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      native.realPcd.set(proxy, real);
+      byStatus.set(status, proxy);
+    }
+    return proxy;
+  }
+
+  /** True while Steam itself drives the app (reads the REAL status). */
+  function isOverviewLive(overview) {
+    try {
+      const pcd = overview?.selected_per_client_data;
+      return !!pcd && isLivePcd(native.realPcd.get(pcd) || pcd);
+    } catch {
+      return false;
+    }
+  }
+
+  /** The same overview answering display_status with `status` (cached per status). */
+  function withDisplayStatus(overview, status) {
+    let byStatus = native.byStatus.get(overview);
+    if (!byStatus) native.byStatus.set(overview, (byStatus = new Map()));
+    const hit = byStatus.get(status);
+    if (hit) return hit;
+    const proxy = new Proxy(overview, {
+      get(target, key, receiver) {
+        if (key === "selected_per_client_data") return withStatusPcd(Reflect.get(target, key, receiver), status);
+        if (key === "per_client_data") {
+          const list = Reflect.get(target, key, receiver);
+          return Array.isArray(list) ? list.map((pcd) => withStatusPcd(pcd, status)) : list;
+        }
+        if (key === "display_status") {
+          const real = Reflect.get(target, key, receiver);
+          return typeof real === "number" && liveDisplayStatuses.has(real) ? real : status;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    byStatus.set(status, proxy);
+    return proxy;
+  }
+
+  /**
+   * Our record -> what Steam's button shows and does. `null` = leave the
+   * button stock. Pure (tested through internals).
+   */
+  function resolveNativeAction(record, { busyAction = "" } = {}) {
+    const game = record?.game;
+    if (!game || !record.storeId || record.storeId === "rom-library") return null;
+    const entry = record.entry || null;
+    let status = String(game.download?.status || "idle").toLowerCase();
+    if (status === "completed" && !game.installed) status = "idle";
+    if (status === "canceling") status = "idle-busy";
+    if (status === "canceled") status = "idle";
+    const unavailable = { status: displayStatus.InstallUnavailable, action: "" };
+    if (busyAction) return { status: displayStatus.Install, action: "", busy: true };
+    switch (status) {
+      case "preparing":
+      case "queued":
+      case "downloading":
+      case "reconnecting":
+      case "finalizing":
+        if (entry?.canPause && displayStatus.Pause) return { status: displayStatus.Pause, action: "pause" };
+        if (entry?.canCancel) return { status: displayStatus.Cancel, action: "cancel" };
+        return displayStatus.Pause ? { status: displayStatus.Pause, action: "" } : unavailable;
+      case "paused":
+        if (entry && !entry.canResume) return { status: displayStatus.Install, action: "install" };
+        return { status: displayStatus.Resume || displayStatus.Install, action: "resume" };
+      case "action-required":
+      case "failed":
+      case "cancel-failed":
+        return { status: displayStatus.Install, action: "install" };
+      case "idle-busy":
+      case "uninstalling":
+        return unavailable;
+      default:
+        if (game.installed || game.cloudPlayable) return null;
+        return { status: displayStatus.Install, action: "install" };
+    }
+  }
+
+  function findActionButton(tfs) {
+    const req = tfs?.webpack?.getWebpackRequire?.();
+    if (!req?.m) return null;
+    for (const id of Object.keys(req.m)) {
+      let source = "";
+      try { source = String(req.m[id]); } catch { continue; }
+      if (!actionButtonNeedles.every((needle) => source.includes(needle))) continue;
+      let moduleExports;
+      try { moduleExports = req(id); } catch { continue; }
+      if (!moduleExports || typeof moduleExports !== "object") continue;
+      for (const key of Object.keys(moduleExports)) {
+        let value;
+        try { value = moduleExports[key]; } catch { continue; }
+        if (value?.$$typeof === Symbol.for("react.forward_ref") && typeof value.render === "function") return value;
+      }
+    }
+    return null;
+  }
+
+  /** Reload-safe replacement of a function slot on a Steam singleton. */
+  function patchSlot(owner, key, makeWrapper) {
+    const current = owner[key];
+    const stashed = owner[nativeStash(key)];
+    const original = typeof stashed === "function"
+      ? stashed
+      : typeof current === "function" && !current[nativeBrand] ? current : null;
+    if (!original) throw new Error(`cannot recover the original ${key}`);
+    const wrapper = makeWrapper(original);
+    wrapper[nativeBrand] = true;
+    owner[nativeStash(key)] = original;
+    owner[key] = wrapper;
+    return () => {
+      try {
+        if (owner[key] === wrapper) owner[key] = original;
+        if (owner[key] !== wrapper) delete owner[nativeStash(key)];
+      } catch {}
+    };
+  }
+
+  /** Reload-safe replacement of a prototype accessor's getter. */
+  function patchGetter(proto, key, makeGetter) {
+    const stash = nativeStash(`get_${key}`);
+    const original = proto[stash] || Object.getOwnPropertyDescriptor(proto, key);
+    if (!original?.get || !original.configurable) throw new Error(`${key} is not a configurable accessor`);
+    const getter = makeGetter(original.get);
+    Object.defineProperty(proto, stash, { value: original, configurable: true, enumerable: false, writable: true });
+    Object.defineProperty(proto, key, { configurable: true, enumerable: original.enumerable, get: getter });
+    return () => {
+      try {
+        if (Object.getOwnPropertyDescriptor(proto, key)?.get === getter) Object.defineProperty(proto, key, original);
+        delete proto[stash];
+      } catch {}
+    };
+  }
+
+  function stopEvent(event) {
+    try { event?.stopPropagation?.(); } catch {}
+    try { event?.preventDefault?.(); } catch {}
+  }
+
+  /** Patches OnClick on the button's class: our spec for our proxies, Steam's otherwise. */
+  function patchClick(cls) {
+    if (typeof cls !== "function" || !cls.prototype?.isReactComponent) throw new Error("button is not a class");
+    const proto = cls.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "OnClick");
+    const runOurs = (self, args, fallback) => {
+      const overview = self?.props?.overview;
+      const spec = overview && typeof overview === "object" ? native.specs.get(overview)?.current : null;
+      if (!spec || isOverviewLive(overview)) return fallback(...args);
+      try { spec.onPrimary(); } catch (error) { console.warn("[TFS Downloads] native action failed", error); }
+      for (const arg of args) if (arg && typeof arg === "object" && "stopPropagation" in arg) stopEvent(arg);
+      return undefined;
+    };
+    if (descriptor?.get) {
+      return patchGetter(proto, "OnClick", (originalGet) => function tfsGetOnClick() {
+        const self = this;
+        // The original getter binds and caches on whatever `this` it gets.
+        // A shim inheriting from the instance yields Steam's handler without
+        // letting it claim the instance's own OnClick slot.
+        const steamHandler = originalGet.call(Object.create(self));
+        const onClick = (...args) => runOurs(self, args, steamHandler);
+        Object.defineProperty(self, "OnClick", { value: onClick, configurable: true, writable: true });
+        return onClick;
+      });
+    }
+    if (typeof descriptor?.value === "function") {
+      return patchSlot(proto, "OnClick", (original) => function tfsOnClick(...args) {
+        return runOurs(this, args, (...rest) => original.apply(this, rest));
+      });
+    }
+    throw new Error("OnClick seam not found");
+  }
+
+  function getNativeHost(tfs) {
+    if (native.Host) return native.Host;
+    const React = tfs.React;
+    native.Host = function TfsOmniNativeAction({ element, appId }) {
+      const [, setTick] = React.useState(0);
+      React.useEffect(() => {
+        let alive = true;
+        let timer = 0;
+        const rerender = () => { if (alive) setTick((value) => (value + 1) % 1000000); };
+        const unsubscribe = subscribe(appId, rerender);
+        const schedule = () => {
+          window.clearTimeout(timer);
+          if (!alive) return;
+          const status = String(state.cache.get(appId)?.record?.game?.download?.status || "").toLowerCase();
+          timer = window.setTimeout(tick, busyStatuses.includes(status) ? activePollMs : idlePollMs);
+        };
+        const tick = () => { loadRecord(appId).catch(() => {}).finally(schedule); };
+        loadRecord(appId).catch(() => {}).finally(schedule);
+        return () => {
+          alive = false;
+          window.clearTimeout(timer);
+          unsubscribe();
+        };
+      }, [appId]);
+
+      const specRef = React.useRef({ onPrimary: () => {} });
+      const overview = element?.props?.overview;
+      const record = state.cache.get(appId)?.record;
+      const action = resolveNativeAction(record, { busyAction: state.busy.get(appId) || "" });
+      specRef.current = {
+        onPrimary: () => {
+          if (action?.action) void runAction(appId, action.action);
+        },
+      };
+      if (!overview || !action || native.broken) return element;
+      const proxied = withDisplayStatus(overview, action.status);
+      native.specs.set(proxied, specRef);
+      return React.cloneElement(element, { overview: proxied });
+    };
+    return native.Host;
+  }
+
+  function patchNativeActionButton(tfs) {
+    if (native.unpatchRender || native.broken) return true;
+    const button = findActionButton(tfs);
+    if (!button) return false;
+    resolveDisplayStatuses(tfs);
+    const React = tfs.React;
+    native.unpatchRender = patchSlot(button, "render", (original) => function tfsOmniActionRender(props, ref) {
+      const element = original.call(this, props, ref);
+      if (state.destroyed || native.broken || !element || typeof element !== "object") return element;
+      try {
+        const appId = Number(props?.overview?.appid) >>> 0;
+        if (!isManagedShortcutAppId(appId)) return element;
+        if (!native.unpatchClick) native.unpatchClick = patchClick(element.type);
+        return React.createElement(getNativeHost(tfs), { element, appId });
+      } catch (error) {
+        native.broken = true;
+        console.warn("[TFS Downloads] Steam's action button left stock:", error);
+        return element;
+      }
+    });
+    return true;
+  }
+
+  /** Steam loads the game page's chunk lazily: look again for a while. */
+  function attachNativeActionButton(tfs, attempt) {
+    window.clearTimeout(native.retryTimer);
+    if (state.destroyed || native.broken) return;
+    try {
+      if (patchNativeActionButton(tfs)) return;
+    } catch (error) {
+      native.broken = true;
+      console.warn("[TFS Downloads] Steam's action button left stock:", error);
+      return;
+    }
+    if (attempt >= 40) {
+      console.warn("[TFS Downloads] Steam's action button not found; the download row stays the only control.");
+      return;
+    }
+    native.retryTimer = window.setTimeout(() => attachNativeActionButton(tfs, attempt + 1), 3000);
+  }
+
+  function unpatchNativeActionButton() {
+    window.clearTimeout(native.retryTimer);
+    try { native.unpatchRender?.(); } catch {}
+    try { native.unpatchClick?.(); } catch {}
+    native.unpatchRender = null;
+    native.unpatchClick = null;
   }
 
   /**
@@ -821,6 +1213,7 @@
     try { state.channel?.close?.(); } catch {}
     state.channel = null;
     try { core()?.css?.remove?.(cssId); } catch {}
+    unpatchNativeActionButton();
     state.listeners.clear();
   }
 
@@ -833,7 +1226,10 @@
     get patched() {
       return Boolean(state.removePatch);
     },
-    internals: { describe, installLabel, transferMetrics, insertAfterPlaySection, isManagedShortcutAppId, isAppDetailsSections, state },
+    get nativeButton() {
+      return Boolean(native.unpatchRender && native.unpatchClick && !native.broken);
+    },
+    internals: { resolveNativeAction, withDisplayStatus, isOverviewLive, displayStatus, describe, installLabel, transferMetrics, insertAfterPlaySection, isManagedShortcutAppId, isAppDetailsSections, state },
   };
 
   void register();

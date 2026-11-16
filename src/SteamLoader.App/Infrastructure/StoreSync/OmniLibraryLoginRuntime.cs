@@ -62,9 +62,11 @@ internal static class OmniLibraryLoginRuntime
             CreateNoWindow = false,
         };
         startInfo.ArgumentList.Add($"{LoginArgumentPrefix}{profile.StoreId}");
-        return Process.Start(startInfo)
-               ?? throw new InvalidOperationException(
-                   $"Tools for Steam could not start the {profile.Title} sign-in window.");
+        var process = Process.Start(startInfo)
+                      ?? throw new InvalidOperationException(
+                          $"Tools for Steam could not start the {profile.Title} sign-in window.");
+        OmniLibraryLoginWindowFocus.AllowForeground(process);
+        return process;
     }
 
     public static void ClearUserData(string storeId)
@@ -154,33 +156,41 @@ internal static class OmniLibraryLoginRuntime
     // helper's own two-minute sign-in limit.
     private static readonly TimeSpan AuthenticationTimeout = TimeSpan.FromMinutes(6);
 
-    private const int ShowWindowRestore = 9;
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
-    private static extern bool SetForegroundWindow(IntPtr windowHandle);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
-    private static extern bool ShowWindow(IntPtr windowHandle, int command);
+    // How long after opening the window takes the foreground back when Big
+    // Picture grabs it again (Steam re-asserts its window while it settles).
+    private static readonly TimeSpan ForegroundGuardWindow = TimeSpan.FromSeconds(20);
+    private const int MaxForegroundReclaims = 6;
 
     /// <summary>
     /// Brings an already open sign-in window back in front. A second Sign In
-    /// press used to do nothing when the window had fallen behind Big Picture.
+    /// press used to do nothing when the window had fallen behind Big Picture,
+    /// and restoring it (SW_RESTORE) shrank the maximized window to a small
+    /// default size. The running sign-in process is asked to come forward
+    /// itself: it may take the foreground, the background host may not.
     /// </summary>
-    public static void TryActivate(Process process)
+    public static void TryActivate(Process process, string storeId)
     {
         try
         {
-            process.Refresh();
-            var handle = process.MainWindowHandle;
-            if (handle == IntPtr.Zero)
+            if (EventWaitHandle.TryOpenExisting(
+                    OmniLibraryLoginWindowFocus.ActivationEventName(storeId),
+                    out var activation))
             {
+                using (activation)
+                {
+                    activation.Set();
+                }
+
                 return;
             }
 
-            ShowWindow(handle, ShowWindowRestore);
-            SetForegroundWindow(handle);
+            process.Refresh();
+            var handle = process.MainWindowHandle;
+            if (handle != IntPtr.Zero)
+            {
+                OmniLibraryLoginWindowFocus.CoverTargetMonitor(handle);
+                OmniLibraryLoginWindowFocus.TryBringToForeground(handle, keepTopMost: true);
+            }
         }
         catch
         {
@@ -199,6 +209,12 @@ internal static class OmniLibraryLoginRuntime
         private readonly WebView2 _webView = new();
         private readonly TextBlock _statusText = new();
         private readonly System.Windows.Controls.Button _closeButton = new();
+        private readonly DateTime _openedAt = DateTime.UtcNow;
+        private readonly CancellationTokenSource _lifetime = new();
+        private IntPtr _handle;
+        private bool _openedOverBigPicture;
+        private int _foregroundReclaims;
+        private OmniLibraryLoginGamepad? _gamepad;
         private bool _completing;
         private bool _successful;
 
@@ -209,14 +225,240 @@ internal static class OmniLibraryLoginRuntime
             Background = WindowBackground;
             Foreground = WpfBrushes.White;
             WindowStyle = WindowStyle.None;
-            WindowState = WindowState.Maximized;
+            // Bounds come from the monitor Big Picture is on (SourceInitialized),
+            // never from WindowState.Maximized: a maximized window is maximized
+            // on whatever monitor Windows picks, and restoring it shrinks it.
+            WindowState = WindowState.Normal;
+            WindowStartupLocation = WindowStartupLocation.Manual;
             ResizeMode = ResizeMode.NoResize;
             Topmost = true;
             ShowInTaskbar = true;
+            ShowActivated = true;
             Content = BuildContent();
             KeyDown += OnKeyDown;
+            SourceInitialized += OnSourceInitialized;
+            ContentRendered += (_, _) => ClaimForeground();
+            Deactivated += OnDeactivated;
             Loaded += OnLoaded;
-            Closed += (_, _) => _webView.Dispose();
+            Closed += OnClosed;
+        }
+
+        private void OnSourceInitialized(object? sender, EventArgs e)
+        {
+            _handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            _openedOverBigPicture = OmniLibraryLoginWindowFocus.FindBigPictureWindow() != IntPtr.Zero;
+            OmniLibraryLoginWindowFocus.CoverTargetMonitor(_handle);
+            StartActivationListener();
+        }
+
+        /// <summary>
+        /// Takes the foreground, retried a few times while Steam settles. The
+        /// window is useless behind Big Picture: the controller keeps driving
+        /// Steam and the page never sees input.
+        /// </summary>
+        private void ClaimForeground()
+        {
+            if (_handle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            OmniLibraryLoginWindowFocus.CoverTargetMonitor(_handle);
+            if (OmniLibraryLoginWindowFocus.TryBringToForeground(_handle, keepTopMost: true))
+            {
+                FocusPage();
+                return;
+            }
+
+            var attempt = 0;
+            var retry = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(350),
+            };
+            retry.Tick += (_, _) =>
+            {
+                attempt++;
+                if (_lifetime.IsCancellationRequested ||
+                    OmniLibraryLoginWindowFocus.IsForeground(_handle) ||
+                    attempt > 8)
+                {
+                    retry.Stop();
+                    return;
+                }
+
+                OmniLibraryLoginWindowFocus.CoverTargetMonitor(_handle);
+                if (OmniLibraryLoginWindowFocus.TryBringToForeground(_handle, keepTopMost: true))
+                {
+                    FocusPage();
+                }
+            };
+            retry.Start();
+        }
+
+        private void FocusPage()
+        {
+            try
+            {
+                Activate();
+                _webView.Focus();
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
+        /// Big Picture re-asserts its window shortly after the sign-in window
+        /// appears. During the first seconds the window takes the foreground
+        /// back from Big Picture (only from Big Picture, so the touch keyboard
+        /// or another app the user opens are never fought).
+        /// </summary>
+        private void OnDeactivated(object? sender, EventArgs e)
+        {
+            if (_completing ||
+                _lifetime.IsCancellationRequested ||
+                _foregroundReclaims >= MaxForegroundReclaims ||
+                DateTime.UtcNow - _openedAt > ForegroundGuardWindow)
+            {
+                return;
+            }
+
+            _ = Dispatcher.InvokeAsync(async () =>
+            {
+                await Task.Delay(150);
+                if (_lifetime.IsCancellationRequested ||
+                    !OmniLibraryLoginWindowFocus.IsBigPictureForeground())
+                {
+                    return;
+                }
+
+                _foregroundReclaims++;
+                ClaimForeground();
+            });
+        }
+
+        /// <summary>A second Sign In press signals this event (see TryActivate).</summary>
+        private void StartActivationListener()
+        {
+            EventWaitHandle activation;
+            try
+            {
+                activation = new EventWaitHandle(
+                    false,
+                    EventResetMode.AutoReset,
+                    OmniLibraryLoginWindowFocus.ActivationEventName(_profile.StoreId));
+            }
+            catch
+            {
+                return;
+            }
+
+            var token = _lifetime.Token;
+            var thread = new Thread(() =>
+            {
+                using (activation)
+                {
+                    var handles = new WaitHandle[] { activation, token.WaitHandle };
+                    while (WaitHandle.WaitAny(handles) == 0)
+                    {
+                        Dispatcher.BeginInvoke(() =>
+                        {
+                            _foregroundReclaims = 0;
+                            ClaimForeground();
+                        });
+                    }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "OmniLibrary sign-in activation",
+            };
+            thread.Start();
+        }
+
+        private void OnClosed(object? sender, EventArgs e)
+        {
+            _lifetime.Cancel();
+            _gamepad?.Dispose();
+            OmniLibraryLoginGamepad.HideTouchKeyboard();
+            _webView.Dispose();
+            if (_openedOverBigPicture)
+            {
+                // Back to Big Picture with the controller driving Steam again.
+                OmniLibraryLoginWindowFocus.ReleaseForeground();
+                OmniLibraryLoginWindowFocus.ReturnToBigPicture();
+            }
+        }
+
+        private void StartGamepad()
+        {
+            _gamepad = new OmniLibraryLoginGamepad(
+                Dispatcher,
+                () => OmniLibraryLoginWindowFocus.IsForeground(_handle),
+                action => _ = OnGamepadActionAsync(action));
+            _gamepad.Start();
+        }
+
+        private async Task OnGamepadActionAsync(string action)
+        {
+            if (_webView.CoreWebView2 is null)
+            {
+                if (action == "b" && !_completing)
+                {
+                    Close();
+                }
+
+                return;
+            }
+
+            if (action == "x")
+            {
+                OmniLibraryLoginGamepad.ShowTouchKeyboard(toggle: true);
+                return;
+            }
+
+            if (action == "b" && OmniLibraryLoginGamepad.HideTouchKeyboard())
+            {
+                return;
+            }
+
+            string result;
+            try
+            {
+                // Give a key Steam Input may have produced for the same press a
+                // moment to reach the page, so the page script can skip ours.
+                if (!action.StartsWith("scroll:", StringComparison.Ordinal))
+                {
+                    await Task.Delay(60);
+                }
+
+                var raw = await _webView.CoreWebView2.ExecuteScriptAsync(
+                    $"window.__tfsLoginPad ? window.__tfsLoginPad.run({JsonSerializer.Serialize(action)}) : 'missing'");
+                result = JsonSerializer.Deserialize<string>(raw) ?? string.Empty;
+            }
+            catch
+            {
+                return;
+            }
+
+            switch (result)
+            {
+                case "text":
+                    _webView.Focus();
+                    OmniLibraryLoginGamepad.ShowTouchKeyboard();
+                    break;
+                case "back":
+                    if (_webView.CoreWebView2.CanGoBack)
+                    {
+                        _webView.CoreWebView2.GoBack();
+                    }
+                    else if (!_completing)
+                    {
+                        Close();
+                    }
+
+                    break;
+            }
         }
 
         public int ResultCode => _successful ? 0 : 1;
@@ -230,7 +472,7 @@ internal static class OmniLibraryLoginRuntime
             var header = new Grid
             {
                 Background = HeaderBackground,
-                Height = 86,
+                Height = 104,
                 Margin = new Thickness(0),
             };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -254,6 +496,13 @@ internal static class OmniLibraryLoginRuntime
             _statusText.Foreground = MutedForeground;
             _statusText.Margin = new Thickness(0, 5, 0, 0);
             textStack.Children.Add(_statusText);
+            textStack.Children.Add(new TextBlock
+            {
+                Text = "Controller: D-pad move · A select · B back · X keyboard · Start confirm · LB/RB next field",
+                FontSize = 13,
+                Foreground = MutedForeground,
+                Margin = new Thickness(0, 4, 0, 0),
+            });
             header.Children.Add(textStack);
 
             _closeButton.Content = "Cancel";
@@ -298,7 +547,11 @@ internal static class OmniLibraryLoginRuntime
                 _webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
                 _webView.CoreWebView2.WebResourceResponseReceived += OnWebResourceResponseReceived;
                 _webView.CoreWebView2.NewWindowRequested += OnNewWindowRequested;
+                await _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
+                    OmniLibraryLoginGamepad.NavigationScript);
+                StartGamepad();
                 _webView.CoreWebView2.Navigate(_profile.LoginUrl);
+                FocusPage();
             }
             catch (Exception exception)
             {
