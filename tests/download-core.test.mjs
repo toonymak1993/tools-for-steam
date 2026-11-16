@@ -204,10 +204,10 @@ test("Steam's own action button: Install / Pause / Resume for OmniLibrary games,
   assert.equal(resolveNativeAction({ storeId: "", game: null }), null);
 
   const running = { download: { status: "downloading", progressPercent: 40 } };
-  // Without Steam's enum (tests), Pause is unknown: Cancel when allowed.
-  deepEqual(status(running, { canPause: true, canCancel: true }), { status: displayStatus.Cancel, action: "cancel" });
-  displayStatus.Pause = 7;
-  displayStatus.Resume = 22;
+  // Pinned Steam values: 7 Downloading renders "Pause", 22 DownloadPaused "Resume".
+  assert.equal(displayStatus.Pause, 7);
+  assert.equal(displayStatus.Resume, 22);
+  deepEqual(status(running, { canPause: false, canCancel: true }), { status: displayStatus.Cancel, action: "cancel" });
   deepEqual(status(running, { canPause: true, canCancel: true }), { status: 7, action: "pause" });
   deepEqual(status({ download: { status: "paused" } }, { canResume: true }), { status: 22, action: "resume" });
   deepEqual(status({ download: { status: "paused" } }, { canResume: false }), { status: displayStatus.Install, action: "install" });

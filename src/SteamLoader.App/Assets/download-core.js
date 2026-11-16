@@ -838,15 +838,25 @@
   /** Steam's live statuses: while Steam sets one of these its own button stays. */
   const liveDisplayStatuses = new Set([1, 4, 36]);
 
-  /** EDisplayStatus values (read from Steam at runtime when possible). */
+  /**
+   * Steam's EDisplayStatus values and the action its button derives from
+   * each (read live from Steam build 1794536281, 2026-11-16; the enum's keys
+   * are minified, so the values are pinned here):
+   *   1 Launching -> "Cancel", 7 Downloading -> "Pause",
+   *   9 ReadyToInstall -> "Install", 11 ReadyToLaunch -> "Play",
+   *   14 InvalidPlatform -> disabled "Install", 20 UpdateRequired -> "Update",
+   *   22 DownloadPaused -> "Resume".
+   * Steam's own clicks for Pause/Resume act on Steam's download queue, which
+   * is why OnClick is routed to OmniLibrary for our proxies.
+   */
   const displayStatus = {
     Cancel: 1,
     Install: 9,
     Play: 11,
     InstallUnavailable: 14,
     Update: 20,
-    Pause: 0,
-    Resume: 0,
+    Pause: 7,
+    Resume: 22,
   };
 
   const native = {
