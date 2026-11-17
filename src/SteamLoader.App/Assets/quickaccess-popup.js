@@ -1,6 +1,6 @@
 (() => {
   const apiBase = "__STEAMLOADER_API_BASE__";
-  const stateVersion = 210;
+  const stateVersion = 211;
   const popupScriptVersion = "__STEAMLOADER_SCRIPT_VERSION__";
   // Steam's drawer slide is 300 ms; TFS waits for it before touching bounds.
   const nativeBoundsAnimationMs = 300;
@@ -645,8 +645,10 @@
     window.__steamLoaderExternalGameVisibilityHandler = null;
   }
 
-  // OmniLibrary's tab manager. Its engine is bundled ahead of this script.
-  const tabHeroEngine = window.__steamLoaderTabHero;
+  // Tab Hero (OmniLibrary's TabMaster-style tab manager) was removed on
+  // 17.11.2026: it caused problems for users, and the store tabs are Steam's
+  // own Library tabs now. Without the engine its entry and pages never show.
+  const tabHeroEngine = null;
 
   function createTabHeroUiState() {
     return {
@@ -13476,7 +13478,7 @@
   const tabHeroPagePrefix = "tabs";
 
   function isTabHeroRoute(route = state.route) {
-    return route?.screen === "page" &&
+    return Boolean(tabHeroEngine) && route?.screen === "page" &&
       route?.pluginId === "omnilibrary" &&
       String(route?.pageId || "").startsWith(tabHeroPagePrefix);
   }

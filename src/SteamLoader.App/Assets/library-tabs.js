@@ -47,7 +47,7 @@
     return;
   }
 
-  const stateVersion = "omnilibrary-store-tabs-v78-library-only-focus";
+  const stateVersion = "omnilibrary-store-tabs-v82-native-tabs-core";
   // TabMaster-style route tabs (every tab a real /library/tab/<id> route) are
   // off for now: in the live test LB/RB stopped moving between our tabs. The
   // v72 virtual navigation with the catch-all bumper handler is active again.
@@ -85,8 +85,11 @@
   // Tab Hero is OmniLibrary's tab manager. It never patches Steam itself: this
   // file is the single compositor for Steam's own tabs, OmniLibrary's store
   // and platform tabs, and Tab Hero's renames, order and filter tabs.
-  const tabHero = window.__steamLoaderTabHero;
+  // Tab Hero (TFS's TabMaster-style tab manager) was removed on 17.11.2026.
+  // A copy an older build left in this window must not come back.
+  const tabHero = null;
   const tabHeroCustomTabPrefix = "tabhero-";
+  const nativeStoreTabsOwnLibrary = true;
   const tabHeroFilterMarkerKey = "__steamLoaderTabHeroFilter";
   const tabHeroOriginalTitleKey = "__steamLoaderTabHeroOriginalTitle";
   const tabHeroFilterCacheMs = 2000;
@@ -817,7 +820,10 @@
   state.showUninstallNotice = showOmniLibraryUninstallNotice;
 
   function getEnabledStoreDefinitions() {
-    if (!state.pluginEnabled) {
+    // The store tabs are Steam's own Library tabs now (omnilibrary-tabs-core.js
+    // in the shared context). This compositor no longer adds or repairs tabs,
+    // and its inactive path removes tabs an older build injected.
+    if (nativeStoreTabsOwnLibrary || !state.pluginEnabled) {
       return [];
     }
     return storeDefinitions.filter((definition) =>
@@ -3423,6 +3429,11 @@
   }
 
   function reconcileTabs(tabs) {
+    // Steam's tab list belongs to Steam (and the native store tabs) now; only
+    // tabs an older build spliced in are taken out again.
+    if (nativeStoreTabsOwnLibrary && !tabs.some((tab) => isInjectedXboxTab(tab))) {
+      return false;
+    }
     const merged = mergeXboxTab(tabs);
     if (tabsSignature(tabs) === tabsSignature(merged) && tabs.length === merged.length) {
       return false;

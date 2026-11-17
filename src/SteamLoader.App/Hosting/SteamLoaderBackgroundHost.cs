@@ -233,6 +233,9 @@ public sealed class SteamLoaderBackgroundHost
             // OmniLibrary download row on the game page, right below Play
             // (after hltb-core so it wraps outermost and sits above HLTB).
             EmbeddedAssetReader.ReadText("Assets/download-core.js"),
+            // OmniLibrary store tabs as Steam's own Library tabs (patches the
+            // /library route and splices the tabs into Steam's tab list).
+            EmbeddedAssetReader.ReadText("Assets/omnilibrary-tabs-core.js"),
             // TFS Overture: game page theme music and its settings route.
             EmbeddedAssetReader.ReadText("Assets/overture-core.js"),
             // TFS Metadata: per-game metadata editor route (/tfs/metadata/:appId).
@@ -249,7 +252,6 @@ public sealed class SteamLoaderBackgroundHost
         var popupScript = string.Join(
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/st-frontend-lib.js"),
-            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/quickaccess-popup.js"),
             // Window bridge: Steam keyboard for every text field + core.css (tfs-core).
             EmbeddedAssetReader.ReadText("Assets/window-bridge.js"));
@@ -257,7 +259,6 @@ public sealed class SteamLoaderBackgroundHost
             Environment.NewLine,
             EmbeddedAssetReader.ReadText("Assets/theme-surface.js"),
             EmbeddedAssetReader.ReadText("Assets/hltb-surface.js"),
-            EmbeddedAssetReader.ReadText("Assets/tabhero-engine.js"),
             EmbeddedAssetReader.ReadText("Assets/omnilibrary-tab-topology.js"),
             EmbeddedAssetReader.ReadText("Assets/library-tabs.js"),
             EmbeddedAssetReader.ReadText("Assets/xbox-library-surface.js"),

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -721,7 +721,7 @@ test("disabling OmniLibrary removes its owned UI and standalone tab runtime", ()
   assert.match(tabs, /state\.pluginEnabled = snapshot\?\.pluginEnabled === true/);
   assert.match(tabs, /if \(!isLibraryTabRuntimeEnabled\(\) \|\| !direction\)/);
   assert.match(tabs, /if \(!runtimeActive\)\s*\{\s*setVirtualActiveTabId\("", true\)/s);
-  assert.match(tabs, /function getEnabledStoreDefinitions\(\)\s*\{\s*if \(!state\.pluginEnabled\)/s);
+  assert.match(tabs, /function getEnabledStoreDefinitions\(\)\s*\{[\s\S]*?if \(nativeStoreTabsOwnLibrary \|\| !state\.pluginEnabled\)/);
   assert.match(tabs, /const omniLibraryRuntimeActive =\s*state\.pluginEnabled && getEnabledStoreDefinitions\(\)\.length > 0/);
   assert.match(
     tabs,
@@ -754,37 +754,21 @@ test("disabling OmniLibrary removes its owned UI and standalone tab runtime", ()
   assert.match(artwork, /removeOmniLibraryUninstallContextRows\(\)/);
 });
 
-test("Tab Hero lives inside OmniLibrary instead of being a separate plugin", () => {
+test("Tab Hero (TabMaster-style tab manager) is removed from OmniLibrary", () => {
   const catalog = read("src/SteamLoader.App/Infrastructure/Settings/SteamLoaderPluginCatalog.cs");
   const host = read("src/SteamLoader.App/Hosting/SteamLoaderBackgroundHost.cs");
   const tabs = read("src/SteamLoader.App/Assets/library-tabs.js");
   const popup = read("src/SteamLoader.App/Assets/quickaccess-popup.js");
 
-  // No own plugin entry: Tab Hero is switched on and off with OmniLibrary.
   assert.doesNotMatch(catalog.toLowerCase(), /tabhero/);
-  // The engine is loaded before both consumers in each injected bundle.
-  assert.match(
-    host,
-    /ReadText\("Assets\/tabhero-engine\.js"\)[\s\S]*?ReadText\("Assets\/quickaccess-popup\.js"\)/,
-  );
-  assert.match(
-    host,
-    /ReadText\("Assets\/tabhero-engine\.js"\)[\s\S]*?ReadText\("Assets\/omnilibrary-tab-topology\.js"\)[\s\S]*?ReadText\("Assets\/library-tabs\.js"\)/,
-  );
-  // One compositor: library-tabs.js builds store tabs and Tab Hero tabs together.
-  assert.match(tabs, /const tabHero = window\.__steamLoaderTabHero/);
-  assert.match(tabs, /state\.tabMasterOwnsLayout !== true/);
-  assert.match(tabs, /isTabHeroEnabled\(\)\s*\?\s*tabHero\.composeTabs\(combinedTabs\)/);
-  assert.match(tabs, /tabHero\.composeTabs\(omniLibraryTabs, \{ observe: false \}\)/);
-  assert.match(tabs, /state\.tabHeroUnsubscribe = tabHero\.subscribe\(/);
-  assert.doesNotMatch(tabs, /localStorage\.removeItem\("ToolsForSteamTabheroSettings/);
-  // Neither script may dispose the engine or wipe its saved layout any more.
-  for (const source of [tabs, popup]) {
-    assert.doesNotMatch(source, /heroSettings\.v1|heroCatalog\.v1|"Tab", "Hero"/);
-  }
-  // The UI is the "Library Tabs" page inside the OmniLibrary plugin.
-  assert.match(popup, /const tabHeroPagePrefix = "tabs"/);
-  assert.match(popup, /slotKey: "omnilibrary-tabhero-entry"/);
+  assert.doesNotMatch(host, /tabhero-engine\.js/);
+  assert.equal(existsSync(new URL("../src/SteamLoader.App/Assets/tabhero-engine.js", import.meta.url)), false);
+  // A copy an older build left in a Steam window is ignored as well.
+  assert.match(tabs, /const tabHero = null;/);
+  assert.doesNotMatch(tabs, /window\.__steamLoaderTabHero\b/);
+  assert.match(popup, /const tabHeroEngine = null;/);
+  assert.doesNotMatch(popup, /window\.__steamLoaderTabHero\b/);
+  assert.match(popup, /function isTabHeroRoute\(route = state\.route\) \{\s*return Boolean\(tabHeroEngine\) &&/);
   assert.match(popup, /\.\.\.\(tabHeroEngine \? \[buildTabHeroEntrySlot\(\)\] : \[\]\)/);
 });
 
